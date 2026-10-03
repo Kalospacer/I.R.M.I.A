@@ -1,0 +1,142 @@
+{
+  "$comment": [
+    "Irmia Agent 配置（M2 最小子集：JSON 语法子集，语义对齐 docs/operations.md §1）",
+    "以 \"$\" 开头的键是注释，加载时忽略；删掉它们不影响运行。",
+    "密钥不落配置文件：apiKeyEnv 只写环境变量名，密钥值放进程环境里。",
+    "本文件缺失时会自动重建；字段缺失时按默认值补齐，但不会自动改写你写过的文件。",
+    "用法：把本文件复制成 config.json 再改（config.json 不进版本库）。",
+    "相对路径（dataDir / paths.workspaceAllowlist）以**本配置文件所在目录**为基准解析。"
+  ],
+  "schemaVersion": 1,
+  "dataDir": "./data",
+  "models": {
+    "$comment": [
+      "heavy = turn 主循环；light = 必要性判断/摘要/守卫分类；degraded = 降级链备用路由（不写即不启用）。",
+      "baseUrl 是 API 根地址（不含 /responses）。"
+    ],
+    "heavy": {
+      "model": "deepseek-flash",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKeyEnv": "IRMIA_API_KEY"
+    },
+    "light": {
+      "model": "deepseek-flash",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKeyEnv": "IRMIA_API_KEY"
+    }
+  },
+  "budget": {
+    "$comment": [
+      "三层刹车 + 每日额度 + 软阈值（design.md §4.6）。全部跨重启累计。",
+      "softRatio：达到 上限×ratio 时先提示模型收尾，越过才硬停。",
+      "taskTokens / dailyTokens 的口径都是**未扣缓存**的 token 数（含 cacheHit）——真实花销比这个数字小，所以上限按这个口径定（2026-10-03 把 dailyTokens 抬到 1e8；当时缓存命中率约 92%）。"
+    ],
+    "stepTools": 20,
+    "turnSteps": 30,
+    "taskTokens": 100000000,
+    "dailyTokens": 100000000,
+    "softRatio": 0.8,
+    "failStreakMax": 5
+  },
+  "wake": {
+    "$comment": [
+      "心跳基线 30 分钟，空拍按 2^n 退避、封顶 8 倍，压力高则压缩；任何外部事件到达即复位（design.md §4.12）。",
+      "heartbeatFloorMin / heartbeatCeilMin：间隔的实际上下限（分钟）。退避再深也不超过 60 分钟不露面，压力再大也不短于 10 分钟一拍。"
+    ],
+    "heartbeatBaselineMin": 30,
+    "idleBackoffMax": 8,
+    "heartbeatFloorMin": 10,
+    "heartbeatCeilMin": 60
+  },
+  "vision": {
+    "$comment": [
+      "图片进上下文的两个出口：聊天图片直接进上下文（模型亲眼看），以及 vision_read 的文字转述。",
+      "imagesToContext：默认 true。开 = QQ 发来的图片直接进上下文（最多 maxContextImages 张），且 vision_read 可用 inline 参数把指定图放进上下文；关 = 图片一律不进，只剩地址与转述。",
+      "maxContextImages：同时待在上下文里的图片张数上限（默认 2）。图片每轮都要重发，留太多等于每轮都为旧图付费。"
+    ],
+    "imagesToContext": true,
+    "maxContextImages": 2
+  },
+  "speak": {
+    "$comment": [
+      "发言节奏（speak 的拆条投递）：段与段之间按「这一段要打多久」隔开，界面与 IM 同一个节奏。",
+      "typingEffect：默认 true。关掉则所有段立刻发完，没有「人在打字」的体感。",
+      "charsPerMinute：打字速度（默认 90 字/分钟，中文手机输入的常见速度）。调大说得更快，范围 30~600。",
+      "说话期间人又从聊天框或 QQ 发来消息时，speak 会立刻停下（已发出的收不回来，没发的不发）。"
+    ],
+    "typingEffect": true,
+    "charsPerMinute": 90
+  },
+  "paths": {
+    "$comment": [
+      "工作目录白名单：文件操作解析后必须落在其中任一目录内；空数组 = 一个都不允许。"
+    ],
+    "workspaceAllowlist": [
+      "./workspace"
+    ]
+  },
+  "tools": {
+    "$comment": [
+      "destructive 工具开关，三态：false 全关（默认）/ true 全开 / 数组只开名单内的（如 [\"pwsh\",\"http_post\"]）。",
+      "「危险」在系统里的含义是\"崩溃后不可自动重试\"，不代表开关可以随手打开。"
+    ],
+    "destructiveEnabled": true,
+    "disabled": [],
+    "groupSceneHardRefusal": false
+  },
+  "deps": {
+    "$comment": [
+      "外部依赖（pwsh 7 / ripgrep / es.exe）的用户指定路径 —— 探测顺序的第一段：用户指定 > 框架自装目录 <dataDir>/tools/<name> > PATH。",
+      "不写就走后两段；写了一个不可用的路径**不会**静默退回 PATH，而是如实报「你指的那个用不了」——「我配了却不生效」是最难查的一类故障。",
+      "rg 与 es 可以在 GUI 设置页「外部依赖」一键安装（下载官方包解压到 <dataDir>/tools/<name>/，装完就地复检、不必重启进程）。",
+      "pwsh 7 需要人工安装（winget install Microsoft.PowerShell）——它的 Windows 分发是 MSI/winget/商店包，静默安装要提权，无人值守进程里弹 UAC 只会卡住。"
+    ],
+    "paths": {}
+  },
+  "persona": {
+    "$comment": [
+      "owner：本机用户的档案标识。你在聊天框说话时它会作为 person 注入那一轮，",
+      "于是 persona/RELATIONSHIPS/<owner>.md 每轮自动进上下文（人格的唤醒路由）。",
+      "它是文件名，不是昵称展示位——写什么就得有同名文件（含空格与大小写）。默认 owner。",
+      "contacts：联系人表（会话 sid → 名字）。QQ 不给昵称、也没有查成员的接口，",
+      "所以「这个 QQ 会话是某个人」这类知识只能在这里声明；它优先于她自己记的 MEMORIES/aliases.md。",
+      "compactionThresholdTokens：可见历史估算超过它就压一次。2026-10-04 定稿：32000 太低，抬到 100000（代码默认值仍是 32000，这里显式覆盖）。"
+    ],
+    "owner": "owner",
+    "contacts": {},
+    "compactionThresholdTokens": 100000
+  },
+  "channels": {
+    "$comment": [
+      "QQ 官方 Bot API：要填的是 AppID 与 AppSecret 这两把密钥的**值**，在 GUI「消息适配器 → QQ 官方」的两个输入框里填，存进 data/.keys.json（不进这个文件）。",
+      "groupBatchMinutes：群消息攒批窗口（分钟）。单聊是有人直接跟你说话，每句都及时看；群聊的一条 @ 常常只是半句话，攒到窗口再一起看。0 = 每条都唤醒。",
+      "OneBot 11 是另一条通道（连本机协议端的 ws 端口），不用官方 AppID/Secret。"
+    ],
+    "qqOfficial": {
+      "enabled": true,
+      "groupBatchMinutes": 3
+    },
+    "onebot": {
+      "enabled": true,
+      "managed": {
+        "dir": "./data/services/snowluma",
+        "kind": "snowluma",
+        "autoStart": true
+      }
+    },
+    "mentionKeywords": [
+      "伊尔弥亚",
+      "弥亚小姐",
+      "弥亚",
+      "魔神小姐"
+    ]
+  },
+  "alerts": {
+    "$comment": [
+      "通用 webhook 出口：POST JSON { level, title, body, ts, fingerprint }；不配 webhookUrl 即只落日志。",
+      "rateLimitMin：同类告警限流窗口（分钟）。"
+    ],
+    "rateLimitMin": 30
+  },
+  "timezone": "Asia/Shanghai"
+}

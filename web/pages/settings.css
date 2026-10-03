@@ -1,0 +1,76 @@
+/* 设置页 —— 模型 / 界面 / 系统 / 关于
+ * 模型卡可写（模型名 + 密钥）；界面/系统/关于三格都是"一行一个事实"的清单：
+ * 左标签、右只读值（复用 app.css 的 .field-row 栅格）。
+ */
+
+.set-body {
+  margin-top: 4px;
+}
+
+/* 明暗切换：两枚按钮的分段控件（.seg 来自 app.css），贴在行尾 */
+#set-theme {
+  justify-self: start;
+}
+
+/* 只读值：等宽字要能横着读完，不要被栅格挤断 */
+.set-body .field-row > .mono {
+  min-width: 0;
+  color: var(--on-surface-variant);
+  word-break: break-all;
+}
+
+/* “需重启”这类标签行：左标签是正文色，只读值是次要色，层次靠色阶不靠粗细 */
+.set-body .field-row > div:first-child {
+  color: var(--on-surface);
+}
+
+/* 需重启徽章：别跟标签挤在一行里打架 */
+.set-body .field-row .badge[data-tone="warn"] {
+  vertical-align: middle;
+}
+
+/* 关于卡的脚注：说明这几个数是从哪儿来的 */
+#set-about .footnote {
+  margin-top: 12px;
+}
+
+/* ── 模型分区（可写） ──
+ * 两条 lane 各一张卡：模型名与 API key 各占一个 .field-row，行尾的输入框 + 按钮
+ * 用一个 flex 容器接住（input 自适应，窄屏折行）。卡片之间留一口气。
+ */
+.set-body .card + .card {
+  margin-top: 16px;
+}
+
+.set-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.set-inline input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+/* 密钥框用等宽字：它能看到的永远只是一串点位，字宽稳定才好对 */
+.set-inline input[type="password"] {
+  font-family: var(--font-mono);
+  letter-spacing: 0.02em;
+}
+
+/* 标题里的「已配置 sk-…1234」徽章：跟标题同基线，不被行高挤歪 */
+#set-lane-heavy .card-title,
+#set-lane-light .card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+@media (max-width: 768px) {
+  .set-body .field-row {
+    grid-template-columns: 1fr;
+  }
+}

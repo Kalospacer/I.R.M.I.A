@@ -1,0 +1,39 @@
+/* 扩展页 —— 顶部四个 tab（下划线指示器来自 app.css 的 .tabs/.tab），下面是四格之一
+ * 这一页全是只读观测，只有技能格有写动作（信任门放行）。
+ */
+
+.ext-body {
+  margin-top: 4px;
+}
+
+/* 技能行：名字与徽章在上，路径/字节/哈希是第二行的小字（.field-row 的两列栅格照旧） */
+.ext-body .field-row[data-trust] > div:first-child {
+  min-width: 0;
+}
+
+/* 待确认那一格是唯一需要动手的地方：描边跟上信息色 */
+#sk-pending {
+  border-color: var(--primary);
+}
+
+/* Hook 是 agent 不可改的：条目读起来要像一份只读清单，不像表单 */
+#hk-list .field-row {
+  grid-template-columns: 1fr auto;
+}
+
+/* 坏条目与配置问题：贴在各自卡片底部，别混进正常条目里 */
+#hk-problems .st-line:first-child,
+#mcp-problems .st-line:first-child {
+  padding-top: 0;
+}
+
+/* 工具行为：三属性徽章同行，描述另起一行 */
+#tl-list .field-row .badge {
+  margin-right: 4px;
+}
+
+@media (max-width: 768px) {
+  #hk-list .field-row {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "anysearch",
+  "version": "3.1.1",
+  "source": "https://github.com/anysearch-ai/anysearch-skill",
+  "tag": "v3.1.1",
+  "archive": "https://github.com/anysearch-ai/anysearch-skill/archive/refs/tags/v3.1.1.zip",
+  "installedAt": "2026-09-29T20:25:29Z",
+  "skillMdSha256": "54702f6066dc76cb2b3c04ba556404e6113b1cdcf0f63120ef3306343f9ab25e"
+}

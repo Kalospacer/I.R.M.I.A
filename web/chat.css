@@ -1,0 +1,500 @@
+/* Irmia 聊天版（傻瓜首页）样式 —— 复用运维台的 token 表，只写增量
+ *
+ * 依赖 app.css：@import 进来即可拿到 token 表（--surface/--primary/--ok…）、
+ * 明暗双模、字体栈、以及 .btn/.gate/.dialog/.toast/.tiny/.variant/.row 这些基础件。
+ * 于是这里只负责「聊天」这一件事，颜色一律走 token，不出现字面色值。
+ *
+ * 外观规格（视觉效果与验收断言一一对应）：
+ *   ① 她有脸：内联 SVG sprite（index.html 的 #c-her-mark）——顶栏 40px、气泡左侧 28px；
+ *   ② 状态点 8px：沉睡缓慢呼吸 2.4s、运行中常亮、告警 1s 脉冲，三者都只动 opacity；
+ *   ③ 气泡质感：她白底 16/16/16/4、你浅蓝底 16/16/4/16、最大宽 70%、行高 1.65、
+ *      连续同侧贴 4px、换侧换气 16px；时间戳 10px，默认隐去、hover 才淡入；
+ *   ④ 背景：内容区纯白，只有对话滚动区铺一层极浅网格；
+ *   ⑤ 顶部发丝带：状态栏底部 2px，从左往右由实到无。
+ *
+ * 装饰纪律（验收清单）：装饰性的"渐变"在全页只出现在两处——对话区网格与顶栏发丝带
+ * （本文件里渐变的函数调用共 3 个：网格两向各一、发丝带一，验收按此计数）；
+ * 禁 box-shadow 泛光、禁毛玻璃、禁 emoji 图标、禁图片外链。
+ */
+
+@import url('app.css');
+
+/* ──────────────────────────── 本页增量 token ──────────────────────────── */
+
+:root {
+  /* 两个别名：色相仍出自 app.css 的种子色，这里不出现任何字面色值 */
+  --accent: var(--primary);
+  --accent-soft: var(--surface-highest);
+  --text-dim: var(--on-surface-variant);
+  /* 气泡节奏：连续同侧贴紧、换侧换气 */
+  --gap-same: 4px;
+  --gap-turn: 16px;
+  /* 她的房间的氛围光：顶部一片淡蓝晕开（全页两条渐变之一，另一条是发丝带） */
+  --dawn: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  /* 发丝级阴影：不是泛光，是纸的厚度 */
+  --shadow-hairline: 0 1px 2px rgba(16, 24, 40, .05);
+}
+
+/* 氛围光：body 底色，顶部淡蓝向下晕开为纯白——她醒着时的房间光 */
+body {
+  background: linear-gradient(180deg, var(--dawn) 0%, var(--surface) 340px);
+}
+[data-theme="dark"] body {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 10%, var(--bg)) 0%, var(--bg) 340px);
+}
+
+/* ──────────────────────────────── 骨架 ──────────────────────────────── */
+
+/* 三块：对话流 / 确认卡片 / 输入行；中间那行吃掉全部剩余高度并自己滚动
+ * （顶栏搬到主壳之后，这里不再需要给它留一行） */
+.c-app {
+  display: grid;
+  grid-template-rows: 1fr auto auto;
+  height: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  border-left: 1px solid var(--outline-variant);
+  border-right: 1px solid var(--outline-variant);
+}
+
+/* sprite 容器：不占位、不显示，但仍能被 <use> 引用（不能用 display:none） */
+.c-sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* ──────────────────────────────── 顶栏 ──────────────────────────────── */
+
+.c-top {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  padding: 14px 18px;
+}
+
+/* 发丝带：3px 更可见，60% 透明收敛 */
+.c-top::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background-image: linear-gradient(90deg, color-mix(in srgb, var(--accent) 60%, transparent) 0%, transparent 65%);
+  pointer-events: none;
+}
+
+/* 她的脸：48px，圆角 16px，底色浅蓝晕白，火苗鹿首 30px */
+.c-avatar {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  background: var(--accent-soft);
+  border: 1px solid var(--outline-variant);
+  box-shadow: var(--shadow-hairline);
+}
+
+.c-face {
+  display: block;
+  width: 30px;
+  height: 30px;
+  color: var(--accent);
+}
+
+.c-statuswrap {
+  min-width: 0;
+}
+
+/* 状态行：8px 状态点 + 一句人话（17px/650） */
+.c-srow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.c-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--sleep);
+  animation: c-breathe 2.4s ease-in-out infinite;
+}
+
+/* 沉睡/闲置：缓慢呼吸（只动 opacity，绝不动尺寸——缩放会让人以为界面在抖） */
+.c-dot[data-kind="idle"] { background: var(--primary); animation: c-breathe 2.4s ease-in-out infinite; }
+.c-dot[data-kind="sleeping"] { background: var(--sleep); animation: c-breathe 2.4s ease-in-out infinite; }
+.c-dot[data-kind="loading"] { background: var(--sleep); animation: c-breathe 2.4s ease-in-out infinite; }
+/* 运行中：常亮（她醒着干活，不该闪） */
+.c-dot[data-kind="running"] { background: var(--ok); animation: none; }
+/* 告警：1s 脉冲（同样只动透明度） */
+.c-dot[data-kind="degraded"],
+.c-dot[data-kind="paused"],
+.c-dot[data-kind="needs-review"],
+.c-dot[data-kind="offline"] {
+  background: var(--warn);
+  animation: c-pulse 1s ease-in-out infinite;
+}
+
+.c-status {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: .01em;
+  color: var(--on-surface);
+  transition: color var(--t-state) var(--ease-out);
+}
+
+.c-status[data-kind="needs-review"] { color: var(--warn); }
+.c-status[data-kind="paused"] { color: var(--warn); }
+.c-status[data-kind="degraded"] { color: var(--warn); }
+.c-status[data-kind="offline"] { color: var(--warn); }
+
+/* 状态句上有「（点这里）」时给一个可点的样子 */
+.c-status[data-act] { cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+
+.c-sub { margin: 2px 0 0; }
+
+.c-menu-btn {
+  margin-left: auto;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--on-surface-variant);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.c-menu-btn:hover { background: var(--surface-highest); }
+
+.c-menu {
+  position: absolute;
+  top: 56px;
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-width: 160px;
+  padding: 4px;
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.c-menu-item {
+  padding: 8px 12px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.c-menu-item:hover { background: var(--surface-highest); }
+
+/* ──────────────────────────────── 对话流 ──────────────────────────────── */
+
+/* 对话区：纯净底色（网格是工程图纸审美，她的房间该更柔），细滚动条 */
+.c-feed {
+  overflow-y: auto;
+  padding: 20px 18px;
+  background: transparent;
+  scrollbar-width: thin;
+  scrollbar-color: var(--outline-variant) transparent;
+}
+.c-feed::-webkit-scrollbar { width: 6px; }
+.c-feed::-webkit-scrollbar-thumb { background: var(--outline-variant); border-radius: 3px; }
+.c-feed::-webkit-scrollbar-track { background: transparent; }
+
+/* 行距由每行的 data-cont 决定（连续同侧 4、换侧 16），所以列表自身不再留 gap */
+.c-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.c-feed[data-state="loading"] .c-list,
+.c-feed[data-state="empty"] .c-list { display: none; }
+
+/* 引导卡只在"空对话"这一刻出现；加载中与有对话时都让位 */
+.c-feed[data-state="loading"] .c-guide,
+.c-feed[data-state="data"] .c-guide { display: none; }
+
+/* 同理，"正在把她叫醒"只在真没连上时出现：连上以后不该还挂着这句 */
+.c-feed[data-state="data"] .c-hint,
+.c-feed[data-state="empty"] .c-hint { display: none; }
+
+.c-hint { color: var(--on-surface-variant); font-size: 12px; }
+
+/* 首启引导卡：与对话流同一套行结构（28px 小脸 + 她的气泡），只是多了个按钮 */
+.c-guide {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: var(--empty-max);
+  margin: 24px auto 0;
+}
+
+.c-guide-actions { padding-left: 36px; }
+
+/* 一行对话：她在左、你在右；她与外面来的左侧带一枚小脸 */
+.c-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: var(--gap-turn);
+}
+
+/* 连续同侧的气泡贴紧，换侧才换气 */
+.c-row[data-cont="true"] { margin-top: var(--gap-same); }
+
+.c-row:first-child { margin-top: 0; }
+
+.c-row[data-side="me"] { justify-content: flex-end; }
+
+/* 气泡左侧那枚 28px 小脸：与顶栏同一份记号，但只露火苗 */
+.c-mini {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  background: var(--accent-soft);
+}
+
+.c-mini .c-face { width: 19px; height: 19px; }
+
+.c-bubble {
+  position: relative;
+  max-width: 70%;
+  padding: 10px 14px;
+  font-size: 14.5px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+  animation: c-in var(--t-sse) var(--ease-out);
+}
+
+/* 她的气泡：白底 + 发丝边 + 发丝影，左下角收一个小角 */
+.c-bubble[data-side="her"] {
+  background: var(--surface);
+  border: 1px solid var(--outline-variant);
+  border-radius: 16px 16px 16px 4px;
+  box-shadow: var(--shadow-hairline);
+}
+
+/* 外面来的人（QQ/网页回调）：浅底区分来源 */
+.c-bubble[data-side="them"] {
+  background: var(--surface-highest);
+  border: 1px solid var(--outline-variant);
+  border-radius: 16px 16px 16px 4px;
+}
+
+/* 你的气泡：实心蓝底白字（iMessage 式的确定性），右下小角 */
+.c-bubble[data-side="me"] {
+  background: var(--accent);
+  color: var(--on-primary);
+  border: none;
+  border-radius: 16px 16px 4px 16px;
+  box-shadow: var(--shadow-hairline);
+}
+
+/* 说话时刻：默认看不见，hover 气泡才淡入（不占布局，故绝对定位在右下角内侧） */
+.c-time {
+  position: absolute;
+  right: 10px;
+  bottom: 3px;
+  padding-left: 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+  background: inherit;
+  opacity: 0;
+  transition: opacity var(--t-sse) var(--ease-out);
+}
+
+.c-bubble:hover .c-time { opacity: 1; }
+
+.c-bubble[data-side="me"] .c-time { color: color-mix(in srgb, var(--on-primary) 70%, transparent); background: transparent; }
+
+/* 打字机光标：600ms 方波（用 steps 让透明度硬切，不渐变） */
+.c-caret {
+  margin-left: 1px;
+  color: var(--accent);
+  animation: c-blink 600ms steps(1, end) infinite;
+}
+
+.c-src { display: block; margin-top: 4px; color: var(--on-surface-variant); font-size: 12px; }
+
+/* 系统行：不打扰的灰色小字（定时到点、有人来过这类） */
+.c-sys {
+  align-self: center;
+  margin-top: var(--gap-turn);
+  color: var(--on-surface-variant);
+  font-size: 12px;
+  text-align: center;
+  animation: c-in var(--t-sse) var(--ease-out);
+}
+
+@keyframes c-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 呼吸与脉冲：只动 opacity（验收会 grep 这两个关键帧里不许出现缩放/位移） */
+@keyframes c-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@keyframes c-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+@keyframes c-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+/* ──────────────────────────────── 确认卡片 ──────────────────────────────── */
+
+.c-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 16px 12px;
+  background: var(--surface);
+}
+
+.c-card {
+  padding: 12px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.c-card-head { font-weight: 600; margin-bottom: 4px; }
+
+.c-card-args {
+  margin: 0 0 8px;
+  color: var(--on-surface-variant);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+
+.c-card-q { margin: 0 0 8px; }
+
+.c-card-hint { margin: 8px 0 0; }
+
+/* 输入区：一颗浮起的药丸——这是对她说话的地方，不是表单字段 */
+.c-compose {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px 16px;
+  background: transparent;
+}
+
+#c-input {
+  flex: 1;
+  height: 48px;
+  padding: 8px 18px;
+  border: 1px solid var(--outline-variant);
+  border-radius: 24px;
+  background: var(--surface);
+  box-shadow: var(--shadow-hairline);
+  font-size: 14.5px;
+  outline: none;
+  transition: border-color var(--t-sse) var(--ease-out), box-shadow var(--t-sse) var(--ease-out);
+}
+
+#c-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.c-send {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-primary);
+  cursor: pointer;
+  transition: background var(--t-sse) var(--ease-out);
+}
+.c-send:hover:not([disabled]) { background: color-mix(in srgb, var(--accent) 88%, black); }
+
+.c-send svg { width: 20px; height: 20px; }
+
+.c-send[disabled] { background: var(--surface-highest); color: var(--on-surface-variant); cursor: default; }
+
+/* 菜单弹出：透明度 + 4px 位移 */
+.c-menu { animation: c-menu-in 180ms ease-out; }
+@keyframes c-menu-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ──────────────────────────── token 门与弹层增量 ──────────────────────────── */
+
+.gate-avatar {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 4px;
+  border-radius: 20px;
+  background: var(--accent-soft);
+  border: 1px solid var(--outline-variant);
+  box-shadow: var(--shadow-hairline);
+  color: var(--accent);
+}
+.gate-avatar svg { width: 42px; height: 42px; }
+
+.c-modal-foot { margin-top: 16px; justify-content: flex-end; }
+
+.c-big {
+  font-size: 32px;
+  font-weight: 600;
+  line-height: 1.2;
+  margin: 8px 0;
+}
+
+.c-cost-row { display: flex; align-items: baseline; gap: 8px; }
+
+/* ──────────────────────────────── 窄屏 ──────────────────────────────── */
+
+@media (max-width: 768px) {
+  .c-app { border-left: none; border-right: none; }
+}
+
+/* ──────────────────────────── 壳内挂载（#/chat 页） ────────────────────────────
+ * 搬进主壳之后：氛围光由壳的内容区（.sh-main）铺，令牌门与状态句也归壳，
+ * 所以这一页不再自带底色，也不再自己撑高度——滚动发生在 .c-feed 里而不是壳上。
+ * 上面的规则一律原样保留：气泡、卡片、时间戳的选择器与 id 都没动。
+ */
+
+/* 聊天页占满壳内容区的确定高度（.sh-main 是 grid 行，高度已定），对话流自己滚 */
+#page-chat { height: 100%; }
+
+/* 对话区彻底透明：把壳那片氛围光透出来，不叠第二层背景 */
+#page-chat .c-feed { background: transparent; }
+

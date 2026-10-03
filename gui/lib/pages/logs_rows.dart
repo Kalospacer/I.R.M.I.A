@@ -1,0 +1,254 @@
+part of 'logs_page.dart';
+
+/// 事件摘要：与 web/pages/logs.js 的 summarize 同一张表
+String _summary(Map<String, dynamic> ev) {
+  final d = _map(ev['data']);
+  switch (_str(ev['type'])) {
+    case 'tool/call':
+      return '${d['name'] ?? '工具'}(${_brief(d['arguments'])})';
+    case 'tool/result':
+      return '${d['status'] ?? '结果'} · ${_brief(d['content'])}';
+    case 'budget/consumed':
+      return '+${_num(_int(d['inputTokens']))}↑ +${_num(_int(d['outputTokens']))}↓ (hit ${_num(_int(d['cacheHitTokens']))}) ${d['lane'] ?? ''}';
+    case 'turn/end':
+      return d['reason'] is Map ? _str(_map(d['reason'])['kind']) : '结束原因未知';
+    case 'turn/start':
+      return 'turn ${d['turn'] ?? '-'}';
+    case 'step/start':
+      return 'turn ${d['turn'] ?? '-'} step ${d['step'] ?? '-'} · ${d['model'] ?? ''}';
+    case 'step/end':
+      return '${d['toolCalls'] ?? 0} 次工具调用';
+    case 'wake/manual':
+      return '手动唤醒 · ${_brief(d['note'], 60)}';
+    case 'wake/timer':
+      return '定时器 ${d['timerId'] ?? ''}';
+    case 'wake/file':
+      return '${d['kind'] ?? '变更'} · ${d['path'] ?? ''}';
+    case 'wake/webhook':
+      return 'webhook ${d['path'] ?? ''}';
+    case 'wake/channel':
+      return '${d['channel'] ?? '通道'} · ${_brief(d['text'], 60)}';
+    case 'speak/sent':
+      return '${d['channel'] ?? ''} → ${_brief(d['text'], 60)}';
+    case 'wake/heartbeat':
+      return '心跳 · 空拍 ${d['idleTicks'] ?? 0}';
+    case 'message/assistant':
+      final text = _brief(d['text'], 70);
+      return text.isEmpty ? '工具调用 ${(d['toolCalls'] as List?)?.length ?? 0} 个' : text;
+    case 'message/user':
+      return _brief(d['text'], 70);
+    case 'policy/denied':
+      return '${d['tool'] ?? '工具'} 已拦截：${d['rule'] ?? ''} · ${_brief(d['reason'], 50)}';
+    case 'alarm/sent':
+      return '${d['level'] ?? ''} · ${_brief(d['title'], 60)}';
+    case 'session/start':
+      return 'pid ${d['pid'] ?? ''} · schema ${d['schemaVersion'] ?? ''}';
+    case 'instance/takeover':
+      return '接管旧实例 pid ${d['previousPid'] ?? ''}';
+    case 'model/degraded':
+      return '${d['lane'] ?? ''} 降级：${_brief(d['reason'], 50)}';
+    default:
+      return _brief(d, 90);
+  }
+}
+
+/// lane 大数字卡：进度条走「该 lane 今日消耗 / 日层硬上限」，软线由 softRatio 标出
+class _LaneCard extends StatelessWidget {
+  const _LaneCard({
+    required this.label,
+    required this.tokens,
+    required this.total,
+    required this.hardLimit,
+    required this.softRatio,
+  });
+
+  final String label;
+  final int tokens;
+  final int total;
+  final int hardLimit;
+  final double softRatio;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final soft = (hardLimit * softRatio).round();
+    final ratio = hardLimit > 0 ? (tokens / hardLimit).clamp(0.0, 1.0).toDouble() : 0.0;
+    final tone = hardLimit > 0 && tokens > hardLimit
+        ? IrmiaTheme.danger
+        : (hardLimit > 0 && tokens > soft ? IrmiaTheme.warn : scheme.primary);
+    return _card(
+      context,
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(label, style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+              const Spacer(),
+              Text(total > 0 ? '占今日 ${(tokens / total * 100).round()}%' : '—',
+                  style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(_num(tokens),
+              style: const TextStyle(
+                  fontSize: 26, fontWeight: FontWeight.w600, fontFeatures: [FontFeature.tabularFigures()])),
+          const SizedBox(height: 10),
+          SizedBox(
+            height: 6,
+            child: Stack(
+              children: [
+                Container(
+                  decoration: BoxDecoration(
+                    color: scheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+                FractionallySizedBox(
+                  widthFactor: ratio,
+                  child: Container(
+                    decoration: BoxDecoration(color: tone, borderRadius: BorderRadius.circular(4)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            hardLimit > 0 ? '距预算上限 ${_num(tokens)} / ${_num(hardLimit)}（软线 ${_num(soft)}）' : '未设置日上限，进度条不可用',
+            style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TypeMenu extends StatelessWidget {
+  const _TypeMenu({required this.picked, required this.onToggle, required this.onClear});
+
+  final Set<String> picked;
+  final ValueChanged<String> onToggle;
+  final VoidCallback onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return PopupMenuButton<void>(
+      tooltip: '按类型过滤',
+      itemBuilder: (context) => [
+        for (final group in _eventGroups.entries) ...[
+          PopupMenuItem<void>(
+            enabled: false,
+            height: 28,
+            child: Text(group.key,
+                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: scheme.onSurfaceVariant)),
+          ),
+          for (final type in group.value)
+            PopupMenuItem<void>(
+              height: 32,
+              onTap: () => onToggle(type),
+              child: Row(
+                children: [
+                  Icon(
+                    picked.contains(type) ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+                    size: 15,
+                    color: picked.contains(type) ? scheme.primary : scheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(type, style: _mono(11.5, picked.contains(type) ? scheme.primary : scheme.onSurface)),
+                ],
+              ),
+            ),
+        ],
+        const PopupMenuDivider(),
+        PopupMenuItem<void>(height: 32, onTap: onClear, child: const Text('清空过滤', style: TextStyle(fontSize: 12.5))),
+      ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        decoration: BoxDecoration(
+          color: scheme.surface,
+          border: Border.all(color: scheme.outlineVariant),
+          borderRadius: BorderRadius.circular(IrmiaTheme.radiusCtl),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.filter_list_rounded, size: 15, color: scheme.onSurfaceVariant),
+            const SizedBox(width: 6),
+            Text(picked.isEmpty ? '类型：全部' : '类型：${picked.length} 个', style: const TextStyle(fontSize: 12.5)),
+            const SizedBox(width: 2),
+            Icon(Icons.expand_more_rounded, size: 16, color: scheme.onSurfaceVariant),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 事件行：时间等宽 + 类型徽章 + 摘要；点开给详情（seq / 可见性 / 来源 + 原始 JSON）
+class _EventRow extends StatelessWidget {
+  const _EventRow({required this.ev, required this.open, required this.onTap});
+
+  final Map<String, dynamic> ev;
+  final bool open;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final type = _str(ev['type']);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 9),
+            child: Row(
+              children: [
+                SizedBox(width: 66, child: Text(_hms(ev['ts']?.toString()), style: _mono(11.5, scheme.onSurfaceVariant))),
+                _Badge(type, tone: _typeTone(context, type)),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(_summary(ev),
+                      maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13)),
+                ),
+                Icon(open ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                    size: 16, color: scheme.onSurfaceVariant),
+              ],
+            ),
+          ),
+        ),
+        if (open)
+          Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainer,
+              borderRadius: BorderRadius.circular(IrmiaTheme.radiusCtl),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // 技术字段（seq / 可见性 / 来源）默认收起：行上只留时间与摘要
+                DetailRow(label: '序列号', value: '#${ev['seq'] ?? '—'}'),
+                DetailRow(label: '可见性', value: _str(ev['visibility']).isEmpty ? 'internal' : _str(ev['visibility'])),
+                DetailRow(label: '来源', value: _str(ev['origin']).isEmpty ? '—' : _str(ev['origin'])),
+                const SizedBox(height: 8),
+                Text('原始 JSON', style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant)),
+                const SizedBox(height: 6),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 260),
+                  child: SingleChildScrollView(
+                    child: SelectableText(_jsonEncoder.convert(ev), style: _mono(11.5, scheme.onSurface)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        Divider(height: 1, color: scheme.outlineVariant),
+      ],
+    );
+  }
+}

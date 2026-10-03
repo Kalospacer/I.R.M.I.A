@@ -1,0 +1,1245 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:irmia_gui/api.dart';
+import 'package:irmia_gui/app.dart';
+import 'package:irmia_gui/pages/settings_page.dart';
+import 'package:irmia_gui/theme.dart';
+import 'package:irmia_gui/ui_kit.dart';
+
+/// 设置页的锚点 + 分区卡片交互（docs/astrbot-ux-interaction.md「改造后适用」第一条）：
+/// 用真实 loopback 服务喂数据，锁住这些事——锚点列表渲染（含 v30 的「外部依赖」与 v34 的「协议端」）、
+/// 字段两列的断点行为、「保存」未改动即禁用、保存成功后的提示、
+/// 外部依赖卡片的三态与安装通道、"建议安装"必须写清影响，
+/// 协议端卡片的开关/目录/启停/登录入口与「需重启」提示，
+/// 以及 v35 的「一键安装」：装成功后**确实**调了 PUT /config 把三件事一次写好、
+/// 失败时 detail 与逐行过程记录留在卡上（不塞进 toast）、安装期间按钮点不动。
+///
+/// ⑭ 起系统卡是**逐行就地编辑**（紧凑表 + 每行一枚「编辑」胶囊）：只动这一行、只写这一行、
+/// 取消就丢、默认只露 4 行能展开收起、两条只读行没有胶囊——这七条锁在文件末尾。
+void main() {
+  /// GET /api/protocol-side 的样例（v34）：配置齐备、已就绪、正在跑。
+  /// 各用例按需改其中几个键（没配置 / 读失败 / 需重启 / 已停止）。
+  Map<String, dynamic> protocolView() => <String, dynamic>{
+        'configured': true,
+        'enabled': true,
+        'kind': 'snowluma',
+        'dir': 'C:/SnowLuma',
+        'autoStart': true,
+        'configSource': 'disk',
+        'attached': true,
+        'state': 'ready',
+        'stateText': '已就绪',
+        'detail': '已就绪，OneBot 在 ws://127.0.0.1:3001/',
+        'restartRequired': false,
+        'endpoint': {'wsUrl': 'ws://127.0.0.1:3001/', 'hasToken': true, 'source': 'live'},
+        'webuiUrl': 'http://localhost:5099',
+        'installed': true,
+        'entryPath': 'C:/SnowLuma/dist/index.mjs',
+      };
+
+  /// GET /api/deps 的样例：rg 就绪、es 可一键装、pwsh 只能人工装（三态各一）
+  Map<String, dynamic> depsReport() => <String, dynamic>{
+        'available': true,
+        'dataDir': 'C:/path/to/data',
+        'toolsDir': 'C:/path/to/data/tools',
+        'needsAttention': true,
+        'entries': [
+          {
+            'name': 'pwsh',
+            'label': 'PowerShell 7（pwsh）',
+            'status': 'missing',
+            'ok': false,
+            'path': '',
+            'version': '',
+            'source': null,
+            'reason': '未找到 pwsh（最低要求 7.0）',
+            'purpose': 'pwsh 工具的默认 shell；工具的第一条通道',
+            'impact': '没有它时 pwsh 工具如实回退到 Windows PowerShell 5.1',
+            'action': 'open-download',
+            'installable': false,
+            'manualHint': 'winget install Microsoft.PowerShell',
+            'downloadPage': 'https://github.com/PowerShell/PowerShell/releases/latest',
+            'minVersion': '7.0',
+            'managedDir': 'C:/path/to/data/tools/pwsh',
+          },
+          {
+            'name': 'rg',
+            'label': 'ripgrep（rg）',
+            'status': 'ready',
+            'ok': true,
+            'path': 'C:/path/to/data/tools/rg/rg.exe',
+            'version': '15.1.0',
+            'source': 'managed',
+            'reason': '',
+            'purpose': 'rg_search 的引擎；按内容搜索',
+            'impact': '没有它时 rg_search 不注册',
+            'action': null,
+            'installable': true,
+            'manualHint': null,
+            'downloadPage': 'https://github.com/BurntSushi/ripgrep/releases',
+            'minVersion': '13.0',
+            'managedDir': 'C:/path/to/data/tools/rg',
+          },
+          {
+            'name': 'es',
+            'label': 'Everything 命令行（es.exe）',
+            'status': 'missing',
+            'ok': false,
+            'path': '',
+            'version': '',
+            'source': null,
+            'reason': '未找到 es（最低要求 1.1）',
+            'purpose': 'es_search 的引擎；按文件名搜索',
+            'impact': '没有它时 es_search 不注册（装 Everything 主程序不会带上 es.exe）',
+            'action': 'install',
+            'installable': true,
+            'manualHint': null,
+            'downloadPage': 'https://www.voidtools.com/downloads/',
+            'minVersion': '1.1',
+            'managedDir': 'C:/path/to/data/tools/es',
+          },
+        ],
+        'generatedAt': '2026-10-01T00:00:00.000Z',
+      };
+
+  const config = <String, dynamic>{
+    'dataDir': 'C:/path/to/data',
+    'web': {'host': '127.0.0.1', 'port': 7788},
+    'timezone': 'Asia/Shanghai',
+    'models': {
+      'heavy': {
+        'model': 'gpt-4o-mini',
+        'baseUrl': 'https://api.example.com',
+        'apiKeyEnv': 'IRMIA_KEY_HEAVY',
+      },
+      'light': {
+        'model': 'gpt-4o-mini-lite',
+        'baseUrl': 'https://api.example.com',
+        'apiKeyEnv': 'IRMIA_KEY_LIGHT',
+      },
+    },
+    'budget': {
+      'stepTools': 8,
+      'turnSteps': 30,
+      'taskTokens': 120000,
+      'dailyTokens': 2000000,
+      'softRatio': 0.8,
+      'failStreakMax': 3,
+    },
+    'tools': {'destructiveEnabled': false},
+    'speak': {'typingEffect': true, 'charsPerMinute': 90},
+  };
+
+  late HttpServer server;
+  late AppState state;
+  Map<String, dynamic>? lastPost;
+  String? lastConfirm;
+  /// 写命令的**次数**（⑭：逐行保存要断言"只发一条"，只看 lastPost 分不出"发了一条"还是
+  /// "发了三条、最后一条正好是它"——这条计数是那次踩过之后的必备件）
+  int postCount = 0;
+  /// 安装接口的回执：默认成功；失败路径的用例改写它（三种 step 各一条）
+  Map<String, dynamic> installReply = <String, dynamic>{};
+  /// 让 /api/deps 返回 404（"读不到依赖状态"那条路径）
+  bool depsFails = false;
+
+  /// GET /api/protocol-side 的回执（v34）；protocolFails = 让它 500（"读不到协议端状态"）
+  Map<String, dynamic> protocolSide = protocolView();
+  bool protocolFails = false;
+  /// 一键安装（v35）的回执：默认成功；失败路径的用例改写它
+  Map<String, dynamic> installSideReply = <String, dynamic>{};
+  /// 装了几次——"安装中不许重复点"那条靠它断言（只发一次请求才算数）
+  int installCalls = 0;
+  /// 把安装请求按在"进行中"：那条端点是同步的（几秒到几十秒），
+  /// 用例靠它撑开"安装中"那一段窗口，好在那一瞬间断言按钮点不动
+  Completer<void>? installGate;
+  /// 协议端三条写通道最近一次的请求：方法 / 路径 / body
+  String? sideMethod;
+  String? sidePath;
+  Map<String, dynamic>? sideBody;
+  /// PUT 配置与启停各自的回执（默认按服务端形状给一份）
+  Map<String, dynamic> sideWriteReply = <String, dynamic>{'ok': true, 'restartRequired': true, 'dir': 'C:/SnowLuma'};
+  Map<String, dynamic> sideActionReply = <String, dynamic>{
+    'ok': true,
+    'action': 'start',
+    'changed': true,
+    'state': 'ready',
+    'note': '已拉起，OneBot 在 ws://127.0.0.1:3001/',
+  };
+
+  setUp(() async {
+    // TestWidgetsFlutterBinding 默认把所有 HttpClient 请求挡成 400（请求不会真的发出），
+    // 本组要打真实 loopback 服务，先把那层 mock 摘掉。
+    HttpOverrides.global = null;
+    lastPost = null;
+    lastConfirm = null;
+    postCount = 0;
+    depsFails = false;
+    installReply = <String, dynamic>{'ok': true, 'step': 'done', 'version': '1.1.0.38'};
+    protocolSide = protocolView();
+    protocolFails = false;
+    installCalls = 0;
+    installGate = null;
+    // 一键安装的回执：**照真服务端的形状**给（含逐行 log——那是给人看的进度）
+    installSideReply = <String, dynamic>{
+      'ok': true,
+      'dir': r'C:\path\to\data\services\snowluma',
+      'version': 'v1.14.20',
+      'detail': '已装好 v1.14.20',
+      'log': <String>[
+        '正在查询官方 Releases…',
+        '找到 v1.14.20 的 SnowLuma-v1.14.20-win-x64-lite.zip（4.6 MB）',
+        '正在下载…',
+        '下载完成（4.6 MB）',
+        '正在解压…',
+        // 文件数是**实测值**（真包解出来 43 个文件、13 个顶层条目）：假数据与事实对齐，
+        // 免得以后有人拿测试里的数字去写文档
+        '解压完成（43 个文件）',
+        r'就绪：C:\path\to\data\services\snowluma',
+      ],
+    };
+    sideMethod = null;
+    sidePath = null;
+    sideBody = null;
+    sideWriteReply = <String, dynamic>{'ok': true, 'restartRequired': true, 'dir': 'C:/SnowLuma'};
+    sideActionReply = <String, dynamic>{
+      'ok': true,
+      'action': 'start',
+      'changed': true,
+      'state': 'ready',
+      'note': '已拉起，OneBot 在 ws://127.0.0.1:3001/',
+    };
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((req) async {
+      final response = req.response..headers.contentType = ContentType.json;
+      final path = req.uri.path;
+      if (path == '/api/config') {
+        response.write(jsonEncode(config));
+      } else if (path == '/api/keys') {
+        response.write(jsonEncode({'heavy': {'configured': true, 'mask': 'sk-…1a2b'}, 'light': {'configured': false}}));
+      } else if (path == '/api/projection') {
+        response.write(jsonEncode({'watermark': 42, 'firstEventAt': '2026-09-01T00:00:00.000Z'}));
+      } else if (path == '/api/deps') {
+        if (depsFails) {
+          response.statusCode = 500;
+          response.write(jsonEncode({'error': {'message': 'deps 端点不可用'}}));
+        } else {
+          response.write(jsonEncode(depsReport()));
+        }
+      } else if (path == '/api/protocol-side') {
+        // 协议端状态（v34）：读不到时 500，让卡片走它自己的 error 态
+        if (protocolFails) {
+          response.statusCode = 500;
+          response.write(jsonEncode({'error': {'message': '协议端状态端点不可用'}}));
+        } else {
+          response.write(jsonEncode(protocolSide));
+        }
+      } else if (path == '/api/protocol-side/install') {
+        // 一键安装（v35）：无 body 的同步请求。installGate 让用例把这一段按住，
+        // 好在"安装中"那一瞬间断言按钮点不动、且**只**发了一次请求
+        installCalls += 1;
+        sideMethod = req.method;
+        sidePath = path;
+        final raw = await utf8.decoder.bind(req).join();
+        sideBody = raw.isEmpty ? <String, dynamic>{} : (jsonDecode(raw) as Map<String, dynamic>);
+        if (installGate != null) await installGate!.future;
+        response.write(jsonEncode(installSideReply));
+      } else if (path.startsWith('/api/protocol-side/')) {
+        // 写通道：PUT 配置 / POST 启停。方法与路径都记下来，用例要按它们断言
+        sideMethod = req.method;
+        sidePath = path;
+        final raw = await utf8.decoder.bind(req).join();
+        sideBody = raw.isEmpty ? <String, dynamic>{} : (jsonDecode(raw) as Map<String, dynamic>);
+        response.write(jsonEncode(path == '/api/protocol-side/config' ? sideWriteReply : sideActionReply));
+      } else if (path.startsWith('/api/commands/')) {
+        postCount += 1;
+        lastPost = jsonDecode(await utf8.decoder.bind(req).join()) as Map<String, dynamic>;
+        lastConfirm = req.headers.value('X-Confirm');
+        response.write(jsonEncode(installReply));
+      } else {
+        response.statusCode = 404;
+        response.write(jsonEncode({'error': {'message': '接口不存在'}}));
+      }
+      unawaited(response.close());
+    });
+    state = AppState(api: IrmiaApi(baseUrl: 'http://127.0.0.1:${server.port}'));
+  });
+
+  tearDown(() async {
+    state.dispose();
+    await server.close(force: true);
+  });
+
+  /// 交替推进真异步与假时钟：HttpClient 的每一步 await 都要先让真实 I/O 跑完，
+  /// 再 pump 把结果落进树——单次「等待 + pump」跑不完整条请求链，因此轮询到目标出现。
+  Future<void> pumpUntil(WidgetTester tester, Finder target, {int rounds = 40}) async {
+    for (var i = 0; i < rounds; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 25)));
+      await tester.pump();
+      if (target.evaluate().isNotEmpty) {
+        await tester.pump();
+        return;
+      }
+    }
+    fail('等待目标未出现：$target');
+  }
+
+  /// 收尾：把所有还在飞的请求与 toast 计时器跑完，避免测试结束时报 pending timer
+  Future<void> drain(WidgetTester tester) async {
+    for (var i = 0; i < 6; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 20)));
+      await tester.pump();
+    }
+    await tester.pump(IrmiaToast.duration + const Duration(milliseconds: 600));
+    await tester.pump(const Duration(milliseconds: 400));
+  }
+
+  /// 把当前那条 toast **彻底**送走（不是"跑完计时器"就够了）。
+  ///
+  /// 为什么要单独一条、不能只靠 [drain]：SnackBar 的自动消失计时器是在**入场动画结束
+  /// 之后**才起跑的，而 `pump(4s)` 一次推完只会让那条计时器"刚刚开始倒数"——toast 于是
+  /// 留在屏上。它是一条贴底的漂浮条，正好盖住页面底部的「保存」键：⑪ 的校验用例要连按
+  /// 五次保存，第二次开始就点在了 toast 上（这条用例踩过，现象是"该来的提示一句都没来"）。
+  Future<void> away(WidgetTester tester) async {
+    await tester.pump(const Duration(milliseconds: 400)); // 入场动画走完，4 秒计时器起跑
+    await tester.pump(IrmiaToast.duration + const Duration(milliseconds: 400)); // 计时器触发
+    await tester.pump(const Duration(milliseconds: 600)); // 退出动画走完，条子离场
+  }
+
+  /// 把断言**限定在某一张设置卡内部**。
+  ///
+  /// v34 之后页面上并排站着两张同形态的卡（「外部依赖」与「协议端」），它们各自的徽章词表
+  /// 是同一套（已就绪 / 未安装 / 需重启…）。全局按文本找会跨卡命中，于是"依赖卡该有三态徽章"
+  /// 这种断言会被另一张卡的存在搅浑——那既可能假绿（别处凑够了数）也可能假红。
+  /// 定位锚用卡头的说明句（每张卡唯一），取它最近的那个 Container 祖先 = 卡本身。
+  Finder inCard(String noteFragment, Finder target) => find.descendant(
+        of: find.ancestor(of: find.textContaining(noteFragment), matching: find.byType(Container)).first,
+        matching: target,
+      );
+
+  /// 「外部依赖」卡内部
+  Finder inDepsCard(Finder target) => inCard('建议安装的外部依赖', target);
+  /// 「协议端（可选）」卡内部（锚句随 2026-10-02 的副标题更正换过一次）
+  Finder inProtocolCard(Finder target) => inCard('各是一条独立的入站通道', target);
+  /// 「系统」卡内部（⑪ 之后它不再只读，卡头说明句是这一页上唯一的那句）
+  Finder inSystemCard(Finder target) =>
+      inCard('监听地址、时区与六条预算是这个进程的启动参数', target);
+
+  /// 系统卡某一格**编辑态**输入框里的文本：按点路径取，不按"页面上第几个框"取——
+  /// 这一页的输入框已经多到按序号取必然出错（⑪ 之前那条 `.last` 就是被这件事绊倒的）。
+  String sysText(WidgetTester tester, String path) =>
+      tester.widget<TextField>(find.byKey(ValueKey('sys-field-$path'))).controller?.text ?? '';
+
+  /// 系统卡某一行**读态**摆出来的当前值（按行 id 取；行 id 见 settings_page.dart 的 _sysRowFields）
+  String sysValue(WidgetTester tester, String id) =>
+      tester.widget<Text>(find.byKey(ValueKey('sys-value-$id'))).data ?? '';
+
+  /// 行尾那枚「编辑」胶囊 / 行内的「保存」「取消」
+  Finder sysEdit(String id) => find.byKey(ValueKey('sys-edit-$id'));
+  Finder sysSaveBtn(String id) => find.byKey(ValueKey('sys-save-$id'));
+  Finder sysCancelBtn(String id) => find.byKey(ValueKey('sys-cancel-$id'));
+
+  /// 点系统卡里的某个控件：先把它滚进视口（设置页很长，tap 点不到屏幕外的控件），
+  /// 再把屏上那条 toast 送走——它是贴底漂浮条，会盖住卡片底部的控件（⑪ 踩过这个坑，
+  /// 现象是"该来的提示一句都没来"，所以这里把它做进"点"这个动作本身）。
+  Future<void> tapInCard(WidgetTester tester, Finder target) async {
+    await away(tester);
+    await tester.ensureVisible(target);
+    await tester.pump();
+    await tester.tap(target);
+    await tester.pump();
+  }
+
+  Future<void> pumpSettings(WidgetTester tester, {Size size = const Size(1350, 900)}) async {
+    tester.view.physicalSize = size;
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: IrmiaTheme.light(),
+        home: Scaffold(body: SettingsPage(state: state)),
+      ),
+    );
+    // 「模型」锚点出现 = 配置到手、分区卡片已渲染（三态已越过）
+    await pumpUntil(tester, find.text('模型'));
+    await drain(tester);
+  }
+
+  testWidgets('七个分区锚点与分区卡片同时就位（含 v30 的「外部依赖」与 v34 的「协议端」）', (tester) async {
+    await pumpSettings(tester);
+
+    // 锚点在左栏（「模型」只属于锚点；「外部依赖」也只有锚点——卡头与它同名但只渲染一次，
+    // 其余四个与卡头同名，各出现两次）
+    expect(find.text('模型'), findsOneWidget);
+    expect(find.text('界面'), findsNWidgets(2));
+    expect(find.text('发言'), findsNWidgets(2));
+    expect(find.text('外部依赖'), findsNWidgets(2));
+    expect(find.text('系统'), findsNWidgets(2));
+    expect(find.text('关于'), findsNWidgets(2));
+
+    // v34 的锚点：左栏一处，卡头是「协议端（可选）」（不同名，所以锚点只有一处）
+    expect(find.text('协议端'), findsOneWidget);
+    expect(find.text('协议端（可选）'), findsOneWidget);
+
+    // 模型组两条 lane 各一张卡片，卡头 = 组名 + 一句说明
+    expect(find.text('主循环（heavy）'), findsOneWidget);
+    expect(find.text('turn 主循环使用的模型'), findsOneWidget);
+    expect(find.text('轻量（light）'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('发言分区：打字节奏开关与速度输入，都写 config.speak', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 2400));
+
+    // 开关反映生效值（示例配置 speak.typingEffect = true）
+    final speakSwitch = inCard('她说话时的节奏', find.byType(Switch));
+    expect(tester.widget<Switch>(speakSwitch).value, isTrue, reason: '开关要显示"当前生效"的值，而不是一个空壳');
+
+    // 点一下立刻提交（开关这类二值项没有"改到一半"的中间态，不该逼人多按一次保存）
+    await tester.tap(speakSwitch);
+    await drain(tester);
+    expect(lastPost?['fields']?['speak.typingEffect'], isFalse);
+    expect(lastConfirm, 'config-update');
+
+    // 速度输入框预填生效值，改完按保存才提交（限定在发言卡里：v34 的协议端卡也有输入框，
+    // ⑪ 之后系统卡还多了一个「保存」——所以这里按卡定位，不再用"页面上最后一个"那种取法）
+    final speed = inCard('她说话时的节奏', find.byType(TextField));
+    final speedSave = inCard('她说话时的节奏', find.widgetWithText(FilledButton, '保存'));
+    expect(tester.widget<TextField>(speed).controller?.text, '90');
+    await tester.enterText(speed, '150');
+    await tester.pump();
+    await tester.tap(speedSave);
+    await drain(tester);
+    expect(lastPost?['fields']?['speak.charsPerMinute'], 150);
+
+    // 越界的值不发请求（30~600 之外是笔误，不该写进配置）
+    lastPost = null;
+    await tester.enterText(speed, '5');
+    await tester.pump();
+    await tester.tap(speedSave);
+    await drain(tester);
+    expect(lastPost, isNull, reason: '5 字/分钟是笔误，不该写进配置');
+  });
+
+  testWidgets('宽窗字段两列、窄窗降一列', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 900));
+    var model = tester.getRect(find.byType(TextField).at(0));
+    var baseUrl = tester.getRect(find.byType(TextField).at(1));
+    expect((baseUrl.top - model.top).abs() < 0.5, isTrue,
+        reason: '宽窗下模型名与 Base URL 应在同一行（model.top=${model.top}, base.top=${baseUrl.top}）');
+    expect(model.left, lessThan(baseUrl.left), reason: '两列时左格应在右格左侧');
+
+    await pumpSettings(tester, size: const Size(700, 900));
+    model = tester.getRect(find.byType(TextField).at(0));
+    baseUrl = tester.getRect(find.byType(TextField).at(1));
+    expect(baseUrl.top, greaterThan(model.top), reason: '窄窗下降为一列（上下叠放）');
+  });
+
+  testWidgets('保存按钮未改动即禁用，改动后可用并给出脏提示', (tester) async {
+    await pumpSettings(tester);
+
+    FilledButton saveButton() =>
+        tester.widget<FilledButton>(find.widgetWithText(FilledButton, '保存').first);
+
+    expect(saveButton().onPressed, isNull, reason: '未改动时「保存」应禁用');
+    expect(find.text('有未保存的更改'), findsNothing);
+
+    await tester.enterText(find.byType(TextField).first, 'deepseek-reasoner');
+    await tester.pump();
+    expect(saveButton().onPressed, isNotNull, reason: '改动后「保存」应可用');
+    expect(find.text('有未保存的更改'), findsOneWidget);
+
+    // 改回生效配置里的原值：脏状态自动消失，按钮回到禁用
+    await tester.enterText(find.byType(TextField).first, 'gpt-4o-mini');
+    await tester.pump();
+    expect(saveButton().onPressed, isNull, reason: '改回原值后应重新禁用');
+    expect(find.text('有未保存的更改'), findsNothing);
+  });
+
+  testWidgets('保存提交改动字段并提示成功', (tester) async {
+    await pumpSettings(tester);
+
+    await tester.enterText(find.byType(TextField).first, 'deepseek-reasoner');
+    await tester.pump();
+    await tester.tap(find.widgetWithText(FilledButton, '保存').first);
+    await tester.pump();
+    await pumpUntil(tester, find.text('已保存模型设置，进程重启后生效'));
+
+    expect(lastPost?['fields'], {'models.heavy.model': 'deepseek-reasoner'});
+    expect(lastConfirm, 'config-update', reason: '写配置必须带 X-Confirm');
+    expect(find.text('已保存模型设置，进程重启后生效'), findsOneWidget);
+    await drain(tester);
+  });
+
+  testWidgets('模型密钥格：已配置的那条整格转蓝并居中，未配置的不变', (tester) async {
+    await pumpSettings(tester);
+    await pumpUntil(tester, find.text('主循环（heavy）'));
+
+    // 两条 lane 各一个密钥格（假数据里 heavy 已配置、light 没有），正好断言对照
+    final obscured = tester.widgetList<TextField>(find.byType(TextField)).where((f) => f.obscureText).toList();
+    expect(obscured.length, 2, reason: '两条 lane 各一个密钥格');
+    expect(obscured[0].decoration?.hintStyle?.color, IrmiaTheme.light().colorScheme.primary,
+        reason: '用户 ⑦：设置页这里与渠道页同样处理——蓝色');
+    expect(obscured[0].textAlign, TextAlign.center, reason: '用户 ⑦：居中');
+    expect(obscured[1].decoration?.hintStyle, isNull, reason: 'light 没配密钥：它就是普通输入框');
+    expect(obscured[1].textAlign, TextAlign.start);
+    await drain(tester);
+  });
+
+  testWidgets('清除密钥走统一确认框，取消不发请求、确认才发', (tester) async {
+    await pumpSettings(tester);
+    await pumpUntil(tester, find.text('清除密钥').first);
+
+    await tester.tap(find.text('清除密钥').first);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.text('清除密钥 · 主循环（heavy）'), findsOneWidget, reason: '应弹出 ui_kit 确认框');
+
+    await tester.tap(find.text('取消'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(lastPost, isNull, reason: '取消不应发出写请求');
+
+    await tester.tap(find.text('清除密钥').first);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.tap(find.text('清除'));
+    await tester.pump();
+    await pumpUntil(tester, find.text('已清除本地密钥'));
+
+    expect(lastPost, {'name': 'heavy', 'value': ''});
+    expect(lastConfirm, 'set-key');
+    await drain(tester);
+  });
+
+  testWidgets('点锚点滚动到对应分区并高亮它', (tester) async {
+    await pumpSettings(tester);
+
+    final before = tester.getRect(find.text('版本')).top;
+    await tester.tap(find.text('关于').first);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 240));
+
+    expect(tester.takeException(), isNull);
+    expect(tester.getRect(find.text('版本')).top, lessThan(before), reason: '「关于」分区应滚到视口上方');
+    final active = tester.widget<Text>(find.text('关于').first);
+    expect(active.style?.color, IrmiaTheme.light().colorScheme.primary, reason: '被点中的锚点应高亮');
+  });
+
+  testWidgets('手动滚动时高亮跟着走，不再钉死在「模型」', (tester) async {
+    await pumpSettings(tester);
+    final primary = IrmiaTheme.light().colorScheme.primary;
+    Color? colorOf(String label) => tester.widget<Text>(find.text(label).first).style?.color;
+
+    expect(colorOf('模型'), primary, reason: '一开始在最上面，高亮就是「模型」');
+
+    // 先确认拖拽真的滚起来了——否则后面的断言都是假的
+    final position = tester.state<ScrollableState>(find.byType(Scrollable).first).position;
+    expect(position.pixels, 0);
+    await tester.drag(find.byType(SingleChildScrollView), const Offset(0, -240));
+    await tester.pump();
+    expect(position.pixels, greaterThan(0), reason: '拖拽要能滚动这张页');
+
+    // 一格一格往下滚（不点锚点）：滚到「外部依赖」那一段就该亮它。
+    // 目标取中段的分区，不取「系统」——滚到「系统」时页面已经到底，
+    // 「到底钉住最后一项」那条分支会接管（那是刻意的），断言会跟着变得依赖布局高度。
+    // 也不用 scrollUntilVisible——SingleChildScrollView 的子树整棵都在，那个 finder 一开始就非空，
+    // 它会一步都不滚就返回。
+    var steps = 0;
+    final seen = <String>{};
+    while (colorOf('外部依赖') != primary && steps < 40) {
+      for (final id in ['模型', '界面', '发言', '外部依赖', '协议端', '系统', '关于']) {
+        if (colorOf(id) == primary) seen.add(id);
+      }
+      await tester.drag(find.byType(SingleChildScrollView), const Offset(0, -200));
+      await tester.pump();
+      steps += 1;
+    }
+
+    expect(steps, lessThan(40), reason: '滚了 $steps 格还没轮到「外部依赖」；途中亮过：$seen');
+    expect(colorOf('外部依赖'), primary, reason: '滚到哪一区，高亮就该落在哪一区');
+    expect(colorOf('模型'), isNot(primary),
+        reason: '原来这里恒为「模型」——判定线没把滚动量算进去（用户 ⑩）');
+  });
+
+  testWidgets('窄窗锚点降级为顶部横条', (tester) async {
+    await pumpSettings(tester, size: const Size(760, 900));
+
+    expect(find.text('模型'), findsOneWidget, reason: '锚点应以横条形式保留');
+    await tester.tap(find.text('系统').first);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 240));
+    expect(tester.takeException(), isNull);
+  });
+
+  // ── 外部依赖卡片（v30） ──
+
+  testWidgets('外部依赖卡片：三态徽章、探测到的路径与版本、建议安装的计数', (tester) async {
+    // 卡片在「发言」之后，长页面要够高才渲染得到它
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.text('PowerShell 7（pwsh）'));
+
+    // 徽章三态各一：就绪 / 未安装（×2）。断言限定在这张卡里——v34 的协议端卡也在用同一套词
+    expect(inDepsCard(find.text('已就绪')), findsOneWidget);
+    expect(inDepsCard(find.text('未安装')), findsNWidgets(2));
+    // 卡头的汇总徽章："建议安装 N 项"（rg 已就绪，剩 pwsh 与 es）
+    expect(find.text('建议安装 2 项'), findsOneWidget);
+
+    // 就绪的行要给"探测到的路径与版本"（这是事实，不是承诺）
+    expect(find.textContaining('15.1.0 · C:/path/to/data/tools/rg/rg.exe'), findsOneWidget);
+
+    // **显式告知建议安装**：未安装的行必须写清"没有它会怎样"
+    expect(find.textContaining('如实回退到 Windows PowerShell 5.1'), findsOneWidget);
+    expect(find.textContaining('es_search 不注册'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('外部依赖卡片：可一键装的给「安装」、只能人装的给「打开下载页」', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.text('Everything 命令行（es.exe）'));
+
+    // es 可一键装：按钮是「安装」（另配一个「下载页」旁路）
+    expect(inDepsCard(find.widgetWithText(FilledButton, '安装')), findsOneWidget);
+    // pwsh 只能人工装：动作是「打开下载页」（tonal 样式，与「安装」区分开）。
+    // 限定在依赖卡里：协议端卡的下载引导也用同一个词（同一个动作，同一个说法）
+    expect(inDepsCard(find.widgetWithText(FilledButton, '打开下载页')), findsOneWidget);
+    expect(inDepsCard(find.widgetWithText(FilledButton, '安装')), findsOneWidget,
+        reason: '就绪的那件不该给「安装」按钮');
+    // 就绪行明确写"无需操作"，而不是摆一枚按下去只会重复劳动的按钮
+    expect(find.text('无需操作'), findsOneWidget);
+  });
+
+  testWidgets('安装走确认框 + X-Confirm: dep-install，成功后提示并复检', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.widgetWithText(FilledButton, '安装'));
+
+    await tester.tap(find.widgetWithText(FilledButton, '安装'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    // 确认框要说清装什么、装到哪（这一步会把一段外部代码放到盘上）
+    expect(find.text('安装 Everything 命令行（es.exe）'), findsOneWidget);
+    expect(find.textContaining('C:/path/to/data/tools/es'), findsOneWidget);
+
+    // 先取消：不发请求
+    await tester.tap(find.text('取消'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(lastPost, isNull, reason: '取消不应发出安装请求');
+
+    // 再确认：post 到 dep-install，带危险操作短语。
+    // 等待条件要**唯一**：卡片上本来就有「已就绪」徽章，用 find.textContaining('已就绪')
+    // 会在 POST 还没发出去时就命中——那正是"假锁"的一种（绿得没有信息）。
+    // 这里等 toast 的整句话（它带上服务端回的版本号，只有安装成功才会有）。
+    await tester.tap(find.widgetWithText(FilledButton, '安装'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.tap(find.text('下载并安装'));
+    await tester.pump();
+    await pumpUntil(tester, find.text('Everything 命令行（es.exe） 已就绪（1.1.0.38）'));
+    expect(lastPost, {'name': 'es'});
+    expect(lastConfirm, 'dep-install', reason: '安装外部可执行文件必须带 X-Confirm');
+    await drain(tester);
+  });
+
+  testWidgets('三种安装失败分开反馈：下载 / 解压 / 复检各有各的话', (tester) async {
+    // 逐条验：合成一句"安装失败"的代价是用户不知道该重试、该换源、还是该看杀毒软件
+    const cases = <String, String>{
+      'download': '下载失败',
+      'extract': '解压失败',
+      'verify': '装完复检没通过',
+    };
+    for (final entry in cases.entries) {
+      installReply = <String, dynamic>{
+        'ok': false,
+        'step': entry.key,
+        'error': '（服务端原话：${entry.key} 阶段的具体原因）',
+      };
+      await pumpSettings(tester, size: const Size(1350, 2600));
+      await pumpUntil(tester, find.widgetWithText(FilledButton, '安装'));
+
+      await tester.tap(find.widgetWithText(FilledButton, '安装'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+      await tester.tap(find.text('下载并安装'));
+      await tester.pump();
+      // 等 toast 的整句话（"<阶段>：<服务端原话>"）：只等阶段名的话，
+      // 卡片上本来就有的「安装」按钮文案也可能先命中——那是假锁
+      final expected = '${entry.value}：（服务端原话：${entry.key} 阶段的具体原因）';
+      await pumpUntil(tester, find.text(expected));
+      expect(find.text(expected), findsOneWidget, reason: 'step=${entry.key} 该报「${entry.value}」');
+      expect(lastPost, {'name': 'es'}, reason: '失败路径也要真的发过请求');
+      await drain(tester);
+    }
+  });
+
+  testWidgets('依赖报告读不到时卡片降级：说清读不到，而不是假装清单正常', (tester) async {
+    // 这条锁的是"失败不白屏也不撒谎"：api 报错时卡片必须显式说出来
+    depsFails = true;
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.textContaining('依赖报告读取失败'));
+    expect(find.textContaining('依赖报告读取失败'), findsOneWidget);
+    // 读不到时**不许**出现"全部就绪"这种乐观结论
+    expect(find.text('全部就绪'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('依赖报告正常时不该挂着报错文案（反向断言）', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.text('PowerShell 7（pwsh）'));
+    expect(find.textContaining('依赖报告读取失败'), findsNothing);
+  });
+
+  // ── 协议端卡片（v34） ──
+
+  testWidgets('协议端卡片：锚点 + 状态徽章 + detail 全文 + 对接点 + 登录入口', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    // 锚点（左栏）与卡头各一处
+    expect(find.text('协议端'), findsOneWidget, reason: '锚点栏要有它');
+    expect(find.text('协议端（可选）'), findsOneWidget);
+    // 状态：中文说法（服务端给的 stateText，本页不自己译一份）+ detail 原样显示
+    expect(inProtocolCard(find.text('已就绪')), findsOneWidget, reason: '徽章用服务端给的 stateText');
+    expect(find.text('已就绪，OneBot 在 ws://127.0.0.1:3001/'), findsOneWidget,
+        reason: 'detail 是给人看的那句话，要全文显示');
+    expect(find.text('对接点：ws://127.0.0.1:3001/'), findsOneWidget);
+    expect(find.text('C:/SnowLuma'), findsNWidgets(2),
+        reason: '装在哪要摆两处：状态行（事实）与目录输入框（可改的那个）');
+    expect(find.text('已找到可执行入口'), findsOneWidget, reason: '装没装是实测的（entryPath 找得到）');
+
+    // 三个动作：启动 / 停止 / 打开登录界面（已在跑时「启动」禁用）
+    expect(find.widgetWithText(FilledButton, '启动'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '停止'), findsOneWidget);
+    expect(find.widgetWithText(TextButton, '打开登录界面'), findsOneWidget);
+    final start = tester.widget<FilledButton>(find.widgetWithText(FilledButton, '启动'));
+    expect(start.onPressed, isNull, reason: '已经在跑：再点「启动」没有意义');
+    expect(find.textContaining('扫码登录在 http://localhost:5099'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('协议端卡片：开关写 channels.onebot.enabled（PUT，不是 commands）', (tester) async {
+    // 视口要高过整张卡：v35 在状态行下面加了「一键安装」那一块，开关随之下移
+    await pumpSettings(tester, size: const Size(1350, 4000));
+
+    final toggle = find.byKey(const ValueKey('protocol-side-enabled'));
+    expect(tester.widget<Switch>(toggle).value, isTrue, reason: '开关显示的是盘上那份的当前值');
+
+    await tester.tap(toggle);
+    await drain(tester);
+    expect(sideMethod, 'PUT');
+    expect(sidePath, '/api/protocol-side/config');
+    expect(sideBody, {'enabled': false});
+    // 回执里说要重启：提示里必须带上这句（不说的话人点完保存会以为已经生效）
+    await pumpUntil(tester, find.textContaining('已关闭内置协议端'));
+    expect(find.textContaining('重启进程后接管'), findsOneWidget);
+  });
+
+  testWidgets('协议端卡片：目录可编辑、保存走 PUT、回填服务端归一化后的路径', (tester) async {
+    // 同上：目录那一格在「一键安装」之下，视口要给够才点得到
+    await pumpSettings(tester, size: const Size(1350, 4000));
+
+    final field = find.byKey(const ValueKey('protocol-side-dir'));
+    expect(tester.widget<TextField>(field).controller?.text, 'C:/SnowLuma');
+
+    // 未改动即禁用（与模型卡的保存同一条口径）
+    FilledButton save() => tester.widget<FilledButton>(find.widgetWithText(FilledButton, '保存目录'));
+    expect(save().onPressed, isNull);
+
+    await tester.enterText(field, r'C:\path\to\SnowLuma');
+    await tester.pump();
+    expect(save().onPressed, isNotNull);
+    // 服务端写盘那一步的回执：**归一化之后**的路径就是它给的（真实服务端会解成绝对路径）
+    sideWriteReply = <String, dynamic>{'ok': true, 'restartRequired': true, 'dir': r'C:\path\to\SnowLuma'};
+    // 写完之后 GET 看到的也是新值（这是"保存成功"的判据）
+    protocolSide = <String, dynamic>{...protocolSide, 'dir': r'C:\path\to\SnowLuma'};
+    await tester.tap(find.widgetWithText(FilledButton, '保存目录'));
+    await drain(tester);
+
+    expect(sideMethod, 'PUT');
+    expect(sideBody, {'dir': r'C:\path\to\SnowLuma'});
+    await pumpUntil(tester, find.textContaining('已保存安装目录'));
+    // 回填的是**服务端存下来的那个**（它才是以后真正会用的路径）
+    expect(tester.widget<TextField>(field).controller?.text, r'C:\path\to\SnowLuma');
+    expect(save().onPressed, isNull, reason: '保存成功后又回到干净态');
+  });
+
+  testWidgets('协议端卡片：启动/停止走 POST，并把服务端那句 note 原样弹出来', (tester) async {
+    protocolSide = <String, dynamic>{
+      ...protocolView(),
+      'state': 'stopped',
+      'stateText': '已停止',
+      'detail': '已停止（本次没有自动拉起：autoStart=false，或者还没点过「启动」）。',
+      'endpoint': null,
+      'webuiUrl': null,
+    };
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    // 没在跑：不给「打开登录界面」（那个页面此刻打不开），「启动」可用、「停止」禁用
+    expect(find.widgetWithText(TextButton, '打开登录界面'), findsNothing);
+    expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, '启动')).onPressed, isNotNull);
+    expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, '停止')).onPressed, isNull);
+
+    sideActionReply = <String, dynamic>{
+      'ok': true,
+      'action': 'start',
+      'changed': false,
+      'state': 'failed',
+      // 服务端那句 note 的原话（界面必须原样弹出来，不自己编一套）
+      'note': '没能拉起来（或者它已经在了但端口一直没通）：原因见下面的状态说明。'
+          '要重来一次，先点「停止」再点「启动」——服务层见到已有子进程会直接返回，重复点「启动」不会有任何动作。',
+    };
+    await tester.tap(find.widgetWithText(FilledButton, '启动'));
+    await drain(tester);
+
+    expect(sideMethod, 'POST');
+    expect(sidePath, '/api/protocol-side/start');
+    await pumpUntil(tester, find.textContaining('没能拉起来'));
+    expect(find.textContaining('先点「停止」再点「启动」'), findsOneWidget,
+        reason: 'note 是服务端写给人看的那句话，要原样出现（界面不自己编一套）');
+  });
+
+  testWidgets('协议端卡片：restartRequired 时摆「需重启」徽章与提示条', (tester) async {
+    protocolSide = <String, dynamic>{
+      ...protocolView(),
+      'attached': false,
+      'restartRequired': true,
+      // 目录刚改过：入口信息属于**旧实例**，服务端因此报"不知道"（null）而不是 false
+      'installed': null,
+      'entryPath': null,
+      'state': 'stopped',
+      'stateText': '已停止',
+      'detail': '这段配置是本次进程启动之后才写下的：重启进程后框架才会接管它的拉起与对接。',
+      'endpoint': null,
+      'webuiUrl': null,
+    };
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    expect(inProtocolCard(find.text('需重启')), findsOneWidget);
+    expect(find.textContaining('要重启进程才接管'), findsOneWidget);
+    // 没有实例时也要说清楚：启停按钮此刻按下去不会有动作
+    expect(find.textContaining('本次进程启动时还没读到这段配置'), findsOneWidget);
+    // installed 的三态要分开：null 不是 false——"不知道"不该被说成"这个目录里没有入口"
+    expect(find.text('入口要重启后才核对'), findsOneWidget);
+    expect(find.text('目录里没有可执行入口'), findsNothing);
+  });
+
+  testWidgets('协议端卡片：没配置时是空态，但引导与输入框都还在（不能把出路藏起来）', (tester) async {
+    protocolSide = <String, dynamic>{
+      'configured': false,
+      'enabled': false,
+      'kind': null,
+      'dir': '',
+      'autoStart': false,
+      'configSource': 'disk',
+      'attached': false,
+      'state': 'stopped',
+      'stateText': '已停止',
+      'detail': '未配置内置协议端：框架不拉起它，OneBot 连的是配置里手填的地址与密钥。',
+      'restartRequired': false,
+      'endpoint': null,
+      'webuiUrl': null,
+      'installed': false,
+      'entryPath': null,
+    };
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    expect(find.text('还没配置内置协议端。'), findsOneWidget);
+    // 引导必须在：下载地址是纯文本给出来的（框架从官方代下载，但自己下的那条路一直在）
+    expect(find.textContaining('https://github.com/SnowLuma/SnowLuma/releases'), findsOneWidget);
+    expect(inProtocolCard(find.widgetWithText(FilledButton, '打开下载页')), findsOneWidget);
+    // v35 的主路径也必须在这里：没配置的时候正是最需要「一键安装」的时候
+    expect(find.byKey(const ValueKey('protocol-side-install')), findsOneWidget);
+    // 输入框与开关也必须在——空态里没有它们，人就没有地方可填
+    expect(find.byKey(const ValueKey('protocol-side-dir')), findsOneWidget);
+    expect(find.byKey(const ValueKey('protocol-side-enabled')), findsOneWidget);
+    // 卡头也要如实说"未配置"，而不是留白或者乐观地写一句状态
+    expect(inProtocolCard(find.text('未配置')), findsOneWidget);
+  });
+
+  testWidgets('协议端状态读不到：只灰这张卡，且不给写入控件（不在盲写）', (tester) async {
+    protocolFails = true;
+    await pumpSettings(tester, size: const Size(1350, 3400));
+    await pumpUntil(tester, find.textContaining('协议端状态读取失败'));
+
+    expect(find.textContaining('协议端状态读取失败'), findsOneWidget);
+    // 整页照常：别的分区还在
+    expect(find.text('外部依赖'), findsNWidgets(2));
+    expect(find.text('系统'), findsNWidgets(2));
+    // 读不到当前值时**不提供**开关与目录：那等于让人在看不到当前值的情况下写它。
+    // v35 的「一键安装」同理不摆——它紧接着就要写配置，那就是盲写
+    expect(find.byKey(const ValueKey('protocol-side-enabled')), findsNothing);
+    expect(find.byKey(const ValueKey('protocol-side-dir')), findsNothing);
+    expect(find.byKey(const ValueKey('protocol-side-install')), findsNothing);
+    expect(find.textContaining('这张卡读不到不影响其它设置'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('协议端状态正常时不该挂着报错文案（反向断言）', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+    await pumpUntil(tester, find.text('协议端（可选）'));
+    expect(find.textContaining('协议端状态读取失败'), findsNothing);
+  });
+
+  // ── 一键安装（v35）：一次点击 + 一次重启 + 一次扫码 ──
+
+  testWidgets('一键安装：装成功后自动把目录/开关/自动拉起一次写好，并给出「重启 → 扫码」的引导', (tester) async {
+    // 起点就是用户说的那个场景：这台机器还没配置过，用户点一下要能走通
+    protocolSide = <String, dynamic>{
+      'configured': false,
+      'enabled': false,
+      'kind': null,
+      'dir': '',
+      'autoStart': false,
+      'configSource': 'disk',
+      'attached': false,
+      'state': 'stopped',
+      'stateText': '已停止',
+      'detail': '未配置内置协议端：框架不拉起它，OneBot 连的是配置里手填的地址与密钥。',
+      'restartRequired': false,
+      'endpoint': null,
+      'webuiUrl': null,
+      'installed': false,
+      'entryPath': null,
+    };
+    // 把安装请求按住：这段窗口里补上"盘上已经有了"这条事实（真服务端装完就是这样）
+    final gate = Completer<void>();
+    installGate = gate;
+    await pumpSettings(tester, size: const Size(1350, 4000));
+
+    // 空态里也必须有一键安装这条路——空态最忌讳的就是把出路一起藏起来
+    final install = find.byKey(const ValueKey('protocol-side-install'));
+    expect(install, findsOneWidget);
+    expect(find.text('还没配置内置协议端。'), findsOneWidget);
+    // 前提要**装之前**就说，而且是用户 ⑨ 定的那句
+    expect(find.textContaining('使用前提：本机已登录 QQ 客户端'), findsOneWidget);
+
+    await tester.tap(install);
+    await pumpUntil(tester, find.textContaining('正在从官方 Releases 下载并解压'));
+    await drain(tester);
+    expect(installCalls, 1);
+
+    // 装完：PUT 的回执与随后的 GET 都按真服务端的形状给（配置写下了、本进程还没接管它）
+    sideWriteReply = <String, dynamic>{
+      'ok': true,
+      'restartRequired': true,
+      'dir': r'C:\path\to\data\services\snowluma',
+    };
+    protocolSide = <String, dynamic>{
+      ...protocolView(),
+      'dir': r'C:\path\to\data\services\snowluma',
+      'restartRequired': true,
+      'attached': false,
+      'state': 'stopped',
+      'stateText': '已停止',
+      'detail': '这段配置是本次进程启动之后才写下的：重启进程后框架才会接管它的拉起与对接。',
+      'endpoint': null,
+      'webuiUrl': null,
+      // 没有实例去核对那个目录："不知道"就报 null，不能说成"这个目录里没有入口"
+      'installed': null,
+      'entryPath': null,
+    };
+    gate.complete();
+    await pumpUntil(tester, find.text('已装好并用它配好了；重启一下就能用'));
+    await drain(tester);
+
+    // **本轮的核心那一条**：装成功后确实调了 PUT /config，而且一次把三件事都写好——
+    // 这就是"尽量少配置"的落点：用户一个字段都不用碰
+    expect(sideMethod, 'PUT');
+    expect(sidePath, '/api/protocol-side/config');
+    expect(sideBody, <String, dynamic>{
+      'dir': r'C:\path\to\data\services\snowluma',
+      'enabled': true,
+      'autoStart': true,
+    });
+
+    // 卡上：装好那句话 + 逐行过程记录（那是给人看的进度，不藏着）
+    expect(find.textContaining('已装好 v1.14.20，并用它配好了；重启一下就能用。'), findsOneWidget);
+    expect(find.text('正在下载…'), findsOneWidget);
+    expect(find.text('下载完成（4.6 MB）'), findsOneWidget);
+
+    // 装好之后的引导：先重启、再扫码、扫码是接入 QQ 客户端
+    expect(find.textContaining('已经装好了。下一步'), findsOneWidget);
+    expect(find.textContaining('先重启服务'), findsOneWidget);
+    expect(find.textContaining('打开登录界面'), findsWidgets);
+    expect(find.textContaining('扫码接的是你本机的 QQ 客户端'), findsOneWidget);
+
+    // 目录与开关都替人写好了：目录框回填的是**服务端存下来的那个**，开关是开的，且没有未保存改动
+    expect(tester.widget<TextField>(find.byKey(const ValueKey('protocol-side-dir'))).controller?.text,
+        r'C:\path\to\data\services\snowluma');
+    expect(tester.widget<Switch>(find.byKey(const ValueKey('protocol-side-enabled'))).value, isTrue);
+    expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, '保存目录')).onPressed, isNull);
+    // 「需重启」要摆出来，且入口三态不许把"不知道"说成"没有"
+    expect(inProtocolCard(find.text('需重启')), findsOneWidget);
+    expect(find.text('入口要重启后才核对'), findsOneWidget);
+    expect(inProtocolCard(find.text('目录里没有可执行入口')), findsNothing);
+  });
+
+  testWidgets('一键安装失败：detail 原文与过程记录摆在卡上，并留着手动下载那条出路', (tester) async {
+    // 失败也是 200（只有鉴权 / 方法不对才非 200），所以判据是 ok，界面不能只看状态码
+    const detail = '下载失败：connect ETIMEDOUT——检查网络，或手动下载后把目录填进来。';
+    installSideReply = <String, dynamic>{
+      'ok': false,
+      'dir': null,
+      'version': null,
+      'detail': detail,
+      'log': <String>[
+        '正在查询官方 Releases…',
+        '找到 v1.14.20 的 SnowLuma-v1.14.20-win-x64-lite.zip（4.6 MB）',
+        '正在下载…',
+      ],
+    };
+    await pumpSettings(tester, size: const Size(1350, 4000));
+
+    await tester.tap(find.byKey(const ValueKey('protocol-side-install')));
+    await pumpUntil(tester, find.text('一键安装失败：原因见卡片'));
+    await drain(tester);
+
+    // 失败**不能**塞进一条 toast 就完了：detail 与 log 都留在卡上，人要看得见卡在哪一步
+    expect(find.text(detail), findsOneWidget);
+    expect(inProtocolCard(find.text('正在下载…')), findsOneWidget);
+    expect(inProtocolCard(find.textContaining('找到 v1.14.20 的')), findsOneWidget);
+    expect(inProtocolCard(find.textContaining('过程记录')), findsOneWidget);
+
+    // 出路还在：手动下载那条路（地址 + 按钮）不能被失败一起吞掉
+    expect(inProtocolCard(find.textContaining('手动出路')), findsOneWidget);
+    expect(find.textContaining('https://github.com/SnowLuma/SnowLuma/releases'), findsWidgets);
+    expect(inProtocolCard(find.widgetWithText(FilledButton, '打开下载页')), findsOneWidget);
+
+    // 没装成就不该往配置里写：**没有** PUT /config（请求停在安装那一条上）
+    expect(installCalls, 1);
+    expect(sideMethod, 'POST');
+    expect(sidePath, '/api/protocol-side/install');
+    // 也不许摆出"重启一下就能用"这种乐观结论
+    expect(find.textContaining('已装好'), findsNothing);
+    expect(find.textContaining('已经装好了。下一步'), findsNothing);
+  });
+
+  testWidgets('安装期间：按钮转忙且点不动，重复点只发一次请求，这张卡的写控件一并按下', (tester) async {
+    final gate = Completer<void>();
+    installGate = gate;
+    await pumpSettings(tester, size: const Size(1350, 4000));
+
+    final install = find.byKey(const ValueKey('protocol-side-install'));
+    await tester.tap(install);
+    await pumpUntil(tester, find.textContaining('正在从官方 Releases 下载并解压'));
+    await drain(tester);
+    expect(installCalls, 1);
+    // 不能摆假进度：这条端点是同步的，中间插不进进度行——就说清"记录会一次性回来"
+    expect(find.textContaining('分步记录'), findsOneWidget);
+
+    // 安装中按钮必须是禁用的：这条端点同步跑几秒到几十秒，点两遍就是下两份、解压两遍
+    expect(tester.widget<FilledButton>(install).onPressed, isNull);
+    // 再点一次（禁用态）：仍然只有一次请求
+    await tester.tap(install, warnIfMissed: false);
+    await drain(tester);
+    expect(installCalls, 1, reason: '安装中重复点击不该发第二个请求');
+
+    // 这张卡的其它写控件也一并按下：安装会把那个目录整段清空重写，
+    // 这期间去启停一个正从那个目录跑着的实例，两件事都能弄坏
+    expect(tester.widget<Switch>(find.byKey(const ValueKey('protocol-side-enabled'))).onChanged, isNull);
+    expect(tester.widget<TextField>(find.byKey(const ValueKey('protocol-side-dir'))).enabled, isFalse);
+
+    // 放开闸门：这一次安装照常走完，提示与请求都还是那一次
+    gate.complete();
+    await pumpUntil(tester, find.text('已装好并用它配好了；重启一下就能用'));
+    await drain(tester);
+    expect(installCalls, 1);
+    expect(sidePath, '/api/protocol-side/config');
+  });
+
+  // ── 「系统」卡（用户 ⑪ 起可改，⑭ 起改成逐行就地编辑） ──
+  //
+  // ⑪ 那四条用例断言的是"一直摊开的表单"（九格常驻输入框、卡头浮脏提示、卡底一个总保存键）。
+  // ⑭ 把交互换成了"紧凑表 + 每行一枚胶囊"（用户原话："就像原来这样，后面有个胶囊按钮，
+  // 点击就可以编辑对应行行不行吗"），语义变了，所以这四条**重写**而不是把断言改绿：
+  // 现在要锁的是"只动这一行、只写这一行、取消就丢、改不了的行没有胶囊"。
+
+  testWidgets('系统卡：默认只露 4 行，其余收在「查看全部」后面，展开后能再收起', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    // 默认露出来的正是那 4 项：监听地址 / 时区 / 预算 · 每日 token 上限 / 数据目录
+    // （用户 ⑭ 点名："最常看/最常调的先摆"）。读数就是 config.json 里的原值。
+    expect(sysValue(tester, 'web'), '127.0.0.1:7788');
+    expect(sysValue(tester, 'timezone'), 'Asia/Shanghai');
+    expect(sysValue(tester, 'budget.dailyTokens'), '2000000');
+    expect(inSystemCard(find.text('C:/path/to/data')), findsOneWidget, reason: '第 4 行是数据目录');
+
+    // 其余 6 行连渲染都还没发生（不是"藏起来"，是根本没挂上去）
+    expect(find.byKey(const ValueKey('sys-value-budget.stepTools')), findsNothing);
+    expect(inSystemCard(find.text('预算 · 软阈值')), findsNothing);
+    expect(inSystemCard(find.text('destructive 工具策略')), findsNothing);
+
+    // CappedChildren 报的是**总行数**（10 = 8 个可编辑 + 2 个只读），标签在展开后切成「收起」
+    await tapInCard(tester, inSystemCard(find.text('查看全部（10 行）')));
+    expect(inSystemCard(find.text('预算 · 软阈值')), findsOneWidget);
+    expect(inSystemCard(find.text('destructive 工具策略')), findsOneWidget);
+    expect(inSystemCard(find.text('查看全部（10 行）')), findsNothing);
+    expect(inSystemCard(find.text('收起')), findsOneWidget);
+
+    await tapInCard(tester, inSystemCard(find.text('收起')));
+    expect(inSystemCard(find.text('预算 · 软阈值')), findsNothing, reason: '展开后要能再收起');
+    expect(inSystemCard(find.text('查看全部（10 行）')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await drain(tester);
+  });
+
+  testWidgets('系统卡：点「编辑」只让那一行就地变输入框，别行照旧是只读值', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    await tapInCard(tester, sysEdit('timezone'));
+
+    // 就地：框里先摆着当前值（不是空框，也不是示例）
+    expect(sysText(tester, 'timezone'), 'Asia/Shanghai');
+    // 这一行的读态值让位给输入框（两者不会同时在）
+    expect(find.byKey(const ValueKey('sys-value-timezone')), findsNothing);
+    // 胶囊那一位换成「保存 / 取消」
+    expect(sysEdit('timezone'), findsNothing);
+    expect(sysSaveBtn('timezone'), findsOneWidget);
+    expect(sysCancelBtn('timezone'), findsOneWidget);
+
+    // **其余行不动**：它们还是只读值 + 各自的胶囊，页面上没有第二个输入框
+    expect(sysValue(tester, 'budget.dailyTokens'), '2000000');
+    expect(find.byKey(const ValueKey('sys-field-budget.dailyTokens')), findsNothing);
+    expect(sysEdit('budget.dailyTokens'), findsOneWidget);
+
+    // 没改动时「保存」是灰的（这一页的既有分寸：未改动即禁用）
+    expect(tester.widget<FilledButton>(sysSaveBtn('timezone')).onPressed, isNull);
+    await tester.enterText(find.byKey(const ValueKey('sys-field-timezone')), 'Europe/Paris');
+    await tester.pump();
+    expect(tester.widget<FilledButton>(sysSaveBtn('timezone')).onPressed, isNotNull);
+
+    // ⑭ 起没有"整卡脏了"这个概念：卡头不再浮脏提示，卡片底部也没有总保存键——
+    // 卡里此刻只有**这一行**那一枚「保存」
+    expect(find.text('有未保存的更改'), findsNothing);
+    expect(inSystemCard(find.widgetWithText(FilledButton, '保存')), findsOneWidget);
+    await drain(tester);
+  });
+
+  testWidgets('系统卡：行内「保存」只发一条 config-update，body 里只有这一行的字段', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    await tapInCard(tester, sysEdit('budget.dailyTokens'));
+    await tester.enterText(find.byKey(const ValueKey('sys-field-budget.dailyTokens')), '5000000');
+    await tester.pump();
+    await tapInCard(tester, sysSaveBtn('budget.dailyTokens'));
+    await pumpUntil(tester, find.text('已保存，重启后生效'));
+
+    // 一条请求、只有这一个字段（别的八行一个字都没带）
+    expect(postCount, 1, reason: '逐行保存就是一条请求');
+    expect(lastPost?['fields'], {'budget.dailyTokens': 5000000});
+    expect(lastConfirm, 'config-update', reason: '写配置必须带 X-Confirm');
+
+    // 保存成功后退出编辑态、退回只读行；值按盘上那份回填（假服务端没改值，所以回到原值）
+    expect(find.byKey(const ValueKey('sys-field-budget.dailyTokens')), findsNothing);
+    expect(sysEdit('budget.dailyTokens'), findsOneWidget);
+    expect(sysValue(tester, 'budget.dailyTokens'), '2000000');
+    expect(find.text('有未保存的更改'), findsNothing);
+    await drain(tester);
+  });
+
+  testWidgets('系统卡：非法值当场拦下，一个字节都不写盘（六种取值逐个试）', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+    // 六次里有两次落在默认收起的那几行上（软阈值 / 步内工具调用上限），先把整张表展开
+    await tapInCard(tester, inSystemCard(find.text('查看全部（10 行）')));
+
+    // 逐条按解析器的规则来（src/config/config.ts）。每一格试完用「取消」把这一行收掉：
+    // 不然那一行还开着输入框，下一行要点的「编辑」胶囊根本不在（这正是逐行交互的样子）。
+    Future<void> check(String id, String path, String bad, String message) async {
+      await tapInCard(tester, sysEdit(id));
+      await tester.enterText(find.byKey(ValueKey('sys-field-$path')), bad);
+      await tester.pump();
+      await tapInCard(tester, sysSaveBtn(id));
+      await pumpUntil(tester, find.text(message));
+      expect(postCount, 0, reason: '$path = $bad 不该写进配置');
+      // 拦下之后**留在编辑态**：人就在那个框上，改完再按一次就行
+      expect(find.byKey(ValueKey('sys-field-$path')), findsOneWidget);
+      await tapInCard(tester, sysCancelBtn(id));
+      expect(find.byKey(ValueKey('sys-field-$path')), findsNothing);
+    }
+
+    // host 空串：解析器收，但空串会绑到所有网卡——界面按危险处理
+    await check('web', 'web.host', '', '监听地址不能为空：空值等于监听所有网卡，未保存');
+    // 端口越界（pickInt(..., 1, 65535)）
+    await check('web', 'web.port', '70000', '端口要在 1~65535 之间，未保存');
+    // 时区空串：pickNonEmptyString 直接拒
+    await check('timezone', 'timezone', '', '时区不能为空，未保存');
+    // 80 而不是 0.8：这是解析器专门抓的那个真实错误（pickRatio 的注释里就写着它）
+    await check('budget.softRatio', 'budget.softRatio', '80',
+        '预算 · 软阈值是比例，要落在 0~1 之间（不含 0），未保存');
+    // 预算是整数，下限 1（pickInt 的 min）
+    await check('budget.stepTools', 'budget.stepTools', '0', '预算 · 步内工具调用上限最小是 1，未保存');
+    // 紧凑写法在这里不接受：框里要的是 config.json 里的原值（⑪ 的硬要求，⑭ 照旧）
+    await check('budget.dailyTokens', 'budget.dailyTokens', '2M', '预算 · 每日 token 上限要填整数，未保存');
+
+    // 六次尝试，零请求
+    expect(postCount, 0);
+    await drain(tester);
+  });
+
+  testWidgets('系统卡：行内「取消」丢弃这一行的改动，一个请求都不发', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    await tapInCard(tester, sysEdit('timezone'));
+    await tester.enterText(find.byKey(const ValueKey('sys-field-timezone')), 'Europe/Paris');
+    await tester.pump();
+    await tapInCard(tester, sysCancelBtn('timezone'));
+
+    expect(postCount, 0, reason: '「取消」就是丢弃，不该有任何写请求');
+    expect(find.byKey(const ValueKey('sys-field-timezone')), findsNothing);
+    expect(sysValue(tester, 'timezone'), 'Asia/Shanghai');
+
+    // 草稿没留下：再点开还是盘上那份
+    await tapInCard(tester, sysEdit('timezone'));
+    expect(sysText(tester, 'timezone'), 'Asia/Shanghai');
+    expect(postCount, 0);
+    await drain(tester);
+  });
+
+  testWidgets('系统卡：改不了的行不挂「编辑」胶囊、也不喊「需重启」', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+    await tapInCard(tester, inSystemCard(find.text('查看全部（10 行）')));
+
+    // 两条不走「编辑」胶囊的行：它们没有输入框（键就是点路径/行 id，找不到即证明它不可编辑）
+    expect(find.byKey(const ValueKey('sys-edit-dataDir')), findsNothing);
+    expect(find.byKey(const ValueKey('sys-edit-tools.destructiveEnabled')), findsNothing);
+    expect(find.byKey(const ValueKey('sys-field-dataDir')), findsNothing);
+    expect(find.byKey(const ValueKey('sys-field-tools.destructiveEnabled')), findsNothing);
+
+    // 原因写在各自那一行里（不是一句"只读"）
+    expect(inSystemCard(find.text('C:/path/to/data')), findsOneWidget);
+    expect(inSystemCard(find.textContaining('换它等于让下一个进程从空目录开始')), findsOneWidget);
+    // destructive 那一条**刻意不复用「编辑」胶囊**：它的写通道要带确认短语
+    // （`update-config; enable-destructive`），所以走自己那枚「修改」。
+    expect(inSystemCard(find.text('destructive 工具策略')), findsOneWidget);
+    expect(inSystemCard(find.text('修改')), findsOneWidget);
+
+    // 「需重启」只挂在能改的那 8 行上：改不了的行喊重启没意义（⑭ 的原话）
+    expect(inSystemCard(find.text('需重启')), findsNWidgets(8));
+    await drain(tester);
+  });
+
+  testWidgets('系统卡：监听地址那一行编辑时是两个框，保存时两个字段一起写', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    expect(sysValue(tester, 'web'), '127.0.0.1:7788', reason: '一行一个读数：host:port');
+
+    await tapInCard(tester, sysEdit('web'));
+    expect(find.byKey(const ValueKey('sys-field-web.host')), findsOneWidget);
+    expect(find.byKey(const ValueKey('sys-field-web.port')), findsOneWidget);
+
+    await tester.enterText(find.byKey(const ValueKey('sys-field-web.host')), '0.0.0.0');
+    await tester.enterText(find.byKey(const ValueKey('sys-field-web.port')), '8899');
+    await tester.pump();
+    await tapInCard(tester, sysSaveBtn('web'));
+    await pumpUntil(tester, find.text('已保存，重启后生效'));
+
+    // 两半本来就是同一行的两个字段：一次写、一条请求
+    expect(postCount, 1);
+    expect(lastPost?['fields'], {'web.host': '0.0.0.0', 'web.port': 8899});
+    expect(lastConfirm, 'config-update');
+    await drain(tester);
+  });
+}

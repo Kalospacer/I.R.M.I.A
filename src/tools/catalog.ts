@@ -1,0 +1,317 @@
+/**
+ * Irmia Agent — 默认工具集装配（main.ts 与 cli.ts 共用的一份清单）
+ *
+ * 存在的唯一理由：**工具清单是 render 的输入之一**，而 render 是"可重建"承诺的核心
+ * （docs/schema.md §13：模型请求的全部内容可由 model 事件 + 人格资产重建）。
+ * 事后重建（`replay <turn> <step>`、`doctor` 的 internal 抽查）必须与运行期拿到**同一份**
+ * 工具说明，否则重建出来的输入与当时不一致，而"重建不一致"这件事是查不出来的——
+ * 它看起来永远像"模型当时就是这么看到的"。
+ *
+ * 因此装配顺序、注册选项、视角（`listForModel` 的 destructive 开关）都在这里落定一处：
+ *   buildFsTools → createNetTools → createVisionTools → createAdminTools → buildShellTools
+ * 与 docs/design.md §4.10 的第四级（按需工具）一致。main.ts 只是调用方之一。
+ *
+ * 零外部依赖：只用 node: 标准库。
+ */
+
+import { join } from 'node:path';
+
+import type { TimerStore } from '../wake/timer-store.js';
+import type { JobManager } from '../runtime/job-manager.js';
+import type { WakeChannel } from '../log/types.js';
+import type { DepsManager } from '../deps/manager.js';
+import type { MediaPoster, AdminEventEmitter, ChannelNameResolver, ChannelReader, ChannelSpokenReader, Notifier, PersonaUpdatedPayload, ReplyPoster } from './admin.js';
+import type { ToolDefinition } from './types.js';
+import type { ToolModelSpec } from './registry.js';
+import type { VisionModelClient } from './vision.js';
+import { createAdminTools } from './admin.ts';
+import { createNetTools } from './net.ts';
+import { createPwshTool } from './pwsh.ts';
+import { buildFsTools } from './fs/index.ts';
+import { createVisionTools } from './vision.ts';
+import { ToolRegistry } from './registry.ts';
+import { TimerStore as TimerStoreClass } from '../wake/timer-store.ts';
+
+// ──────────────────────────────── 选项 ────────────────────────────────
+
+export interface ToolCatalogOptions {
+  /** 数据目录：fs 工具白名单根、vision 缓存、admin 的 personaRoot 都以它为准 */
+  dataDir: string;
+  /** 定时器存储（admin 的三件定时器工具用；CLI 只读场景传一份不布防的实例即可） */
+  timers: TimerStore;
+  /** 事件写入口（admin 工具的唯一出口；没有它这些动作不可复盘） */
+  emit: AdminEventEmitter;
+  /** 模型通道（vision 工具用）。不传时给一个"未接线"实现：注册可用，调用即报错 */
+  visionClient?: VisionModelClient;
+  /** persona 写入后的副作用钩子（刷新人格缓存、重算 personaHash） */
+  onPersonaUpdated?: (payload: PersonaUpdatedPayload) => void;
+  /** pwsh 的破坏性命令开关，默认 false（安全默认，与 design.md §4.10 第三级门一致） */
+  destructiveEnabled?: boolean;
+  /**
+   * 外部依赖管理器（`src/deps/`，v30）。**探测只做一次**的来源：
+   *   · `buildFsTools` 用它决定 rg_search / es_search 注不注册（没装就不注册）；
+   *   · pwsh 工具用它拿默认 shell（探测到的 pwsh 7，可能是 PATH/自装目录/用户指定）。
+   * 不传时各处各自兜底探测——CLI 只读场景（replay / doctor）也就能白拿一份缓存。
+   */
+  deps?: DepsManager | undefined;
+  /**
+   * 装配期的如实告知出口（启动日志）。**条件注册的工具不出现时不能无声无息**：
+   * 用户点名要"保留没有时如实告知"——注册层面拿掉它，日志里必须说清为什么。
+   */
+  onNote?: ((message: string) => void) | undefined;
+  /**
+   * 受保护配置文件（绝对路径，如 `data/hooks.json`）：fs 写入口一律拒绝（design.md §4.19 第 5 条）。
+   * 这类文件定义的是「谁能改我」——agent 能写它就等于没有门，因此拦在写入点而不是提示词里。
+   */
+  protectedPaths?: readonly string[];
+  /**
+   * 后台任务管理器（design §4.21 jobs）。传了它，pwsh 的 `runInBackground` 才能用。
+   * 不传时后台模式被拒绝并说明原因（不静默降级成前台阻塞）。
+   *
+   * 用 getter 而不是直接传 JobManager：装配顺序上「建注册表」与「建 JobManager」
+   * 互相依赖，惰性取回调让两者都不需要知道对方的构造时刻。
+   */
+  jobs?: () => JobManager | null;
+  /**
+   * 告警出口（speak 的第二路）：不传时 speak 如实报"未配置告警出口"，而不是假装成功。
+   *
+   * v27 之后它只服务 speak / report 这一条路——独立的 `notify` 工具删掉了
+   * （与 speak 重复：model 侧有两个"推一条给人"的入口，实测都走 speak）。
+   */
+  notifier?: Notifier;
+  /**
+   * 当前 turn 的回投会话（M9）：由宿主提供（真循环给的是本拍分派的 wake/channel），
+   * 返回 null 表示这一轮没有可回投的 IM 会话——speak 的第三路如实报"跳过"。
+   *
+   * 用回调而不是快照：speak 在 turn 中途被调用，那一瞬的值才是要用的值。
+   */
+  currentWakeChannel?: () => WakeChannel['data'] | null;
+  /** 回投实现（默认全局 fetch）；接了 IM 通道时换成通道自己的发送器 */
+  replyPoster?: ReplyPoster;
+  /**
+   * 图片直通是否开启（`config.vision.imagesToContext`）。
+   *
+   * 它决定 `vision_read` 的 `inline` 参数能不能用：开了才有"把原图放进上下文"这条路
+   * （写一条 `image/attached` 事件，渲染层注入 input_image）；关掉时如实报不可用，
+   * 而不是写一条没人看的事件让她以为"我看见了"。
+   */
+  visionImagesToContext?: boolean;
+  /** 发言节奏（`config.speak`）：打字效果开关与速度，交给 speak */
+  speakTyping?: { typingEffect: boolean; charsPerMinute: number };
+  /**
+   * 「他刚说了什么」：speak 被人插话打断时，用它把对方的新话写进回执。
+   * 用回调而不是快照——打断发生在 speak 执行途中，那一刻的值才是要用的值。
+   * 一并给出那条唤醒的 `wakeSeq`（speak 据此销账，见 `ToolContext.claimInterruption`）。
+   */
+  userSpoke?: () => { text: string; wakeSeq: number } | null;
+  /**
+   * IM 消息读取口（`read_channel` 用）：工具层不读日志，所以由宿主把它递进来。
+   * 不传时 read_channel 照常注册，但一调就如实报"宿主没接线"（而不是假装读到空）。
+   */
+  channelReader?: ChannelReader;
+  /**
+   * 她在这个会话里**说过的话**（`read_channel` 用）：宿主注入。
+   *
+   * 与 `channelReader` 分开是因为来源不同：一个是别人发来的消息（`wake/channel` /
+   * `channel/message`），一个是她自己的投递回执（`speak/sent` 带 text 的那条）。
+   * 不传时 read_channel 照常可用，只是读不到自己的发言。
+   */
+  channelSpokenReader?: ChannelSpokenReader;
+  /**
+   * 会话名解析（`read_channel` 的渲染用）：sid → 名字。
+   *
+   * 与 `render.ts` 的 `channelRender` 是同一件事的两个入口（一个给旧消息回放、一个给本轮唤醒），
+   * 名字的真源只有一处——宿主知道她的别名表和人声明的联系人表，工具层两样都不读。
+   */
+  resolveChannelName?: ChannelNameResolver;
+  /** 这一轮叫她的那条消息（提及/@；read_channel 对那个会话一律照给，见 admin.ts） */
+  mentionMessage?: () => { sid: string; messageId: string } | null;
+  /** 媒体投递口（`send_media` 用）：宿主注入 */
+  mediaPoster?: MediaPoster;
+  /** 发言人（openid）→ 名字：read_channel 每行那个"谁"（不是会话名） */
+  resolvePersonName?: (person: string) => string | null;
+  /**
+   * 本机时区（IANA 名）：`read_channel` 每行那个短时间用它（`MM-DD HH:MM`，她不用自己换算）。
+   * 与此刻层 `时刻：` 同一条纪律（v26）；工具层不读配置，所以由宿主递进来。
+   */
+  timezone?: string;
+  /**
+   * `ask_human` 回执里报的等待时长（`config.tools.askHumanTimeoutMin`，毫秒）。
+   * 不传时走工具自己的兜底默认——超时事实的落库在 real-loop，两处读同一个配置值。
+   */
+  askHumanTimeoutMs?: number;
+}
+
+/** 未接线的模型通道：把"CLI 里调不动 vision"变成一条可读的错误，而不是一个静默的空实现 */
+export function unwiredVisionClient(): VisionModelClient {
+  return {
+    generate: () => Promise.reject(new Error(
+      'vision 工具需要模型通道，当前进程没有接线（CLI 只做请求重建与自检，不发起模型调用）',
+    )),
+  };
+}
+
+// ──────────────────────────────── 装配 ────────────────────────────────
+
+/**
+ * 默认工具集的工具定义清单（顺序即断言顺序：render 的 tools 数组按注册顺序序列化，
+ * 顺序变了就是一次缓存前缀变更，必须是有意为之）。
+ *
+ * async 的唯一来源是 fs 那一族：es_search 要探测到 es.exe 才注册（见 fs/index.ts），
+ * 而"清单里有哪几件"必须落定之后才谈得上顺序。
+ */
+export async function buildToolCatalog(options: ToolCatalogOptions): Promise<ToolDefinition[]> {
+  const visionClient = options.visionClient ?? unwiredVisionClient();
+  const adminKit = createAdminTools({
+    timers: options.timers,
+    emit: options.emit,
+    personaRoot: join(options.dataDir, 'persona'),
+    ...(options.notifier !== undefined ? { notifier: options.notifier } : {}),
+    ...(options.onPersonaUpdated !== undefined ? { onPersonaUpdated: options.onPersonaUpdated } : {}),
+    // 回投接线（M9）：有 IM 通道时 speak 的第三路才有地址；没有就如实跳过
+    ...(options.currentWakeChannel === undefined ? {} : { currentWakeChannel: options.currentWakeChannel }),
+    ...(options.replyPoster === undefined ? {} : { replyPoster: options.replyPoster }),
+    // 发言节奏与"他刚说了什么"：都只服务 speak（见 admin.ts）
+    ...(options.speakTyping === undefined ? {} : { speakTyping: options.speakTyping }),
+    ...(options.userSpoke === undefined ? {} : { userSpoke: options.userSpoke }),
+    // read_channel 的两个注入点（v32）：消息从日志里来、名字从她的别名表与人的联系人表来。
+    // 两样都在宿主的视野里，工具层只接收结论。
+    ...(options.channelReader === undefined ? {} : { channelReader: options.channelReader }),
+    // 她自己在这个会话里说过的话（2026-10-04）：同一个来源（日志里的投递回执），
+    // 只是读法不同——它不参与未读与话题，只让 read_channel 能摆出"我已经回过什么"。
+    ...(options.channelSpokenReader === undefined ? {} : { channelSpokenReader: options.channelSpokenReader }),
+    ...(options.resolveChannelName === undefined ? {} : { resolveChannelName: options.resolveChannelName }),
+    // read_channel 每行那个短时间要本机时区（与此刻层 `时刻：` 同一条纪律：换算不该由她做）
+    ...(options.timezone === undefined ? {} : { timezone: options.timezone }),
+    ...(options.mentionMessage === undefined ? {} : { mentionMessage: options.mentionMessage }),
+    ...(options.mediaPoster === undefined ? {} : { mediaPoster: options.mediaPoster }),
+    ...(options.resolvePersonName === undefined ? {} : { resolvePersonName: options.resolvePersonName }),
+    // ask_human 的回执要说清"多久之后你会得知他可能不在"：这个数字与 real-loop 落 human/expired
+    // 用的是同一个配置值，两处各写一个数必然漂移
+    ...(options.askHumanTimeoutMs === undefined ? {} : { askTimeoutMs: options.askHumanTimeoutMs }),
+  });
+
+  return [
+    ...await buildFsTools({
+      dataDir: options.dataDir,
+      // 受保护文件（钩子配置等）的绝对路径：fs 写入口据此拒绝，读不受限
+      ...(options.protectedPaths !== undefined ? { protectedPaths: options.protectedPaths } : {}),
+      // 依赖探测的唯一来源：两件搜索工具注册与否都照它的结论（没装就不注册）
+      ...(options.deps !== undefined ? { deps: options.deps } : {}),
+      ...(options.onNote !== undefined ? { onNote: options.onNote } : {}),
+    }),
+    ...createNetTools(
+      // 出网写入类（http_post / http_download）是 destructive 工具：§4.10 的第三级门要求
+      // 「配置里显式开启才注册」。开关接的是 config.tools.destructiveEnabled。
+      //
+      // 两个开关都要拨：以前这里只传了 enablePost，于是 http_download 无论配置怎么写都不存在
+      // ——而她是会收到图片的（QQ 富媒体给的是**临时直链**），手里没有下载工具时她只能
+      // 自己拼 pwsh 的 Invoke-WebRequest，或者干脆回一句"图加载不出来"（实测两次都是后者）。
+      options.destructiveEnabled === true ? { enablePost: true, enableDownload: true } : {},
+    ),
+    ...createVisionTools({
+      dsClient: visionClient,
+      dataDir: options.dataDir,
+      // 图片直通的另一半（design §4.20）：`inline` 模式要写一条 image/attached 事件，
+      // 因为工具结果只能是文本、塞不下图片。事件出口在这里包一层——vision 只该有
+      // 写这一种事件的能力，不该拿到任意写权限。
+      emit: (type, data) => options.emit(type, data),
+      imagesToContext: options.visionImagesToContext === true,
+    }),
+    ...adminKit.tools,
+    ...buildShellTools(options),
+  ];
+}
+
+/**
+ * shell 工具族：**只有 `pwsh` 一件**。
+ *
+ * v27 删掉了它的别名 `run_command`。那个别名当年是为对齐 design §4.21 的措辞而加的
+ * （把「后台任务」说出口），代价是两份**完全相同的参数 schema**（151 token）常驻，
+ * 外加一次"两个名字选哪个"的犹豫。实测 66 次后台调用里 0 次走 `run_command`
+ * ——她一直用 `pwsh` 的 `runInBackground`。措辞对齐的价值落不到调用行为上，
+ * 于是参数级审计之后按实测取舍：留下有实测使用的那一个。
+ */
+function buildShellTools(options: ToolCatalogOptions): ToolDefinition[] {
+  const jobs = options.jobs?.() ?? null;
+  const destructiveEnabled = options.destructiveEnabled === true;
+
+  const pwsh = createPwshTool({
+    destructiveEnabled,
+    // 注入了管理器才提供回调与落盘目录；否则后台模式被明确拒绝（不静默降级成前台）
+    ...(jobs !== null ? { jobs: jobs.callbacks, jobsDir: jobs.jobsDir } : {}),
+    // v30：默认 shell 是**探测到的 pwsh 7**（可能是 PATH、自装目录或用户指定的完整路径）。
+    // 探测结论来自依赖管理器的那份缓存——启动路径上不会再为 pwsh 单独起一次进程。
+    ...(options.deps === undefined
+      ? {}
+      : { depsProbe: async () => {
+        const probe = await options.deps!.get('pwsh');
+        return {
+          ok: probe.status === 'ready',
+          path: probe.path,
+          version: probe.version,
+          reason: probe.reason,
+        };
+      } }),
+  });
+
+  return [pwsh];
+}
+
+export interface CatalogRegistryResult {
+  registry: ToolRegistry;
+  /** 注册失败的工具族（描述超预算等）；CLI 重建时如实报告，不假装清单齐全 */
+  problems: string[];
+}
+
+/**
+ * 装配一个可用的注册表。
+ *
+ * 两种失败的处置刻意不同：
+ *   - **整套装配失败**（工厂函数抛错）→ 直接抛出：那是编程错误，静默返回空注册表会让
+ *     "模型一件工具都没有"变成一件需要从行为异常里反推的事；
+ *   - **单件注册失败**（描述 token 超预算 §4.18、名字非法等）→ 记为 problems 并跳过其余。
+ *     一件文案超预算不该让整机起不来（真实实例的 register 是启动路径上的硬断言），
+ *     但也绝不能静默：调用方必须把 problems 打出来，否则就是悄悄少了一件能力。
+ */
+export async function buildCatalogRegistry(options: ToolCatalogOptions): Promise<CatalogRegistryResult> {
+  const registry = new ToolRegistry();
+  const problems: string[] = [];
+  for (const def of await buildToolCatalog(options)) {
+    try {
+      registry.register(def);
+    } catch (err) {
+      problems.push(`${def.name}：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return { registry, problems };
+}
+
+/**
+ * CLI 只读场景的注册表：不布防定时器、不写事件（emit 是空实现）、模型通道未接线。
+ * 用途只有一个——拿到与运行期同形的 `listForModel` 结果去做请求重建与自检。
+ */
+export function buildOfflineCatalogRegistry(dataDir: string): Promise<CatalogRegistryResult> {
+  return buildCatalogRegistry({
+    dataDir,
+    timers: new TimerStoreClass(join(dataDir, 'timers.json')),
+    emit: () => undefined,
+  });
+}
+
+/**
+ * 交给模型的工具说明。`includeDestructive` 三态透传 registry 语义：
+ * 不传 = 一件破坏性工具都不列（与真实循环的默认视角一致），
+ * 这正是 `replay` 需要复现的那个视角。
+ */
+export async function catalogToolSpecs(
+  dataDir: string,
+  options: { includeDestructive?: boolean | readonly string[] } = {},
+): Promise<{ specs: ToolModelSpec[]; problems: string[] }> {
+  const { registry, problems } = await buildOfflineCatalogRegistry(dataDir);
+  const includeDestructive = options.includeDestructive;
+  const specs = includeDestructive === undefined
+    ? registry.listForModel({})
+    : registry.listForModel({ includeDestructive });
+  return { specs, problems };
+}
