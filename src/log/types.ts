@@ -447,6 +447,37 @@ export interface BudgetToppedUp extends EventEnvelope<'budget/topped-up', {
   layer: BudgetLayer; addedTokens: number; by: string;
 }> {}
 
+/**
+ * 暂停解除：那条 `budget/exhausted` 记下的可恢复暂停**已经解开**（internal）。
+ *
+ * 为什么它必须是一条自己的事件（2026-10-04 修的真 bug）：投影里的 `lastExhausted` 是**日志的
+ * 折叠结果**——"上限调大 + 重启"只是把同一条 `budget/exhausted` 原样重放一遍，记录照样回来，
+ * 于是配置变了、进程也重读了配置，唤醒门仍然拿那条历史记录拦住所有输入（现场：用户发的
+ * `wake/manual` 躺在队列里没有 turn 起来；一加注、`budget/topped-up` 刚到，紧接着就
+ * `turn/start`）。**解除是一件事，就得落成事件**：只改投影不落库，下一次重启会被日志推翻。
+ *
+ * 与 `budget/topped-up` 的分工：加注那条路自己就是凭据（`topped-up` 一到，fold 同样清掉该层
+ * 记录），所以它不再补写这条；本事件记的是"没有加注，只是**活的有效上限**高过了已用量"
+ * 那一路——`reason` 说清上限是谁抬起来的，`limit` / `actual` 是**解除那一刻**的两个数
+ * （判定用的就是它们；当时撞线的那个数在它前面那条 `budget/exhausted` 里）。
+ */
+export interface BudgetResumed extends EventEnvelope<'budget/resumed', {
+  layer: BudgetLayer;
+  /** 解除那一刻的**有效上限** = 基础上限 + 累计人工加注 */
+  limit: number;
+  /** 解除那一刻的**已用量**（进度一个字节都没被改写） */
+  actual: number;
+  /**
+   * 上限是被谁抬起来的：
+   *   - `limit-raised` —— 配置改了（budget.* 是启动参数，重启后生效）；
+   *   - `topup`        —— 配置没动，是累计加注把它抬上去的。
+   *
+   * 正常路径上人工加注走 `budget/topped-up`（那条自己就把记录清了），所以 `topup` 这一档
+   * 是给"记录还在、而上限已被加注抬高"的情形兜底（例如投影缓存落后于日志时重建）。
+   */
+  reason: 'limit-raised' | 'topup';
+}> {}
+
 // ──────────────────────────────── 策略与运维 ────────────────────────────────
 
 export interface PolicyDenied extends EventEnvelope<'policy/denied', {
@@ -897,7 +928,7 @@ export type AppEvent =
   | ChannelMessage | ChannelRead | ChannelTopic | InjectionFlagged | InjectionNoted
   | ImageAttached
   | TimerSet | TimerFired | TimerCancelled
-  | BudgetConsumed | BudgetRollover | BudgetExhausted | BudgetToppedUp
+  | BudgetConsumed | BudgetRollover | BudgetExhausted | BudgetToppedUp | BudgetResumed
   | PolicyDenied | AuthzDenied | LogRepaired | InstanceTakeover
   | InputClaimed | InputDeadLetter | InputRequeued | ToolZombie
   | SlashHandled
@@ -936,6 +967,9 @@ export const EVENT_VISIBILITY: Record<string, Visibility> = {
   'injection/noted': 'internal',
   // 她自己要求放进来的图：与 wake/channel 的附件同一条出口（渲染层注入 input_image）
   'image/attached': 'model',
+  // 抬上限解除暂停同理：它是**簿记**（谁解的、凭什么解的），不是给她的输入。
+  // 她该看见的是"又能干活了"这件事本身（下一次 turn），不是框架内部的解扣动作
+  'budget/resumed': 'internal',
   'human/asked': 'model', 'human/answered': 'model',
   // 超时事实同样进上下文：她必须**得知**"人可能不在机器旁、或没注意到"才能自己决定下一步
   // （design §6.1：换个方式找人是她的判断）。写成 internal 等于让这件事只留在日志里，
@@ -1136,8 +1170,20 @@ export interface Projection {
   humanAsks: HumanAskEntry[];
   /** 执行中挂起等待人答（`human/asked` 未 paired）——**只认系统来源**（计划批准那种挂起） */
   waitingHuman: { question: string; turn: number; at: string } | null;
-  /** 各层最近一次 budget/exhausted（paused 派生：存在且无后续 topped-up） */
-  lastExhausted: Partial<Record<BudgetLayer, { at: string; limit: number; actual: number }>>;
+  /**
+   * 各层最近一次 budget/exhausted（paused 派生：存在且无后续 `budget/topped-up` /
+   * `budget/resumed`）。
+   *
+   * `resumable: false` **只在不可恢复的暂停上出现**（正常写入口写的都是 `true`，于是这一位
+   * 恒为 undefined）：抬上限那条规则（`BudgetGuard.liftedPauses`）跳过带它的记录——一条不是
+   * "预算用尽"的硬停，不该被"上限比已用大了"顺手解开。事件类型里 `resumable` 是字面量 `true`，
+   * 所以这一位只有手写日志（或将来真的加了硬停）才会出现；留一位是为了让那种日志不被误放行，
+   * 而不是说今天存在这种暂停。
+   */
+  lastExhausted: Partial<Record<BudgetLayer, {
+    at: string; limit: number; actual: number;
+    resumable?: false;
+  }>>;
   /** dedupe 窗口：最近 1000 个 wake 幂等键（FIFO 淘汰） */
   dedupeKeys: string[];
   /** 最后一次成功的模型调用，用于判断水位是否停滞 */

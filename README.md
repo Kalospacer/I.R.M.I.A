@@ -45,14 +45,12 @@ npm run build
 npm start
 ```
 
-启动后终端会打印观测台地址与 token（首次生成、只打印一次）：
+启动后它就在本机待着了（默认监听 `127.0.0.1:7788`，端口在 `config.json` 的 `web.port`）。
 
-```
-[前端] 观测台 http://127.0.0.1:7788 · 首次 token（仅打印一次）：<token>
-```
-
-把这个地址开在浏览器里、粘上 token 就能用观测台。之后 token 一直沿用 `<dataDir>/.ui-token`
-（想重置就删掉这个文件再重启）。
+界面只有一个：**桌面 GUI**（下一节）。框架不提供网页界面——用浏览器打开那个地址，它会如实
+回一句「本框架不提供网页界面；桌面界面请用 GUI」。首次打开 GUI 会让你**设一个密码**，设完即为
+登录态；忘记密码的处理办法是删掉 `data/.auth.json` 后重启进程，再设一次。这个密码防的是
+"本机上别的程序或某个本地网页顺手打你的本地端口"，**不是**防住拿到磁盘的人。
 
 环境变量（都可选）：
 
@@ -79,7 +77,7 @@ flutter run -d windows          # 开发
 flutter build windows --release # 出产物
 ```
 
-或者用仓库里那条脚本（它会拉起后端、把 UI token 同步到界面自己的存储、再启动界面）：
+或者用仓库里那条脚本（没在跑就先拉起后端，起来之后再打开界面）：
 
 ```powershell
 pwsh -File scripts\start-gui.ps1
@@ -110,8 +108,7 @@ cp config.example.json config.json   # Windows: copy config.example.json config.
 | 目录 | 里面是什么 |
 | --- | --- |
 | `src/` | 后端本体（零运行时依赖） |
-| `web/` | 观测台静态页（可选的本机入口） |
-| `gui/` | Windows 桌面界面（Flutter） |
+| `gui/` | Windows 桌面界面（Flutter），唯一的界面 |
 | `test/` | 后端测试；`gui/test/` 是界面测试 |
 | `tools/` `scripts/` | 运行期工具与启停脚本 |
 | `skills/` | 技能包（目前只有第三方的 `anysearch`，见下方许可证一节） |

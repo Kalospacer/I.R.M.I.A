@@ -59,9 +59,10 @@ export function applySubagentEvent(p: Projection, e: AppEvent): void {
       applyBudgetConsumed(p, e);
       break;
     case 'budget/exhausted':
-      p.lastExhausted[e.data.layer] = { at: e.ts, limit: e.data.limit, actual: e.data.actual };
+      applyBudgetExhausted(p, e);
       break;
     case 'budget/topped-up':
+    case 'budget/resumed':
       delete p.lastExhausted[e.data.layer];
       break;
     default:
@@ -85,6 +86,30 @@ function applyBudgetConsumed(p: Projection, e: AppEvent & { type: 'budget/consum
     p.failStreak = 0;
     p.lastModelSuccessAt = e.ts;
   }
+}
+
+/**
+ * `budget/exhausted` 的折叠：按层记档（同层以最新一次为准），本层与子代理链共用同一份。
+ *
+ * 这里**只记事实**（谁在哪一刻撞了哪一层的线、当时的两个数），不作判定：暂停该不该解除由
+ * `BudgetGuard.liftedPauses`（看活的上限与已用）判定、由运行时落 `budget/resumed` 落定。
+ * 投影里留一条记录 = "这一层此刻是暂停的"，所以解除必须是**事件**（见 BudgetResumed 的说明）。
+ *
+ * `resumable: false` 是唯一会被折进投影的一位（正常路径不写，见 Projection.lastExhausted）：
+ * 它是"别拿抬上限的规则来解这条"的凭据，而日志是外部输入（手写/旧日志），不能假定它不会出现。
+ */
+function applyBudgetExhausted(p: Projection, e: AppEvent & { type: 'budget/exhausted' }): void {
+  p.lastExhausted[e.data.layer] = {
+    at: e.ts,
+    limit: e.data.limit,
+    actual: e.data.actual,
+    ...(resumableOf(e.data) ? {} : { resumable: false as const }),
+  };
+}
+
+/** `budget/exhausted.resumable` 的判读：缺省 = 可恢复（schema 上它是字面量 true，这里按外部输入读） */
+function resumableOf(data: unknown): boolean {
+  return (data as { resumable?: unknown } | null | undefined)?.resumable !== false;
 }
 
 /** 增量折叠：运行期把单条新事件应用进既有投影（原地修改） */
@@ -237,9 +262,10 @@ export function applyOne(p: Projection, e: AppEvent): void {
       p.budget.cacheMissToday = 0;
       break;
     case 'budget/exhausted':
-      p.lastExhausted[e.data.layer] = { at: e.ts, limit: e.data.limit, actual: e.data.actual };
+      applyBudgetExhausted(p, e);
       break;
     case 'budget/topped-up':
+    case 'budget/resumed':
       delete p.lastExhausted[e.data.layer];
       break;
 
