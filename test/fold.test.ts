@@ -12,11 +12,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { applyEvent, applyOne, finalizePressure, fold } from '../src/state/fold.ts';
+import { applyOne, finalizePressure, fold } from '../src/state/fold.ts';
 import { defaultVisibility, emptyProjection } from '../src/log/types.ts';
 import type {
   AlarmSent, AppEvent, AssistantMessage, BudgetConsumed, BudgetExhausted,
-  BudgetRollover, BudgetResumed, BudgetToppedUp, CompactionSummary, ConfigChanged,
+  BudgetRollover, BudgetToppedUp, CompactionSummary, ConfigChanged,
   DeveloperMessage, HumanAnswered, HumanAsked, InputClaimed, InputDeadLetter,
   InputRequeued, InstanceTakeover, IntentionActed, IntentionRaised, JobFinished,
   JobStarted, LogRepaired, McpServerStarted, McpServerStopped, ModelDegraded,
@@ -704,51 +704,6 @@ test('budget/exhausted 按层记档，同层覆盖，topped-up 清除对应层',
   applyOne(p, evt<BudgetToppedUp>('budget/topped-up', { layer: 'daily', addedTokens: 500_000, by: 'human' }));
   assert.equal(p.lastExhausted.daily, undefined);
   assert.deepEqual(p.lastExhausted.step, { at: stepEx.ts, limit: 8_000, actual: 8_100 }, '加预算只清指定层');
-});
-
-/**
- * `budget/resumed`：抬上限解除暂停的**那件事**（2026-10-04 修的真 bug）。
- *
- * 这里盯的是折叠口径：解除必须是日志里的事件（与 `topped-up` 同一个出口，只清指定层），
- * 因为 `lastExhausted` 是日志的折叠结果——解除只改投影的话，下一次重启会被日志推翻。
- * 顺带钉住 `resumable: false` 那一位的折法：它只在不可恢复的暂停上出现，是抬上限那条
- * 规则"别解它"的凭据（见 Projection.lastExhausted 与 BudgetGuard.liftedPauses）。
- */
-test('budget/resumed 解除指定层暂停（与 topped-up 同出口），resumable:false 留下凭据', () => {
-  resetFactory();
-  const p = emptyProjection();
-  const task = evt<BudgetExhausted>('budget/exhausted', { layer: 'task', limit: 100, actual: 120, resumable: true });
-  const daily = evt<BudgetExhausted>('budget/exhausted', { layer: 'daily', limit: 1_000, actual: 1_100, resumable: true });
-  applyOne(p, task);
-  applyOne(p, daily);
-  assert.deepEqual(Object.keys(p.lastExhausted).sort(), ['daily', 'task']);
-
-  const resumed = evt<BudgetResumed>('budget/resumed', { layer: 'task', limit: 1_000, actual: 120, reason: 'limit-raised' });
-  applyOne(p, resumed);
-  assert.equal(p.lastExhausted.task, undefined, 'budget/resumed 解掉记录');
-  assert.deepEqual(p.lastExhausted.daily, { at: daily.ts, limit: 1_000, actual: 1_100 }, '只清指定层');
-  // 全量与增量一致：同一条序列 fold 出来的解除结果必须逐字节相同
-  assert.deepEqual(fold([task, daily, resumed]).lastExhausted, { daily: { at: daily.ts, limit: 1_000, actual: 1_100 } });
-
-  // 子代理链的事件同样在父层折这份记账（与 topped-up 同一口径：父的唤醒门读的就是它）
-  const childResume = {
-    ...evt<BudgetResumed>('budget/resumed', { layer: 'daily', limit: 9_000, actual: 1_100, reason: 'topup' }),
-    parentCallId: 'call_child_1',
-  } as BudgetResumed;
-  applyEvent(p, childResume);
-  assert.equal(p.lastExhausted.daily, undefined, '子代理链的解除同样折进父层');
-
-  // 不可恢复的暂停（手写/旧日志才可能出现，类型上是字面量 true）：折进投影时必须带标记，
-  // 否则"抬上限"那条规则会把它当成普通的预算暂停顺手解掉
-  const hard = evt<BudgetExhausted>('budget/exhausted', { layer: 'turn', limit: 30, actual: 30, resumable: true });
-  (hard.data as { resumable: unknown }).resumable = false;
-  applyOne(p, hard);
-  assert.deepEqual(p.lastExhausted.turn, { at: hard.ts, limit: 30, actual: 30, resumable: false });
-
-  // 同层再来一条可恢复的：覆盖时标记要一并消失（暂停的性质以后写的为准）
-  const soft = evt<BudgetExhausted>('budget/exhausted', { layer: 'turn', limit: 30, actual: 31, resumable: true });
-  applyOne(p, soft);
-  assert.deepEqual(p.lastExhausted.turn, { at: soft.ts, limit: 30, actual: 31 });
 });
 
 // ──────────────────────────────── 定时器 ────────────────────────────────

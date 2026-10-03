@@ -694,10 +694,6 @@ export class RealLoop {
     await this.ensureReady();
     this.rolloverIfNeeded();
     this.settleTopUpRequests();
-    // 抬上限解除暂停：每一拍再判一次（幂等——写完之后记录就没了，不会再写第二条）。
-    // 启动那一次已经覆盖"改配置 + 重启"，这里覆盖运行期上限变化的其余路径（加注看门文件
-    // 刚被拾取、判定器被重建……），并保证唤醒门读到的记录与活的上限永远对得上。
-    this.releaseLiftedPauses();
     await this.healthCheck();
     // 图片附件：每拍补下最近到达的（**包括 turn 进行中到达的那张**——它会立刻出现在她
     // 后续 step 的历史里）。放在 busy 检查之前：她正忙的时候恰恰是图片最容易到场的时候。
@@ -1084,57 +1080,10 @@ export class RealLoop {
       title: `预算耗尽（${facts.name}）：已用 ${used} / 上限 ${limit}`,
       body: `${facts.name}这一档到上限了：已用 ${used} / 上限 ${limit}。${state}`
         + `两条出路：① 去「设置 → 系统」把「${facts.field}」调大——${facts.scope}；`
-        + '它是启动参数，改完要重启进程才生效。已经暂停的层，重启后新上限只要高于已用量，'
-        + '暂停就自动解除（会落一条 budget/resumed，说清是谁解的、凭什么解的）；'
-        + '新上限仍不高于已用量则照旧停着，那就只剩加注这条路。'
+        + '它是启动参数，改完要重启进程才生效。'
         + `② 加注：irmia topup --layer ${layer} --tokens <N> —— 不用重启，循环下一拍拾取后接着跑。`,
       params: { layer },
     });
-  }
-
-  /**
-   * 抬上限解除暂停（2026-10-04 修的真 bug）：**判据看活的数，不看那条粘在投影里的记录**。
-   *
-   * 现场：任务层撞线 → 暂停；用户去「设置 → 系统」把上限调大并重启进程，什么都没变——因为
-   * `lastExhausted` 是**日志的折叠结果**，重启只是把同一条 `budget/exhausted` 重放一遍，
-   * 唤醒门照旧拿它拦住所有输入（那条 `wake/manual` 一直躺着没有 turn 起来），用户只好再加一次注
-   * （`budget/topped-up` 一到，紧接着就 `turn/start`）。**配置变了、进程也重读了配置，
-   * 却解不开一个"上限不够"造成的暂停——这是判据看错了东西**。
-   *
-   * 判据在 `BudgetGuard.liftedPauses`（三条：不是不可恢复的暂停、记录确实来自撞线、
-   * 当刻不再越线），这里只做两件属于循环层的事：
-   *   ① **人审挂起在台上时 task 层让路**——那条暂停的解除条件是"人答了"（答复到达会写
-   *      `budget/topped-up{by:'human-answer'}`），不是"上限比已用大了"。挂起线索是进程态
-   *      （`this.suspension`，由 warmUp 的 scanSuspension 从日志重建），只有循环层知道；
-   *   ② **落事件**：解除是一件事，就得写进日志。只改投影会在下一次重启时被日志推翻
-   *      （这正是本 bug 的成因）。
-   *
-   * 幂等：写完之后 fold 立刻把该层记录删掉，下一拍判据为空，不会再写第二条。
-   * 调用点两处：warmUp（"改配置 + 重启"那条路）与每一拍（运行期上限变化的其余路径）。
-   */
-  private releaseLiftedPauses(): number {
-    const p = this.deps.projection;
-    let released = 0;
-    for (const lifted of this.guard.liftedPauses(p)) {
-      if (lifted.layer === 'task' && this.suspension !== null) continue;
-      this.appendSync('budget/resumed', {
-        layer: lifted.layer,
-        limit: lifted.limit,
-        actual: lifted.actual,
-        reason: lifted.reason,
-      }, 'internal');
-      released += 1;
-      const how = lifted.reason === 'limit-raised'
-        ? '上限已调到' : '加注累计已把上限抬到';
-      this.write(`[预算] ${lifted.layer} 层暂停已解除（${how} ${lifted.limit} > 已用 ${lifted.actual}）`);
-      // 恢复通知走告警出口（与加注同一条口径）：上一个进程报出去的那条故障要有人来销账，
-      // 否则人只会在告警面板上一直看见"预算耗尽"，不知道重启之后它已经解开了
-      void this.notifier.ok(
-        CATEGORY.budget,
-        `${lifted.layer} 层预算暂停已解除：${how} ${lifted.limit}，高于当刻已用 ${lifted.actual}。`,
-      );
-    }
-    return released;
   }
 
   // ──────────────────────────────── 加注 ────────────────────────────────
@@ -1472,11 +1421,6 @@ export class RealLoop {
       this.write(`[人审] 停机期间收到答复（「${hanging.answered.answer}」）：turn ${hanging.answered.suspension.turn} 的输入将重新入队`);
     }
     this.setTopUps(foldTopUps(events));
-    // 抬上限解除暂停：**启动时就判一次**。「设置 → 系统」那四项是启动参数，改完重启才生效，
-    // 所以"改配置解暂停"这条路只可能在这里落地（判据看活的有效上限，见 releaseLiftedPauses）。
-    // 必须排在 setTopUps 之后：有效上限 = 配置 + 加注累计，两个来源都齐了才能比；
-    // 也必须排在 scanSuspension 之后：人审挂起在台上时 task 层要让路。
-    this.releaseLiftedPauses();
     // 信任门的真相源是日志：重启后谁被确认过必须原样重建，否则已生效的 skill 会集体掉出 catalog
     this.skills?.setTrustEvents(events);
     for (const event of events) {
