@@ -1,411 +1,295 @@
 /**
- * 前端静态资源测试 — web/ops.html + web/app.js + web/app.css
+ * 网页观测台已删除 —— `web/` 目录、`/` 静态分支、SPA 回落、MIME 表，一个都不留。
  *
- * 注：运维台住在 `web/ops.html`（`/ops.html`），首页让给了聊天版（那份在 test/chat-assets.test.ts 里测）；
- * 收纳结构（侧边栏一级入口 + 页内 tab + 设置沉底）另有一份 test/ops-ia.test.ts 专门断言。
+ * ## 这份文件原来测什么，为什么现在测这个
  *
- * 覆盖 docs/frontend.md §5 复刻验收清单里可自动化的部分，全部断言都打在"浏览器真正拿到的字节"上：
- * 起一个只服务 web/ 的本地 HTTP 服务，用 fetch 取回三份资源再逐条检查。这样测的不只是磁盘上
- * 有文件，而是"进程内嵌静态资源 + 单 HTML + 单 JS + 单 CSS"这条交付路径真的通。
+ * 原来它叫「前端静态资源测试」，逐条断言 `web/ops.html + app.js + app.css` 的字节
+ * （关键 ID 锚点、颜色只出自 token 块、动效四处时长、768px 单断点……）。用户的口径是
+ * 「web 默认关闭，我们框架不要 web」「删掉 web」——这个框架的**正式产品只有 GUI**，
+ * 那 21 个文件整份删掉了，于是那些断言**没有主语了**：不是"暂时跳过"，是"被断言的东西
+ * 已经不存在"。留着一个读不到文件的测试文件不叫覆盖，叫自欺。
  *
- * 六类断言：
- *   ① 可服务性：三文件 200 + 正确 Content-Type + 非空；
- *   ② 零外部请求：总字节 <150KB，且不出现任何非 localhost 的 http(s) 引用；
- *   ③ 关键 ID 锚点齐全（布局壳 / 六个一级入口 / 页内 tab 容器 / 确认框 / token 门 / 四态）；
- *   ④ 视觉纪律：颜色只出自 token 块、禁 shadow/gradient/毛玻璃、间距六档、圆角两档、只动白名单属性；
- *   ⑤ 动效四处时长（180/150/240/300ms）、单断点 768px、四态选择器齐全；
- *   ⑥ 契约对接：读端点、写命令、X-Confirm 短语、Bearer 与 Last-Event-ID、SSE 帧字段。
+ * 所以这份文件被改写成**新行为的守卫**，而且比原来更狠一点：过去它证明"前端能拿到"，
+ * 现在它要证明"**前端拿不到，而且说得出为什么**"。三条：
+ *   ① 任何非 `/api`、非 `/webhook` 的路径都回 `no-web-ui` + 一句人话（不是莫名其妙的 404）；
+ *   ② 磁盘上真的没有 `web/` 了（不是"服务端不指过去"，是"东西没了"）；
+ *   ③ 删掉的是那张脸，不是后台：`/api/*` 与 `/webhook/*` 照常，
+ *      而且**不该再吐出任何 HTML/静态字节**（连 content-type 都只能是 JSON）。
+ *
+ * 起真实服务、发真实请求：测的是"浏览器/脚本真拿到什么"，不是"源码里有没有某个字符串"。
  */
 
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { createServer, type Server } from 'node:http';
-import { extname, join, normalize } from 'node:path';
-import test, { after, before } from 'node:test';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
+
+import { defaultConfig } from '../src/config/config.ts';
+import { EventLog } from '../src/log/event-log.ts';
+import { emptyProjection } from '../src/log/types.ts';
+import { ensurePersonaSeeds } from '../src/persona/loader.ts';
+import { TimerStore } from '../src/wake/timer-store.ts';
+import { startWebServer, type WebServer } from '../src/web/server.ts';
 
 // ──────────────────────────────── 脚手架 ────────────────────────────────
 
-const WEB_DIR = fileURLToPath(new URL('../web/', import.meta.url));
-const ASSETS = ['ops.html', 'app.js', 'app.css'] as const;
+const TEST_TOKEN = 'test-token-0123456789abcdef';
+const REPO_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
-const CONTENT_TYPES: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-};
+/** 「观测台」当年那一整套产物；每一个都必须不可达 */
+const OBSERVATORY_PATHS = [
+  '/',
+  '/index.html',
+  '/ops.html',
+  '/app.js',
+  '/app.css',
+  '/chat.css',
+  '/shell.js',
+  '/shell.css',
+  '/pages/_kit.js',
+  '/pages/overview.js',
+  '/pages/overview.css',
+  '/pages/chat.js',
+  '/pages/logs.js',
+  '/pages/persona.js',
+  '/pages/settings.js',
+  '/pages/channels.js',
+  '/pages/extensions.js',
+] as const;
 
-function contentTypeOf(path: string): string | null {
-  return CONTENT_TYPES[extname(path)] ?? null;
+interface Rig {
+  dir: string;
+  dataDir: string;
+  server: WebServer;
+  base: string;
 }
 
-/** 已取回的资源正文（浏览器视角的字节） */
-const bodies = new Map<string, string>();
-const sizes = new Map<string, number>();
-
-let server: Server | undefined;
-let base = '';
-
-before(async () => {
-  server = createServer((req, res) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    // 运维台的深链（hash 路由）落到 ops.html：与 src/web/server.ts 的 `/` → index.html
-    // 不是一回事，这一份测试只服务运维台三件套
-    const name = url.pathname === '/' ? '/ops.html' : url.pathname;
-    const target = join(WEB_DIR, normalize(name).replace(/^[/\\]+/u, ''));
-    const type = contentTypeOf(target);
-    if (!target.startsWith(WEB_DIR) || type === null) {
-      res.writeHead(404);
-      res.end('not found');
-      return;
+async function rig(t: TestContext): Promise<Rig> {
+  const dir = mkdtempSync(join(tmpdir(), 'irmia-noweb-'));
+  const dataDir = join(dir, 'data');
+  ensurePersonaSeeds(dataDir);
+  const log = await EventLog.open(join(dataDir, 'events'));
+  const server = await startWebServer({
+    log,
+    projection: emptyProjection(),
+    config: defaultConfig(dir),
+    personaRoot: join(dataDir, 'persona'),
+    dataDir,
+    timers: new TimerStore(join(dataDir, 'timers.json')),
+    now: () => new Date('2026-02-14T10:00:00.000Z'),
+    uiToken: TEST_TOKEN,
+    port: 0,
+    out: () => undefined,
+  });
+  t.after(async () => {
+    await server.close();
+    log.close();
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* Windows 上偶发的句柄占用：清理失败不影响断言结论 */
     }
-    readFile(target, 'utf8').then(
-      (body) => {
-        res.writeHead(200, { 'Content-Type': type });
-        res.end(body);
-      },
-      () => {
-        res.writeHead(404);
-        res.end('not found');
-      },
+  });
+  return { dir, dataDir, server, base: server.url() };
+}
+
+interface Res {
+  status: number;
+  text: string;
+  contentType: string;
+  body: unknown;
+}
+
+async function call(base: string, path: string, init: RequestInit = {}): Promise<Res> {
+  const response = await fetch(`${base}${path}`, init);
+  const text = await response.text();
+  let body: unknown = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+  return { status: response.status, text, contentType: response.headers.get('content-type') ?? '', body };
+}
+
+function errorOf(res: Res): { code: string; message: string } {
+  const body = res.body as { error?: { code?: unknown; message?: unknown } } | null;
+  assert.ok(body !== null && typeof body === 'object', '错误响应必须是 JSON 对象');
+  assert.ok(body.error !== undefined, '错误响应必须带 error 字段');
+  return { code: String(body.error.code), message: String(body.error.message) };
+}
+
+// ──────────────────────────────── ① 不可达 ────────────────────────────────
+
+test('观测台的每一条路径都不可达：404 + no-web-ui + 一句人话', async (t) => {
+  const r = await rig(t);
+
+  for (const path of OBSERVATORY_PATHS) {
+    const res = await call(r.base, path);
+    assert.equal(res.status, 404, `${path} 不该再拿到任何东西`);
+    assert.equal(errorOf(res).code, 'no-web-ui', `${path} 的错误码要说明"这儿没有网页"`);
+    assert.equal(
+      errorOf(res).message,
+      '本框架不提供网页界面；桌面界面请用 GUI。',
+      `${path} 要回一句人话，而不是让人以为是服务没起来`,
     );
+  }
+});
+
+test('不再吐任何静态字节：content-type 只有 JSON，HTML/JS/CSS 一次都不出现', async (t) => {
+  const r = await rig(t);
+
+  for (const path of OBSERVATORY_PATHS) {
+    const res = await call(r.base, path);
+    assert.match(res.contentType, /application\/json/u, `${path} 的 content-type 只能是 JSON`);
+    assert.doesNotMatch(res.contentType, /text\/html|text\/css|javascript/u);
+    assert.doesNotMatch(res.text, /<!doctype|<html|<script|<link/iu, `${path} 不该回任何 HTML`);
+  }
+});
+
+test('工作目录里就算摆着 index.html，也不会被服务出去（没有"读文件"这条路了）', async (t) => {
+  const r = await rig(t);
+  // 过去 `/` 会落到 `<cwd>/web/index.html`；现在连 cwd 下的同名文件都不该被看见
+  writeFileSync(join(r.dir, 'index.html'), '<!doctype html><title>假的观测台</title>', 'utf8');
+
+  const res = await call(r.base, '/');
+  assert.equal(res.text.includes('假的观测台'), false);
+  assert.equal(res.status, 404);
+  assert.equal(errorOf(res).code, 'no-web-ui');
+});
+
+test('深链与杂路径一视同仁：hash 路由的 /events、/chat 也是 no-web-ui（没有 SPA 回落）', async (t) => {
+  const r = await rig(t);
+
+  for (const path of ['/events', '/chat', '/logs', '/settings/persona', '/nope.txt', '/favicon.ico']) {
+    const res = await call(r.base, path);
+    assert.equal(res.status, 404, `${path} 过去会回落到 index.html，现在必须说实话`);
+    assert.equal(errorOf(res).code, 'no-web-ui');
+  }
+});
+
+test('非 GET 也走同一条答复：不再有"静态资源只接受 GET/HEAD"的 405', async (t) => {
+  const r = await rig(t);
+
+  for (const method of ['POST', 'PUT', 'DELETE']) {
+    const res = await call(r.base, '/index.html', {
+      method,
+      ...(method === 'POST' ? { body: 'x' } : {}),
+    });
+    assert.equal(res.status, 404, `${method} /index.html`);
+    assert.equal(errorOf(res).code, 'no-web-ui');
+  }
+});
+
+test('URL 里的安全形状不再是问题：编码点段 / 空字节都落在同一条 no-web-ui 上', async (t) => {
+  const r = await rig(t);
+  writeFileSync(join(r.dir, 'secret.txt'), '不该被读到\n', 'utf8');
+
+  // 过去这里有一整套"防路径穿越"（403）；没有读文件这条路之后，它连同攻击面一起消失了。
+  // 断言保留下来，因为它保证的是**结果**：不管拦在哪一层，secret 都不能出现在响应里。
+  for (const path of ['/%2e%2e%2fsecret.txt', '/../../secret.txt', '/%00', '/web/../index.html']) {
+    const res = await call(r.base, path);
+    assert.equal(res.text.includes('不该被读到'), false, `${path} 不能读到 web/ 之外的文件`);
+    assert.equal(res.status, 404, `${path} 应回 no-web-ui`);
+  }
+});
+
+// ──────────────────────────────── ② 磁盘上真的没了 ────────────────────────────────
+
+test('磁盘上不再有 web/ 目录（不是"服务端不指过去"，是东西没了）', () => {
+  assert.equal(existsSync(join(REPO_ROOT, 'web')), false, 'web/ 应已整个删除（21 个文件）');
+  assert.equal(existsSync(join(REPO_ROOT, 'web', 'index.html')), false);
+  assert.equal(existsSync(join(REPO_ROOT, 'web', 'ops.html')), false);
+  assert.equal(existsSync(join(REPO_ROOT, 'web', 'pages')), false);
+
+  // 当年给网页版写的无头冒烟脚本也一并删掉了：它的入口就是那些文件
+  assert.equal(existsSync(join(REPO_ROOT, 'scripts', 'smoke-web.mjs')), false);
+});
+
+test('服务端不再有静态服务那段代码的入口（WEB_DIR_NAME / ensureUiToken 都没了）', async () => {
+  const server = await import('../src/web/server.ts');
+  assert.equal('WEB_DIR_NAME' in server, false, 'WEB_DIR_NAME 应随静态分支一起删除');
+  assert.equal('ensureUiToken' in server, false, '生成 UI token 那条路应已删除（改成密码）');
+  assert.equal('UI_TOKEN_BYTES' in server, false);
+  // 工厂与启动入口照旧（宿主与测试都从这两个进去）
+  assert.equal(typeof server.createWebServer, 'function');
+  assert.equal(typeof server.startWebServer, 'function');
+  // 认证库挂在 WebServer 上（宿主据此问"设过密码没有"），而不再是 token/tokenCreated 那对字段
+  assert.equal('instanceIdOf' in server, true, '实例标识的计算只此一份');
+});
+
+// ──────────────────────────────── ③ 删的是脸，不是后台 ────────────────────────────────
+
+test('/api/* 照常：带凭据就能读（删掉的是那张网页脸，不是后台）', async (t) => {
+  const r = await rig(t);
+
+  const projection = await call(r.base, '/api/projection', {
+    headers: { authorization: `Bearer ${TEST_TOKEN}` },
   });
-  await new Promise<void>((resolve) => {
-    server?.listen(0, '127.0.0.1', resolve);
+  assert.equal(projection.status, 200);
+  assert.equal((projection.body as { lastSeq: number }).lastSeq, 0);
+
+  const dashboard = await call(r.base, '/api/stats/dashboard', {
+    headers: { authorization: `Bearer ${TEST_TOKEN}` },
   });
-  const address = server?.address();
-  assert.ok(address !== null && typeof address === 'object', '本地服务应已监听在 127.0.0.1');
-  base = `http://127.0.0.1:${address.port}`;
+  assert.equal(dashboard.status, 200);
 
-  for (const name of ASSETS) {
-    const res = await fetch(`${base}/${name}`);
-    assert.equal(res.status, 200, `${name} 应能由本地服务取出`);
-    const body = await res.text();
-    assert.ok(body.length > 0, `${name} 不应为空`);
-    bodies.set(name, body);
-    sizes.set(name, Buffer.byteLength(body, 'utf8'));
-    const type = contentTypeOf(name);
-    if (type !== null) {
-      assert.ok(
-        (res.headers.get('content-type') ?? '').startsWith(type.split(';')[0] ?? ''),
-        `${name} 的 Content-Type 应是 ${type}`,
-      );
-    }
-  }
-});
-
-after(() => {
-  server?.close();
-});
-
-function body(name: (typeof ASSETS)[number]): string {
-  const text = bodies.get(name);
-  assert.ok(text !== undefined, `${name} 尚未取回`);
-  return text;
-}
-
-/** 提取 id="x" 集合 */
-function idsOf(html: string): Set<string> {
-  const out = new Set<string>();
-  for (const match of html.matchAll(/\bid="([^"]+)"/gu)) {
-    if (match[1] !== undefined) out.add(match[1]);
-  }
-  return out;
-}
-
-/** 提取所有 CSS 声明（行号用于定位 token 块） */
-function declarations(css: string): { line: number; prop: string; value: string }[] {
-  const out: { line: number; prop: string; value: string }[] = [];
-  css.split('\n').forEach((text, index) => {
-    const match = /^\s*(--?[\w-]+|\w[\w-]*)\s*:\s*(.+?);?\s*$/u.exec(text);
-    if (match?.[1] !== undefined && match[2] !== undefined) {
-      out.push({ line: index + 1, prop: match[1], value: match[2] });
-    }
+  const config = await call(r.base, '/api/config', {
+    headers: { authorization: `Bearer ${TEST_TOKEN}` },
   });
-  return out;
-}
+  assert.equal(config.status, 200);
 
-function pxValues(value: string): number[] {
-  return [...value.matchAll(/(\d+(?:\.\d+)?)px/gu)].map((match) => Number(match[1]));
-}
-
-// ──────────────────────────────── ① 可服务性与体积 ────────────────────────────────
-
-test('三个资源可由本地服务取出，且总体积 <150KB', () => {
-  let total = 0;
-  for (const name of ASSETS) {
-    const size = sizes.get(name);
-    assert.ok(size !== undefined && size > 0, `${name} 应有内容`);
-    total += size;
-  }
-  assert.ok(total < 150 * 1024, `三文件总计 ${total} 字节，应小于 150KB`);
-});
-
-// ──────────────────────────────── ② 零外部请求 ────────────────────────────────
-
-test('不引用任何外部 URL（零 CDN、零字体文件）', () => {
-  for (const name of ASSETS) {
-    const text = body(name);
-    const matches = [...text.matchAll(/https?:\/\/[^\s"'`)<>]*/gu)].map((match) => match[0]);
-    const external = matches.filter(
-      (url) => !/^https?:\/\/(127\.0\.0\.1|localhost)([:/]|$)/u.test(url),
-    );
-    assert.deepEqual(external, [], `${name} 出现了外部 URL`);
-  }
-});
-
-test('ops.html 只引用同源的 app.css 与 app.js', () => {
-  const html = body('ops.html');
-  assert.match(html, /<link rel="stylesheet" href="\/app\.css">/u);
-  assert.match(html, /<script type="module" src="\/app\.js"><\/script>/u);
-  assert.ok(!/<(script|link)[^>]+(?:src|href)="(?:https?:)?\/\//u.test(html), '不应有外链资源');
-});
-
-// ──────────────────────────────── ③ 关键 ID 锚点 ────────────────────────────────
-
-test('布局壳 / 一级入口 / 页内 tab / 确认框 / token 门的 ID 锚点齐全', () => {
-  const ids = idsOf(body('ops.html'));
-  const required = [
-    'app', 'rail', 'conn-dot', 'rail-main', 'rail-bottom',
-    'nav-chat', 'nav-config', 'nav-plugins', 'nav-data', 'nav-persona', 'nav-more', 'nav-settings',
-    'rail-badge-config', 'rail-badge-plugins', 'rail-badge-data', 'rail-badge-persona', 'rail-badge-more',
-    'page-title', 'page-subtitle', 'page-root', 'page-tabs', 'tab-root', 'cfg-save',
-    'token-gate', 'token-input', 'token-submit', 'token-error',
-    'confirm-dialog', 'confirm-title', 'confirm-body', 'confirm-phrase', 'confirm-phrase-input', 'confirm-ok', 'confirm-cancel',
-    'toast-host',
-  ];
-  const missing = required.filter((id) => !ids.has(id));
-  assert.deepEqual(missing, [], 'ops.html 缺少这些 ID 锚点');
-});
-
-test('JS 渲染的页面区块锚点齐全（含四态容器）', () => {
-  const js = body('app.js');
-  const anchors = [
-    'stat-head', 'stat-tiles', 'stat-budget', 'stat-recent', 'stat-quick', 'stat-suggest',
-    'ev-filter', 'ev-list', 'ev-list-block', 'ev-spacer', 'ev-newbar-wrap', 'ev-replay', 'ev-banner',
-    'ps-tree', 'ps-content', 'ps-timeline', 'ps-proposal',
-    'sk-list-block', 'sk-pending', 'sk-active', 'mcp-list', 'hk-list', 'tl-list',
-    'log-alarms', 'log-doctor', 'tr-form', 'tr-result', 'cfg-path-card', 'cfg-panel', 'cfg-toolset',
-    'set-ui', 'set-system', 'set-about', 'more-grid',
-  ];
-  const missing = anchors.filter((anchor) => !js.includes(anchor));
-  assert.deepEqual(missing, [], 'app.js 缺少这些区块锚点');
-});
-
-// ──────────────────────────────── ④ 视觉纪律 ────────────────────────────────
-
-test('颜色只出自 token 块：块外不出现任何字面色值', () => {
-  const css = body('app.css');
-  const start = css.indexOf('/* == tokens:start == */');
-  const end = css.indexOf('/* == tokens:end == */');
-  assert.ok(start >= 0 && end > start, 'token 块标记应存在');
-  const endLine = css.slice(0, end).split('\n').length;
-
-  const offenders: string[] = [];
-  css.split('\n').forEach((text, index) => {
-    if (index + 1 <= endLine) return;
-    for (const match of text.matchAll(/#[0-9a-fA-F]{3,6}\b/gu)) offenders.push(`${index + 1}: ${match[0]}`);
+  const command = await call(r.base, '/api/commands/wake', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TEST_TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ note: '界面还在用这条路' }),
   });
-  assert.deepEqual(offenders, [], 'token 块之外出现了硬编码色值');
+  assert.equal(command.status, 200);
+  assert.equal((command.body as { type: string }).type, 'wake/manual');
 });
 
-test('明暗双模：两份 token 表齐备且暗色覆盖关键项', () => {
-  const css = body('app.css');
-  for (const token of ['--surface', '--surface-container', '--surface-highest', '--on-surface', '--on-surface-variant', '--primary', '--on-primary', '--outline-variant', '--ok', '--warn', '--danger', '--sleep']) {
-    assert.ok(css.includes(`${token}:`), `缺少 token ${token}`);
-  }
-  const darkBlock = css.slice(css.indexOf('[data-theme="dark"]'), css.indexOf('/* == tokens:end == */'));
-  for (const token of ['--surface:', '--surface-container:', '--surface-highest:', '--on-surface:', '--primary:', '--outline-variant:']) {
-    assert.ok(darkBlock.includes(token), `暗色表缺少 ${token}`);
-  }
+test('/api/* 仍然是 401 而不是 404：门还在，只是换成了密码那套', async (t) => {
+  const r = await rig(t);
+
+  const anon = await call(r.base, '/api/projection');
+  assert.equal(anon.status, 401, '绝不能让"没网页"顺手把 API 也一起变成 404');
+  assert.match(anon.contentType, /application\/json/u);
 });
 
-test('禁阴影 / 禁渐变 / 禁毛玻璃', () => {
-  const css = body('app.css');
-  for (const banned of ['box-shadow', 'gradient', 'backdrop-filter', 'text-shadow', 'drop-shadow']) {
-    assert.ok(!css.includes(banned), `不应出现 ${banned}`);
-  }
-});
+test('/webhook/* 照常（通道靠它）：带专用凭据 POST 落 wake/webhook', async (t) => {
+  const r = await rig(t);
 
-test('间距只有 4/8/12/16/24/32，其余尺寸值在白名单内', () => {
-  const css = body('app.css');
-  const spacingProp = /^(?:margin|padding|gap|row-gap|column-gap)(?:-(?:top|right|bottom|left))?$/u;
-  const spacingAllowed = new Set([0, 4, 8, 12, 16, 24, 32]);
-  const pxAllowed = new Set([0, 1, 4, 8, 12, 14, 16, 18, 20, 24, 28, 32, 40, 56, 80, 120, 160, 200, 240, 420, 480, 768, 1200]);
+  // 专用凭据（B9）：这条通道**只认它**。老实例迁移期还没设密码，但 /api/* 认那份 `.ui-token`，
+  // 所以生成这一步现在就能走通；生成之后 webhook 用新凭据，而 `.ui-token` 在那条通道上仍是 401。
+  const minted = await call(r.base, '/api/commands/regenerate-webhook-token', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${TEST_TOKEN}`,
+      'content-type': 'application/json',
+      'x-confirm': 'regenerate-webhook-token',
+    },
+    body: JSON.stringify({ by: 'test' }),
+  });
+  assert.equal(minted.status, 200, minted.text);
+  const hookToken = (minted.body as { token: string }).token;
 
-  const badSpacing: string[] = [];
-  const badPx: string[] = [];
-  for (const { line, prop, value } of declarations(css)) {
-    if (prop.startsWith('--')) continue;
-    for (const px of pxValues(value)) {
-      if (spacingProp.test(prop)) {
-        if (!spacingAllowed.has(px)) badSpacing.push(`${line}: ${prop}: ${px}px`);
-      } else if (!pxAllowed.has(px)) {
-        badPx.push(`${line}: ${prop}: ${px}px`);
-      }
-    }
-  }
-  assert.deepEqual(badSpacing, [], '间距只能是 4/8/12/16/24/32');
-  assert.deepEqual(badPx, [], '出现了白名单之外的尺寸值');
-});
+  const res = await call(r.base, '/webhook/test', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${hookToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ hello: 'world' }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal((res.body as { type: string }).type, 'wake/webhook');
 
-test('圆角只有两档：组件 8px、内容区左上 12px', () => {
-  const css = body('app.css');
-  const allowed = new Set(['var(--radius)', 'var(--radius-paper)']);
-  const bad: string[] = [];
-  for (const { line, prop, value } of declarations(css)) {
-    if (!prop.startsWith('border') || !prop.includes('radius')) continue;
-    if (!allowed.has(value.trim())) bad.push(`${line}: ${prop}: ${value}`);
-  }
-  assert.deepEqual(bad, [], '圆角只允许 var(--radius) 与 var(--radius-paper)');
-  assert.ok(css.includes('--radius: 8px'), '组件圆角应是 8px');
-  assert.ok(css.includes('--radius-paper: 12px'), '内容区左上圆角应是 12px');
-});
+  const anon = await call(r.base, '/webhook/test', { method: 'POST', body: '{}' });
+  assert.equal(anon.status, 401, 'webhook 一样要凭据');
 
-test('过渡只作用在 opacity / transform / 颜色 / 高度上', () => {
-  const css = body('app.css');
-  const allowed = new Set(['opacity', 'transform', 'height', 'color', 'background-color', 'border-color', 'fill', 'stroke']);
-  const bad: string[] = [];
-  for (const { line, prop, value } of declarations(css)) {
-    if (prop !== 'transition') continue;
-    for (const part of value.split(',')) {
-      const name = part.trim().split(/\s+/u)[0] ?? '';
-      if (name !== '' && !allowed.has(name) && !name.startsWith('--')) bad.push(`${line}: ${name}`);
-    }
-  }
-  assert.deepEqual(bad, [], '过渡属性超出白名单');
-});
-
-// ──────────────────────────────── ⑤ 动效、断点、四态 ────────────────────────────────
-
-test('四处动效时长与曲线齐全（180/150/240/300ms）', () => {
-  const css = body('app.css');
-  assert.ok(css.includes('--t-page: 180ms'), '页面切换应是 180ms');
-  assert.ok(css.includes('--t-sse: 150ms'), 'SSE 新行淡入应是 150ms');
-  assert.ok(css.includes('--t-card: 240ms'), '卡片进出应是 240ms');
-  assert.ok(css.includes('--t-ok: 240ms'), '写成功变勾应是 240ms');
-  assert.ok(css.includes('--t-state: 300ms'), '状态变色应是 300ms');
-  assert.ok(css.includes('cubic-bezier(0.33, 1, 0.68, 1)'), 'easeOutCubic 曲线应存在');
-  assert.ok(css.includes('cubic-bezier(0.32, 0, 0.67, 0)'), 'easeInCubic 曲线应存在');
-  for (const frame of ['page-in', 'card-in', 'row-in', 'ok-in']) {
-    assert.ok(css.includes(`@keyframes ${frame}`), `缺少关键帧 ${frame}`);
-  }
-});
-
-test('单断点 768px：侧边栏收成底部导航条', () => {
-  const css = body('app.css');
-  assert.ok(css.includes('@media (max-width: 768px)'), '应只有 768px 这一个断点');
-  const others = [...css.matchAll(/@media[^{]*\(\s*(?:max|min)-width:\s*(\d+)px/gu)].map((match) => match[1]);
-  assert.deepEqual([...new Set(others)], ['768'], '不应出现第二个断点');
-});
-
-test('四态选择器齐全，且每个数据区块都走同一套状态容器', () => {
-  const css = body('app.css');
-  for (const state of ['loading', 'error', 'empty', 'data']) {
-    assert.ok(css.includes(`[data-state="${state}"]`), `缺少 ${state} 态选择器`);
-    assert.ok(css.includes(`[data-slot="${state}"]`) || css.includes(`data-slot="${state}"`), `缺少 ${state} 槽位`);
-  }
-  const js = body('app.js');
-  for (const state of ["'loading'", "'error'", "'empty'", "'data'"]) {
-    assert.ok(js.includes(state), `app.js 未使用 ${state} 态`);
-  }
-  assert.ok(js.includes('data-state='), '状态应写在 data-state 上');
-});
-
-test('侧边栏选中态 = 实心图标 + primary，未选中 = 线框', () => {
-  const css = body('app.css');
-  const html = body('ops.html');
-  assert.ok(css.includes('.rail-item[data-active="true"] .icon-on'), '选中应展示实心图标');
-  assert.ok(css.includes('.rail-item[data-active="true"] .icon-off'), '选中应隐藏线框图标');
-  assert.ok(html.includes('class="icon icon-on"') && html.includes('class="icon icon-off"'), '导航项应同时内联两套图标');
-  assert.ok(html.includes('id="rail-bottom"'), '管控应沉底（trailing）');
-});
-
-// ──────────────────────────────── ⑥ 契约对接 ────────────────────────────────
-
-test('读端点与写命令严格按契约拼路径', () => {
-  const js = body('app.js');
-  const readEndpoints = [
-    '/api/projection',
-    '/api/stats/dashboard',
-    '/api/events',
-    '/api/events/stream',
-    '/api/budget',
-    '/api/config',
-    '/api/doctor',
-    '/api/persona/files',
-    '/api/persona/file',
-    '/api/persona/history',
-    '/api/replay',
-  ];
-  for (const endpoint of readEndpoints) {
-    assert.ok(js.includes(`'${endpoint}'`) || js.includes(`\`${endpoint}`), `缺少读端点 ${endpoint}`);
-  }
-  for (const name of ['wake', 'review-resolve', 'requeue', 'persona-approve', 'config-update', 'timer-cancel']) {
-    assert.ok(js.includes(`'${name}'`), `缺少写命令 ${name}`);
-  }
-  assert.ok(js.includes('/api/commands/'), '写通道应走 /api/commands/');
-  assert.ok(js.includes('limit') && js.includes('from_seq'), '事件接口应带 limit / from_seq');
-  assert.ok(js.includes("q.set('limit', String(") , 'limit 应固定为每批条数');
-  assert.ok(js.includes('const BATCH = 200'), '每批 200 条');
-});
-
-test('写操作带上 Bearer 与 X-Confirm，401 回到 token 输入态', () => {
-  const js = body('app.js');
-  assert.ok(js.includes('Authorization') && js.includes('Bearer'), '应带 Bearer 令牌');
-  assert.ok(js.includes('X-Confirm'), '危险操作应带 X-Confirm 头');
-  // 短语表与 src/web/server.ts 的 CONFIRM_PHRASES / DANGEROUS_FIELDS 同源：命令级全为 null，
-  // 唯一必给的短语是字段级的 enable-destructive
-  assert.ok(js.includes("const DANGEROUS_FIELDS = { 'tools.destructiveEnabled': 'enable-destructive' }"), '字段级危险短语应与 server 一致');
-  assert.ok(js.includes('const PHRASE'), '应保留命令级短语表（与 CONFIRM_PHRASES 同源）');
-  assert.ok(js.includes("phrases.join('; ')"), 'X-Confirm 应是分号分隔的短语列表');
-  assert.ok(js.includes('irmia.ui.token'), '令牌应存 localStorage');
-  assert.ok(js.includes('localStorage.setItem(TOKEN_KEY'), '令牌写入 localStorage');
-  assert.ok(js.includes('res.status === 401'), '401 应回到输入态');
-  const html = body('ops.html');
-  assert.ok(html.includes('X-Confirm') || js.includes('确认短语'), '确认对话框应展示短语原文');
-  assert.ok(js.includes('data.error'), '错误应读 { error: { code, message } }');
-});
-
-test('未实现命令如实透传服务端的 501 原因', () => {
-  const js = body('app.js');
-  assert.ok(!js.includes('UNAVAILABLE_COMMANDS'), '不应在前端自建“未提供命令”清单（原因由服务端给）');
-  for (const command of ['dead-discard', 'export', 'backup', 'archive-now', 'ping', 'webhook-test']) {
-    assert.ok(js.includes(`'${command}'`), `应保留 ${command} 的入口`);
-  }
-  assert.ok(js.includes('res.error?.message'), '错误原因应原样展示给人');
-});
-
-test('SSE 帧按契约解析：event / id / data / retry，断线带 Last-Event-ID 补拉', () => {
-  const js = body('app.js');
-  for (const field of ["field === 'event'", "field === 'id'", "field === 'data'", "field === 'retry'"]) {
-    assert.ok(js.includes(field), `SSE 解析缺少 ${field}`);
-  }
-  assert.ok(js.includes("text/event-stream"), '应以 SSE 方式订阅');
-  assert.ok(js.includes("'Last-Event-ID'"), '重连应带 Last-Event-ID');
-  assert.ok(js.includes('if (S.sse.everConnected) void loadProjection();'), '重连应全量重拉投影');
-  assert.ok(js.includes('setTimeout'), 'retry 语义应落到重连等待上');
-});
-
-test('六态状态机取值与 server 的 DashboardState 同名同序', () => {
-  const js = body('app.js');
-  assert.ok(
-    js.includes("const STATE_ORDER = ['needs-review', 'paused', 'degraded', 'running', 'sleeping', 'idle']"),
-    '六态应取 needs-review/paused/degraded/running/sleeping/idle',
-  );
-  assert.ok(js.includes('dash.stateText'), '大状态句优先用后端的 stateText');
-  const css = body('app.css');
-  assert.ok(css.includes('[data-state-kind="needs-review"]'), 'CSS 应有 needs-review 变色');
-  assert.ok(css.includes('[data-state-kind="idle"]'), 'CSS 应有 idle 变色');
-});
-
-test('hash 路由：一级 + 页内二级 + token 首启流程', () => {
-  const js = body('app.js');
-  for (const route of ["'#/config'", "'#/plugins/skills'", "'#/data/stats'", "'#/data/events'", "'#/data/logs'", "'#/data/trace'", "'#/persona'", "'#/settings/ui'"]) {
-    assert.ok(js.includes(route), `缺少路由 ${route}`);
-  }
-  assert.ok(js.includes('hashchange'), '应监听 hash 路由变化');
-  assert.ok(js.includes("getItem(TOKEN_KEY)"), '启动应读 localStorage 里的令牌');
-  const html = body('ops.html');
-  assert.ok(html.includes('data-theme='), '明暗双模应挂在根元素 data-theme 上');
+  const legacy = await call(r.base, '/webhook/test', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TEST_TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ hello: 'again' }),
+  });
+  assert.equal(legacy.status, 401, '收窄：`.ui-token`（界面的凭据）不再能打 webhook');
 });

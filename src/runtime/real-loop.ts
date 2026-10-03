@@ -35,7 +35,7 @@ import { readFileSync, readdirSync, statfsSync, unlinkSync } from 'node:fs';
 import { arch, platform as osPlatform, release as osRelease } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
-import type { AppEvent, BudgetLayer, PendingInput, Projection, TurnEndReason, WakeChannel } from '../log/types.js';
+import type { AppEvent, BudgetLayer, MemorySelected, PendingInput, Projection, TurnEndReason, WakeChannel } from '../log/types.js';
 import { isTopLevelEvent } from '../log/types.ts';
 import { InjectionJudge, type InjectionVerdict } from '../channel/injection-judge.ts';
 import { injectionNoteOf, noteForFlagged, quotesOfHints, reasonOfHints, scanForInjection } from '../channel/injection.ts';
@@ -49,7 +49,7 @@ import type { PersonaAssets } from '../persona/loader.js';
 import { applyOne, finalizePressure, wakeSourceOf } from '../state/fold.ts';
 import { saveProjectionCache } from '../state/projection-cache.ts';
 import { writeSnapshot } from '../state/snapshot.ts';
-import { runTurn, type AgentLoopBudget, type AgentLoopDeps } from './agent-loop.ts';
+import { runTurn, isHeartbeatTurn, compactionCoveredUpToSeq, handoffOptionsOf, type AgentLoopBudget, type AgentLoopDeps } from './agent-loop.ts';
 // 回投能力的唯一判据在 tools/admin（speak 第三路用它）：这里读同一个函数，
 // 免得「提示词告诉她能发」与「实际能不能发」变成两套口径。
 import {
@@ -65,13 +65,13 @@ import {
 } from '../channel/attachment-store.ts';
 import { replyableWakeChannel } from '../tools/admin.ts';
 import type { ContactFacts } from '../model/self-brief.ts';
-import type { MachineFacts, RenderChannelContext, RenderImageRef, UsageFacts } from '../model/render.ts';
+import type { MachineFacts, RenderChannelContext, RenderImageRef, TurnBlockFacts, UsageFacts } from '../model/render.ts';
 import {
   ASK_HUMAN_BLOCKED_BY, DEFAULT_HUMAN_TIMEOUT_MS, PlanMode,
   humanTimeoutElapsed, scanSuspension, type Suspension,
 } from './plan-mode.ts';
 import { relationshipForWake } from '../persona/relationship.ts';
-import { BudgetGuard } from './budget-guard.ts';
+import { BudgetGuard, DEFAULT_STALL_MS, stallOf, type StallInfo } from './budget-guard.ts';
 import { createNotifier, type AlertNotifier } from '../alert/notifier.ts';
 import { Heartbeat, HeartbeatSource, type HeartbeatFiring } from '../wake/heartbeat.ts';
 import { NecessityGate } from './necessity-gate.ts';
@@ -85,9 +85,18 @@ import { GroupMemberBook } from '../channel/group-members.ts';
 import { WarnExemptBook } from '../channel/warn-exempt.ts';
 import { MEMORY_MAINTAIN_PAYLOAD_KIND, maintainMemory, memoriesDir } from '../persona/memory-maintain.ts';
 import {
+  buildMemoryIndex, ensureMemoryIndex, readExcerpt, renderMemoryIndex, renderSelectedMemory, selectMemory,
+  type MemoryExcerpt, type MemoryIndex,
+} from '../persona/memory-injection.ts';
+import {
   applyTopUpEvent, emptyTopUps, foldTopUps, parseTopUpRequest, raiseLimits,
   TOPUP_FILE_PREFIX, TOPUP_WATCH_DIR_NAME, type TopUpTotals,
 } from './topup.ts';
+import {
+  COMPACT_EMPTY_RECEIPT, COMPACT_RECEIPT, HANDOFF_EMPTY_RECEIPT, HANDOFF_RECEIPT,
+  isSlashCommandEvent, parseSlashCommand, unknownCommandReply, type SlashCommand,
+} from './slash-commands.ts';
+import { renderHandoffNote } from '../persona/handoff-note.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
@@ -100,12 +109,72 @@ const CATEGORY = {
   human: 'human-timeout',
 } as const;
 
-/** 水位停滞阈值（毫秒）：design §4.9「事件进来了但 10 分钟没被处理」 */
-const DEFAULT_STALL_MS = 10 * 60 * 1000;
+/**
+ * 水位停滞阈值（毫秒，`DEFAULT_STALL_MS`，见 budget-guard）：**输入自己**等了这么久还没被处理
+ * → §4.9 告警。
+ *
+ * 值仍是 10 分钟（design §4.9 的原口径），但计时起点从"距上次成功模型调用"改成了
+ * "最早那条待处理输入的到达时刻"（见 `stallOf`）——所以它与 30 分钟的心跳基线不再冲突：
+ * 安静地待着不会累积这个时长，只有真有人在等才会。
+ *
+ * 唯一要留意的量级约束：它必须明显大于群消息攒批窗口
+ * （`channels.qqOfficial.groupBatchMinutes`，默认 3 分钟）——那段时间里输入是**有意**压着的。
+ */
+
 /** 失败刹车后的半开冷却（毫秒）：冷却期满放行一次试探，避免坏接口被反复打 */
 const DEFAULT_FAIL_COOLDOWN_MS = 30 * 60 * 1000;
 /** 单拍最多认领的输入条数（与 M2 一致：一批多条时的边界固定，便于复盘） */
 const BATCH_LIMIT = 8;
+
+/**
+ * 「到的是哪一档」那一句话的素材——**唯一一处**。
+ *
+ * `field` 是界面上那几行**字段标签的逐字**（`gui/lib/pages/settings_page.dart` 的 `_SysField`，
+ * 「分区七：系统」那张卡）：人拿着告警去设置里找，标签差一个字就等于没说。
+ *
+ * `scope` 是这一档"数的是什么"的口径。token 那两档用的是仓库里既有的那句话
+ * （与界面字段说明、`BUDGET_METRIC_NOTE` 同一口径）：数的是**未扣缓存**的 token，
+ * 含缓存命中的那部分，不等于花销——第一次看到"今日用量 34599.9k"的人，反应都是"我没用这么多"。
+ * 次数那两档就如实说数的是次数，不硬套 token 的话。
+ */
+const BUDGET_LAYER_FACTS: Record<BudgetLayer, { name: string; field: string; scope: string }> = {
+  step: {
+    name: '步内工具调用',
+    field: '预算 · 步内工具调用上限',
+    scope: '这一档数的是**工具调用次数**，不是 token',
+  },
+  turn: {
+    name: '单 turn 步数',
+    field: '预算 · 单 turn 步数上限',
+    scope: '这一档数的是**一个 turn 里跑了几步**，不是 token',
+  },
+  task: {
+    name: '任务 token',
+    field: '预算 · 任务 token 上限',
+    scope: '口径是**未扣缓存**的 token 数（含缓存命中的那部分），不等于花销',
+  },
+  daily: {
+    name: '每日 token',
+    field: '预算 · 每日 token 上限',
+    scope: '口径是**未扣缓存**的 token 数（含缓存命中的那部分），不等于花销',
+  },
+};
+
+/**
+ * 进主循环上下文的事件（`AgentLoopDeps.eventFilter`）——两刀，判据都在别的模块里：
+ *
+ *   ① **顶层**（design §4.21）：子代理链（`parentCallId` 非空）是它自己那条 turn 链的内部过程，
+ *      进了父请求就等于让父模型看见"自己"没说过的话（`isTopLevelEvent`）；
+ *   ② **不是"整条就是一条指令"的 `wake/manual`**（B1 第二步，`isSlashCommandEvent`）：
+ *      指令是给框架的，她该看见的是效果而不是按钮。
+ *
+ * 为什么它是一个模块级函数而不是内联的箭头函数：`replay` 必须用**同一份**口径重建请求
+ * （`replay.ts` 的归属过滤里引的是同一个函数），否则"同一份日志重建同一份请求"就断了。
+ */
+function contextEventFilter(event: AppEvent): boolean {
+  if (!isTopLevelEvent(event)) return false;
+  return !isSlashCommandEvent(event);
+}
 
 /**
  * 附件预热一次最多回看多少条事件。
@@ -654,6 +723,12 @@ export class RealLoop {
     await this.settleHumanSuspension();
     const p = this.deps.projection;
     if (p.pending.length === 0) return;
+    // ── 人打的指令（B1 第二步：`/compact` 与 `/handoff`）──
+    // 放在攒批门与唤醒门**之前**：指令是框架自己就能办的事（收紧她的上下文 / 写一份交接笔记），
+    // 既不该被群消息的攒批窗口压住，也不该被预算暂停拦住——**撞上限时人恰恰更需要它**。
+    await this.handleSlashCommands();
+    // 指令已把队列里那几条摘走（input/claimed），可能这一拍就没别的可做了
+    if (p.pending.length === 0) return;
     // 群消息攒批（design §4.24）：单聊每句都看，群聊攒够窗口再一起看
     if (this.holdsGroupBatch(p)) return;
     if (!(await this.admitWake())) return;
@@ -749,6 +824,165 @@ export class RealLoop {
     return true;
   }
 
+  // ──────────────────────────────── 指令（B1 第二步） ────────────────────────────────
+
+  /**
+   * 人打进来的那两条指令：`/compact` 与 `/handoff`（解析口径见 `slash-commands.ts` 的文件头）。
+   *
+   * **当场执行，不唤醒 turn**：人要的是"现在压一次"或"现在把交接写下来"，不是要她回话。
+   * 所以这条路既不写 `turn/start` 也不调模型——它只把那条输入摘出队列、落一条留痕、
+   * 把事办掉、回收据。三条边界：
+   *
+   *   • **只认本机对话流**（`wake/manual`）：`wake/channel` 是外面递进来的话，群里谁都能打
+   *     `/compact`——让外部文字决定"她该忘掉什么"是把改她自己上下文的能力交给了外人；
+   *   • **不认框架自己拼的那条**（`via: 'dream'`）：那是框架指令（见 web/server.ts 的 dream），
+   *     不是人打的字。它的正文万一哪天以斜杠开头，也不该被当成人在按按钮；
+   *   • **不认识的词不回给模型**：回一句"没有这个指令 <name>"并列出手上的两个
+   *     （不打这句回话就等于让用户以为按钮坏了——`/dream` 那次"按了没反应"的教训）。
+   *
+   * 返回处理掉的条数（调用方据此判断这一拍还有没有别的活）。
+   */
+  private async handleSlashCommands(): Promise<number> {
+    const pending = this.deps.projection.pending;
+    let handled = 0;
+    for (const item of pending.slice(0, BATCH_LIMIT)) {
+      const wake = this.deps.log.get(item.wakeSeq);
+      if (wake === null) continue;
+      // 判据只有一份（`isSlashCommandEvent`：只认本机对话流里整条就是指令的那些），
+      // 这里再解一次是为了拿到 kind/name/argument——短字符串，多解一次换来的是"两处不会漂移"
+      if (!isSlashCommandEvent(wake)) continue;
+      const command = parseSlashCommand((wake.data as { note: string }).note);
+      if (command === null) continue; // 与上面同一判据，理论上到不了这里
+      await this.runSlashCommand(command, item);
+      handled += 1;
+    }
+    return handled;
+  }
+
+  /**
+   * 执行一条指令：**消费输入 → 真办事 → 落留痕 → 回收据**。
+   *
+   * 顺序里有两处是刻意的：
+   *   • **先消费再算遮蔽点**：队列里剩下的输入就是"还没轮到她看的那些"，遮蔽点必须停在它们
+   *     之前（见 {@link slashCoverFloor}）。反过来的话，这一拍刚到的那句话会被自己人的
+   *     `/compact` 一起遮掉；
+   *   • **先算计划再落留痕**：`slash/handled.coveredUpToSeq` 要与紧随其后的
+   *     `compaction/summary` 是同一个数——两个数对不上，事后读日志就得猜哪个是真的。
+   */
+  private async runSlashCommand(command: SlashCommand, item: PendingInput): Promise<void> {
+    // ① 消费这条输入。指令不唤醒 turn，所以不写 turn/start 与 turn/end，只把它摘出队列。
+    //    turn 挂 0 是既有的"这条账不是 turn 归属"口径（与 judgeChannelWakes 的先例一致）。
+    //    不摘的后果很具体：下一拍它还在 pending 里，下一个 turn 会把它当普通消息送进模型，
+    //    她就得对着 "/compact" 猜用户想干什么——那正是 B1 写明不许发生的事。
+    this.appendSync('input/claimed', {
+      turn: 0, wakeSeqs: [item.wakeSeq], claimCounts: [item.claimCount],
+    }, 'internal');
+
+    // ② 真办事。`unknown` 什么都不做；两条真指令共用**同一条落库路径**（见 planSlashCompaction）
+    const plan = command.kind === 'unknown' ? null : await this.planSlashCompaction();
+    const outcome = command.kind === 'unknown' ? 'rejected' : plan === null ? 'empty' : 'compacted';
+    // 回执在落账**之前**定下来：它要逐字进 `slash/handled`（日志是唯一真相源，
+    // 回执不能只活在告警文件里），同时也要发给用户（见下面③）。
+    const receipt = command.kind === 'unknown'
+      ? unknownCommandReply(command.name)
+      : plan === null
+        ? (command.kind === 'compact' ? COMPACT_EMPTY_RECEIPT : HANDOFF_EMPTY_RECEIPT)
+        : (command.kind === 'compact' ? COMPACT_RECEIPT : HANDOFF_RECEIPT);
+    const trace = this.appendSync('slash/handled', {
+      kind: command.kind,
+      name: command.name,
+      argument: command.argument,
+      outcome,
+      inputSeq: item.wakeSeq,
+      ...(plan === null ? {} : { coveredUpToSeq: plan.coveredUpToSeq }),
+      receipt,
+    }, 'internal');
+    if (plan !== null) {
+      // 与自动压缩写的是**同一种事件、同一份 payload**（`{coveredUpToSeq, summary}`）。
+      // 可见性取 model（与 defaultVisibility('compaction/summary') 同值）：摘要要进她的上下文，
+      // 这是"下一个 turn 读得到"的唯一通道（render 的 renderMemoryLayer 只认这个事件）。
+      // 信封上的 origin 是 runtime/real-loop（不是 web/api），所以界面把它渲染成
+      // 「上下文在此处压缩」而不是人工 reset（见 gui 的 _isManualReset）——这一次确实是压缩。
+      this.appendSync('compaction/summary', plan, 'model');
+      this.deps.log.flush();
+    }
+
+    // ③ 送给人。走**现有回执通道**：告警出口（文件档 + webhook + `alarm/sent` 事件）。
+    //    为什么是它而不是别的：框架要"对用户说一句"的既有路径只有两条——`this.write` 只到本机
+    //    控制台（她也看不见），而告警出口是唯一一条真能送到人手上的（`notifyBudgetExhausted`、
+    //    `settleTopUpRequests`、人审挂起都用它）。用 `alert` 而不是 `fail`：回执不是故障，
+    //    `fail` 会登记 stall 并在之后配一条莫名其妙的"已恢复"。
+    //    指纹里带上留痕的 seq：**每一次按下都要有回答**——限流把回执吞掉，在界面上就是
+    //    "按了没反应"（`/dream` 那次事故的教训）。人不会连按这个按钮，宁可多发一条。
+    //
+    //    注意 `alarm/sent` 只装 title（回执正文在文件档与 webhook 里）——所以正文另行逐字
+    //    落在 `slash/handled.receipt` 上，日志自己就说得清当时回了什么。
+    this.write(`[指令] /${command.name} → ${outcome}${plan === null ? '' : `（遮蔽至 seq ${plan.coveredUpToSeq}）`}`);
+    await this.notifier.alert({
+      category: 'slash-command',
+      level: 'info',
+      title: command.kind === 'unknown' ? `不认识的指令 /${command.name}` : `已执行 /${command.name}`,
+      body: receipt,
+      params: { kind: command.kind, seq: trace.seq },
+    });
+  }
+
+  /**
+   * 立刻压一次（`/compact` 与 `/handoff` **共用**这一条）：越过阈值判断，其余照抄自动压缩
+   * 那条路（`agent-loop.maybeCompact`）——同一份笔记渲染、同一份遮蔽点口径、同一个事件。
+   *
+   * 为什么 `/handoff` 也走这里（2026-10-04 接线时才定下的事实，报告里要写清）：
+   * 交接笔记**只有**写进 `compaction/summary` 才会被下一个 turn 读到。渲染层只在长期记忆层
+   * 里渲染这个事件（`model/render.ts` 的 `renderMemoryLayer`），而且要求 `coveredUpToSeq`
+   * 严格大于已有值——不遮蔽就不渲染。所以两条指令的效果都是"写一份交接笔记并把截至此刻的
+   * 往来遮蔽掉"，区别只在**人按它的理由**：一个是"接下来要干长活，先把上下文收紧"，
+   * 一个是"我要关机器了，把交接写下来"。收据文案按这个事实写（见 slash-commands.ts）。
+   */
+  private async planSlashCompaction(): Promise<{ coveredUpToSeq: number; summary: string } | null> {
+    // 全量读日志。笔记的条目来自**全部**事件，所以这一次读是必要的——它与
+    // `runMemoryMaintain` 的 `maxTurnInLog` 同一个量级，而且只在人真的按下指令时发生。
+    // 自动压缩那条路用的是 turn 内的增量快照，因为它本来就每步同步一次；这里没有那个快照。
+    //
+    // **必须过同一把刀**（`contextEventFilter`）：自动压缩喂给笔记的是**过滤后**的事件
+    // （agent-loop 的 syncEvents 走 eventFilter），两条路给笔记喂的得是同一种东西。
+    // 少这一刀会漏一件很具体的事：笔记会把"用户打了 /handoff 换班"当成一条 user 消息收进去，
+    // 而笔记进她的上下文——于是那条指令**绕开 eventFilter 又回到了她眼前**。
+    const events: AppEvent[] = [];
+    for await (const event of this.deps.log.readAll()) {
+      if (contextEventFilter(event)) events.push(event);
+    }
+
+    const note = renderHandoffNote(events, handoffOptionsOf({
+      budgetTokens: this.deps.config.persona.handoffBudgetTokens,
+      foldTokens: this.deps.config.persona.handoffFoldTokens,
+    }));
+    // 一条条目都装不进去就**不写**：只有标题的空摘要会把它覆盖的那段历史遮掉却不留替代品，
+    // 那是净损失。如实回一句"什么都没压"，上下文原样不动。
+    if (note.included === 0) return null;
+
+    return {
+      coveredUpToSeq: compactionCoveredUpToSeq(events, null, this.slashCoverFloor()),
+      summary: note.text,
+    };
+  }
+
+  /**
+   * 手动压缩的遮蔽点**下界**（`compactionCoveredUpToSeq` 的 `floorSeq`）：
+   * **队列里还没处理的输入不能被遮蔽**——它们还没轮到她看，遮掉就是吞了用户的话
+   * （而且不是"进了摘要"，是连摘要都来不及收录：笔记在它们之前就渲染好了）。
+   * 队列空了才允许"遮到此刻"（`projection.lastSeq`）——那正是"把到这一刻为止的往来
+   * 收紧成一份笔记"的字面意思。
+   */
+  private slashCoverFloor(): number {
+    const pending = this.deps.projection.pending;
+    if (pending.length === 0) return this.deps.projection.lastSeq;
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const item of pending) {
+      if (item.wakeSeq < oldest) oldest = item.wakeSeq;
+    }
+    return Math.max(0, oldest - 1);
+  }
+
   /**
    * 失败刹车放行判定：未达阈值即放行；已达阈值时只在半开冷却期满后放行一次试探——
    * 成功一次投影里的 failStreak 自然归零（fold 的口径），于是暂停自动解除。
@@ -776,14 +1010,15 @@ export class RealLoop {
 
     const stall = this.stallReport(p);
     if (stall === null) {
-      await this.notifier.ok(CATEGORY.stall, '水位恢复正常：模型调用已成功推进。');
+      await this.notifier.ok(CATEGORY.stall, '水位恢复正常：等待中的输入已被处理。');
     } else {
       await this.notifier.fail({
         category: CATEGORY.stall,
         level: 'warn',
-        title: `水位停滞：${Math.floor(stall.silentMs / 60_000)} 分钟没有成功模型调用`,
-        body: `上次成功的模型调用是 ${stall.lastModelSuccessAt}，距今 ${Math.floor(stall.silentMs / 60_000)} 分钟，`
-          + `同时还有 ${stall.pending} 条输入没有处理。循环可能被预算暂停卡住，或模型侧一直失败。`,
+        title: `水位停滞：有输入等了 ${Math.floor(stall.waitedMs / 60_000)} 分钟没被处理`,
+        body: `最早一条待处理的输入到于 ${stall.oldestPendingAt}，已经等了 ${Math.floor(stall.waitedMs / 60_000)} 分钟`
+          + `（队列里现有 ${stall.pending} 条，循环手上没有活）。`
+          + '循环可能被预算暂停卡住，或模型侧一直失败。',
         params: { pending: stall.pending > 0 },
       });
     }
@@ -810,20 +1045,43 @@ export class RealLoop {
     });
   }
 
-  /** 撞刹车告警（§4.9「撞到任何一层刹车」）。暂停不是失败：正文里给恢复动作 */
+  /**
+   * 撞刹车告警（§4.9「撞到任何一层刹车」）。暂停不是失败：正文里给恢复动作。
+   *
+   * **这是"到上限了"给人看的唯一一句话**——三条路都汇到这里（turn 收尾的结局、
+   * task 层暂停、daily 层拒绝唤醒），所以它必须一次说全五件事：
+   * **哪一档 + 上限多少 + 已用多少 + 这一档锁没锁住循环 + 两条出路**。
+   * 只说"到上限了"等于把人扔在半路：他既不知道该去哪儿调，也不知道还能加注。
+   *
+   * 两条出路都是**已有的机制**，这里只是把它们说出来：
+   *   ① 「设置 → 系统」里改那一档（`budget.stepTools` / `turnSteps` / `taskTokens` / `dailyTokens`，
+   *      与界面上那几行的标签逐字对齐——见 {@link BUDGET_LAYER_FACTS}）；它是启动参数，
+   *      改完要重启进程才生效；
+   *   ② `irmia topup --layer <层> --tokens <N>`（`runtime/topup.ts` 的看门文件，循环下一拍拾取，
+   *      不用重启）。加注是**抬高上限**，不是清零消耗——进度一个字节都不动。
+   *
+   * 标题里也带上"哪一档 + 已用 / 上限"：事件列表只显示标题（正文在告警文件与 webhook 里，
+   * 界面「告警」面板读的是文件），只写"预算耗尽"就又回到了"到上限了、没有下一步"。
+   * 全文不含任何价格 / 货币口径（只有 token 与次数）。
+   */
   private async notifyBudgetExhausted(layer: BudgetLayer): Promise<void> {
     const status = this.guard.statuses(this.deps.projection).find(st => st.layer === layer);
     const used = status?.used ?? 0;
     const limit = status?.limit ?? 0;
-    const advice = layer === 'daily' || layer === 'task'
-      ? `继续方式：irmia topup --layer ${layer} --tokens <N>`
-      : '本层只结束当前 turn，下一个 turn 从第 1 步重新开始。';
+    const facts = BUDGET_LAYER_FACTS[layer];
+    // 这一档锁不锁循环（budget-guard 的四层语义）：step / turn 只结束本 turn，
+    // task / daily 会拒绝唤醒。说错这一句，人会以为整个循环死了。
+    const state = layer === 'task' || layer === 'daily'
+      ? `循环已暂停唤醒：队列里现有 ${this.deps.projection.pending.length} 条输入原地留着（可恢复，不清空重来）。`
+      : '这一档只结束当前 turn：下一个 turn 从第 1 步重新开始，循环没有被锁住。';
     await this.notifier.fail({
       category: CATEGORY.budget,
       level: 'critical',
-      title: `预算耗尽（${layer} 层）`,
-      body: `${layer} 层撞上限：已用 ${used} / 上限 ${limit}。进度已保留（resumable，pending `
-        + `${this.deps.projection.pending.length} 条）。${advice}`,
+      title: `预算耗尽（${facts.name}）：已用 ${used} / 上限 ${limit}`,
+      body: `${facts.name}这一档到上限了：已用 ${used} / 上限 ${limit}。${state}`
+        + `两条出路：① 去「设置 → 系统」把「${facts.field}」调大——${facts.scope}；`
+        + '它是启动参数，改完要重启进程才生效。'
+        + `② 加注：irmia topup --layer ${layer} --tokens <N> —— 不用重启，循环下一拍拾取后接着跑。`,
       params: { layer },
     });
   }
@@ -892,17 +1150,38 @@ export class RealLoop {
   // ──────────────────────────────── 水位停滞 ────────────────────────────────
 
   /**
-   * 水位停滞：有输入进来了，却超过 stallMs 没有一次成功的模型调用。
-   * `lastModelSuccessAt` 为 null（本进程从未成功过）时不判定——那属于"一直在失败"，
-   * 由失败刹车负责；两条判据分工不清就会在冷启动时误报。
+   * 水位停滞：队列里有输入，而**它自己**已经等了超过 stallMs 没人管。
+   *
+   * 判据与阈值都在 `budget-guard.ts` 的 {@link stallOf}（唯一一份实现）。这里只负责把
+   * 「最早那条输入是哪一刻到的」从日志里取出来——pending 里存的是 wakeSeq，到达时刻在它
+   * 对应的那条 wake 事件上（与 `holdsGroupBatch` 读 ts 是同一口径）。
+   *
+   * 三条刻意的否定条件：
+   *   • `lastModelSuccessAt === null` 不再是"停滞"：那是"从来没成功过"，由失败刹车负责
+   *     （两条判据分工不清就会在冷启动时误报）；
+   *   • 循环手上有活（busy / openTurn）时不判：一个跑着工具的长 turn 里积压输入是正常背压；
+   *   • 一条到达时刻都读不出来时不判：宁可漏报一次，也不拿当前时刻编一个等待时长。
    */
-  private stallReport(p: Projection): { lastModelSuccessAt: string; silentMs: number; pending: number } | null {
-    const last = p.lastModelSuccessAt;
-    if (last === null || p.pending.length === 0) return null;
-    const at = Date.parse(last);
-    if (Number.isNaN(at)) return null;
-    const silentMs = this.deps.now().getTime() - at;
-    return silentMs > this.stallMs ? { lastModelSuccessAt: last, silentMs, pending: p.pending.length } : null;
+  private stallReport(p: Projection): StallInfo | null {
+    if (p.pending.length === 0) return null;
+    let oldestMs = Number.POSITIVE_INFINITY;
+    let oldestAt: string | null = null;
+    for (const item of p.pending) {
+      const event = this.deps.log.get(item.wakeSeq);
+      if (event === null) continue;
+      const at = Date.parse(event.ts);
+      if (Number.isFinite(at) && at < oldestMs) {
+        oldestMs = at;
+        oldestAt = event.ts;
+      }
+    }
+    return stallOf({
+      pending: p.pending.length,
+      oldestPendingAt: oldestAt,
+      busy: this.busy || p.openTurn !== null,
+      now: this.deps.now(),
+      stallMs: this.stallMs,
+    });
   }
 
   // ──────────────────────────────── 她问的人没答（design §6.1） ────────────────────────────────
@@ -1281,6 +1560,13 @@ export class RealLoop {
     // 场合：最高档 = GUI/本机唤醒、官 bot 上用户 id 的会话（单聊与群聊都算）、她自己。
     // 其余（群里别人、陌生单聊、webhook）都是"软件里遇到的人"→ guest。
     const scenario: Scenario = this.scenarioOf(wakeEvents);
+    // 本轮固定块的素材（B2）：**在这里读一次**，整轮共用同一份（见 turnBlockFacts）。
+    // 读一次是这段代码的全部要点：`deriveRequest` 每步都会重新读 deps，而 deps 里的这份
+    // 是**轮首快照**——一轮之内它逐字节不变，"不必每步重新编码"才成立。
+    const turnBlock = this.turnBlockFacts();
+    // 记忆索引（B2）：也在这里建/读一次。选材与注入用的是**同一份**索引——两处各读一次盘，
+    // 就可能在"记忆刚好被改动"的那一拍选出与正文对不上的指针。
+    const index = this.ensureMemoryIndexSafely();
     const authzGate = createAuthzGate({
       scenario,
       hardRefusal: d.config.tools.groupSceneHardRefusal === true,
@@ -1301,10 +1587,14 @@ export class RealLoop {
       registry: d.registry,
       projection: d.projection,
       // persona 用 **getter** 而不是拷快照：deriveRequest 每步都会重新读这些字段，
-      // 而本方法每 turn 只装配一次。拷快照的话，她在 turn 内改了自己的 STATE
-      // （write_persona → 宿主刷新 d.persona）本 turn 的后续 step 还读旧值——
-      // 实测她为此困惑了五步，并得出「注入滞后于磁盘」的结论。
-      // 代价为 0：状态进此刻层（尾部），本就每轮都在变。
+      // 而本方法每 turn 只装配一次。
+      //
+      // **B2 起 state 是例外**：它改由 `turnBlock` 携带（轮首读一次的快照）。
+      // 原先这里也是 getter，于是她在 turn 内用 write_persona 改了自己的 STATE，本 turn 的
+      // 后续 step 立刻能读到——代价是"状态"跟着此刻层每步重发（实测整份 STATE.md
+      // 约 3845 token/步，占那几天账单的 28.6%）。缓存前缀的纪律优先于"同轮立刻可见"：
+      // 改动现在**下一轮**才进她的上下文（取舍记在 docs/memory-injection.md §2）。
+      // 哈希仍取实时值：它是缓存破坏哨兵与 step/start 的指纹，本来就该反映"此刻盘上是什么"。
       persona: {
         get identity() { return d.persona.identity; },
         get constitution() { return d.persona.constitution; },
@@ -1330,7 +1620,13 @@ export class RealLoop {
       budget: this.budgetHook(),
       // 上下文隔离（design §4.21）：主循环的上下文只有顶层事件。子代理链（parentCallId 非空）
       // 是它自己那条 turn 链的内部过程，进了父请求就等于让父模型看见"自己"没说过的话。
-      eventFilter: isTopLevelEvent,
+      //
+      // 第二刀（B1 第二步）：**整条就是一条指令的 `wake/manual` 不进她的上下文**
+      // （`/compact`、`/handoff`、以及打错的那些）。判据在 `isSlashCommandEvent`（唯一一份），
+      // `replay` 用同一条重建，所以两边看到的仍是同一份事件。理由：指令是给框架的，
+      // 不是对她说的话——少了这一刀，打错的 `/clear` 会在下一个 turn 的历史里当成一条
+      // user 消息出现在她眼前，她就得去猜"用户是不是想清空什么"（B1 写明不许发生的事）。
+      eventFilter: contextEventFilter,
       // 大结果外置（§4.12）：阈值与预览长度走 blob-store 的默认口径（估算 8k token / 2k 字符）
       blobOffload: { dataDir: d.dataDir },
       necessityGate: (wakeText, wakeEvents) => this.gateAdmits(wakeText, wakeEvents ?? []),
@@ -1343,12 +1639,28 @@ export class RealLoop {
       },
       // 技能索引（§4.19）：每 turn 重扫一次技能根，信任门未放行的不进 catalog
       skillCatalog: this.skills?.catalogText() ?? null,
+      // 记忆索引（B2）：`MEMORIES/INDEX.md` 的渲染形态——只有指针（路径 + 一行摘要 + !pinned），
+      // 正文要她按需 safe_read。每 turn 重建一次索引文件（幂等：内容没变就不写盘），
+      // 因为上一轮里她可能刚写过新记忆。见 persona/memory-injection.ts。
+      memoryIndex: renderMemoryIndex(index),
+      // 本轮固定块（B2）：轮首读一次的状态 / 关系档案。记忆那一段由**循环层**在轮首补上
+      // （`memory/selected` 与它同一时刻定下，见 agent-loop 的 selectMemoryForTurn）——
+      // 那样"选了哪几条"与"注入了什么"是同一份结论，不会两处各算一遍。
+      turnBlock,
+      // 记忆选材（B2）：宿主给判据与正文，循环层在轮首写 `memory/selected` 事件。
+      // 心跳轮（只有 wake/heartbeat）返回零条——没人在跟她说话，正文不注入（docs §5）。
+      memorySelector: ({ wakeEvents: turnWakes }) => this.planMemorySelection(index, turnWakes),
       // 联络方式（装置自述的状态层那一半）：配置事实 + 本轮唤醒来源
       contact: this.contactFacts(),
       // 本机与用度（此刻层 `本机：` / `用度：` 两份素材）：**只能在这里算**——os/fs 与投影都
       // 在宿主手上，而渲染层是纯函数（不读环境值，缓存铁律 1）。一 turn 算一次。
       machine: this.machineFacts(),
       usage: this.usageFacts(),
+      // 缓存破坏哨兵的阈值（config.contextAudit）：观测阈值，只决定"要不要记一条 cacheBreak"
+      cacheBreakThresholds: {
+        idleMs: this.deps.config.contextAudit.cacheBreakIdleMin * 60_000,
+        hitDrop: this.deps.config.contextAudit.cacheBreakHitDrop,
+      },
       // 通道消息的显示名（v32）：名字的真源在她的别名表与人的联系人表里，render 是纯函数，
       // 所以由这里算好递进去——本轮那条消息才是要回的那条，名字必须先带上。
       ...(this.channelRenderContext() === undefined ? {} : { channelRender: this.channelRenderContext() }),
@@ -1494,6 +1806,86 @@ export class RealLoop {
         this.write(`[图片] 这张不进上下文（${outcome.reason}）：${label}`);
       }
     }
+  }
+
+  /**
+   * 建/读一次索引（幂等）。读盘或写盘失败（磁盘满、权限）时照常按现有文件建一份内存索引，
+   * 绝不让这一轮发不出去——记忆索引是**便利**，不是存续的前提；她自己的记忆文件才是真源。
+   */
+  private ensureMemoryIndexSafely(): MemoryIndex {
+    try {
+      ensureMemoryIndex(this.deps.dataDir);
+    } catch {
+      // 写不进去：下面仍按盘上现有内容建索引
+    }
+    return buildMemoryIndex(this.deps.dataDir);
+  }
+
+  /**
+   * 本轮的记忆选材（B2，docs/memory-injection.md §4）：判据是纯函数，正文在这里现取。
+   *
+   * 三件事：
+   *   ① **判心跳轮**：本轮唤醒只有 `wake/heartbeat` → 一条都不选（没人在跟她说话，
+   *      没有谁的上下文需要对齐；她要看就按索引 `safe_read`）；
+   *   ② **选哪几条**：`selectMemory`（pinned 必选 + 按索引顺序补足到条数上限）；
+   *   ③ **取正文**：按 `path:line` 从盘上现读那一条（与 `safe_read` 同一份素材、同一口径）。
+   *
+   * 取正文失败的条目**跳过**（文件被删、行号漂了）：选材账里照记它被选中过（那是当时的判据结论），
+   * 但正文那一段里不出现——不臆造内容，也不让一条读不到的指针把整块搞没。
+   */
+  private planMemorySelection(index: MemoryIndex, wakeEvents: readonly AppEvent[]): {
+    injection: 'human' | 'heartbeat';
+    selected: MemorySelected['data']['selected'];
+    notSelected: MemorySelected['data']['notSelected'];
+    indexSize: number;
+    text: string;
+  } {
+    const heartbeatTurn = isHeartbeatTurn(wakeEvents);
+    const selection = selectMemory(index, { heartbeatTurn });
+    const excerpts: MemoryExcerpt[] = [];
+    for (const entry of selection.selected) {
+      const excerpt = readExcerpt(this.deps.dataDir, entry);
+      if (excerpt !== null) excerpts.push(excerpt);
+    }
+    return {
+      injection: heartbeatTurn ? 'heartbeat' : 'human',
+      selected: selection.selected.map((entry) => ({
+        path: entry.path,
+        line: entry.line,
+        summary: entry.summary,
+        pinned: entry.pinned,
+      })),
+      notSelected: {
+        heartbeat: selection.skipped.heartbeat,
+        notNeeded: selection.skipped.notNeeded,
+      },
+      indexSize: index.entries.length,
+      text: renderSelectedMemory(excerpts),
+    };
+  }
+
+  /**
+   * 本轮固定块的素材（B2）：**这一轮里不会再变**的状态与关系档案。
+   *
+   * 这个函数在 `agentDeps()` 里被调用**一次**（一轮一次），返回的是一份**快照**。
+   * 循环层每步原样转手，所以：
+   *   • `[当前状态]`（`STATE.md`）在这一轮的任何一步里逐字节相同——不必每步重新编码；
+   *   • 她在 turn 内用 `write_persona` 改的 STATE 要到**下一轮**才进上下文。
+   *     这是有意的取舍（改前是 getter，同轮立刻可见但每步重发整份 STATE，
+   *     实测约 3845 token/步），理由与代价都写在 docs/memory-injection.md §2。
+   *
+   * 关系档案与此刻层用的是**同一个判据**（`relationshipForCurrentWake`）：
+   * 一次唤醒一个人，所以"本轮命中谁"在一轮内是常量。
+   *
+   * 记忆那一段**不在这里**：它由循环层在轮首按 `memory/selected` 的**同一份**结论补上
+   * （见 agent-loop 的 `selectMemoryForTurn`）——两处各算一遍就是给漂移留门。
+   */
+  private turnBlockFacts(): TurnBlockFacts {
+    return {
+      state: this.deps.persona.state,
+      relationship: this.relationshipForCurrentWake(),
+      memory: null,
+    };
   }
 
   /** 读 `MEMORIES/aliases.md`（她给外部会话起的名字）；读不到就当没有，不报错 */
@@ -1969,7 +2361,7 @@ export class RealLoop {
    * 名字的真源只有两处（联系人表、她自己的别名表），而**两张表的键都是 sid**——所以能直接
    * 认出来的只有"单聊会话的对方"：`qq:c2c:<openid>` 里的 openid 就是那个人的 id。
    * 群里发言的人没有单独的键，但只要他有过单聊（用户就是这样），两处一拼就认出来了：
-   * 用户 11:03 在群里发的那几句，概括里该写"owner"而不是"甲"。
+   * 用户 11:03 在群里发的那几句，概括里该写"用户（OWNER）"而不是"甲"。
    * 认不出的返回 null，由概括那边退成 甲/乙/丙（不编名字）。
    */
   /** 工具层的口：发言人 → 名字（`read_channel` 每行那个"谁"用） */

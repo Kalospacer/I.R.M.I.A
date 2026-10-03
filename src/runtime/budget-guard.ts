@@ -110,11 +110,61 @@ export interface FailStreakBreach {
 
 /** 水位停滞的观测（§4.9：有事件进来但一直没被处理） */
 export interface StallInfo {
-  /** 距上次成功模型调用的毫秒数 */
-  silentMs: number;
-  lastModelSuccessAt: string | null;
+  /** **最早那条待处理输入**已经等了多久（毫秒）——它就是判据里的"停滞时长" */
+  waitedMs: number;
+  /** 最早那条待处理输入的到达时刻（ISO），来自它自己的 wake 事件 */
+  oldestPendingAt: string;
   /** 同时积压的输入条数 */
   pending: number;
+}
+
+/**
+ * 水位停滞的**观测输入**（纯数据，判据自己不读时钟、不读日志）。
+ *
+ * 为什么判据要长这样（2026-10-03 修一次实测刷屏）：
+ * 原来判的是「距上次成功模型调用的静默时长 > 阈值 **且** pending 非空」。空闲期里静默时长
+ * 必然一直在长，于是**任何一条刚到 1 毫秒的输入**都会立刻把它顶过阈值——报警的其实是
+ * "空闲被打破的那一瞬间"，而不是"输入卡住了"。实测 seq 16036→16041（心跳进来即报警、
+ * 下一秒被领走即"已恢复"）、seq 16137→16142（用户 14:13:22 发来消息，14:13:23 报"停滞 27 分钟"，
+ * 14:13:24 她又"恢复"了）都是这一条造成的：每一段正常空闲都稳定产出"警告 + 提示"一对。
+ *
+ * 现在改成**给输入自己计时**：停滞 = 最早那条待处理的输入已经等了超过阈值，且循环此刻
+ * 手上没有活（busy / openTurn）。三条理由：
+ *   ① 空闲不再计入——没人在等的时候，时间流逝不是故障，这是本判据唯一该有的"零";
+ *   ② 心跳（30 分钟基线）不再能顶出报警：它到达与判停在同一拍，等待时长 ≈ 0；
+ *   ③ "卡住"仍然会报：被预算/失败刹车拦住、循环不再领活、工具长挂，输入都会真的等下去。
+ */
+export interface StallObservation {
+  /** 待处理输入条数 */
+  pending: number;
+  /** 最早那条待处理输入的到达时刻（ISO）；时间戳读不出来时给 null（宁可不报，也不编时长） */
+  oldestPendingAt: string | null;
+  /** 循环此刻手上有没有活：正在跑一个 turn（`openTurn` 非空 / busy）时为 true */
+  busy: boolean;
+  /** 当前时刻（调用方给：本模块不读时钟） */
+  now: Date;
+  /** 阈值（毫秒）：输入等超过它才算停滞 */
+  stallMs: number;
+}
+
+/**
+ * 水位停滞判据：**唯一一份实现**（运行期 real-loop 与 BudgetGuard 的判定入口共用）。
+ *
+ * 分成 `stallOf`（纯函数）与调用点两处，是为了不再出现"循环报的停滞"与"判定器认为的停滞"
+ * 两套口径——这个 bug 本身就是两套口径的产物（旧判据里 `pending` 只要非空就算数，
+ * 而"这条输入等了多久"根本没人看）。
+ */
+export function stallOf(o: StallObservation): StallInfo | null {
+  if (o.pending <= 0) return null;
+  // 循环手上有活（一个 turn 正在跑）：输入排队是正常的背压，不是停滞
+  if (o.busy) return null;
+  const oldest = o.oldestPendingAt;
+  if (oldest === null) return null;
+  const at = Date.parse(oldest);
+  if (!Number.isFinite(at)) return null;
+  const waitedMs = o.now.getTime() - at;
+  if (!(waitedMs > o.stallMs)) return null;
+  return { waitedMs, oldestPendingAt: oldest, pending: o.pending };
 }
 
 /** 判定版的构造选项 */
@@ -319,16 +369,13 @@ export class BudgetGuard {
   }
 
   /**
-   * 水位停滞（§4.9）：队列里有输入，但距最后一次成功模型调用已超过阈值。
-   * 没有成功记录时以首事件时刻为基准——"从来没成功过"本身就是停滞。
+   * 水位停滞（§4.9）：队列里有输入，而**它自己**已经等了超过阈值没人管。
+   *
+   * 判据在 {@link stallOf}（唯一一份实现）。这里只负责把本判定器配置的阈值填进去——
+   * 运行期 real-loop 直接用 `stallOf` 并带自己的 `deps.stallMs`，两条路径共用同一段逻辑。
    */
-  stall(p: Projection, now: Date): StallInfo | null {
-    if (p.pending.length === 0) return null;
-    const reference = p.lastModelSuccessAt ?? p.firstEventAt;
-    const baseMs = reference === null ? now.getTime() : Date.parse(reference);
-    const silentMs = now.getTime() - (Number.isFinite(baseMs) ? baseMs : now.getTime());
-    if (silentMs < this.stallMsValue) return null;
-    return { silentMs, lastModelSuccessAt: p.lastModelSuccessAt, pending: p.pending.length };
+  stall(o: Omit<StallObservation, 'stallMs'>): StallInfo | null {
+    return stallOf({ ...o, stallMs: this.stallMsValue });
   }
 
   // ── 加注 ──

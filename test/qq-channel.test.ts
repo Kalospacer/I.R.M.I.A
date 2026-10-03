@@ -1407,10 +1407,10 @@ test('事件映射：全量群消息（GROUP_MESSAGE_CREATE）不再被丢掉', 
   // ① @ 标记：三种形状都换成 `@…尾四位`
   const atMarkup = mapDispatchToWakeChannel('GROUP_AT_MESSAGE_CREATE', {
     id: 'M4', group_openid: 'G1', author: { member_openid: 'P1' },
-    content: '<@A1B2C3D4E5F60718293A4B5C6D7E8F90> 看这个，还有 <@!AABBCCDDEEFF0011> 和 '
+    content: '<@23757A4ED946257ECBB87585D20A9F56> 看这个，还有 <@!AABBCCDDEEFF0011> 和 '
       + '<qqbot-at-user id="1122334455667788" /> 也在',
   });
-  assert.ok(atMarkup?.text.includes('@…8F90'), `@ 要可读化：${atMarkup?.text}`);
+  assert.ok(atMarkup?.text.includes('@…9F56'), `@ 要可读化：${atMarkup?.text}`);
   assert.ok(atMarkup?.text.includes('@…0011') && atMarkup?.text.includes('@…7788'),
     '另外两种形状同样处理');
   assert.equal(atMarkup?.text.includes('<@'), false, '不许把 markup 原样留给她');

@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 
 import { EventLog } from '../src/log/event-log.ts';
 import { fold } from '../src/state/fold.ts';
+import { AuthStore } from '../src/web/auth.ts';
 import { startWebServer, type WebServer } from '../src/web/server.ts';
 import { loadConfig } from '../src/config/config.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
@@ -14,6 +15,9 @@ import { TimerStore } from '../src/wake/timer-store.ts';
  * persona-edit 命令的验收：
  * 人类在 GUI 里直编人格文件，必须走「快照 → 原子写 → persona/updated 事件」三步，
  * 且只允许四个具名文件与 RELATIONSHIPS/ 下一级。
+ *
+ * 认证：2026-10 起 `/api/*` 要的是**会话凭据**（本地认证换成了密码），
+ * 所以这里现设一次密码、拿它签发的那条会话去打（一次 scrypt，几十毫秒）。
  */
 
 let dir: string;
@@ -40,6 +44,9 @@ before(async () => {
   const loaded = await loadConfig(dir);
   const log = await EventLog.open(join(dataDir, 'events'));
   const timers = new TimerStore(join(dataDir, 'timers.json'));
+  const auth = new AuthStore({ dataDir, now: () => new Date(), out: () => {} });
+  const issued = await auth.setup('persona-edit-test-pw', 'test');
+  assert.equal(issued.ok, true, '夹具要先有一条会话');
   server = await startWebServer({
     log,
     projection: fold([]),
@@ -48,11 +55,12 @@ before(async () => {
     dataDir,
     timers,
     now: () => new Date(),
+    auth,
     host: '127.0.0.1',
     port: 0,
     out: () => {},
   });
-  token = server.token;
+  token = issued.ok ? issued.token : '';
 });
 
 after(async () => {

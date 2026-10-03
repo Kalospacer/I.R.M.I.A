@@ -18,7 +18,7 @@ import { emptyProjection, defaultVisibility } from '../src/log/types.ts';
 import type { AppEvent, Projection } from '../src/log/types.ts';
 import { fold } from '../src/state/fold.ts';
 import {
-  applyTopUpEvent, BudgetGuard, emptyTopUps, parseTopUpRequest, writeTopUpRequest,
+  applyTopUpEvent, BudgetGuard, emptyTopUps, parseTopUpRequest, stallOf, writeTopUpRequest,
   TOPUP_FILE_PREFIX, TOPUP_WATCH_DIR_NAME, type BudgetGuardConfig, type TopUpRequest,
 } from '../src/runtime/budget-guard.ts';
 
@@ -336,19 +336,30 @@ test('单步切分与收束：超限部分不执行，收束结局由预算实�
 test('判定版（宿主自己写事件的形状）：breachOf / failBreach / stall 三路判定', () => {
   const p = emptyProjection();
   p.pending.push({ wakeSeq: 1, source: 'manual', claimCount: 0 });
-  p.lastModelSuccessAt = new Date(T0).toISOString();
   const guard = new BudgetGuard(CONFIG, { stallMs: 10 * MIN_MS });
 
-  assert.equal(guard.stall(p, new Date(T0 + 9 * MIN_MS)), null, '未到阈值不算停滞');
-  const stall = guard.stall(p, new Date(T0 + 11 * MIN_MS));
+  // 停滞的计时起点是**输入自己的到达时刻**（2026-10-03 改口径：原来量的是"距上次成功模型调用"，
+  // 于是正常空闲一被新输入打破就误报）
+  const observation = (nowMs: number, busy = false) => ({
+    pending: p.pending.length,
+    oldestPendingAt: new Date(T0).toISOString(),
+    busy,
+    now: new Date(nowMs),
+  });
+
+  assert.equal(guard.stall(observation(T0 + 9 * MIN_MS)), null, '未到阈值不算停滞');
+  const stall = guard.stall(observation(T0 + 11 * MIN_MS));
   assert.ok(stall !== null);
   assert.equal(stall.pending, 1);
-  assert.ok(stall.silentMs >= 10 * MIN_MS);
-  assert.equal(stall.lastModelSuccessAt, p.lastModelSuccessAt);
+  assert.equal(stall.oldestPendingAt, new Date(T0).toISOString());
+  assert.ok(stall.waitedMs >= 10 * MIN_MS, '停滞时长 = 最早那条输入已经等了多久');
+
+  // 循环手上有活（一个 turn 正在跑）时输入排队是正常背压，不是停滞
+  assert.equal(guard.stall(observation(T0 + 60 * MIN_MS, true)), null);
 
   // 队列空时不报停滞（没人等，就不是停滞）
   p.pending = [];
-  assert.equal(guard.stall(p, new Date(T0 + 60 * MIN_MS)), null);
+  assert.equal(guard.stall(observation(T0 + 60 * MIN_MS)), null);
 
   p.failStreak = 5;
   assert.deepEqual(guard.failBreach(p), { limit: 5, actual: 5 });
@@ -359,6 +370,24 @@ test('判定版（宿主自己写事件的形状）：breachOf / failBreach / st
   assert.throws(() => guard.checkBeforeStep(), /未持有投影/u);
   p.budget.stepsThisTurn = 30;
   assert.equal(guard.checkBeforeStep(p)?.kind, 'budget-exhausted');
+});
+
+test('stallOf（唯一一份判据）：到达时刻读不出来时不报，而不是拿当前时刻编一个时长', () => {
+  const now = new Date(T0 + 60 * MIN_MS);
+  assert.equal(stallOf({ pending: 1, oldestPendingAt: null, busy: false, now, stallMs: MIN_MS }), null);
+  assert.equal(stallOf({ pending: 1, oldestPendingAt: '不是时间', busy: false, now, stallMs: MIN_MS }), null);
+  // 阈值是严格大于：刚好等于阈值那一拍不报
+  assert.equal(
+    stallOf({ pending: 2, oldestPendingAt: new Date(T0).toISOString(), busy: false, now: new Date(T0 + MIN_MS), stallMs: MIN_MS }),
+    null,
+  );
+  assert.notEqual(
+    stallOf({
+      pending: 2, oldestPendingAt: new Date(T0).toISOString(), busy: false,
+      now: new Date(T0 + MIN_MS + 1), stallMs: MIN_MS,
+    }),
+    null,
+  );
 });
 
 // ──────────────────────────────── 加注看门文件 ────────────────────────────────

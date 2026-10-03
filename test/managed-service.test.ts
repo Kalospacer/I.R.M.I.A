@@ -142,6 +142,6 @@ setInterval(() => {}, 1000);
 });
 
 test('服务目录：相对路径按给定基准解，绝对路径原样', () => {
-  assert.equal(resolveServiceDir('C:/SnowLuma', 'C:/base'), 'C:/SnowLuma');
+  assert.equal(resolveServiceDir('D:/SnowLuma', 'C:/base'), 'D:/SnowLuma');
   assert.equal(resolveServiceDir('vendor/snowluma', 'C:/base'), join('C:/base', 'vendor/snowluma'));
 });

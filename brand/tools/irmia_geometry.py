@@ -1,7 +1,7 @@
 """IRMIA brand geometry - the single source of truth.
 
-Every number here was measured from the reference bitmap (see `README.md` for how
-each parameter was derived).  build_svg.py, build_png.py and build_ico.py all import
+Every number here was measured from the reference bitmap (the analysis scripts in
+this directory record how).  build_svg.py, build_png.py and build_ico.py all import
 this module, so the SVG master and every exported bitmap are the same geometry.
 
 Local coordinate system

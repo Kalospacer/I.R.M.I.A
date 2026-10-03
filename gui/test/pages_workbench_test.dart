@@ -57,7 +57,7 @@ void main() {
     },
     'alerts': {'webhookUrl': 'http://127.0.0.1:9000/hook', 'rateLimitMin': 5},
     'web': {'host': '127.0.0.1', 'port': 7788},
-    'paths': {'workspaceAllowlist': ['C:/work']},
+    'paths': {'workspaceAllowlist': ['D:/work']},
   };
   final events = <String, dynamic>{
     'events': [
@@ -113,7 +113,7 @@ void main() {
         'name': 'filesystem',
         'command': 'npx',
         'args': ['-y', '@modelcontextprotocol/server-filesystem'],
-        'env': {'ROOT': 'C:/work'},
+        'env': {'ROOT': 'D:/work'},
         'disabled': false,
         'state': 'never-started',
         'toolsCount': 1,
@@ -577,8 +577,8 @@ void main() {
     // 按 key 定位输入框（hint 是会被改的文案，key 是契约）
     await tester.enterText(find.byKey(const ValueKey('mcp-field-name')), 'demo');
     await tester.enterText(find.byKey(const ValueKey('mcp-field-command')), 'node');
-    await tester.enterText(find.byKey(const ValueKey('mcp-field-args')), 'server.mjs\n--root\nC:/work');
-    await tester.enterText(find.byKey(const ValueKey('mcp-field-env')), 'ROOT=C:/work');
+    await tester.enterText(find.byKey(const ValueKey('mcp-field-args')), 'server.mjs\n--root\nD:/work');
+    await tester.enterText(find.byKey(const ValueKey('mcp-field-env')), 'ROOT=D:/work');
     await tester.tap(find.text('保存'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 50));
@@ -588,8 +588,8 @@ void main() {
     expect(post.confirm, 'mcp-save', reason: '加一个 MCP 服务 = 扩大能力边界');
     expect(post.body['name'], 'demo');
     expect(post.body['command'], 'node');
-    expect(post.body['args'], ['server.mjs', '--root', 'C:/work']);
-    expect(post.body['env'], {'ROOT': 'C:/work'});
+    expect(post.body['args'], ['server.mjs', '--root', 'D:/work']);
+    expect(post.body['env'], {'ROOT': 'D:/work'});
     expect(post.body['enabled'], isTrue);
     await tester.pump(const Duration(seconds: 5));
   });

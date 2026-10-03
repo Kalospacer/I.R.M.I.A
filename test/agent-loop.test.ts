@@ -21,8 +21,8 @@ import test, { type TestContext } from 'node:test';
 
 import { EventLog } from '../src/log/event-log.ts';
 import type {
-  AppEvent, AssistantMessage, InputClaimed, InputRequeued, ModelLane, Projection, StepEnd, StepStart, ToolCall, ToolResult,
-  TurnEnd, TurnStart,
+  AppEvent, AssistantMessage, BudgetConsumed, InputClaimed, InputRequeued, ModelLane, Projection, StepEnd, StepStart,
+  ToolCall, ToolResult, TurnEnd, TurnStart,
 } from '../src/log/types.ts';
 import { defaultVisibility } from '../src/log/types.ts';
 import { DsClientError, type DsClient, type DsRequest, type DsStreamResult } from '../src/model/ds-client.ts';
@@ -437,15 +437,14 @@ test('M2-2 请求可重建：同一批日志事件重新派生，请求字节一
     model: stepStart.data.model,
   });
 
-  assert.equal(
-    JSON.stringify(rebuilt),
-    JSON.stringify({
-      model: captured.model,
-      instructions: captured.instructions,
-      input: captured.input,
-      tools: captured.tools,
-    }),
-  );
+  // 比的是**发往模型的那四个键**（model / instructions / input / tools）：请求字节由 agent-loop 的
+  // toDsRequest 显式装配，`context` 是 2026-10-03 加的渲染副产物（上下文归因），不在这四键里。
+  const wire = (r: { model: string; instructions: string; input: unknown; tools: unknown }): string =>
+    JSON.stringify({ model: r.model, instructions: r.instructions, input: r.input, tools: r.tools });
+  assert.equal(wire(rebuilt), wire(captured));
+  // 归因同样可重建：运行期把它写进了 budget/consumed，重放派生出来的必须是同一份（重放保真）
+  const recorded = ofType<BudgetConsumed>(events, 'budget/consumed')[0]!;
+  assert.deepEqual(rebuilt.context, recorded.data.context, '归因要能由日志重建');
   // 再接一次运行：两次派生结果也必须逐字节相同（渲染确定性的最低要求）
   const again = deriveRequest({
     persona: PERSONA,

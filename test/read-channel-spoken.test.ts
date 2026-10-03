@@ -142,7 +142,7 @@ describe('read_channel · 她自己说过的话', () => {
   });
 
   test('标记是 `（我）`：不是发言人昵称的样子，也不会被当成某个群友', async () => {
-    // 用户自己叫"owner"，群友的群名片什么都能改——标记必须只由"这是她"决定。
+    // 用户自己叫"用户（OWNER）"，群友的群名片什么都能改——标记必须只由"这是她"决定。
     assert.equal(SELF_SPEAK_LABEL, '（我）');
     const rec = recorder();
     const tk = toolkit(

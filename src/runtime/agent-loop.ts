@@ -53,14 +53,18 @@
 
 import type { DsClient, DsRequest, DsStreamResult } from '../model/ds-client.js';
 import { isDsClientError } from '../model/ds-client.ts';
-import type { MachineFacts, RenderImageRef, RenderPersona, RenderedRequest, UsageFacts } from '../model/render.js';
+import type { MachineFacts, RenderImageRef, RenderPersona, RenderedRequest, TurnBlockFacts, UsageFacts } from '../model/render.js';
 import { RENDER_VERSION, clipTaskTitle, render, renderWake, wakeTitle } from '../model/render.ts';
+import {
+  DEFAULT_CACHE_BREAK_THRESHOLDS, detectCacheBreak, lastAuditedCall,
+  type AuditedCall, type CacheBreakThresholds,
+} from '../model/context-audit.ts';
 import type { ContactFacts } from '../model/self-brief.ts';
 import { renderMentionNote } from '../model/self-brief.ts';
 import { sidOf } from '../channel/sessions.ts';
 import type { EventLog } from '../log/event-log.js';
 import type {
-  AppEvent, AppEventType, ModelLane, Projection, TurnEndReason, WakeSource,
+  AppEvent, AppEventType, MemorySelected, ModelLane, Projection, TurnEndReason, WakeSource,
 } from '../log/types.js';
 import { defaultVisibility } from '../log/types.ts';
 import {
@@ -172,6 +176,34 @@ export interface AgentLoopDeps {
    */
   skillCatalog?: string | null;
   /**
+   * 记忆索引文本（B2：`MEMORIES/INDEX.md` 的渲染形态，见 docs/memory-injection.md §3）。
+   *
+   * 由**宿主**读盘并组装（索引文件是机制生成的，正文不在里面——只有路径 + 一行摘要 + `!pinned`）；
+   * 循环层只转手，与 `skillCatalog` / `contact` 同一条纪律。缺省/null 表示本次没有索引，
+   * 长期记忆层里那一段整体不出现（重放与子代理就是这种情形）。
+   */
+  memoryIndex?: string | null;
+  /**
+   * 本轮固定块的素材（B2，见 render.ts 的 `TurnBlockFacts`）：历史之后、此刻层之前那一段。
+   *
+   * **素材在一轮开始时定下**（宿主读一次 `STATE.md` / 关系档案 / 写入本轮的 `memory/selected`），
+   * 循环层每步原样转手——「一轮之内逐字节不变」这条契约的落点就在这里。
+   * 缺省 = 整块不出现（子代理、重放、诊断）。
+   */
+  turnBlock?: TurnBlockFacts | null;
+  /**
+   * 本轮的记忆选材（B2，docs/memory-injection.md §4）：给一个函数，循环层在**轮首**调它一次，
+   * 把结论写成 `memory/selected` 事件，并把同一份结论交给固定块渲染。
+   *
+   * 为什么由循环层调、而不是宿主自己写好：turn 号在这里才分配（`turn/start` 刚落下），
+   * 而事件必须带上正确的 turn 才能被 `deriveRequest`/重放按 turn 取回。
+   * 宿主只提供**纯函数**（判据 + 取正文），落库这一步交给唯一写入点，与 `compaction/summary`
+   * 同一条纪律：循环层不自己算业务判据，宿主不自己分配 seq。
+   *
+   * 不配 = 那一轮不注入记忆（子代理、诊断、老调用点），固定块里也就没有记忆那一段。
+   */
+  memorySelector?: MemorySelector | null;
+  /**
    * 此刻的联络事实（design §4.13 状态层素材，见 model/self-brief.ts）：启用了哪些通道、
    * 告警出口在不在、本轮能不能把话发回唤醒来源。不配即该段整体不出现——
    * 子代理就属于这种情形：发言是主循环的事，它不需要知道往哪儿发。
@@ -206,6 +238,11 @@ export interface AgentLoopDeps {
    * 子代理用它把父历史与外部事件挡在请求之外——过滤之后事件流就是「从空事件序列起」的那一份，
    * 与「换一个 scoped 日志句柄」相比，它不动日志本身的语义（seq 分配与 append 仍是全局单一）。
    * 不传即全部可见：顶层 turn 的默认口径，与未引入子代理时逐字节一致。
+   *
+   * 顶层那条路（`real-loop`）现在也用它挡第二类事件：**整条就是一条指令的 `wake/manual`**
+   * （`/compact`、`/handoff`、以及打错的那些）。指令是给框架的，不是对她说的话——她要看见的是
+   * 指令的**效果**（摘要 / 交接笔记），不是用户按了哪个按钮（见 `slash-commands.ts` 的
+   * `isSlashCommandEvent`）。`replay` 用同一条判据重建，所以重建结果与当时仍然逐字节一致。
    */
   eventFilter?: (event: AppEvent) => boolean;
   /**
@@ -231,6 +268,13 @@ export interface AgentLoopDeps {
    * 不配即无计划模式，行为与没这个机制时完全一致。
    */
   planGate?: ToolPlanGate;
+  /**
+   * 缓存破坏哨兵的阈值（`config.contextAudit`）。不给即用保守默认（空闲 30 分钟 + 命中率跌半）。
+   *
+   * 它是**观测**阈值，不改变任何运行行为：最坏情况只是多记或少记一条 `budget/consumed.cacheBreak`。
+   * 之所以由宿主递进来而不是循环层读配置：本模块与 config 解耦（测试与子代理都不带配置）。
+   */
+  cacheBreakThresholds?: CacheBreakThresholds;
 }
 
 /**
@@ -240,6 +284,42 @@ export interface AgentLoopDeps {
 export type AgentLoopCompaction = HandoffOptions & { thresholdTokens: number };
 
 // ──────────────────────────────── 请求派生（M2-2） ────────────────────────────────
+
+/**
+ * 本轮的记忆选材（B2）：判据与取正文由宿主给，事件由循环层在轮首写。
+ *
+ * 为什么是"注入一个纯函数"而不是让宿主自己写事件：turn 号只有循环层知道（`turn/start` 刚落下），
+ * 而事件必须带正确的 turn 才能被按 turn 取回。宿主给结论，循环层落库——与 `compaction/summary`
+ * 同一条分工。
+ */
+export type MemorySelector = (input: {
+  /** 本轮的唤醒事件（判"是不是心跳轮"就看它） */
+  wakeEvents: readonly AppEvent[];
+  /** 已分配的本轮 turn 号 */
+  turn: number;
+}) => {
+  /** 'human' = 有人在跟她说话；'heartbeat' = 只有心跳（那一轮**不注入**记忆正文） */
+  injection: 'human' | 'heartbeat';
+  /** 选中的条目（指针；正文不落事件） */
+  selected: MemorySelected['data']['selected'];
+  /** 没被选中的条数与原因 */
+  notSelected: MemorySelected['data']['notSelected'];
+  /** 写这条账时的索引规模（条数） */
+  indexSize: number;
+  /** 已渲染好的**记忆正文那一段**（进固定块）；空串 = 那一段不出现 */
+  text: string;
+};
+
+/**
+ * 本轮是不是"只有心跳"（没有人在跟她说话）。
+ *
+ * 判据在 `wake/heartbeat` 这个事件类型上（唤醒源类型是既有依据，不另造一套）。
+ * 一个 turn 可以认领多条输入，所以是"**全部**都是心跳"才算心跳轮：
+ * 混着一条真人消息时，那就是有人在说话，记忆照注入。
+ */
+export function isHeartbeatTurn(wakeEvents: readonly AppEvent[]): boolean {
+  return wakeEvents.length > 0 && wakeEvents.every((event) => event.type === 'wake/heartbeat');
+}
 
 /**
  * 请求派生输入。全部字段都能从日志 + 人格资产取回：
@@ -262,6 +342,10 @@ export interface RequestDerivation {
   softHint?: string | null;
   /** 技能 catalog（状态层素材，见 AgentLoopDeps.skillCatalog） */
   skillCatalog?: string | null;
+  /** 记忆索引（长期记忆层素材，见 AgentLoopDeps.memoryIndex） */
+  memoryIndex?: string | null;
+  /** 本轮固定块（见 AgentLoopDeps.turnBlock）：**一轮之内逐字节不变**的那一段 */
+  turnBlock?: TurnBlockFacts | null;
   /** 联络事实（状态层素材，见 AgentLoopDeps.contact） */
   contact?: ContactFacts | null;
   /** 本机事实（此刻层 `本机：` 素材，见 AgentLoopDeps.machine）：宿主算好，循环层只转手 */
@@ -342,7 +426,8 @@ function contactWithWakeStamp(
   return { ...contact, wakeMessage: { ...contact.wakeMessage, atLabel, ...(isNew === undefined ? {} : { isNew }) } };
 }
 
-export function deriveRequest(input: RequestDerivation): RenderedRequest {  const persona: RenderPersona = {
+export function deriveRequest(input: RequestDerivation): RenderedRequest {
+  const persona: RenderPersona = {
     identity: input.persona.identity,
     constitution: input.persona.constitution,
     style: input.persona.style,
@@ -368,6 +453,13 @@ export function deriveRequest(input: RequestDerivation): RenderedRequest {  cons
     lane: input.lane,
     // 技能索引：与 events/persona 并列的渲染输入，重放走同一份 deriveRequest 才不会漂移
     skillCatalog: input.skillCatalog ?? null,
+    // 记忆索引（B2）：进长期记忆层（指针表，跨轮稳定）。它同 deriveRequest 的其它素材一样
+    // 由调用方给——重放时从盘上读 INDEX.md，与当时同源。
+    memoryIndex: input.memoryIndex ?? null,
+    // 本轮固定块（B2）：历史之后、此刻层之前，**一轮之内逐字节不变**。
+    // 素材由调用方在轮首定下（real-loop 的 turnBlockFacts），循环层每步原样转手；
+    // 重放时同一份素材由 `memory/selected` 事件 + 人格资产重建（replay.ts）。
+    turnBlock: input.turnBlock ?? null,
     contact: contactWithWakeStamp(input.contact ?? null, input.wakeEvent, input.timezone),
     // 本机与用度：与 contact 同一条纪律——**渲染层不读环境值**，所以磁盘余量、进程已运行多久、
     // 今日用量这些只能由拿得到 os/fs/投影的调用方算好递进来；缺省（重放、子代理、诊断）时
@@ -395,13 +487,11 @@ export function deriveRequest(input: RequestDerivation): RenderedRequest {  cons
     // 那条历史就退化成文字——这是有意的：重放要的是"当时说了什么"，不是把图再传一遍）
     loadImage: input.loadImage ?? null,
     ...(input.maxContextImages === undefined ? {} : { maxContextImages: input.maxContextImages }),
+    // 尾部插播（软阈值提示 / 钩子注入）：**交给渲染层追加**（铁律 2「只追加」不变）。
+    // 为什么挪进去：上下文归因要把 input 的每一段都数清楚，插播是最后一段——在装配点之外
+    // 追加，归因的"合计"就会比真正的请求少一段（2026-10-03）。
+    softHint: input.softHint ?? null,
   });
-
-  // 铁律 2「只追加」：软提示是尾部新 developer 消息，绝不改动已渲染历史（否则摧毁 KV 前缀）
-  const hint = input.softHint ?? null;
-  if (hint !== null && hint !== '') {
-    rendered.input.push({ type: 'message', role: 'developer', content: hint });
-  }
   return rendered;
 }
 
@@ -448,6 +538,13 @@ class TurnRunner {
    * 与软阈值提示同一条尾部 developer 通道：只追加，不改已渲染历史。
    */
   private readonly hookContext: string[] = [];
+  /**
+   * 本轮选中的记忆**正文**（`renderSelectedMemory` 的产物，空 = 那一段不出现）。
+   *
+   * 它在轮首由 {@link selectMemoryForTurn} 定下，之后每个 step 原样进固定块——
+   * "一轮之内逐字节不变"就落在这个字段上（它不含任何随 step 变化的量）。
+   */
+  private turnBlockMemory: string | null = null;
 
   constructor(deps: AgentLoopDeps, wakeEvents: readonly AppEvent[]) {
     this.deps = deps;
@@ -493,6 +590,11 @@ class TurnRunner {
     if (!(await gate(gateText, this.wakeEvents))) return this.endTurn({ kind: 'completed' });
     // 过了门才把注入文本排进尾部 developer 通道：要沉默就一并沉默，不留孤儿上下文
     if (injected !== null) this.hookContext.push(injected);
+
+    // 记忆选材（B2）：**过了门才写**——门判沉默时这一轮不会有任何 step，写一条没人用的选材账
+    // 只会让日志里多出"选了却没用"的噪音。写在第一个 step/start 之前（轮首），所以
+    // `deriveRequest`/重放按 `seq < step/start.seq` 取得到它。
+    this.selectMemoryForTurn();
 
     let firstStep = true;
     for (;;) {
@@ -558,7 +660,7 @@ class TurnRunner {
       // 思维链只供复盘（渲染层剥离，缓存铁律 3），丢了不影响正确性：按观测类写入
       this.write('message/reasoning', { turn: this.turn, step, text: result.reasoning }, { sync: false });
     }
-    this.accountStep(step, result, interrupted, model);
+    this.accountStep(step, result, interrupted, model, request);
 
     // 单步刹车（§4.6 单 step 层）：超出上限的调用不执行，返回值是被拦下的条数
     let overLimit = 0;
@@ -616,48 +718,12 @@ class TurnRunner {
     await this.syncEvents();
     if (estimateHistoryTokens(this.events) <= cfg.thresholdTokens) return;
 
-    const handoffOptions: HandoffOptions = { ...cfg };
-    const note = renderHandoffNote(this.events, {
-      ...handoffOptions,
-      budgetTokens: cfg.budgetTokens ?? DEFAULT_HANDOFF_BUDGET_TOKENS,
-      foldTokens: cfg.foldTokens ?? DEFAULT_HANDOFF_FOLD_TOKENS,
-    });
+    const note = renderHandoffNote(this.events, handoffOptionsOf(cfg));
     if (note.text.trim() === '') return;
 
-    const covered = Math.max(this.coveredUpToSeq(), this.lastClosedTurnEndSeq());
+    const covered = compactionCoveredUpToSeq(this.events, this.turnStartSeq);
     this.write('compaction/summary', { coveredUpToSeq: covered, summary: note.text }, { sync: true });
     this.log.flush();
-  }
-
-  /**
-   * 遮蔽点：**上一个已经结束的 turn 的 `turn/end` seq**（没有就退回本 turn 起始 seq）。
-   *
-   * 为什么不能再用本 turn 的 `turn/start.seq`（2026-10-02 修）：**叫醒她的那条输入在
-   * `turn/start` 之前**——`wake/channel` 先落盘，循环才开这一轮。于是"遮蔽到本 turn 起始"
-   * 会把**他的那句话遮掉、把她对那句话的回答留在现场**（回答的 seq 更大）。留下的半段读起来
-   * 像她在自言自语，而接下来的新消息看起来像"新的问题"——用户实测到的那句
-   * "每次上下文压缩后她又把已经回复过的东西再回复一遍"就是这么来的（样本见 review.md）。
-   *
-   * 取上一个 `turn/end` 之后，"他问的那句"与"她答的那段"要么一起进笔记、要么一起留在现场，
-   * 永远不会被劈开。代价是遮蔽得少一点（多留一轮），换来的是压缩之后对话仍然对得上。
-   */
-  private lastClosedTurnEndSeq(): number {
-    let end = 0;
-    for (const event of this.events) {
-      if (event.type === 'turn/end' && event.seq < this.turnStartSeq && event.seq > end) end = event.seq;
-    }
-    return end === 0 ? this.turnStartSeq : end;
-  }
-
-  /** 已有摘要的最大 coveredUpToSeq（0 表示尚未压过） */
-  private coveredUpToSeq(): number {
-    let covered = 0;
-    for (const event of this.events) {
-      if (event.type === 'compaction/summary' && event.data.coveredUpToSeq > covered) {
-        covered = event.data.coveredUpToSeq;
-      }
-    }
-    return covered;
   }
 
   // ── 工具执行 ──
@@ -828,12 +894,35 @@ class TurnRunner {
 
   // ── 记账 ──
 
-  /** 模型调用成功返回后的预算归账（缓存命中拆分对齐 §4.13 观测闭环） */
-  private accountStep(step: number, result: DsStreamResult, interrupted: boolean, fallbackModel: string): void {
+  /**
+   * 模型调用成功返回后的预算归账（缓存命中拆分对齐 §4.13 观测闭环）。
+   *
+   * 同一条事件上还挂两笔**上下文事实**（2026-10-03；不新增事件类型，见 context-audit.ts）：
+   *   · `context`：这次请求的上下文构成（渲染层的副产物，段边界只有它知道）；
+   *   · `cacheBreak`：与**上一次被审计的调用**做前缀比对的结论，只在真失守时出现。
+   * 两次比对之间没有额外的请求，所以"一步一条"既是归因的粒度，也是哨兵的粒度。
+   */
+  private accountStep(
+    step: number,
+    result: DsStreamResult,
+    interrupted: boolean,
+    fallbackModel: string,
+    request: RenderedRequest,
+  ): void {
     const usage = result.usage;
     const inputTokens = usage.inputTokens;
     const cacheHit = Math.max(0, Math.min(usage.cachedTokens, inputTokens));
-    this.write('budget/consumed', {
+    const ts = this.deps.now();
+    // 基准取自**日志快照**（不是内存里的"上一次"）：重放时喂进同一段事件，结论逐字段一致
+    const previous = lastAuditedCall(this.events);
+    const audit: AuditedCall = {
+      context: request.context,
+      ts,
+      cacheHitTokens: cacheHit,
+      cacheMissTokens: Math.max(0, inputTokens - cacheHit),
+    };
+    const cacheBreak = detectCacheBreak(previous, audit, this.deps.cacheBreakThresholds);
+    const data: Record<string, unknown> = {
       turn: this.turn,
       step,
       lane: this.lane,
@@ -847,7 +936,11 @@ class TurnRunner {
       retryCount: 0,
       finishReason: finishReasonOf(result, interrupted),
       tokensTodayAccum: this.projection.budget.tokensToday + inputTokens + usage.outputTokens,
-    }, { sync: false });
+      context: request.context,
+      // 只在真破坏时出现：没有它就代表"这次与上次的冻结前缀一致"（不是"没查"）
+      ...(cacheBreak === null ? {} : { cacheBreak }),
+    };
+    this.write('budget/consumed', data, { sync: false });
   }
 
   /** 模型调用抛错：分类 → 结局。失败也必须记账，否则 §4.6 的失败刹车永远看不到连续失败 */
@@ -1074,6 +1167,55 @@ class TurnRunner {
     return max;
   }
 
+  /**
+   * 轮首的记忆选材（B2）：调宿主给的纯函数，把结论**写成事件**，并把同一份结论交给固定块。
+   *
+   * 两件事必须同时发生，少一件这次改造就不成立：
+   *   ① **落库**（`memory/selected`，internal）：事后重建请求时，`deriveRequest` 只能靠事件知道
+   *      "这一轮选了哪几条"（docs/memory-injection.md §4）。运行期临时算一份，重建就得再算一遍，
+   *      而重算要看**现在**的索引文件——那就不是"当时那个请求"了。
+   *   ② **进固定块**（`this.turnBlockMemory`）：选中的正文一轮注入一次。
+   *
+   * 为什么在这里写而不是让宿主写：turn 号刚刚由 `turn/start` 定下（就在上面几行），而事件必须
+   * 带上它，`replay`/`deriveRequest` 才能按 turn 取回。宿主只给判据与正文（它拿得到索引与文件），
+   * 落库交给唯一写入点——与 `compaction/summary` 同一条分工。
+   *
+   * 心跳轮（`isHeartbeatTurn`）：宿主的选择器会返回**零条**——没人在跟她说话，记忆正文不注入。
+   * 事件照写（`injection: 'heartbeat'`）：这样"为什么这一轮她没看见某一条"在日志里是有答案的，
+   * 而不是一个沉默。
+   */
+  private selectMemoryForTurn(): void {
+    const selector = this.deps.memorySelector;
+    if (selector === undefined || selector === null) return;
+    const plan = selector({ wakeEvents: this.wakeEvents, turn: this.turn });
+    // 事件先写：写完之后它才在快照里（seq 小于第一个 step/start），固定块与账目同源
+    this.write('memory/selected', {
+      turn: this.turn,
+      injection: plan.injection,
+      selected: plan.selected,
+      notSelected: plan.notSelected,
+      indexSize: plan.indexSize,
+    }, { sync: true });
+    this.turnBlockMemory = plan.text === '' ? null : plan.text;
+  }
+
+  /**
+   * 这一刻的固定块素材：宿主给的状态 / 关系档案 + 本轮选中的记忆正文。
+   *
+   * 每次 `deriveRequest` 都重新装配一份（`TurnBlockFacts` 是个小对象），但**内容**在一轮之内
+   * 逐字节相同——状态与关系来自 deps（轮首定下），记忆来自 `turnBlockMemory`（轮首定下）。
+   * 没有宿主素材、也没有选中记忆时返回 null：整块不出现（子代理与诊断就是这种情形）。
+   */
+  private turnBlockNow(): TurnBlockFacts | null {
+    const base = this.deps.turnBlock ?? null;
+    if (base === null && this.turnBlockMemory === null) return null;
+    return {
+      state: base?.state ?? null,
+      relationship: base?.relationship ?? null,
+      memory: this.turnBlockMemory,
+    };
+  }
+
   private deriveAt(args: {
     wakeEvent: AppEvent | null;
     step: number;
@@ -1096,6 +1238,12 @@ class TurnRunner {
       model: args.model,
       softHint: args.softHint,
       skillCatalog: this.deps.skillCatalog ?? null,
+      memoryIndex: this.deps.memoryIndex ?? null,
+      // 本轮固定块：deps 里那一份是**轮首定下**的（宿主装配 deps 时算一次），
+      // 每步原样转手——她 turn 内改了 STATE 要等下一轮才在自己的上下文里看见，
+      // 换来的是一轮之内这一段逐字节不变（docs/memory-injection.md §2 的取舍）。
+      // 记忆那一段由**循环层**在轮首补上（`memory/selected` 与它同一时刻定下，见 selectMemoryForTurn）。
+      turnBlock: this.turnBlockNow(),
       contact: this.deps.contact ?? null,
       // 本机与用度：宿主在**每个 turn 装配 deps 时**算一次（与 contact 同节奏）——磁盘 statfs
       // 与进程 uptime 是会失败的 IO，不适合每个 step 都做一遍；用度是"今日累计"，一拍一算是够的。
@@ -1126,6 +1274,71 @@ class TurnRunner {
     this.deps.onEvent?.(event);
     return event;
   }
+}
+
+// ──────────────────────────────── 压缩点（唯一一份口径） ────────────────────────────────
+
+/**
+ * 压缩的**遮蔽点**：三者取大。自动压缩（{@link TurnRunner.maybeCompact}）与人在消息里
+ * 打的那条 `/compact` / `/handoff`（`runtime/real-loop.ts`）**共用这一份**——
+ * 两处各算一遍，迟早会出现"同一份日志、两个遮蔽点"。
+ *
+ * ① **已有摘要的 `coveredUpToSeq`**（`0` = 还没压过）：摘要可以再压缩——更早的摘要本身也被
+ *    新摘要遮蔽，所以取最大者；
+ * ② **上一个已结束 turn 的 `turn/end`**（理由见下，那段话是这块最值钱的东西，逐字保留）；
+ * ③ `floorSeq`：调用方给的**下界**（返回值至少到它）。人工指令用它把"还没被处理的输入"
+ *    挡在遮蔽之外——少了这一条，一次 `/compact` 会把队列里还没轮到的消息一起吞掉。
+ *
+ * @param inFlightTurnStartSeq 本 turn 的 `turn/start` seq（自动压缩在 turn 收尾时调用）。
+ *   人工指令没有"正在进行的 turn"，传 `null`——那时 ② 取**日志里最后一条** `turn/end`。
+ *   两者都没有（一条 `turn/end` 都没写过）时 ② 为 0，遮蔽点由 ①③ 决定。
+ */
+export function compactionCoveredUpToSeq(
+  events: readonly AppEvent[],
+  inFlightTurnStartSeq: number | null,
+  floorSeq = 0,
+): number {
+  // ① 已有摘要的最大 coveredUpToSeq
+  let covered = 0;
+  for (const event of events) {
+    if (event.type === 'compaction/summary' && event.data.coveredUpToSeq > covered) {
+      covered = event.data.coveredUpToSeq;
+    }
+  }
+
+  // ② 遮蔽点：**上一个已经结束的 turn 的 `turn/end` seq**（没有就退回本 turn 起始 seq）。
+  //
+  // 为什么不能再用本 turn 的 `turn/start.seq`（2026-10-02 修）：**叫醒她的那条输入在
+  // `turn/start` 之前**——`wake/channel` 先落盘，循环才开这一轮。于是"遮蔽到本 turn 起始"
+  // 会把**他的那句话遮掉、把她对那句话的回答留在现场**（回答的 seq 更大）。留下的半段读起来
+  // 像她在自言自语，而接下来的新消息看起来像"新的问题"——用户实测到的那句
+  // "每次上下文压缩后她又把已经回复过的东西再回复一遍"就是这么来的（样本见 review.md）。
+  //
+  // 取上一个 `turn/end` 之后，"他问的那句"与"她答的那段"要么一起进笔记、要么一起留在现场，
+  // 永远不会被劈开。代价是遮蔽得少一点（多留一轮），换来的是压缩之后对话仍然对得上。
+  let end = 0;
+  for (const event of events) {
+    if (event.type !== 'turn/end') continue;
+    if (inFlightTurnStartSeq !== null && event.seq >= inFlightTurnStartSeq) continue;
+    if (event.seq > end) end = event.seq;
+  }
+  // 自动压缩的旧口径：一条已结束的 turn 都没有时退回本 turn 起始 seq（它必然 > 0，
+  // 所以摘要一定渲染得出来）。人工指令没有这个退回——它由 floorSeq 兜底。
+  if (inFlightTurnStartSeq !== null && end === 0) end = inFlightTurnStartSeq;
+
+  return Math.max(covered, end, floorSeq);
+}
+
+/**
+ * 交接笔记的渲染参数：总预算与单条满预算的缺省值**只有这一处**。
+ * 人工指令与自动压缩共用（两个调用点各写一遍 `?? 默认值`，迟早漂移成两个数）。
+ */
+export function handoffOptionsOf(cfg: HandoffOptions): HandoffOptions {
+  return {
+    ...cfg,
+    budgetTokens: cfg.budgetTokens ?? DEFAULT_HANDOFF_BUDGET_TOKENS,
+    foldTokens: cfg.foldTokens ?? DEFAULT_HANDOFF_FOLD_TOKENS,
+  };
 }
 
 // ──────────────────────────────── 小工具 ────────────────────────────────

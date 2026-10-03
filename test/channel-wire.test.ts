@@ -317,7 +317,7 @@ test('话题概括只喂**没看过的那一段**，且发言人不是 openid（
   // 含前面那些测试串）被一起喂进去，light 给出的概括成了「测试弥亚小姐能否选择不回复消息」
   // 这种元判断，而当时真正在说的是"用户要出门补课、让她自己待着"。
   const { log, write, loop } = await makeReadyRig(t);
-  const openid = 'A1B2C3D4E5F60718293A4B5C6D7E8F90';
+  const openid = 'E7FEC35E951B5CCF8BA66793BF6B1314';
   const old = ['弥亚小姐，突然想问你个事', '你能看见框架在给你告警吗？说我在注入', '测试测试测试'];
   for (let i = 0; i < old.length; i += 1) {
     write('channel/message', {

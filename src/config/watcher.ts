@@ -47,14 +47,25 @@ export const CONFIG_RELOAD_TIMEOUT_MS = 20_000;
  */
 export const CONFIG_POLL_INTERVAL_MS = 250;
 
-/** 可热更字段（operations.md §1 表格左列）：带尾点的是前缀，不带的是整字段 */
-export const HOT_RELOAD_FIELDS: readonly string[] = [
-  'budget.', // 预算阈值、软阈值比例
-  'wake.', // 心跳基线间隔、退避上限
-  'alerts.', // 告警开关与限流窗口
-  'models.', // light/heavy 的模型与端点
-  'tools.destructiveEnabled', // destructive 工具开关
-];
+/**
+ * 可热更字段（operations.md §1 表格左列）：带尾点的是前缀，不带的是整字段。
+ *
+ * ⚠️ **2026-10-04 清空**：这份名单曾经写着 `budget.` / `wake.` / `alerts.` / `models.` /
+ * `tools.destructiveEnabled`，但**热更从来没有接进主进程**——`main.ts` 只在启动时
+ * `loadConfig` 一次，`ConfigWatcher` 在整个仓库里没有任何调用方（连测试都没有）。
+ * 于是"改了立刻生效"这句话在界面上、在文档里都说了好几天，实际上一次都没发生过：
+ * 设置页保存完再读回来，看到的还是启动时那份（用户报的「保存后弹回旧值」就是这个）。
+ *
+ * 为什么是**清空名单**而不是顺手把它接上：热更的代价不在这段监听代码，而在
+ * 「配置变了会不会换掉提示前缀」——`configHash` 是 render 三指纹之一，
+ * 任何进入提示词的东西一变，KV 缓存就从失守那一条起全部重算（见 docs/context-audit.md）。
+ * 那是个需要用户拍板的取舍，不该由一次"顺手接上"决定。
+ *
+ * 所以现在的口径是：**全部字段都要重启才生效**，界面照这个说，事件里也照这个记
+ * （`config/changed.requiresRestart`）。将来真要热更，先把上面那个取舍定下来，
+ * 再把名单一项一项填回来——填一项就得有一项的证据。
+ */
+export const HOT_RELOAD_FIELDS: readonly string[] = [];
 
 /**
  * 必须重启才生效（§1 表格右列）。`timezone` / `paths` / `persona` 未列入可热更白名单，

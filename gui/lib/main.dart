@@ -1,10 +1,10 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'app.dart';
 import 'shell/tray.dart';
+// 「关窗时收进托盘」这个界面偏好（`%APPDATA%/Irmia/ui-state.json`，键 close-to-tray）
+import 'ui_state.dart';
 
 /// Irmia GUI 入口。
 ///
@@ -13,10 +13,20 @@ import 'shell/tray.dart';
 /// 「客户区 = 整个窗口」，这条约定由 runner 守着（win32_window.cpp 与
 /// flutter_window.cpp 里的 WM_NCCALCSIZE）。
 ///
-/// **托盘化**（2026-10-04 用户要的）：她是常驻的，界面不该"关掉就没了"。所以：
-///   • 关窗 = 收进托盘（不退出）；
-///   • 托盘菜单：显示/隐藏、重启前后端、退出；
-///   • 退出只有两条路——托盘菜单里的"退出"，或者任务管理器。
+/// **关窗行为**（2026-10-04 用户踩了两次之后改的）：**默认点 × 就退出界面**。
+///
+/// 原来是无条件"关窗 = 收进托盘"，理由是她是常驻的、界面不该"关掉就没了"。那条理由
+/// 本身没错，错在**默认**：Windows 11 默认把新出现的托盘图标收进"隐藏的图标"面板
+/// （通知区域那个 `^` 里），用户根本看不见那枚图标——于是"关窗收托盘"在他体验里就是
+/// "窗口消失、再也找不回来"，只能靠外部命令 ShowWindow 捞回来。
+///
+/// 现在：**她（agent）是独立进程，关掉界面不影响她运行**，所以"关窗=退出界面"没有任何
+/// 风险（她照常干活，想再看界面重新打开即可），而"关窗=藏起来"在托盘图标不可见时是个陷阱。
+/// 想收进托盘的人在设置页把「关窗时收进托盘」打开（键 `close-to-tray`，见 ui_state.dart），
+/// 那是**显式选择**：他知道图标可能被系统收到哪里去。
+///
+/// 托盘菜单照旧（显示界面 / 收进托盘 / 重启前后端 / 退出）："收进托盘"作为**显式动作**
+/// 永远可用，不受这个偏好影响。
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await windowManager.ensureInitialized();
@@ -39,25 +49,33 @@ Future<void> main() async {
     await windowManager.focus();
   });
 
-  // 关窗收进托盘：这里拦的是"关闭"，不是"最小化"
-  await windowManager.setPreventClose(true);
+  // 关窗收进托盘是**用户显式打开的偏好**（默认关）：只有它开着才拦关闭。
+  // 读盘失败一律当默认值 false（失败静默在 ui_state 里）——读不到偏好时，
+  // "点 × 干净地退出"永远比"点 × 藏起来、人再也找不回"安全。
+  final closeToTrayEnabled = await restoreCloseToTray();
+  await windowManager.setPreventClose(closeToTrayEnabled);
   windowManager.addListener(_CloseToTray());
 
   // 托盘在 app.dart 里装（那里拿得到命令通道；这里只管窗口）
   runApp(const IrmiaApp());
 }
 
-/// 关窗 → 隐藏（收进托盘）。真退出走托盘菜单里的那一项。
+/// 关窗 → 按偏好处置：默认**退出界面**（她照常跑），开了开关才收进托盘。
+///
+/// 真退出走托盘菜单里的那一项；这里只处理"点窗口的 ×"。
 class _CloseToTray extends WindowListener {
   @override
   void onWindowClose() {
-    // **托盘在，才收进托盘**：托盘没装成（或装着失败）时关窗就是关窗——
-    // 否则人会点一下 X 就再也叫不回界面，只能去任务管理器（子代理实测踩到过）。
-    if (IrmiaTray.instance.installed) {
+    // 只有**人显式打开**了「关窗时收进托盘」才隐藏。默认关着——见 main() 的说明。
+    // 反过来说：没打开开关时这里连拦都不该拦（setPreventClose(false)），走到这儿的是
+    // "开关开着但窗口还是收到关闭事件"的兜底路径。
+    if (closeToTray.value && IrmiaTray.instance.installed) {
       // 界面收起来，她不跟着走：agent 是独立进程，界面只是她的一个窗口
       unawaited(windowManager.hide());
       return;
     }
+    // **托盘没装成就不许隐藏**（与开关无关）：装不上时"隐藏"等于把界面丢进黑洞
+    // ——托盘图标不存在，没有任何入口能把它叫回来，只能去任务管理器。
     unawaited(windowManager.destroy());
   }
 }
@@ -66,7 +84,3 @@ class _CloseToTray extends WindowListener {
 void unawaited(Future<void> future) {
   future.ignore();
 }
-
-/// 让分析器知道这个文件用到了 dart:io（托盘图标路径要用 Platform 判断）
-// ignore: unused_element
-final _platformIsWindows = Platform.isWindows;

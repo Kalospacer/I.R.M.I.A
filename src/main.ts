@@ -27,6 +27,7 @@ import { notifyStartupRecovery } from './alert/startup.ts';
 import { loadConfig, readApiKey, type AppConfig } from './config/config.ts';
 import { ensurePersonaSeeds, loadPersona, type PersonaAssets } from './persona/loader.ts';
 import { ensureMemorySeeds } from './persona/memory-maintain.ts';
+import { ensureMemoryIndex } from './persona/memory-injection.ts';
 import { DsClient } from './model/ds-client.ts';
 import { buildCatalogRegistry } from './tools/catalog.ts';
 import { createDepsManager, summarizeNotReady } from './deps/manager.ts';
@@ -58,7 +59,14 @@ import {
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
-export const AGENT_VERSION = '0.1.0';
+/**
+ * 产品版号（后端唯一真相源，写进 `session/start` 事件，GUI/CLI/日志都显示它）。
+ * 改这一个要同步四处：`package.json` 的 version、`gui/pubspec.yaml` 的 version、
+ * `gui/lib/pages/settings_page.dart` 的 `guiVersion`（界面显示），以及下面两个自持字面量：
+ * `web/server.ts` 的 `McpProbeHost.clientInfo`、`mcp/client.ts` 的 `DEFAULT_CLIENT_INFO`。
+ * 第二个内测版：功能面到"能装能用"，但仍会有破坏性改动，所以带 `-beta.2`。
+ */
+export const AGENT_VERSION = '0.1.0-beta.2';
 /** 事件形状版本（docs/schema.md） */
 export const SCHEMA_VERSION = '1';
 export const DEFAULT_DATA_DIR_NAME = 'data';
@@ -176,6 +184,10 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
   // 不能等第一次整理（默认每日 4 点）才创建——那之前她会发现"记忆目录不存在"而写不下去。
   const seededMemory = ensureMemorySeeds(dataDir);
   if (seededMemory.length > 0) write(`[记忆] 首次启动，已建好记忆结构：${seededMemory.join('、')}`);
+  // 记忆索引（B2）：与种子同一风格——机制保证"结构存在"，但它的内容由记忆文件生成。
+  // 幂等（内容没变不写盘）：否则每次重启都会把常驻前缀打掉一次，而重启并不改变任何一条记忆。
+  const indexAction = ensureMemoryIndex(dataDir);
+  if (indexAction !== 'unchanged') write(`[记忆] 已${indexAction === 'created' ? '生成' : '重建'}记忆索引 INDEX.md`);
 
   // 定时器表由宿主创建并交给恢复流程：唤醒源必须在同一份表上挂 onDue 回调。
   // 若让 recover 自建一份，它的回调只写日志，到期事实不会变成 wake/timer 事件。
@@ -594,7 +606,7 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
 
   // ── 观测前端与 webhook 的本地 HTTP 服务（design §4.15/§4.16）：真假循环都启动——
   // 它不依赖模型，假循环降级时照常可观可控。token 首启只打印一次（server.tokenCreated）。
-  // 韧性：观测台启动失败（如端口被占）只告警不拦启动——agent 的职责是干活，不是陪绑一个端口。
+  // 韧性：本地服务启动失败（如端口被占）只告警不拦启动——agent 的职责是干活，不是陪绑一个端口。
   let webServer: WebServer | null = null;
   try {
     webServer = await startWebServer({
@@ -637,13 +649,17 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       },
       out: write,
     });
-    if (webServer.tokenCreated) {
-      write(`[前端] 观测台 ${webServer.url()} · 首次 token（仅打印一次）：${webServer.token}`);
+    // 启动时只报"门是什么状态"，**不打印任何凭据**（密码与会话凭据的原文从不进日志）。
+    // 首次启动的人要知道的是"去哪儿设密码"，不是一串要粘贴的 token——那段日子结束了。
+    if (webServer.auth.initialized) {
+      write(`[界面] 本地服务 ${webServer.url()} · 已设密码（凭据在 data/.auth.json；忘记密码 = 删掉它重启）`);
+    } else if (webServer.auth.legacyTokenActive) {
+      write(`[界面] 本地服务 ${webServer.url()} · 还没设密码：请打开 GUI 设置一个（旧的 data/.ui-token 现在仍可用，设完即作废）`);
     } else {
-      write(`[前端] 观测台 ${webServer.url()}（token 沿用 data/.ui-token）`);
+      write(`[界面] 本地服务 ${webServer.url()} · 还没设密码：请打开 GUI 设置一个`);
     }
   } catch (err) {
-    write(`[前端] 观测台启动失败（不拦启动）：${describeError(err)}`);
+    write(`[界面] 本地服务启动失败（不拦启动）：${describeError(err)}`);
   }
 
   /**

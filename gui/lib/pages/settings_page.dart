@@ -8,10 +8,18 @@ import 'package:flutter/material.dart';
 import '../app.dart';
 import '../theme.dart';
 import '../ui_kit.dart';
+// 「关窗时收进托盘」是界面自己的偏好（closeToTray / setCloseToTray），不进服务端配置
+import '../ui_state.dart';
+// 「改密码」那张表单（三个框）在 account_security.dart 里：它是这一页的一个分区动作，
+// 但表单本身是一段自包含的东西（本地校验 + confirm + 就地换凭据）
+import 'account_security.dart';
 import 'page_chrome.dart';
+// 「webhook 凭据只显示这一次」那张框：明文只在生成响应里出现一次，本页不留它
+import 'webhook_secret.dart';
 
 // 设置页 —— 锚点 + 分区卡片（docs/astrbot-ux-interaction.md「改造后适用」第一条）：
-//   · 左侧 180px 分区锚点（模型 / 界面 / 系统 / 关于），点击滚动到右侧对应分区；
+//   · 左侧 180px 分区锚点（模型 / 界面 / 发言 / 外部依赖 / 协议端 / 外部回调 / 系统 / 账号与安全 / 关于），
+//     点击滚动到右侧对应分区；
 //   · 右侧每组一张卡片（surface + outlineVariant 描边 + radiusCard），卡头 = 组名 + 一句说明；
 //   · 模型组字段两列排布，窄窗降一列；
 //   · 保存按钮未改动即禁用，脏时给出「有未保存的更改」；保存成功走 toast。
@@ -31,9 +39,14 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
-/// GUI 版本号：与 gui/pubspec.yaml 的 version 同步维护。
+/// GUI 版本号：与 gui/pubspec.yaml 的 version 同步维护（pubspec 那份是 `0.1.0+1`）。
 /// Flutter 没有运行时读取 pubspec 的内置途径，零依赖前提下写成常量。
-const guiVersion = '1.0.0';
+///
+/// 为什么带 `v` 与 `-beta.2` 而 pubspec 里没有：pubspec 的 version 要喂给 Windows 资源
+/// 版本号（windows/runner/Runner.rc 的 FILEVERSION 是 4 个整数）与安装器，容不下预发布
+/// 标记——beta 只体现在这里与包名/说明里；后端那边对同一版号的口径是 `AGENT_VERSION`
+/// （不带 v，见 src/main.ts）。
+const guiVersion = 'v0.1.0-beta.2';
 
 /// 锚点侧栏宽度（AstrBot 的左侧 section 导航）
 const _railWidth = 180.0;
@@ -67,7 +80,15 @@ const _anchors = <_Anchor>[
   // 内置协议端（v34）：紧跟「外部依赖」之后——它与那张卡是同一类东西（框架管的外部程序），
   // 但**可选**：不开的人照旧用官方通道，开了才多一双"看得见群"的眼睛。
   (id: 'protocol', label: '协议端', icon: Icons.hub_outlined),
+  // 外部回调（B9）：`POST /webhook/*` 的专用凭据（生成 / 轮换）。紧跟在「协议端」之后——
+  // 它与那两张卡是同一类东西（框架管的外部程序 / 外部系统怎么接进来），
+  // 而它是一次**可写的运维动作**（生成），不该混进只读的「系统」快照里。
+  (id: 'webhook', label: '外部回调', icon: Icons.webhook_rounded),
   (id: 'system', label: '系统', icon: Icons.dns_outlined),
+  // 账号与安全（B10）：改密码与登出。排在这里而不是塞进「模型」卡里：它改的是**进来的方式**
+  // （凭据），与"她怎么说话、用哪个模型"毫无关系；而它与「系统」同属"整台实例这一层"，
+  // 所以紧跟在系统之后、「关于」之前。
+  (id: 'account', label: '账号与安全', icon: Icons.lock_outline_rounded),
   (id: 'about', label: '关于', icon: Icons.info_outline_rounded),
 ];
 
@@ -329,9 +350,10 @@ const _sysStepTools = _SysField('budget.stepTools', '预算 · 步内工具调�
 const _sysTurnSteps = _SysField('budget.turnSteps', '预算 · 单 turn 步数上限', _SysKind.count,
     note: '一个 turn 最多走多少步。', hint: '30');
 const _sysTaskTokens = _SysField('budget.taskTokens', '预算 · 任务 token 上限', _SysKind.count,
-    note: '单个任务累计上限；填原值，20M 这类简写不接受。', hint: '500000');
+    note: '单个任务累计上限；填原值，20M 这类简写不接受。口径是**未扣缓存**的 token 数'
+        '（含命中缓存的那部分），所以它比账单上的用量大——别拿它当钱数看。', hint: '500000');
 const _sysDailyTokens = _SysField('budget.dailyTokens', '预算 · 每日 token 上限', _SysKind.count,
-    note: '每日累计上限，按上面的时区切分。', hint: '2000000');
+    note: '每日累计上限，按上面的时区切分。口径同上一行：含缓存命中，不等于花销。', hint: '2000000');
 const _sysSoftRatio = _SysField('budget.softRatio', '预算 · 软阈值', _SysKind.ratio,
     note: '0~1 的小数：0.8 就是 80%。到这一线先提示收尾，越过才硬停。', hint: '0.8');
 const _sysFailStreak = _SysField('budget.failStreakMax', '预算 · 连续失败上限', _SysKind.count,
@@ -371,6 +393,17 @@ class _SettingsPageState extends State<SettingsPage> {
   String? cfgError;
   bool loading = true;
 
+  /// **盘上已改、进程还没接管**的字段（服务端 `$pending.restartRequired` 给的点路径）。
+  ///
+  /// 判据只有这一处：本页不另算一份"哪些要重启"（同一件事存两处，迟早有两种说法）。
+  /// 它的用处是把「需重启」那枚徽章说准——那一行现在**真的**和生效值不一样时，
+  /// 徽章换成「尚未生效」；只是"这一类字段改完要重启"时，仍旧是「需重启」。
+  Set<String> pendingRestart = const <String>{};
+
+  /// 这一份配置是从哪儿读来的：`saved` = 盘上那份；`memory` = 盘读不出来、回落成生效配置。
+  /// 空串表示服务端没给这个字段（老服务端）。
+  String savedSource = '';
+
   Map<String, dynamic>? keys;
   String? keysError;
   bool keysLoading = true;
@@ -402,6 +435,19 @@ class _SettingsPageState extends State<SettingsPage> {
   final _protocolDirCtl = TextEditingController();
   /// 目录的已存值快照（「保存」未改动即禁用）
   String protocolDirBase = '';
+
+  /// 外部回调（B9）：`GET /api/webhook-secret` 的状态视图。
+  ///
+  /// **这里面没有明文**（也不该有）：服务端只报"配没配 + 那个非密钥的 id + 时刻"，
+  /// 明文只在生成那一次的响应里出现，直接进 [showWebhookTokenDialog] 那张框，
+  /// **一个字节都不落到本页的字段上**（不写 ui-state.json、不做"再看一眼"）。
+  Map<String, dynamic>? webhookSecret;
+  String? webhookError;
+  bool webhookLoading = true;
+  /// 生成/轮换中：按钮转忙并禁用（这条命令是写盘 + 落事件的，连点两次会连换两把钥匙）
+  bool webhookRotating = false;
+  /// 轮换之后留在卡上的那句话（**只放"上一份已失效"这类非密钥信息**，不含明文）
+  String webhookRotatedNote = '';
 
   /// 发言节奏的速度输入（字/分钟）。开关是即时生效的，速度要按保存键——
   /// 数字框边打字边写盘会把 90 打成 9、再打成 900，那种"逐字符生效"没人想要。
@@ -494,8 +540,31 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> load() async {
     await Future.wait([
       _loadConfig(seed: true), _loadKeys(), _loadProjection(), _loadDeps(), _loadProtocolSide(),
+      _loadWebhookSecret(),
     ]);
     if (mounted) setState(() => loading = false);
+  }
+
+  /// webhook 专用凭据的状态（GET /api/webhook-secret）。与依赖/协议端同一条纪律：
+  /// **不阻塞首屏**、读失败只影响这张卡（卡片自己有三态），不把整页变成错误页。
+  Future<void> _loadWebhookSecret() async {
+    setState(() => webhookLoading = true);
+    try {
+      final data = await widget.state.api.get('/api/webhook-secret');
+      if (!mounted) return;
+      setState(() {
+        webhookSecret = data is Map ? data.cast<String, dynamic>() : null;
+        webhookError = data is Map ? null : '凭据状态读取失败（响应不是对象）';
+        webhookLoading = false;
+      });
+    } catch (err) {
+      if (mounted) {
+        setState(() {
+          webhookError = '$err';
+          webhookLoading = false;
+        });
+      }
+    }
   }
 
   /// 协议端状态（GET /api/protocol-side）。与依赖报告一样**不阻塞首屏**：
@@ -563,11 +632,24 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _loadConfig({bool seed = false}) async {
     try {
-      final data = await widget.state.api.get('/api/config');
+      // **读盘上那份**（`?source=saved`，2026-10-04 修）：设置页编辑的是"我保存下来的值"。
+      // 默认那条 `/api/config` 给的是**进程启动时的生效配置**——保存成功后本页会立刻回读它
+      // 并回填输入框，于是刚写下去的值当场被冲掉（用户报的「编辑后点保存，前端又会弹回
+      // 默认的 url」，系统卡的「编辑」也一样）。盘上那份还多带一个 `$pending`：
+      // 哪些字段与生效值不同（= 还没生效），本页据此把「需重启」说准。
+      final data = await widget.state.api.get('/api/config?source=saved');
       if (!mounted) return;
-      final next = data is Map ? data.cast<String, dynamic>() : null;
+      final raw = data is Map ? data.cast<String, dynamic>() : null;
+      final pending = raw == null ? null : raw[r'$pending'];
+      // `$pending` 是给这一页看的元信息，不是配置项：取出来之后就从文档里摘掉，
+      // 免得它跟着 `_text('…')` 一类的点路径查找走（配置本体里没有以 `$` 开头的可读项）。
+      final next = raw == null ? null : (Map<String, dynamic>.from(raw)..remove(r'$pending'));
       setState(() {
         cfg = next;
+        pendingRestart = pending is Map && pending['restartRequired'] is List
+            ? (pending['restartRequired'] as List).whereType<String>().toSet()
+            : const <String>{};
+        savedSource = pending is Map ? '${pending['source']}' : '';
         cfgError = null; // 非对象走 empty 态（配置不可用），异常才走 error 态
       });
       if (seed && next != null) _seedInputs();
@@ -638,6 +720,10 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 盘上就是这个值。
   bool _sysRowDirty(List<_SysField> fields) =>
       fields.any((field) => _sysText(field) != (_sysBase[field.path] ?? ''));
+
+  /// 这一行的字段里，有没有"盘上已改、进程还没接管"的（判据来自服务端，本页不另算）
+  bool _rowPending(List<_SysField> fields) =>
+      fields.any((field) => pendingRestart.contains(field.path));
 
   /// 把某一行的框还原成盘上那份（「取消」与保存成功都走它）
   void _resetSysDraft(List<_SysField> fields) {
@@ -874,6 +960,11 @@ class _SettingsPageState extends State<SettingsPage> {
         const SizedBox(height: 10),
         if (keysError != null)
           _footnote('密钥状态读取失败（$keysError）。密钥徽章不可用，模型名与 Base URL 仍可保存。'),
+        if (savedSource == 'memory')
+          _footnote('读不到 config.json，这一页显示的是当前**生效**的那份（保存仍会写进文件）。'),
+        if (pendingRestart.any((path) => path.startsWith('models.')))
+          _footnote('上面有改动**还没生效**：模型名与端点是启动参数，要重启进程才接管——'
+              '在那之前跑的还是启动时那份。保存本身是成功的，框里显示的就是盘上那份。'),
         _footnote('密钥只写不读：本页显示的始终是掩码，完整值仅在建立连接时读取一次。保存写入 config.json 与 data/.keys.json，'
             '进程重启后接管，且环境变量优先于文件。'),
       ]),
@@ -886,7 +977,11 @@ class _SettingsPageState extends State<SettingsPage> {
       const SizedBox(height: 18),
       _sectionBlock('protocol', [_protocolCard()]),
       const SizedBox(height: 18),
+      _sectionBlock('webhook', [_webhookCard()]),
+      const SizedBox(height: 18),
       _sectionBlock('system', [_systemCard()]),
+      const SizedBox(height: 18),
+      _sectionBlock('account', [_accountCard()]),
       const SizedBox(height: 18),
       _sectionBlock('about', [_aboutCard()]),
     ];
@@ -1149,14 +1244,24 @@ class _SettingsPageState extends State<SettingsPage> {
     return _badge('已配置 ${state.mask ?? '…'}', IrmiaTheme.ok);
   }
 
-  // ── 分区二：界面 ──
+  // ── 分区二：界面（可写） ──
 
+  /// 「界面」卡：主题偏好 + **关窗行为**。
+  ///
+  /// 2026-10-04 加的「关窗时收进托盘」是**界面自己的偏好**（键 `close-to-tray`，
+  /// 落在 `%APPDATA%/Irmia/ui-state.json`，与主题一样**不写服务端配置**）：
+  /// 关不关窗是窗口的事，与服务端那份 config.json 无关。默认 false——
+  /// 理由写在 ui_state.dart 的 [kCloseToTrayFlag] 上（她是独立进程，关窗不影响她运行；
+  /// 而"藏起来"在托盘图标不可见时就是个陷阱）。
+  ///
+  /// 这里**不摆"需重启"**：开关本身立刻写盘，下次启动由 main.dart 读；
+  /// 而且它在同一次运行里也已经生效（窗口关闭回调读的是内存镜像，见 ui_state 的 [closeToTray]）。
   Widget _uiCard() {
     final scheme = Theme.of(context).colorScheme;
     final mode = widget.state.themeMode;
     return _SectionCard(
       title: '界面',
-      note: '主题偏好与当前生效值；仅本地生效，不写入配置。',
+      note: '主题偏好与关窗行为；仅本地生效，不写入配置。',
       trailing: Text('即时生效', style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
       children: [
         _FieldCell(
@@ -1181,6 +1286,25 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           note: '仅本地偏好，即时生效；不写入配置、不影响渲染指纹。',
+        ),
+        const SizedBox(height: 12),
+        _FieldCell(
+          label: '关窗时收进托盘（不退出界面）',
+          field: Align(
+            alignment: Alignment.centerLeft,
+            child: ValueListenableBuilder<bool>(
+              valueListenable: closeToTray,
+              builder: (context, enabled, _) => Switch(
+                key: const ValueKey('close-to-tray'),
+                value: enabled,
+                onChanged: (next) => unawaited(setCloseToTray(next)),
+              ),
+            ),
+          ),
+          // 后果要写清：托盘图标在 Windows 11 上默认被收进"隐藏的图标"面板，
+          // 那时"关窗"就等于"界面不见了"——这正是用户踩过两次的那个坑。
+          note: '托盘图标若被系统收进"隐藏的图标"面板，关窗后会找不到界面；'
+              '关掉此项则点 × 直接退出（她照常运行）。',
         ),
         const SizedBox(height: 12),
         _readOnlyRow('当前主题', mode == ThemeMode.dark ? '暗' : '亮', restart: false),
@@ -1681,7 +1805,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     autocorrect: false,
                     enableSuggestions: false,
                     style: _mono(12.5, scheme.onSurface),
-                    decoration: const InputDecoration(hintText: r'C:\SnowLuma'),
+                    decoration: const InputDecoration(hintText: r'<协议端安装目录>'),
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -2303,7 +2427,178 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 与当前生效一致时不该喊重启——喊多了这句话就不值钱了。
   String _restartSuffix(Map<String, dynamic> map) => map['restartRequired'] == true ? '（重启进程后接管）' : '';
 
-  // ── 分区七：系统（逐行就地编辑：监听地址 / 时区 / 六条预算） ──
+  // ── 分区七：外部回调（B9：webhook 专用凭据） ──
+
+  /// 「外部回调」卡：`POST /webhook/*` 的专用凭据——现在这份的状态 + **生成 / 轮换**。
+  ///
+  /// 为什么这条通道要一份**单独的**凭据（而不是让人拿界面会话凭据去配外部脚本）：
+  /// 会话凭据会随「改密码 / 登出 / 换机器」失效，而失效的现场在**另一台机器**上——
+  /// 半夜开始收 401，人在这边看不出为什么。专用凭据只够投递、读不到 `/api/*` 上的任何东西，
+  /// 也不随界面那扇门开关（完整取舍见 `src/web/webhook-secret.ts` 的文件头）。
+  ///
+  /// 状态来自只读端点 `GET /api/webhook-secret`：它只报"配没配 + 那个非密钥的 id + 时刻"，
+  /// **绝不吐明文或哈希**。明文只在生成那一次的响应里出现，直接进
+  /// [showWebhookTokenDialog] 那张"只显示这一次"的框，本页一个字节都不留。
+  Widget _webhookCard() {
+    final scheme = Theme.of(context).colorScheme;
+    final configured = webhookSecret?['configured'] == true;
+    final secretId = _secretText('secretId');
+    final createdAt = _stamp(_secretText('createdAt'));
+    final rotatedRaw = _secretText('rotatedAt');
+    final by = _secretText('by');
+    final summary = webhookError != null
+        ? null
+        : (webhookSecret == null
+            ? (webhookLoading ? '读取中…' : null)
+            : (configured ? '已生成' : '还没有生成'));
+    return _SectionCard(
+      title: '外部回调',
+      note: '外部系统往这台实例投递用的专用凭据（POST /webhook/*）。',
+      trailing: summary == null ? null : _badge(summary, configured ? IrmiaTheme.ok : IrmiaTheme.warn),
+      children: [
+        if (webhookError != null) ...[
+          _footnote('凭据状态读取失败（$webhookError）。状态看不见时**先别按"重新生成"**：'
+              '轮换不可逆（旧的那份当场失效），而此刻你并不知道有没有人在用它。'),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              key: const ValueKey('webhook-retry'),
+              onPressed: () => unawaited(_loadWebhookSecret()),
+              child: const Text('重试'),
+            ),
+          ),
+        ],
+        if (webhookSecret == null && webhookError == null)
+          _footnote('正在读取 webhook 凭据状态…'),
+        if (webhookSecret != null) ...[
+          _readOnlyRow(
+            '当前凭据',
+            configured ? '凭据 $secretId · 生成于 $createdAt' : '还没有生成',
+            restart: false,
+            note: configured
+                ? null
+                : '这条通道现在一律 401（没有凭据就没人投得进来）。按下面的按钮生成一份。',
+          ),
+          if (configured)
+            _readOnlyRow(
+              '上次轮换',
+              rotatedRaw.isEmpty ? '从未' : _stamp(rotatedRaw),
+              restart: false,
+              note: by.isEmpty ? null : '发起方：$by',
+            ),
+          if (webhookRotatedNote.isNotEmpty) _footnote(webhookRotatedNote),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              FilledButton(
+                key: const ValueKey('webhook-rotate'),
+                onPressed: webhookRotating ? null : () => unawaited(_rotateWebhookSecret(configured: configured)),
+                style: _btnStyle(context),
+                child: webhookRotating
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(configured ? '重新生成' : '生成 webhook 凭据'),
+              ),
+            ],
+          ),
+        ],
+        const SizedBox(height: 10),
+        // 这条例子是**给外部系统抄的**：host:port 取这一页能看到的生效配置，不写死端口
+        Container(
+          margin: const EdgeInsets.only(top: 4),
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainer,
+            borderRadius: BorderRadius.circular(IrmiaTheme.radiusCtl),
+          ),
+          child: SelectableText(_webhookCurl(), style: _mono(11.5, scheme.onSurface)),
+        ),
+        _footnote('/webhook/* **不认界面凭据**（也不认迁移期那份 data/.ui-token）：这条通道只认'
+            '上面那份专用凭据。它是给外部系统的——投得进来，读不到 /api/* 上的任何东西。'),
+        _footnote('凭据文件：${_secretText('file').isEmpty ? 'data/.webhook-secret.json' : _secretText('file')}'
+            '（盘上只有它的 sha256：原文只在你按下按钮那一次出现在屏幕上，之后再没人读得回来）。'),
+      ],
+    );
+  }
+
+  /// webhook 状态视图里的一个字符串字段（null / 缺失 → 空串）
+  String _secretText(String key) {
+    final value = webhookSecret?[key];
+    return value == null ? '' : value.toString();
+  }
+
+  /// 给外部系统抄的那条 curl（路径与 body 形状照 docs/operations.md §4.2）
+  String _webhookCurl() {
+    final host = _text('web.host').isEmpty ? '127.0.0.1' : _text('web.host');
+    final port = _amount('web.port') == '—' ? '7788' : _amount('web.port');
+    return 'curl -X POST http://$host:$port/webhook/alert \\\n'
+        '     -H "Authorization: Bearer <专用凭据>" \\\n'
+        '     -H "Content-Type: application/json" \\\n'
+        "     -d '{\"level\":\"warn\",\"text\":\"磁盘快满了\"}'";
+  }
+
+  /// 生成 / 轮换 webhook 专用凭据（`POST /api/commands/regenerate-webhook-token`）。
+  ///
+  /// 「重新生成」是**危险操作**：这个通道永远只有一把钥匙，再生成一次就是把旧的那把当场作废——
+  /// 还在用它投递的外部脚本会开始收 401，而故障现场在另一台机器上。所以只在这一档问一次
+  /// （confirm：灰取消 / 红确认）；第一次生成不会让任何东西失效，不必多问一遍。
+  ///
+  /// 明文（响应里的 `token`）**只进那张对话框**：它是这个方法里的一个局部变量，
+  /// 这一页不留它（不写状态文件、不做"再看一眼"）。服务端那句 `note` 照原样摆进框里。
+  Future<void> _rotateWebhookSecret({required bool configured}) async {
+    if (configured) {
+      final go = await confirm(
+        context,
+        title: '重新生成 webhook 凭据',
+        body: '上一份会当场失效：已经在用它的外部脚本会立刻开始收 401——记得把新凭据一起换过去。'
+            '新凭据只显示一次。',
+        confirmLabel: '重新生成',
+        danger: true,
+      );
+      if (!go || !mounted) return;
+    }
+    setState(() => webhookRotating = true);
+    try {
+      final reply = await widget.state.api.post(
+        '/api/commands/regenerate-webhook-token',
+        {'by': 'gui'},
+        confirm: 'regenerate-webhook-token',
+      );
+      if (!mounted) return;
+      final map = reply is Map ? reply.cast<String, dynamic>() : const <String, dynamic>{};
+      final token = map['token']?.toString() ?? '';
+      final action = map['action']?.toString() ?? (configured ? 'rotate' : 'generate');
+      final note = map['note']?.toString() ?? '';
+      // 先刷新状态（卡上的 id 与时刻换成新那份），再弹那张"只显示这一次"的框
+      await _loadWebhookSecret();
+      if (!mounted) return;
+      if (token.isEmpty) {
+        // 服务端没给明文：那就没有"抄走"这回事，如实说（不猜、也不假装成功）
+        _toast('服务端没有回凭据原文，请再按一次；若反复如此，去看主进程日志', kind: ToastKind.error);
+        return;
+      }
+      setState(() {
+        webhookRotatedNote =
+            action == 'rotate' ? '上一份已当场失效（还在用它的外部脚本会开始收 401）。' : '';
+      });
+      await showWebhookTokenDialog(
+        context,
+        token: token,
+        note: note,
+        action: action,
+        previousSecretId: map['previousSecretId']?.toString(),
+      );
+    } catch (err) {
+      if (mounted) _toast('生成失败：$err', kind: ToastKind.error);
+    } finally {
+      if (mounted) setState(() => webhookRotating = false);
+    }
+  }
+
+  // ── 分区八：系统（逐行就地编辑：监听地址 / 时区 / 六条预算） ──
 
   /// 系统卡（用户 ⑪ 起可改，⑭ 起改成**逐行**就地编辑）。
   ///
@@ -2399,9 +2694,15 @@ class _SettingsPageState extends State<SettingsPage> {
                       ),
               ),
               const SizedBox(width: 10),
-              // 八个可编辑行都挂「需重启」：它们全是启动参数，改完要重启进程才接管。
+              // 徽章两选一（2026-10-04）：
+              //   · 「尚未生效」= 盘上这份与生效那份**真的不一样**（服务端比对出来的），
+              //     改完还没重启时才有——它把「需重启」的意思也包含在内，所以同时挂两枚会很吵；
+              //   · 「需重启」  = 这一类字段是启动参数，改完要重启进程才接管（常态说明）。
               // 两条只读行不挂（⑭ 的原话：改不了的行喊重启没意义）。
-              _badge('需重启', IrmiaTheme.warn),
+              if (_rowPending(fields))
+                _badge('尚未生效', IrmiaTheme.warn)
+              else
+                _badge('需重启', IrmiaTheme.warn),
               const SizedBox(width: 10),
               if (editing) ..._sysRowActions(id, fields) else _sysEditPill(id),
             ],
@@ -2520,7 +2821,100 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  // ── 分区七：关于 ──
+  // ── 分区九：账号与安全（B10） ──
+
+  /// 「账号与安全」卡：**改密码** 与 **登出**。
+  ///
+  /// 为什么这两件事在这张卡上、而不是塞进模型卡：它们改的是**进来的方式**（凭据），
+  /// 与"她怎么说话、用哪个模型"毫无关系。这一页的分区是按"改的是什么"分的
+  /// （模型 / 界面 / 发言 / 依赖 / 协议端 / 系统 / 账号），凭据是独立的一类。
+  ///
+  /// 两件事各用自己合适的形状：改密码是**三个框一起填**的表单 → 走页面自己的对话框
+  /// （`account_security.dart`，与 ui_kit 上"要填字段的表单用 showDialog"那条分寸一致）；
+  /// 登出不需要填任何东西 → 卡上一颗按钮 + 项目既有的 `confirm`（灰取消 / 红确认）。
+  Widget _accountCard() {
+    final state = widget.state;
+    // 半升级态：这一份是老的共享 token（这台实例还没设过密码）。它开不出"会话"，
+    // 改密码与登出在服务端都做不成——如实写在按钮上面，并把出路（设置密码）一起摆出来。
+    final legacy = state.onLegacyToken;
+    return _SectionCard(
+      title: '账号与安全',
+      note: '进来这个界面用的凭据：改密码与登出。',
+      trailing: _badge(
+        legacy ? '旧的共享 token' : '会话凭据',
+        legacy ? IrmiaTheme.warn : IrmiaTheme.ok,
+      ),
+      children: [
+        _readOnlyRow(
+          '当前实例',
+          state.instance ?? '',
+          restart: false,
+          note: '凭据按实例分文件存（%APPDATA%\\Irmia\\sessions）：同一台机器上开第二个实例'
+              '不会把这一份顶掉。',
+        ),
+        if (legacy)
+          _footnote('这一份用的是旧的共享 token（这台实例还没设过密码），服务端不认它开出的'
+              '"会话"：改密码与登出都做不成。先设置一个密码，之后按会话登录/登出。'),
+        const SizedBox(height: 14),
+        Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            FilledButton(
+              key: const ValueKey('account-change-open'),
+              // 半升级态下这颗按钮是**灰的**：灰着本身就是一句话（"这条路上改不了"），
+              // 而理由就写在它上面一行
+              onPressed: legacy ? null : () => unawaited(_openChangePassword()),
+              style: _btnStyle(context),
+              child: const Text('改密码'),
+            ),
+            OutlinedButton(
+              key: const ValueKey('account-logout'),
+              onPressed: () => unawaited(_logoutAccount()),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: IrmiaTheme.danger,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                minimumSize: const Size(0, 36),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              child: const Text('登出'),
+            ),
+            if (legacy)
+              TextButton(
+                key: const ValueKey('account-setup-password'),
+                onPressed: () => state.openPasswordSetup(),
+                child: const Text('先去设置密码'),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// 打开「改密码」；改成了就在这一页上留一句提示（对话框那一刻已经收起来了）
+  Future<void> _openChangePassword() async {
+    final changed = await showChangePasswordDialog(context, widget.state);
+    if (changed && mounted) _toast('密码已改；这台界面已经换上新凭据', kind: ToastKind.success);
+  }
+
+  /// 登出：危险操作，走项目既有的 confirm（灰取消 / 红确认）。
+  ///
+  /// 这里**不需要**再收界面：`AppState.logout()` 把 `ready` 置假，整个壳连同这一页一起换成门
+  /// （app.dart 里那个三元）——页面上再写一遍"清状态"就是第二份真相。
+  Future<void> _logoutAccount() async {
+    final go = await confirm(
+      context,
+      title: '登出',
+      body: '退出这个界面并回到门上；本机这份会话凭据会被清掉——下次要用密码进来。',
+      confirmLabel: '登出',
+      danger: true,
+    );
+    if (!go || !mounted) return;
+    await widget.state.logout();
+  }
+
+  // ── 分区十：关于 ──
 
   Widget _aboutCard() {
     final scheme = Theme.of(context).colorScheme;
@@ -2582,9 +2976,9 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// **destructive 工具策略**（全关 / 全开 / 按名单）——这里才是它的家。
   ///
-  /// 2026-10-04 用户定调：正式产品是 GUI，观测台只是备用入口，所以这个开关必须能在界面里改，
-  /// 不能把用户往外推。写通道与服务端一致：它是**字段级危险操作**，X-Confirm 要带
-  /// `update-config; enable-destructive`（服务端 DANGEROUS_FIELDS 登记的就是这一条）。
+  /// 2026-10-04 用户定调：正式产品是 GUI（2026-10 网页观测台整个删除之后更是**唯一**的产品），
+  /// 所以这个开关必须能在界面里改，不能把用户往外推。写通道与服务端一致：它是**字段级危险操作**，
+  /// X-Confirm 要带 `update-config; enable-destructive`（服务端 DANGEROUS_FIELDS 登记的就是这一条）。
   Widget _destructiveRow() {
     final value = _at(cfg, 'tools.destructiveEnabled');
     final label = _policy();  // 与 Web 端同一口径的三态文案，复用不另写一份

@@ -364,10 +364,13 @@ test('Notifier 类：send/recover 形状与 admin 兼容的 send(message) 共存
   assert.equal(delivery.sent, true);
   assert.match(delivery.fingerprint, /^[0-9a-f]{16}$/u);
   assert.ok(delivery.file.endsWith(`${DAY}.log`));
+  // 故障键进事件（2026-10-03）：进程重启后 `foldStalls` 靠它把"还没恢复的故障"重建回来，
+  // 否则一条已经报出去的故障永远配不上它的"已恢复"
   assert.deepEqual(records, [{
     fingerprint: delivery.fingerprint,
     level: 'warn',
     title: '水位停滞',
+    key: 'alert:水位停滞',
   }]);
 
   const suppressed = await core.send('warn', '水位停滞', 'again');

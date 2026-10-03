@@ -428,7 +428,7 @@ export function mapDispatchToWakeChannel(
   // **昵称**：官方事件体的 `author.username` 里就有（2026-10-02 查官方文档确认：
   // `GROUP_AT_MESSAGE_CREATE.author = {id, member_openid, member_role, username, …}`，
   // 示例里写着"小明"；AstrBot 的 PR #2626 正是在修"没读这个字段"）。
-  // 之前本适配器只取 openid，于是她在群里看到的每个人都叫"甲（id …8F90）"——明明是官方给了名字的。
+  // 之前本适配器只取 openid，于是她在群里看到的每个人都叫"甲（id …9F56）"——明明是官方给了名字的。
   // 取来只作**显示**：身份仍按 member_openid/user_openid 判（昵称谁都能改，见 self-brief"名字不是身份"）。
   const nickname = readString(author, 'username').trim();
   // 群角色（member/admin/owner）：官方群消息事件里带，私聊没有。只作**显示**——
@@ -464,8 +464,8 @@ export function mapDispatchToWakeChannel(
  * 正文里的两串"机器话"换成她能读的写法（2026-10-02，对齐 AstrBot 的做法）：
  *
  *   • **@ 标记**：`<@A1B2…>` / `<@!A1B2…>` / `<qqbot-at-user id="A1B2…" />` —— 原来原样进她的
- *     上下文（实测她读到的就是 `<@A1B2C3D4E5F60718293A4B5C6D7E8F90>` 这种一串 id）。
- *     现在换成 `@…8F90`（tail 四位）：她分得清"这几句 @ 的不是同一个人"，也不必读 32 位乱码；
+ *     上下文（实测她读到的就是 `<@23757A4ED946257ECBB87585D20A9F56>` 这种一串 id）。
+ *     现在换成 `@…9F56`（tail 四位）：她分得清"这几句 @ 的不是同一个人"，也不必读 32 位乱码；
  *     **只作可读化，不作身份判定**——身份永远看 `author`（见 self-brief"名字不是身份"）。
  *   • **表情**：`<faceType=6,faceId="0",ext="<base64>">` —— ext 里是 base64 的 JSON，里面有
  *     `text`（表情名）。解出来写成 `[表情:微笑]`，解不出就写 `[表情]`（**不编名字**）。
@@ -479,7 +479,7 @@ export function mapDispatchToWakeChannel(
  * 为什么（2026-10-02 缺口报告第 ④ 项，AstrBot 有、我们没有）：群里"回复某一句"的语义全在被引
  * 的那句话里——只看正文，她读到的是一句没头没尾的话（"这个不行"到底指哪个？）。
  *
- * 形状：`[引用 @…8F90 原话]` + 正文。**只在 103 上做**：普通消息的 `msg_elements` 里也有
+ * 形状：`[引用 @…9F56 原话]` + 正文。**只在 103 上做**：普通消息的 `msg_elements` 里也有
  * 自己的正文，不认这个标记就会把消息本身当成"被引用的那句"（张冠李戴）。
  * 被引原话截到 80 字（她要的是"在说哪件事"，不是逐字转录；全文她自己有办法去看）。
  */
@@ -511,7 +511,7 @@ function readableContent(raw: string): string {
       (_m, ext: string | undefined) => faceLabel(ext));
 }
 
-/** `@…8F90`：留尾四位，够分清是谁，又不摆 32 位乱码 */
+/** `@…9F56`：留尾四位，够分清是谁，又不摆 32 位乱码 */
 function atLabel(id: string): string {
   const tail = id.length <= 4 ? id : id.slice(-4);
   return `@…${tail}`;

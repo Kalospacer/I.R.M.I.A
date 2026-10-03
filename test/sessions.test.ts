@@ -198,14 +198,14 @@ describe('会话簿 · 名字从哪来', () => {
     const aliases = parseAliases([
       '# 身份别名',
       '',
-      '- qq:c2c:X = owner',
+      '- qq:c2c:X = 用户（OWNER）',
       'qq:group-at:G = 技术群',
       '这不是别名',
       'no-colon = 名字',
       'qq:c2c:Y =',
       '',
     ].join('\n'));
-    assert.equal(aliases.get('qq:c2c:X'), 'owner', '列表写法也认');
+    assert.equal(aliases.get('qq:c2c:X'), '用户（OWNER）', '列表写法也认');
     assert.equal(aliases.get('qq:group-at:G'), '技术群');
     assert.equal(aliases.size, 2, '无等号、键不带冒号、名字为空的都跳过');
   });

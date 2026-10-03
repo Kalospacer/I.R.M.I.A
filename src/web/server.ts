@@ -1,12 +1,25 @@
 /**
  * Irmia Agent — 本地 HTTP 服务（docs/design.md §4.15 / §4.16、docs/frontend.md §4）
  *
- * 一个 Node 原生 `http` 服务，三条路由，三个身份：
- *   • `/api/*`     —— 观测台（读写都走这里）。全部要求 `Authorization: Bearer <token>`，
+ * 一个 Node 原生 `http` 服务，**两条路由，两份互不通用的凭据**（2026-10 起不再有第三条）：
+ *   • `/api/*`     —— 桌面界面（GUI）的读写口。全部要求 `Authorization: Bearer <会话凭据>`，
  *                     写命令再按"危险操作表"要求 `X-Confirm: <操作英文标识>`。
  *   • `/webhook/*` —— 外部回调入口（design §4.15：Bearer 校验、body ≤64KB、每源令牌桶）。
- *   • `/`          —— `web/` 静态目录（MIME 基础类型 + 防路径穿越）。目录缺失时进程照常跑，
- *                     前端是可选组件（design §4.16 明文）。
+ *                     **只认 webhook 专用凭据**（`data/.webhook-secret.json`）：
+ *                     界面会话凭据与迁移期那份 `.ui-token` 在这条通道上一律 401。
+ *
+ * **两份凭据为什么必须分开（B9，2026-10）**：外部系统（监控、别台机器上的脚本、
+ * Home Assistant……）只需要"投一条事件进来"，而它们过去只能拿界面会话凭据——那份东西会随
+ * "改密码/登出/换机器"失效，且同时能读**整个** `/api/*`（她的记忆、人格、日志、配置掩码）。
+ * 于是"给它一条只够投递的最小权限凭据"这件事在当时做不到。专用凭据就是那条最小权限：
+ * 权限方向是单向的（能写一条 `wake/webhook`，读不到任何东西），生命周期独立于界面那扇门。
+ * 完整的取舍（含"收窄会把已经在用的外部脚本打断"这条代价）写在 `web/webhook-secret.ts`
+ * 的文件头与 `docs/operations.md` §4.2。
+ *
+ * **`web/` 静态目录与网页观测台已整个删除**（用户口径：「web 默认关闭，我们框架不要 web」
+ * 「删掉 web」）。这个框架的正式产品**只有 GUI**，没有第二张脸要维护；过去那条
+ * `/` → `web/index.html` 的静态分支因此整条移除，`/` 与任何未知路径统一回一句人话
+ * （`no-web-ui`），而不是一个让人摸不着头脑的 404。
  *
  * 四条必须说清的口径：
  *
@@ -26,7 +39,9 @@
  * 不一样"是这类系统最恶心的故障，唯一的根治办法是不给第二份实现。
  *
  * **④ 密钥不落日志**。webhook 记录的 headers 里 `authorization` / `cookie` 等一律存 `[redacted]`；
- * UI token 只写在 `data/.ui-token`（首启生成并打印一次），**不进事件日志**（operations.md §1）。
+ * 界面的凭据（密码哈希 / 会话凭据）只写在 `data/.auth.json`，webhook 专用凭据只写在
+ * `data/.webhook-secret.json`（两处盘上都只有 sha256），**三者的原文都不进任何日志**
+ * （operations.md §1）。认证的完整口径见 `web/auth.ts` 与 `web/webhook-secret.ts` 的文件头。
  *
  * 约定：值导入写 `.ts`（`--experimental-strip-types` 只擦类型、不改路径解析），纯类型导入写 `.js`。
  */
@@ -38,13 +53,15 @@ import {
   statSync, unlinkSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { ALERT_DIR_NAME, type AlertNotifier } from '../alert/notifier.ts';
 import { buildBudgetReport, buildReviewEntries, summarizeEvent } from '../cli.ts';
 import { answerHuman } from '../runtime/plan-mode.ts';
 import type { AppConfig, JsonObject, JsonValue } from '../config/config.js';
 import { CONFIG_FILE_NAME, MENTION_KEYWORD_LEN_MAX, MENTION_KEYWORD_MAX, configHash, loadConfig } from '../config/config.ts';
+import { diffConfigFields } from '../config/watcher.ts';
+import { resolveRestartShell } from '../runtime/restart-shell.ts';
 import { deriveRequest } from '../runtime/agent-loop.ts';
 import { contactFactsForReplay } from '../runtime/replay.ts';
 import { GroupMemberBook } from '../channel/group-members.ts';
@@ -68,12 +85,23 @@ import type {
 import { collectSessions, normalizeSid, parseAliases, resolveSessionName, sidLookupKeys } from '../channel/sessions.ts';
 import { readEndpointFromConfig, resolveServiceDir } from '../services/snowluma.ts';
 import { loadPersona } from '../persona/loader.ts';
-import { MEMORY_MAINTAIN_PAYLOAD_KIND, diaryDir, memoriesDir } from '../persona/memory-maintain.ts';
+import {
+  DIARY_DIR_NAME,
+  EPISODE_ARCHIVE_DIR_NAME,
+  EPISODE_DIR_NAME,
+  MEMORY_DIR_NAME,
+  MEMORY_MAINTAIN_PAYLOAD_KIND,
+  diaryDir,
+  memoriesDir,
+} from '../persona/memory-maintain.ts';
 import { ownerPersonOf } from '../persona/relationship.ts';
 import { writePersonaVersion } from '../persona/versions.ts';
 import { runDoctor } from '../runtime/doctor.ts';
 import type { RenderInput, RenderedRequest } from '../model/render.js';
 import { CACHE_HIT_LOW, CACHE_SAMPLE_MIN, inputContentText, render } from '../model/render.ts';
+import {
+  CACHE_BREAK_CLASS_LABEL, CACHE_BREAK_LABEL, CONTEXT_LABEL, describeContext,
+} from '../model/context-audit.ts';
 import { SKILL_DESCRIPTION_MAX_CHARS, SKILL_FILE_NAME, SkillManager, skillNameProblem } from '../skill/skills.ts';
 import { applyOne, finalizePressure, wakeSourceOf } from '../state/fold.ts';
 import { compactTimestamp } from '../tools/fs/text-codec.ts';
@@ -83,15 +111,20 @@ import type { TimerStore } from '../wake/timer-store.js';
 import type { DepsManager } from '../deps/manager.js';
 import { DEP_NAMES, type DepName } from '../deps/probe.ts';
 import type { ManagedServiceStatus } from '../services/snowluma.js';
+import { AuthStore, UI_TOKEN_FILE } from './auth.ts';
+import { WebhookSecretStore, WEBHOOK_SECRET_FILE_NAME } from './webhook-secret.ts';
+import { sleepSync, writeFileAtomicSync } from './atomic.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
-/** 静态资源目录名（相对 cwd）；缺失时 `/` 返回一句人话，进程照常运行 */
-export const WEB_DIR_NAME = 'web';
-/** UI token 文件名（`<dataDir>/.ui-token`）：重置 = 删文件重启 */
-export const UI_TOKEN_FILE = '.ui-token';
-/** token 随机字节数：32 字节 = 64 位 hex，本地场景足够且便于粘贴 */
-export const UI_TOKEN_BYTES = 32;
+/**
+ * 遗留共享 token 的文件名（`<dataDir>/.ui-token`）——**只读、只兼容，不再生成**。
+ *
+ * 从这里再导出一遍是给老调用方留的路径（测试与脚本过去从 `web/server.ts` 取它）；
+ * 真正的读写都在 `web/auth.ts`（口径也写在那儿）。新实例不生成这个文件：
+ * 「首次启动要人设密码」这条路上，不该同时挂着第二条能进门的钥匙。
+ */
+export { UI_TOKEN_FILE };
 /** 请求体上限（design §4.15：webhook body ≤64KB；/api 写命令同样约束） */
 export const DEFAULT_BODY_LIMIT_BYTES = 64 * 1024;
 /** 事件分页默认批大小（frontend.md §4：200/批） */
@@ -161,6 +194,14 @@ export const MEMORY_READ_MAX_CHARS = 200_000;
 export const FRAMEWORK_NOTES_LIMIT = 20;
 /** `?limit=` 的硬上限：这条端点只服务摘要卡，放开到任意大等于把事件流从这里漏出去 */
 export const FRAMEWORK_NOTES_MAX_LIMIT = 100;
+/**
+ * 上下文归因在卡片里单独占的格数（2026-10-03）。
+ *
+ * 它是"每一步一条"的事实（约 500 条/天），和告警共用一个总额度的话，一天之内就能把
+ * 注入预警与真告警挤出这张卡——那正是这次要修的刷屏。所以给它一个**小**额度：
+ * 卡上留最近几步，够人对上"她刚才那一拍背着多重的上下文"，要翻全部归因去运行情况页/日志。
+ */
+export const CONTEXT_NOTES_LIMIT = 5;
 /** 单条提示里每个引用片段的字数上限：外部原文可能几千字，整段丢出去会把响应撑大，界面也摆不下 */
 export const FRAMEWORK_NOTE_QUOTE_MAX_CHARS = 200;
 /** 单条提示最多带几个引用片段：判定给的是"最可疑的几处"，再多就是噪音 */
@@ -188,6 +229,13 @@ export const PROTOCOL_STATE_TEXT: Record<string, string> = {
 export const DEFAULT_WEBHOOK_RATE = { capacity: 30, refillPerSec: 1 } as const;
 /** 令牌桶表上限（FIFO 淘汰）：防伪造源 IP 把内存撑爆 */
 const MAX_WEBHOOK_BUCKETS = 1024;
+/**
+ * "webhook 被拒"写进诊断输出的最小间隔（60 秒一条）。
+ *
+ * 这条通道的门是未认证的（本机任何程序都能敲），每次失败都写一行就等于给了本地进程一个
+ * 刷日志的把手。限流的是**日志**，不是请求——未认证的请求本来就一律 401，不受这个数影响。
+ */
+const WEBHOOK_REJECT_LOG_MS = 60_000;
 /** 记录进 `wake/webhook` 时被抹掉的敏感头（密钥不落日志） */
 const REDACTED_HEADERS = new Set(['authorization', 'cookie', 'set-cookie', 'proxy-authorization', 'x-api-key']);
 /** 人格常驻层文件名（persona.md §2） */
@@ -289,6 +337,10 @@ export const CONFIRM_PHRASES: Record<string, string | null> = {
   // 短语 = 命令名。来源是固定的官方地址（见 src/deps/manager.ts 的 packageFor），
   // 门挡的是误触（界面按钮点错、脚本里循环调用），不是对抗性攻击。
   'dep-install': 'dep-install',
+  // webhook 专用凭据的生成/轮换（B9）：**写一份密钥，且当场作废旧的那份**。按危险操作处理，
+  // 与 set-key 同级：门挡的是误触（按钮点错、脚本里循环调用）——轮换一次，所有
+  // 还没换凭据的外部投递方**立刻开始收 401**，那是个需要点头的动作，不是一次顺手点击。
+  'regenerate-webhook-token': 'regenerate-webhook-token',
 };
 
 /**
@@ -307,33 +359,13 @@ export const UNIMPLEMENTED_COMMANDS: Record<string, string> = {
   'dead-discard':
     '丢弃死信是状态变更，而 schema 里还没有对应事件类型（需新增 input/discarded）：'
     + '在事件类型落地前不做近似实现（写一条假事件比不实现更糟）',
-  'regenerate-webhook-token':
-    '重新生成 webhook token 需要同时改配置、内存里生效的 token 与 webhook 侧凭证（尚未提供）',
   export: '日志导出属于运维模块（M6）的动作，尚未接到本服务',
   backup: '备份快照属于运维模块（M6）的动作，尚未接到本服务',
   'archive-now': '归档属于运维模块（M6）的动作，尚未接到本服务',
   ping: '端点连通性探测需要模型接入层（DsClient）注入，本服务不持有密钥',
 };
 
-/** 静态资源 MIME 表（基础类型即可：前端产物是单 HTML + 单 JS + 单 CSS + 内联 SVG） */
-const MIME_TYPES: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.map': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-  '.txt': 'text/plain; charset=utf-8',
-  '.wasm': 'application/wasm',
-};
+/** 静态资源 MIME 表已随 `web/` 一起删除：这个服务不再吐任何文件，只吐 JSON。 */
 
 // ──────────────────────────────── 对外类型 ────────────────────────────────
 
@@ -390,10 +422,29 @@ export interface WebServerDeps {
   skillsRoot?: string | undefined;
   /** 告警出口（保留位：写命令失败时可告警；当前版本不强依赖） */
   notifier?: AlertNotifier | undefined;
-  /** token 注入点（测试用）；缺省读/生成 `<dataDir>/.ui-token` */
-  uiToken?: string | undefined;
-  /** 渲染函数覆盖点（测试用）；缺省 `model/render.ts` 的 `render` */  /** 静态资源根目录；缺省 `<cwd>/web` */
-  webRoot?: string | undefined;
+  /**
+   * 认证库覆盖点（测试用）；缺省自建一个 —— 读 `<dataDir>/.auth.json`，
+   * 并兼容 `<dataDir>/.ui-token`（老实例迁移期，完整口径见 `web/auth.ts` 的文件头）。
+   *
+   * 为什么值得留这个注入口：测试里"现设一次密码"要跑一遍 scrypt（~100ms），
+   * 几十条用例叠起来就是十几秒，而它们要验的根本不是密码学（那些由 `test/web-auth.test.ts`
+   * 单独立案）。注入一个已知会话，读端点那批用例就能照旧跑。
+   */
+  auth?: AuthStore | undefined;
+  /**
+   * 遗留共享 token 覆盖点（测试用）。只在这一层转交给自建的 AuthStore；
+   * 给了 `auth` 时它不起作用（认证判据只有一份，在 AuthStore 里）。
+   * 显式给 `null` = "这个实例没有旧 token"，不受磁盘上碰巧存在的文件影响。
+   */
+  uiToken?: string | null | undefined;
+  /**
+   * webhook 专用凭据库覆盖点（测试用）；缺省自建一个 —— 读
+   * `<dataDir>/.webhook-secret.json`（完整口径见 `web/webhook-secret.ts` 的文件头）。
+   *
+   * 与 `auth` 留同一个注入口的理由一样：测试要的是"这条通道认不认这份凭据"，
+   * 而不是再跑一遍随机数生成；注入一份已知凭据，用例就能直接发请求。
+   */
+  webhookSecret?: WebhookSecretStore | undefined;
   /** 绑定地址（design §4.15：默认只绑回环） */
   host?: string | undefined;
   /** 端口；0 = 由系统挑一个（测试友好） */
@@ -452,14 +503,22 @@ export interface WebServerDeps {
 
 export interface WebServer {
   readonly server: Server;
-  /** 生效的 UI/webhook 共享 token（已在磁盘上的值，或调用方注入的值） */
-  readonly token: string;
+  /**
+   * 认证库。宿主（main.ts 与界面）靠它问三件事：设过密码没有、旧 token 还在不在、
+   * 以及把自己的会话撤销掉。**它不对外吐密码或会话凭据的原文**（那些只在签发响应的
+   * 那一次出现），所以把它整份交出去是安全的。
+   */
+  readonly auth: AuthStore;
+  /**
+   * webhook 专用凭据库。宿主（main.ts 与界面）靠它问两件事：生成过没有（没有的话
+   * `/webhook/*` 一律 401，界面该显示"生成"而不是"重新生成"），以及当前那份的标识与时刻。
+   * **它不对外吐凭据原文**（那只在生成响应的那一次出现），所以把它整份交出去是安全的。
+   */
+  readonly webhookSecret: WebhookSecretStore;
   /** 实际监听端口（listen 前为 0） */
   port(): number;
   /** http://host:port */
   url(): string;
-  /** 是否已拿到新生成的 token（首启为 true，用于"只打印一次"的判定） */
-  readonly tokenCreated: boolean;
   listen(): Promise<void>;
   close(): Promise<void>;
 }
@@ -564,10 +623,30 @@ export interface EventsPage {
   hasMore: boolean;
 }
 
+/**
+ * 预算口径的那一句话（`BudgetView.metricNote`）：服务端一处给出，界面照抄。
+ *
+ * 口径 = **未扣缓存**的 token 数（cacheHit + cacheMiss 一起算）。这不是账单价，
+ * 也不能当账单价读——真实花销比它小得多。用户 2026-10-03 把上限按这个口径抬过一次，
+ * 原因就是"按真实花销定上限，会把缓存命中的那一大截当成没花过的钱"。
+ */
+export const BUDGET_METRIC_NOTE =
+  '口径：未扣缓存的 token 数（命中缓存的那部分也算在内），与账单上的实际用量不是同一个数；'
+  + '真实花销比它小。';
+
 export interface BudgetView {
   range: 'today' | '7d';
   generatedAt: string;
   limitSource: string;
+  /**
+   * 预算口径的那一句话，**由服务端一处给出**，界面照抄（2026-10-04 加）。
+   *
+   * 为什么必须摆在数字旁边：五档上限数的是**未扣缓存**的 token（cacheHit + cacheMiss），
+   * 与账单上的实际用量不是同一个数——第一次看到"今日用量 34599.9k"的人，反应都是
+   * "我没用这么多"。真实花销比它小得多（缓存命中的那部分便宜一个量级）。
+   * 让每个消费者各写一份措辞，迟早会写出三种说法（这一条与"标签词只有一处"同源）。
+   */
+  metricNote: string;
   today: {
     tokens: number; heavy: number; light: number; cacheHit: number; cacheMiss: number; hitRate: number | null;
   };
@@ -689,6 +768,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * 把 `patch` 里**真有**的键盖到 `base` 上（递归；`$` 开头的注释键跳过）。
+ *
+ * 为什么要有这个"覆盖"而不是直接用文件里那份：`config.json` 允许只写它关心的几项，
+ * 其余走代码默认（`config.ts` 的教义）。设置页要显示的是**盘上那份**，但它也得显示
+ * "你没写、按默认跑"的那些项——所以底用生效配置，覆盖上去的才是文件里真有的值。
+ */
+function overlayConfig(
+  base: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  for (const [key, value] of Object.entries(patch)) {
+    if (key.startsWith('$')) continue;
+    const current = base[key];
+    base[key] = isRecord(value) && isRecord(current) ? overlayConfig(current, value) : value;
+  }
+  return base;
+}
+
 function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -707,56 +805,16 @@ function parseTs(ts: string): number {
   return Date.parse(ts);
 }
 
-// ──────────────────────────────── token 流程 ────────────────────────────────
-
-export interface UiTokenState {
-  token: string;
-  created: boolean;
-  path: string;
-}
+// ──────────────────────────────── 认证取凭据 ────────────────────────────────
 
 /**
- * 取（必要时生成）UI/webhook 共享 token。
+ * 共享 token 的**生成**路径已经删除（2026-10：本地认证换成密码，见 `web/auth.ts`）。
+ * 这里只留"从请求头里把 Bearer 取出来"这一件事——取法只有一份，
+ * 免得 `/api/*` 与 `/webhook/*` 对"什么算一个 Bearer"各有一套理解。
  *
- * 只在这里生成、只在这里打印：`<dataDir>/.ui-token` 里是 64 位 hex，
- * 首次生成时往控制台打印一次原文（operations.md：token 首启打印一次、不入日志、重置删文件）。
- * 已存在的文件内容过短视为损坏（那必然是手改坏的），重建而不是拿着半截 token 跑。
+ * 为什么不用 cookie：本地网页能把 cookie 顺到你的端口上，而 Bearer 头必须由调用方显式写下
+ * （完整理由写在 `web/auth.ts` 的文件头）。
  */
-export function ensureUiToken(
-  dataDir: string,
-  out: (line: string) => void = (line) => console.log(line),
-): UiTokenState {
-  const path = join(dataDir, UI_TOKEN_FILE);
-
-  try {
-    const existing = readFileSync(path, 'utf8').trim();
-    if (existing.length >= 16) return { token: existing, created: false, path };
-  } catch {
-    // 读不到（缺失/权限）走生成路径：token 是本地门锁，宁可重建也不让服务起不来
-  }
-
-  const token = randomBytes(UI_TOKEN_BYTES).toString('hex');
-  mkdirSync(dirname(path), { recursive: true });
-  const fd = openSync(path, 'w');
-  try {
-    writeSync(fd, `${token}\n`);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  out(`[web] 已生成 UI/webhook 共享 token（只打印这一次）：${token}`);
-  out(`[web] token 存在 ${path}；重置方式：删除该文件后重启进程`);
-  return { token, created: true, path };
-}
-
-/** 常量时间比较：长度不同直接 false（timingSafeEqual 要求等长 buffer） */
-function tokenMatches(provided: string, expected: string): boolean {
-  const a = Buffer.from(provided, 'utf8');
-  const b = Buffer.from(expected, 'utf8');
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-}
-
 function bearerOf(req: IncomingMessage): string | null {
   const raw = req.headers['authorization'];
   if (typeof raw !== 'string') return null;
@@ -780,6 +838,30 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
 function sendError(res: ServerResponse, status: number, code: string, message: string): void {
   const body: ApiErrorBody = { error: { code, message } };
   sendJson(res, status, body);
+}
+
+/**
+ * 实例标识：`<host>:<port>#<数据目录哈希前 16 位>`。
+ *
+ * 为什么界面需要它（它是这轮修的一个真坑）：GUI 过去把凭据存在
+ * `%APPDATA%\Irmia\gui-token` —— 一个**全局路径**。第二个实例一启动就把第一个的凭据顶掉，
+ * 于是"突然进不去"。根治办法只有一个：凭据按**实例**分文件存，而界面得先知道
+ * "我现在连的是哪一个实例"。host:port 它自己有，**数据目录是服务端才知道的事实**，
+ * 所以得由这里告诉它。
+ *
+ * 为什么可以未经认证就给出去：它是数据目录的**哈希前 16 位**，不是路径本身。
+ * 想拿它反推路径，比直接读 `config.json` 难得多；而本地攻击者本来就看得见那个目录。
+ * 挂在 401 的响应体里（而不是另开一条"我是谁"的公开端点），是为了让
+ * 「未初始化时只放行设置密码这一条路」那条纪律一个字都不用让步。
+ *
+ * 归一化（去尾部分隔符、Windows 下转小写）是为了让同一条路径的不同写法算出同一个标识——
+ * 界面换个写法启动就认不出自己存的凭据，那正是这次要消灭的那类故障。
+ */
+export function instanceIdOf(host: string, port: number, dataDir: string): string {
+  let normalized = resolve(dataDir).replace(/[\\/]+$/u, '');
+  if (process.platform === 'win32') normalized = normalized.toLowerCase();
+  const digest = createHash('sha256').update(normalized, 'utf8').digest('hex').slice(0, 16);
+  return `${host}:${port}#${digest}`;
 }
 
 interface BodyReadResult {
@@ -873,61 +955,13 @@ const configFileLock = createFileLock();
 // ──────────────────────────────── 原子写 ────────────────────────────────
 
 /**
- * 原子写：临时文件 → fsync → rename 覆盖。
+ * 原子写（临时文件 → fsync → rename 覆盖）**搬去了 `web/atomic.ts`**（2026-10）。
  *
- * 关于 Windows 上 rename 的 EPERM：真正的根因由 `configFileLock` 处理（并发的异步读句柄）。
- * 这里保留一层**退避重试**兜的是另一类偶发——杀软/索引器恰好在扫那个临时文件或目标文件，
- * 那是几百毫秒就过去的窗口，与"读句柄还在飞"完全不同（后者重试无效，所以必须靠闸）。
- * 重试对"改配置"这种幂等重放完全安全的写入是划算的：把偶发失败原样抛给界面，
- * 人会以为"这个开关坏了"。
- *
- * 临时文件名带一个进程内自增序号：同一拍里的两次写入要有各自的临时文件。
+ * 搬家的理由是 `data/.auth.json`：它和 `config.json` 是同一类东西——一份被并发请求读改写的
+ * JSON，而它写坏的后果更重（凭据文件坏了 = 人得重新设一次密码）。两份实现会让"保证"漂移，
+ * 所以只有一份，两个调用方都用它。这里的纪律不变：**真正的根因是并发的异步读句柄**，
+ * 由上面那个 `configFileLock` 处理；`writeFileAtomicSync` 里那层退避兜的是杀软/索引器的偶发。
  */
-let atomicWriteSeq = 0;
-
-function writeFileAtomicSync(path: string, text: string): void {
-  atomicWriteSeq += 1;
-  const tmp = `${path}.tmp.${process.pid}.${atomicWriteSeq}`;
-  mkdirSync(dirname(path), { recursive: true });
-  const fd = openSync(tmp, 'w');
-  try {
-    writeSync(fd, text);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-
-  // 重试若干次（退避 10·2^n，合计最多约 1s）：本地盘上这已经是"异常持续存在"而不是
-  // "偶发"的分界。实测：并发写同一份 config.json 时，10ms / 320ms 级的退避都不够——
-  // Windows 的 `MoveFileEx(REPLACE_EXISTING)` 在目标文件正被另一个重命名打开时会回 EPERM，
-  // 而那个窗口比想象的长（杀软、索引器都会掺一脚）。
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      renameSync(tmp, path);
-      return;
-    } catch (err) {
-      const code = (err as { code?: string }).code ?? '';
-      const transient = code === 'EPERM' || code === 'EBUSY' || code === 'EACCES';
-      if (!transient || attempt >= 9) {
-        try {
-          unlinkSync(tmp);
-        } catch {
-          // 临时文件清不掉不影响失败结论（下次写入会盖掉自己的那份）
-        }
-        throw err;
-      }
-      // 同步睡一小会儿：这条路径本来就是"写配置"，几十毫秒的阻塞换一次成功是划算的。
-      // 用 Atomics.wait 而不是忙等：它真把这段时间还给操作系统（单线程下没有别的睡法）
-      sleepSync(Math.min(100, 10 * 2 ** attempt));
-    }
-  }
-}
-
-/** 同步睡眠（毫秒）：只在写配置的重试路径上用，绝不出现在请求主路径里 */
-function sleepSync(ms: number): void {
-  const shared = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(shared, 0, 0, ms);
-}
 
 // ──────────────────────────────── 事件读写辅助 ────────────────────────────────
 
@@ -1422,6 +1456,7 @@ export function buildBudgetView(input: {
     range: input.range,
     generatedAt: input.now.toISOString(),
     limitSource: report.limitSource,
+    metricNote: BUDGET_METRIC_NOTE,
     today: { ...report.today },
     limits,
     dailyTokens: limits.dailyTokens,
@@ -1956,18 +1991,18 @@ interface WebhookRate {
 
 class WebServerImpl implements WebServer {
   readonly server: Server;
-  readonly token: string;
-  readonly tokenCreated: boolean;
+  readonly auth: AuthStore;
 
   private readonly deps: WebServerDeps;
   private readonly write: (line: string) => void;
-  private readonly webRoot: string;
   private readonly host: string;
   private readonly portWanted: number;
   private readonly configPath: string;
   private readonly recent: RecentEventView;
   private readonly buckets: TokenBucketTable;
   private readonly sseClients = new Set<ServerResponse>();
+  /** webhook 专用凭据（B9）：`/webhook/*` 的唯一判据，与 `auth` 互不通用 */
+  readonly webhookSecret: WebhookSecretStore;
 
   /** 已广播到的 seq：SSE 只推"新"事件，历史由 /api/events 拉 */
   private pumpedSeq = 0;
@@ -1977,23 +2012,54 @@ class WebServerImpl implements WebServer {
   private closed = false;
   /** webhook 桶表的上一拍时刻，用于惰性回填（这里不用，回填在 take 里逐桶做） */
   private readonly webhookRate: WebhookRate;
+  /**
+   * 上一次把"webhook 被拒"写进诊断输出的时刻（毫秒）：**限流日志，不是限流请求**。
+   *
+   * 为什么需要它：这条通道的门是**未认证**的，本机任何程序都能反复敲。每一次都写一行
+   * `[webhook] 拒绝…` 等于给了本地进程一个"刷用户的日志文件"的把手（磁盘与信噪比都吃亏）。
+   * 60 秒一条足够让排障的人看见"有个老脚本还在用会话凭据"，又不至于把日志淹掉。
+   */
+  private lastWebhookRejectLogAt = 0;
 
   constructor(deps: WebServerDeps) {
     this.deps = deps;
     this.write = deps.out ?? ((line) => console.log(line));
-    this.webRoot = resolve(deps.webRoot ?? join(process.cwd(), WEB_DIR_NAME));
     this.host = deps.host ?? '127.0.0.1';
     this.portWanted = deps.port ?? 0;
-    this.configPath = deps.configPath ?? join(process.cwd(), CONFIG_FILE_NAME);    this.recent = new RecentEventView(deps.log, DASHBOARD_EVENT_WINDOW);
+    this.configPath = deps.configPath ?? join(process.cwd(), CONFIG_FILE_NAME);
+    this.recent = new RecentEventView(deps.log, DASHBOARD_EVENT_WINDOW);
     const rate = deps.webhookRate ?? DEFAULT_WEBHOOK_RATE;
     this.webhookRate = { capacity: rate.capacity, refillPerSec: rate.refillPerSec };
     this.buckets = new TokenBucketTable(this.webhookRate.capacity, this.webhookRate.refillPerSec);
 
-    const tokenState = deps.uiToken === undefined
-      ? ensureUiToken(deps.dataDir, this.write)
-      : { token: deps.uiToken, created: false, path: join(deps.dataDir, UI_TOKEN_FILE) };
-    this.token = tokenState.token;
-    this.tokenCreated = tokenState.created;
+    // 认证库：注入了就用注入的（测试），否则读盘自建。
+    // `uiToken` 只在自建那条路上起作用——判据只有一份，在 AuthStore 里。
+    this.auth = deps.auth ?? new AuthStore({
+      dataDir: deps.dataDir,
+      now: deps.now,
+      out: this.write,
+      ...(deps.uiToken !== undefined ? { legacyToken: deps.uiToken } : {}),
+    });
+    if (this.auth.initialized) {
+      this.write('[认证] 已设密码；界面用密码登录，凭据存在 data/.auth.json');
+    } else if (this.auth.legacyTokenActive) {
+      this.write('[认证] 还没设密码：界面第一次打开会让你设一个。旧的 data/.ui-token 现在仍然可用，设完密码即作废');
+    } else {
+      this.write('[认证] 还没设密码：界面第一次打开会让你设一个');
+    }
+
+    // webhook 专用凭据（B9）：注入了就用注入的（测试），否则读盘自建。
+    // **绝不自动生成**：没有外部投递方时它只是一份凭空多出来的秘密（见 webhook-secret.ts）。
+    this.webhookSecret = deps.webhookSecret ?? new WebhookSecretStore({
+      dataDir: deps.dataDir,
+      now: deps.now,
+      out: this.write,
+    });
+    if (this.webhookSecret.configured) {
+      this.write(`[webhook] /webhook/* 认专用凭据 ${this.webhookSecret.secretId}（${WEBHOOK_SECRET_FILE_NAME}）：界面会话凭据与 .ui-token 在这条通道上一律 401`);
+    } else {
+      this.write(`[webhook] 还没生成 webhook 专用凭据：/webhook/* 现在一律 401。要投递先按一次「生成」（POST /api/commands/regenerate-webhook-token），凭据会写在 ${WEBHOOK_SECRET_FILE_NAME}`);
+    }
 
     this.pumpedSeq = deps.log.latestSeq();
     this.server = createServer((req, res) => {
@@ -2128,24 +2194,62 @@ class WebServerImpl implements WebServer {
       await this.handleWebhook(req, res, url);
       return;
     }
-    await this.handleStatic(req, res, pathname);
+
+    // 这里过去是静态资源分支（`/` → `web/index.html`）。`web/` 已整个删除（2026-10）：
+    // 这个框架的正式产品只有 GUI，服务端不再吐任何文件。剩下的路径统一回一句**人话**——
+    // 一个莫名其妙的 404 会让人以为是"服务没起来"，而事实是"这里从来就没有网页"。
+    sendError(
+      res,
+      404,
+      'no-web-ui',
+      '本框架不提供网页界面；桌面界面请用 GUI。',
+    );
   }
 
   // ── /api ──
 
+  /**
+   * `/api/*` 的认证闸 + 认证端点分流。
+   *
+   * **待初始化态只放行一条路**：`POST /api/auth/setup`（首次设密码）。除此之外，
+   * 所有 `/api/*` 一律 401 并把话说明白（`auth-uninitialized`：还没设密码，请先在界面里设置）——
+   * 让人对着一个"缺少或无效的 Bearer token"猜半天，是这类门最没品的失败方式。
+   *
+   * 界面据此**不需要第二条探测通道**：它随便打一条读端点，401 的 `code` 就告诉了它是
+   * "该设密码"还是"该登录"（见 gui/lib/api.dart 的 ApiAuthError.code）。
+   */
   private async handleApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-    const isStream = url.pathname === '/api/events/stream';
-    // EventSource 无法设置自定义头，因此**只在这一条**上接受 ?token= 作为等价凭证；
-    // 其余接口一律只认 Authorization 头（少一个可泄漏点）。
-    const provided = isStream && url.searchParams.get('token') !== null
-      ? url.searchParams.get('token')!
-      : bearerOf(req);
-    if (provided === null || !tokenMatches(provided, this.token)) {
-      sendError(res, 401, 'unauthorized', '缺少或无效的 Bearer token：token 见启动时打印的那串，或 data/.ui-token');
+    const path = url.pathname;
+
+    // 认证端点先行：它们在"未认证"这件事上各有各的规矩
+    if (path === '/api/auth/setup' || path === '/api/auth/login'
+      || path === '/api/auth/logout' || path === '/api/auth/password') {
+      await this.handleAuth(req, res, path);
       return;
     }
 
-    const path = url.pathname;
+    // 过去 SSE 在 `?token=` 上开了个后门（EventSource 设不了自定义头）。**现在没有了**：
+    // 网页界面整个删掉之后，这条后门的唯一理由（浏览器 EventSource）也不存在了；
+    // GUI 用的是 HttpClient，本来就能带 Authorization 头。凭证出现在 URL 里会被各处日志
+    // 顺手记下来，能关掉就关掉。
+    //
+    // 判据只有 `AuthStore.authenticate` 一处（`/webhook/*` 走的是**另一份**凭据，
+    // 见 `webhook-secret.ts`）：没有凭据就喂一个空串，
+    // 它会如实回答"还没设密码"还是"凭据无效"——这两句话对应界面上的两种门。
+    //
+    // **webhook 专用凭据进不来这里**（B9）：两份凭据的权限是单向的，它能投事件但读不到
+    // 任何东西。反方向的拒绝在 handleWebhook 里，两边都不是"顺带"，是各自的门规。
+    const verdict = this.auth.authenticate(bearerOf(req) ?? '');
+    if (!verdict.ok) {
+      if (verdict.reason === 'uninitialized') {
+        this.sendAuthError(res, 401, 'auth-uninitialized', '这台实例还没设密码。请先在界面里设置一个密码。');
+        return;
+      }
+      // 凭据旧了/被撤销了（改了密码、登出过、另一台实例顶掉了）。让界面能分辨这一种，
+      // 它才会去重读凭据文件并重试一次（见 gui 的 401 自愈）。
+      this.sendAuthError(res, 401, 'unauthorized', '缺少或无效的会话凭据（可能改过密码或已登出）。请重新登录。');
+      return;
+    }
 
     // 写命令先分流：路径对了但方法不对应该是 405（而不是"未知接口"）——
     // "这个地址存在，但不是 GET"与"没这个地址"是两件事
@@ -2205,16 +2309,51 @@ class WebServerImpl implements WebServer {
         case '/api/budget':
           sendJson(res, 200, await this.budgetView(url));
           return;
-        // 管控页的配置读取：返回**生效配置本体**（前端按点路径取值）；
-        // 指纹放在响应头里，保证响应体形状与 config.json 的语义一一对应
-        case '/api/config':
+        // 管控页的配置读取：默认返回**生效配置本体**（前端按点路径取值）；
+        // 指纹放在响应头里，保证响应体形状与 config.json 的语义一一对应。
+        //
+        // `?source=saved` 返回**盘上那份**（2026-10-04 加）：设置页要编辑的是"我保存下来的值"，
+        // 不是"现在跑着的值"——两者在"改完要重启才生效"时本来就不同，而过去只有一个来源，
+        // 于是人一按保存，界面立刻回读生效配置，把刚写下去的值冲掉（用户报的
+        // 「编辑后点保存，前端又会弹回默认的 url」）。盘上那份额外带一个 `$pending` 字段：
+        // 哪些字段与生效值不同（= 还没生效），界面据此把话说准。
+        //
+        // 为什么不把默认那条也改成盘上那份：`/api/config` 另有使用者（引导、频道页、
+        // 「她怎么被称呼」），它们问的都是"现在按什么跑"——生效配置才是对的答案。
+        case '/api/config': {
           res.setHeader('x-config-hash', configHash(this.deps.config));
-          sendJson(res, 200, this.deps.config);
+          if (url.searchParams.get('source') !== 'saved') {
+            sendJson(res, 200, this.deps.config);
+            return;
+          }
+          const saved = this.readSavedConfig();
+          res.setHeader('x-config-source', saved.source);
+          const pending = saved.source === 'saved'
+            ? diffConfigFields(this.deps.config, saved.config)
+            : [];
+          sendJson(res, 200, {
+            ...saved.config,
+            $pending: { source: saved.source, restartRequired: pending },
+          });
           return;
+        }
         // 设置页 · 模型分区：每个受管密钥「配没配」+ 掩码。形状固定为 { configured, mask }——
         // 值永不出这个进程（掩码由 config/keys.ts 的 maskKey 给，短值整体打码）。
         case '/api/keys':
           sendJson(res, 200, this.keysView());
+          return;
+        // 设置页 · 外部回调：webhook 专用凭据的**状态**（配没配、哪一份、什么时候生成的）。
+        //
+        // 它刻意不是 `/api/commands/*` 的一员：那套通道的语义是"写一条事件日志"，
+        // 而这是一条只读端点（与 `/api/keys` 同形）。**响应里绝不含凭据原文，也不含哈希**——
+        // 原文只在生成响应的那一次出现。界面靠 `configured` 决定按钮写「生成」还是「重新生成」。
+        case '/api/webhook-secret':
+          sendJson(res, 200, {
+            ...this.webhookSecret.view(),
+            channel: '/webhook/*',
+            header: 'Authorization: Bearer <token>',
+            command: 'regenerate-webhook-token',
+          });
           return;
         // 设置页 · 外部依赖卡片（v30）：三件外部依赖的探测结果、建议动作、自装目录路径。
         // 它读的是与 rg_search/es_search/pwsh 同一份缓存结论——界面上看到的"已就绪"
@@ -2621,6 +2760,33 @@ class WebServerImpl implements WebServer {
   }
 
   /**
+   * 读**盘上**那份配置，用作设置页的取值来源（`GET /api/config?source=saved`）。
+   *
+   * 三件事在这里定死：
+   *   • **同步读**：异步 readFile 会留下一个在飞的读句柄，而 config.json 的写回是
+   *     `rename` 覆盖——那个句柄正好卡住它（与 `readSavedOnebot` 同一个理由、同一个手法）。
+   *     只读的一行不需要进 `configFileLock`。
+   *   • **以生效配置为底、用盘上真有的值覆盖**：配置文件可以只写它关心的几项（其余走代码默认），
+   *     所以"把文件原样丢给界面"会让没写的项显示成空——那不是"盘上那份"的本意。
+   *   • **`$` 开头的键不进结果**：那些是配置里的注释键；带进来就会被算成"与生效值不同"，
+   *     于是设置页每一行都挂上"尚未生效"。
+   *
+   * 读不出来（文件不在、不是 JSON、顶层不是对象）时**回落生效配置**并如实标 `memory`——
+   * 界面据此可以把"这是盘上那份"与"这是内存那份"分开说，而不是假装读到了。
+   */
+  private readSavedConfig(): { source: 'saved' | 'memory'; config: AppConfig } {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(this.configPath, 'utf8'));
+    } catch {
+      return { source: 'memory', config: this.deps.config };
+    }
+    if (!isRecord(parsed)) return { source: 'memory', config: this.deps.config };
+    const base = structuredClone(this.deps.config) as unknown as Record<string, unknown>;
+    return { source: 'saved', config: overlayConfig(base, parsed) as unknown as AppConfig };
+  }
+
+  /**
    * 读**盘上**那份 `channels.onebot`（人刚保存的就是它）。
    *
    * 为什么不直接用内存里的 `this.deps.config`：那是**进程启动时**读的，界面刚保存完再刷新
@@ -2908,16 +3074,218 @@ class WebServerImpl implements WebServer {
     res.on('error', drop);
   }
 
+  // ── /api/auth/*（认证端点） ──
+
+  /**
+   * 认证失败的统一出口：`{error:{code,message}, instance}`。
+   *
+   * 带上 `instance` 是**功能需要**，不是顺手多给：界面要先知道"我在连哪个实例"
+   * 才能去对的地方读自己那份会话凭据（见 [instanceIdOf]）。它不含任何凭据。
+   */
+  private sendAuthError(res: ServerResponse, status: number, code: string, message: string): void {
+    sendJson(res, status, {
+      error: { code, message },
+      instance: instanceIdOf(this.host, this.port(), this.deps.dataDir),
+    });
+  }
+
+  /** 认证成功（签发/换发会话）的响应：凭据**只在这里出现这一次**，之后盘上只有它的哈希 */
+  private sendSession(
+    res: ServerResponse,
+    issued: { token: string; sessionId: string; createdAt: string },
+  ): void {
+    sendJson(res, 200, {
+      ok: true,
+      token: issued.token,
+      sessionId: issued.sessionId,
+      createdAt: issued.createdAt,
+      instance: instanceIdOf(this.host, this.port(), this.deps.dataDir),
+    });
+  }
+
+  /**
+   * 认证四条：设密码 / 登录 / 登出 / 改密码。
+   *
+   * 它们**不走**上面那道 Bearer 闸（否则"没有凭据"就成了"永远拿不到凭据"），
+   * 各自的规矩写在方法体里：
+   *   • `setup`    —— 只在**还没设密码**时可用；成功即登录（当场签发会话），不必再输一遍；
+   *   • `login`    —— 验密码，带退避（见 `auth.ts` 的 BACKOFF_*）；
+   *   • `logout`   —— 要凭据（撤的就是它自己）；没有凭据也无所谓，结果一样是"没登着"；
+   *   • `password` —— 要凭据 + 旧密码；成功会让**全部**旧会话失效，并当场签发一条新的。
+   *
+   * 响应体里只出现会话凭据**这一次**（`token` 字段），盘上只有它的哈希。
+   * 日志里一个都不出现。
+   */
+  private async handleAuth(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
+    if (req.method !== 'POST') {
+      throw new HttpError(405, 'method-not-allowed', `认证端点只接受 POST：${path}`);
+    }
+    const body = await readBody(req, DEFAULT_BODY_LIMIT_BYTES);
+    if (!body.ok) {
+      sendError(res, body.code === 'payload-too-large' ? 413 : 400, body.code, body.message);
+      return;
+    }
+    const payload = parseJsonObject(body.text);
+    const password = typeof payload['password'] === 'string' ? payload['password'] : '';
+    const label = typeof payload['label'] === 'string' ? payload['label'] : 'local';
+
+    if (path === '/api/auth/setup') {
+      // 旧 token 在**动作前**才读得到（AuthStore 一作废就置空了）——先取好，落库时用它
+      const legacyBefore = this.auth.legacyTokenActive;
+      const result = await this.auth.setup(password, label);
+      if (!result.ok) {
+        this.sendAuthError(res, result.status, result.code, result.message);
+        return;
+      }
+      this.recordPasswordSet('setup', label, 0, legacyBefore);
+      this.sendSession(res, result);
+      return;
+    }
+
+    if (path === '/api/auth/login') {
+      // 退避已经在 AuthStore 里等过了（那才是"验之前先等"的唯一落点），这里只落事实
+      const result = await this.auth.login(password, label);
+      if (!result.ok) {
+        this.write(`[认证] 登录失败（${result.code}）`);
+        if (result.status === 401) res.setHeader('retry-after', String(Math.ceil(this.auth.backoffMs() / 1000)));
+        this.sendAuthError(res, result.status, result.code, result.message);
+        return;
+      }
+      this.sendSession(res, result);
+      return;
+    }
+
+    // 剩下两条要凭据：先把当前这条会话认出来（认不出就没有"当前会话"可撤/可换）
+    const provided = bearerOf(req) ?? '';
+    const verdict = this.auth.authenticate(provided);
+    if (!verdict.ok) {
+      if (verdict.reason === 'uninitialized') {
+        this.sendAuthError(res, 401, 'auth-uninitialized', '这台实例还没设密码。请先在界面里设置一个密码。');
+        return;
+      }
+      this.sendAuthError(res, 401, 'unauthorized', '会话凭据无效或已失效。请重新登录。');
+      return;
+    }
+    // 遗留 token 能进 `/api/*`，但它不是一条"会话"，没有可撤销的 id——如实说清而不是假装成功
+    if (verdict.via === 'legacy-token') {
+      this.sendAuthError(
+        res, 409, 'legacy-token',
+        '当前用的是旧的共享 token，它没有会话可撤销。请先设置一个密码，之后按会话登录/登出。',
+      );
+      return;
+    }
+
+    if (path === '/api/auth/logout') {
+      this.auth.logout(provided);
+      sendJson(res, 200, { ok: true, instance: instanceIdOf(this.host, this.port(), this.deps.dataDir) });
+      return;
+    }
+
+    // 改密码：旧密码 + 新密码。`password` 是新的，旧的在 `oldPassword` 里
+    const oldPassword = typeof payload['oldPassword'] === 'string' ? payload['oldPassword'] : '';
+    const legacyBefore = this.auth.legacyTokenActive;
+    const before = this.auth.sessionCount;
+    const result = await this.auth.changePassword(oldPassword, password, label);
+    if (!result.ok) {
+      if (result.status === 401 && result.code === 'bad-password') this.write('[认证] 改密码失败：当前密码不对');
+      this.sendAuthError(res, result.status, result.code, result.message);
+      return;
+    }
+    this.recordPasswordSet('change', label, before, legacyBefore);
+    this.sendSession(res, result);
+  }
+
+  /**
+   * 落一条「密码被设上/被改掉」的**事实**。
+   *
+   * 为什么它必须进事件日志：换锁是一次能力边界的变更——它当场废掉所有已发出的会话凭据，
+   * 也（老实例上）废掉了那份 `data/.ui-token`。事后唯一能回答"谁在什么时候换的锁"的地方
+   * 就是日志；写在别处就是第二份真相源（与 `skills-ignored.json` 的取舍正好相反，
+   * 那条是界面备忘，这条是事实）。
+   *
+   * `legacyDisabled` 必须由调用方在**动作之前**取好传进来：AuthStore 里旧 token 一作废就置空了，
+   * 落库时再读就永远是 false（这条事实恰好只发生一次，读错了等于没记）。
+   */
+  private recordPasswordSet(
+    action: 'setup' | 'change',
+    by: string,
+    sessionsRevoked: number,
+    legacyDisabled: boolean,
+  ): void {
+    this.appendSync('auth/password-set', {
+      by: by.trim() === '' ? 'local' : by.trim().slice(0, 40),
+      action,
+      legacyTokenDisabled: legacyDisabled,
+      sessionsRevoked,
+    }, 'internal');
+  }
+
+  /**
+   * 落一条「webhook 专用凭据被生成/被轮换」的**事实**。
+   *
+   * 与 `recordPasswordSet` 同一条理由：换钥匙是一次能力边界的变更——它当场废掉上一份凭据，
+   * 也就当场打断了所有还没换过来的外部投递方。事后唯一能回答"谁在什么时候换的、换到第几份"
+   * 的地方就是日志（界面上的状态会随下一次生成而变，留不下历史）。
+   *
+   * **不带任何凭据**：没有明文，也没有哈希，只有一个非密钥的 8 字节 id。
+   * 可见性 internal——这是本机的运维事实，与她的行事无关，不该占她的上下文。
+   */
+  private recordWebhookTokenRotated(
+    result: { action: 'generate' | 'rotate'; secretId: string; previousSecretId: string | null },
+    by: string,
+  ): void {
+    this.appendSync('auth/webhook-token-rotated', {
+      by: by.trim() === '' ? 'local' : by.trim().slice(0, 40),
+      action: result.action,
+      secretId: result.secretId,
+      previousSecretId: result.previousSecretId,
+    }, 'internal');
+  }
+
   // ── /webhook ──
 
+  /**
+   * 外部回调入口。**只认 webhook 专用凭据**（`data/.webhook-secret.json`）：
+   * 界面会话凭据与迁移期那份 `.ui-token` 在这条通道上一律 401（B9，2026-10）。
+   *
+   * ## 为什么这条通道要收窄（而不是"加一份凭据、旧的照旧能进"）
+   *
+   * 加一份凭据但保留旧路，等于这一项什么都没做：外部系统照旧会拿界面会话凭据，
+   * 照旧会在用户改密码的那天半夜断掉，照旧能读整个 `/api/*`。**收窄才是要点**——
+   * 它换来的是一条真正的最小权限通道：能投一条 `wake/webhook`，读不到任何东西，
+   * 也不随界面那扇门开关。
+   *
+   * ## 代价（真的会发生，所以三处都说了）
+   *
+   * 今天之前配好的外部脚本**当场开始收 401**。这不是意外，是有意的取舍；能做的就是
+   * 让原因查得到：401 的响应体里写明"从今天起只认专用凭据、去哪儿生成"，
+   * 服务端诊断输出里落一行（限流 60 秒一条，见 `lastWebhookRejectLogAt`），
+   * `docs/operations.md` §4.2 写清怎么拿新凭据。
+   *
+   * ## 失败答复为什么分四种
+   *
+   * 把"还没生成过凭据"和"你这份不对"混成一句话，人就得在两件毫不相干的事之间猜：
+   * 前者要去界面按一次生成，后者要去改外部脚本。所以四种分开：
+   *   · `unconfigured` → `webhook-token-unset`（生成过才有得谈）；
+   *   · `missing`      → `unauthorized`（配了凭据但没带）；
+   *   · `previous`     → `unauthorized`（带的正是**刚被轮换掉**的那份：最有用的一条线索）；
+   *   · `invalid`      → `unauthorized`（别的什么东西；如果它其实是一条**有效会话凭据**，
+   *     响应体与日志都会把这句说出来——那正是"老脚本还没换"的典型现场）。
+   *
+   * 顺序上认证排在最前面（先于令牌桶与 body 读取）：未认证的请求不该消耗任何共享资源，
+   * 也不该让"桶满了"这条信息泄露给一个连凭据都没有的调用方。
+   */
   private async handleWebhook(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     if (req.method !== 'POST') {
       throw new HttpError(405, 'method-not-allowed', 'webhook 只接受 POST');
     }
 
-    const provided = bearerOf(req);
-    if (provided === null || !tokenMatches(provided, this.token)) {
-      sendError(res, 401, 'unauthorized', 'webhook 需要 Authorization: Bearer <token>（与 UI 共享同一 token）');
+    const provided = bearerOf(req) ?? '';
+    const verdict = this.webhookSecret.authenticate(provided);
+    if (!verdict.ok) {
+      this.noteWebhookRejected(req, verdict.reason, provided);
+      const failure = this.webhookAuthError(verdict.reason, provided);
+      this.sendAuthError(res, 401, failure.code, failure.message);
       return;
     }
 
@@ -2962,6 +3330,63 @@ class WebServerImpl implements WebServer {
     }, 'model');
 
     sendJson(res, 200, { ok: true, seq: event.seq, type: event.type });
+  }
+
+  /**
+   * `/webhook/*` 认证失败的答复文案（四个原因共用一个出口，因为**要说的核心事实是同一句**：
+   * "从今天起这条通道只认专用凭据"。分成四份各写一遍，迟早漂移成四种说法）。
+   *
+   * 只差一句"具体差在哪儿"：没生成过 / 没带 / 带的是上一份 / 带的是别的什么。
+   * 而只要调用方**带了东西**、且那东西恰好是一条有效的界面会话凭据，就顺手把这件事点破——
+   * 收窄之后最典型的现场就是老脚本还拿着会话凭据（见 `noteWebhookRejected` 关于这不算泄露的说明）。
+   */
+  private webhookAuthError(reason: string, provided: string): { code: string; message: string } {
+    const common = `从今天起 /webhook/* 只认 webhook 专用凭据（data/${WEBHOOK_SECRET_FILE_NAME}）：`
+      + '界面会话凭据与迁移期那份 data/.ui-token 都不再放行这条通道。'
+      + '请用 POST /api/commands/regenerate-webhook-token 生成一份（响应里的 token 只显示一次）。';
+    const isSession = provided !== '' && this.auth.authenticate(provided).ok;
+    const sessionHint = isSession
+      ? '你带的是一条**有效的界面会话凭据**——它是给 /api/* 用的，这条通道不认它。'
+      : '';
+    if (reason === 'unconfigured') {
+      return {
+        code: 'webhook-token-unset',
+        message: '这台实例还没有生成 webhook 专用凭据，所以 /webhook/* 现在一律 401。'
+          + sessionHint + common,
+      };
+    }
+    if (reason === 'previous') {
+      return {
+        code: 'unauthorized',
+        message: `${common}你带的是**上一份**（已被轮换掉的）凭据，它在轮换的那一刻就失效了：`
+          + '请把调用方换成新生成的那一份。',
+      };
+    }
+    return { code: 'unauthorized', message: `${sessionHint}${common}` };
+  }
+
+  /**
+   * 把一次"webhook 被拒"写成一行诊断输出（**限流 60 秒一条**，见 `lastWebhookRejectLogAt`）。
+   *
+   * 为什么要顺手认出"这是一条**有效的界面会话凭据**"：收窄之后最典型的现场，就是
+   * **一个还没改过来的外部脚本拿着会话凭据在敲**。只说一句"unauthorized"，排障的人得自己
+   * 去猜敲门的是谁；说出这一句，答案就在眼前。这不算泄露——调用方本来就得先持有那份会话凭据，
+   * 而它拿同一份凭据去打 `/api/projection` 同样能知道它有效。
+   */
+  private noteWebhookRejected(req: IncomingMessage, reason: string, provided: string): void {
+    const nowMs = this.deps.now().getTime();
+    if (nowMs - this.lastWebhookRejectLogAt < WEBHOOK_REJECT_LOG_MS) return;
+    this.lastWebhookRejectLogAt = nowMs;
+    const source = req.socket.remoteAddress ?? 'unknown';
+    if (provided !== '' && this.auth.authenticate(provided).ok) {
+      this.write(`[webhook] 拒绝 ${source} 的投递：它带的是**有效的界面会话凭据**，而这条通道从今天起只认专用凭据（去界面上生成一份）`);
+      return;
+    }
+    const why = reason === 'unconfigured' ? '还没生成过专用凭据'
+      : reason === 'missing' ? '没带凭据'
+        : reason === 'previous' ? '带的是上一份（已轮换掉的）凭据'
+          : '凭据不对';
+    this.write(`[webhook] 拒绝 ${source} 的投递（${why}）：/webhook/* 只认专用凭据`);
   }
 
   // ── 写命令 ──
@@ -3210,14 +3635,23 @@ class WebServerImpl implements WebServer {
       }
       case 'config-update': {
         const result = await this.applyConfigUpdate(payload, phrases);
+        // 生效那一份**一个字都没变**：热更白名单现在是空的——所有字段都要重启才生效
+        // （为什么清空，见 `config/watcher.ts` 的文件头）。所以事件里记的是**生效配置**的指纹，
+        // 另加 `requiresRestart: true` 把这层意思说出口。过去这里记的是盘上那份的新指纹，
+        // 于是日志里写着"配置变了"，而进程还在按旧的跑——replay 拿它比对时也跟着对不上。
+        const effectiveHash = configHash(this.deps.config);
         const event = this.appendSync(
           'config/changed',
-          { fields: result.fields, configHash: result.configHash },
+          { fields: result.fields, configHash: effectiveHash, requiresRestart: true },
           'internal',
         );
         sendJson(res, 200, {
           ok: true, seq: event.seq, type: event.type,
-          fields: result.fields, configHash: result.configHash, path: this.configPath,
+          fields: result.fields,
+          configHash: effectiveHash,
+          savedConfigHash: result.configHash,
+          requiresRestart: true,
+          path: this.configPath,
         });
         return;
       }
@@ -3283,14 +3717,14 @@ class WebServerImpl implements WebServer {
           '-Repo', `"${repo}"`,
           ...(guiExe === '' ? [] : ['-GuiExe', `"${guiExe}"`]),
         ];
-        // WMI 起进程：它不在 web 服务的 job 对象里，服务被杀也不受影响。
-        // 调 WMI 的那一步永远用**系统自带的** powershell.exe：它在 System32 里、不依赖 PATH，
-        // 而 WMI 建进程的环境里没有 PATH（实测返回码 9「找不到路径」就是这么来的）。
-        // 被拉起的那个 shell 则优先 pwsh 7：脚本是 UTF-8 无 BOM 的中文，
-        // 系统 PowerShell 5.1 读它会解析失败（脚本已补 BOM，作为兜底）。
-        // 路径不写死——pwsh 装在哪是每台机器的私事，按「配置 → 依赖管理器的探测结论 →
-        // `where pwsh` → powershell.exe」的顺序解析，见 resolveRestartShell。
-        const shellExe = await this.resolveRestartShell();
+        // 谁来跑这个脚本：`resolveRestartShell` 按"显式指定 → PATH → 标准安装目录 → 系统自带"
+        // 四级探测（见 `runtime/restart-shell.ts` 的文件头）。
+        //
+        // 这里过去写死的是一条本机私事：`existsSync('C:\\path\\to\\pwsh.exe') ? … : 'powershell.exe'`。
+        // 它在开发机上永远命中、在任何别人机器上永远不命中——而"WMI 建进程的环境里没有 PATH"
+        // 这件事要求我们**给出一个真的存在的绝对路径**，不能靠猜；探测失败时用
+        // `powershell.exe`（在 System32 里，WMI 环境也找得到；脚本按 5.1 兼容写，兜底是安全的）。
+        const shellExe = resolveRestartShell({ env: process.env, fileExists: existsSync });
         const command = `"${shellExe}" ${args.join(' ')}`;
         const created = spawnSync('powershell.exe', [
           '-NoProfile', '-Command',
@@ -3482,6 +3916,46 @@ class WebServerImpl implements WebServer {
         }, 'tools.disabled');
         sendJson(res, 200, {
           ok: true, name: toolName, enabled, disabled: applied, path: this.configPath,
+        });
+        return;
+      }
+      case 'regenerate-webhook-token': {
+        // webhook 专用凭据的生成 / 轮换（B9）：写 `data/.webhook-secret.json`。
+        //
+        // 三条纪律：
+        //   ① **明文只在响应里出现这一次**（`token` 字段）。盘上只有 sha256；日志、事件、
+        //      诊断输出里一个字节都不落——与 `/api/auth/*` 签发会话同一条纪律。
+        //   ② **当场作废旧的那份**：这个通道永远只有一把钥匙（没有"多把并存"的形态），
+        //      rotate() 覆盖的就是它。所以响应与日志都要把"旧值即刻失效"说出口——
+        //      一定有外部脚本还没换，而那正是这一次收窄的已知代价（见 handleWebhook 的说明）。
+        //   ③ 写一条 `auth/webhook-token-rotated` **事实**事件（internal）：与
+        //      `auth/password-set` 同理——"谁在什么时候换掉了这条通道的钥匙"，
+        //      事后唯一能回答的地方就是日志。它不带凭据，只带那个非密钥的 id。
+        const by = typeof payload['by'] === 'string' ? payload['by'] : 'local';
+        const result = this.webhookSecret.rotate(by);
+        if (!result.ok) {
+          this.write(`[webhook] 生成专用凭据失败（${result.code}）：${result.message}`);
+          throw new HttpError(result.status, result.code, result.message);
+        }
+        this.recordWebhookTokenRotated(result, by);
+        this.write(
+          `[webhook] 专用凭据已${result.action === 'generate' ? '生成' : '轮换'}（${result.secretId}）：`
+          + '/webhook/* 从这一刻起只认它，旧凭据当场失效（还在用旧凭据的调用方会收到 401）',
+        );
+        sendJson(res, 200, {
+          ok: true,
+          token: result.token,
+          note: '这串 token 只显示这一次（盘上只留它的 sha256，日志与事件里都没有原文）：'
+            + '把它配到调用方的 Authorization: Bearer 头上。'
+            + '从今天起 /webhook/* 只认这条专用凭据——界面会话凭据与 data/.ui-token 都不再放行；'
+            + (result.action === 'rotate'
+              ? '上一份凭据此刻已经失效，还在用它的外部脚本会开始收 401，记得一并换掉。'
+              : ''),
+          secretId: result.secretId,
+          createdAt: result.createdAt,
+          action: result.action,
+          previousSecretId: result.previousSecretId,
+          instance: instanceIdOf(this.host, this.port(), this.deps.dataDir),
         });
         return;
       }
@@ -4089,56 +4563,6 @@ class WebServerImpl implements WebServer {
   }
 
   /**
-   * 解析「用哪个 shell 去跑 `tools/restart-agent.ps1`」。
-   *
-   * 为什么不写死一个绝对路径：pwsh 7 装在哪儿是**每台机器的私事**——winget / MSI / 商店包
-   * 各落在不同目录，写死等于"换台机器就重启不了"（返回码 9「找不到路径」正是这么来的）。
-   *
-   * 探测顺序（与 `src/deps/probe.ts` 的三段顺序同源，但这里要的是**当场可用的一个文件名**）：
-   *   ① `deps.paths.pwsh`——用户显式指定的路径，最优先；配了却不可用就如实说，不静默吞掉
-   *      （"我配了却不生效"是最难查的一类故障）；
-   *   ② 依赖管理器的探测结论（`DepsManager.get('pwsh')`：自装目录 → 常见安装位置 → PATH）；
-   *   ③ `where pwsh`——②没注入管理器（`WebServerDeps.deps` 缺省）时的兜底；
-   *   ④ `powershell.exe`——系统自带、一定在，脚本本身是 5.1 兼容的（已补 BOM）。
-   *
-   * 返回值直接拼进命令行，所以 ③④ 允许是裸名字（由 PATH 解析）：真正需要绝对路径的是
-   * **建进程**那一步，而调 WMI 用的永远是 System32 里的 powershell.exe（见调用处注释）。
-   */
-  private async resolveRestartShell(): Promise<string> {
-    const configured = this.deps.config.deps.paths.pwsh;
-    if (typeof configured === 'string' && configured.trim() !== '') {
-      const wanted = configured.trim();
-      if (existsSync(wanted)) return wanted;
-      this.write(`[重启] 配置里的 deps.paths.pwsh 不可用（${wanted}），改走自动探测`);
-    }
-
-    const manager = this.deps.deps;
-    if (manager !== undefined) {
-      try {
-        const probed = await manager.get('pwsh');
-        if (probed.status === 'ready' && probed.path !== '') return probed.path;
-      } catch {
-        // 探测失败不致命：下面还有 where 与 powershell.exe 两级兜底
-      }
-    }
-
-    try {
-      const found = spawnSync('where.exe', ['pwsh'], { encoding: 'utf8' });
-      if (found.status === 0) {
-        const first = String(found.stdout ?? '')
-          .split(/\r?\n/u)
-          .map((line) => line.trim())
-          .find((line) => line !== '');
-        if (first !== undefined && existsSync(first)) return first;
-      }
-    } catch {
-      // where.exe 不在（非 Windows）：落到 powershell.exe，由它自己报错
-    }
-
-    return 'powershell.exe';
-  }
-
-  /**
    * 配置热更（frontend.md §3.4：保存 = 一次性提交该组改动 → `config/changed`）。
    *
    * 三条纪律：
@@ -4737,11 +5161,34 @@ class WebServerImpl implements WebServer {
     const limit = frameworkNoteLimit(url.searchParams.get('limit'));
 
     // 从尾部往前扫：要的是"最近若干条"。日志按 seq 追加，seq 序即时间序——
-    // 两种类型混着走一遍就是全局时间倒序，不需要再排一次（`?limit=` 小的时候还提前停）
+    // 几种类型混着走一遍就是全局时间倒序，不需要再排一次（`?limit=` 小的时候还提前停）
+    //
+    // **每种类型各自计数**（2026-10-03）：上下文归因是"每步一条"（约 500 条/天），
+    // 它与告警共用一个总额度的话，一天之内就能把注入预警与真告警全部挤出这张卡——
+    // 那正是用户这次抱怨的那种刷屏。所以归因只占它自己那一小格（见 CONTEXT_NOTES_LIMIT），
+    // 告警与注入预警照旧各拿到完整的 limit。
     const notes: Array<Record<string, unknown>> = [];
-    for (let index = events.length - 1; index >= 0 && notes.length < limit; index -= 1) {
+    const used: Record<string, number> = { injection: 0, alarm: 0, context: 0 };
+    const quota: Record<string, number> = {
+      injection: limit,
+      alarm: limit,
+      context: Math.min(limit, CONTEXT_NOTES_LIMIT),
+    };
+    const full = (): boolean => Object.keys(quota).every(kind => used[kind]! >= quota[kind]!);
+    /**
+     * 已经出过归因的那几轮（**一轮只留一条**，2026-10-04）。
+     *
+     * 归因是"每一步一条"的事实（约 500 条/天），全摆出来两分钟就把这张卡刷满——用户报的
+     * 「还在刷屏」就是它。倒着扫（新→旧）时，某一轮**第一次**遇到的那条正是这一轮的
+     * 最后一步，也就是"这一轮最后长成什么样"——人要看的是这个，不是中间每一步的快照。
+     */
+    const seenTurns = new Set<number>();
+
+    for (let index = events.length - 1; index >= 0 && !full(); index -= 1) {
       const event = events[index]!;
       if (event.type === 'injection/flagged') {
+        if (used['injection']! >= quota['injection']!) continue;
+        used['injection'] = used['injection']! + 1;
         const data = event.data;
         notes.push({
           seq: event.seq,
@@ -4765,6 +5212,8 @@ class WebServerImpl implements WebServer {
         continue;
       }
       if (event.type === 'alarm/sent') {
+        if (used['alarm']! >= quota['alarm']!) continue;
+        used['alarm'] = used['alarm']! + 1;
         const data = event.data;
         notes.push({
           seq: event.seq,
@@ -4784,6 +5233,64 @@ class WebServerImpl implements WebServer {
           chatType: '',
           name: null,
         });
+        continue;
+      }
+      // 上下文审计的两类事实都挂在 `budget/consumed` 上（一步一条，见 model/context-audit.ts）。
+      // 没有 `cacheBreak` 的那几百条**不进这张卡**——它们不是"框架提示"，只是每次都有的归因事实。
+      if (event.type === 'budget/consumed') {
+        const data = event.data;
+        const breakdown = data.context;
+        const cacheBreak = data.cacheBreak;
+        if (cacheBreak !== undefined) {
+          if (used['alarm']! >= quota['alarm']!) continue;
+          used['alarm'] = used['alarm']! + 1;
+          notes.push({
+            seq: event.seq,
+            at: event.ts,
+            kind: 'cache-break',
+            label: CACHE_BREAK_LABEL,
+            // 缓存失守是"钱与体感都变差"的事，但循环没坏：warn，不是 critical
+            level: 'warn',
+            title: `缓存前缀失守：${CACHE_BREAK_CLASS_LABEL[cacheBreak.class]}`,
+            // reason 是**当时记下来的那句话**（渲染/比对同一个纯函数产出），界面原样贴，不加工
+            reason: cacheBreak.reason,
+            quotes: [],
+            by: null,
+            fingerprint: null,
+            sid: null,
+            person: '',
+            chatType: '',
+            name: null,
+          });
+        }
+        if (breakdown !== undefined) {
+          // 一轮只留最后一步（倒着扫，第一次遇到就是最后一步）。已经出过的那一轮直接跳过——
+          // 连额度都不占，免得几步就把 CONTEXT_NOTES_LIMIT 那几格用光、更早的轮次全被挤掉。
+          if (seenTurns.has(data.turn)) continue;
+          if (used['context']! >= quota['context']!) continue;
+          seenTurns.add(data.turn);
+          used['context'] = used['context']! + 1;
+          notes.push({
+            seq: event.seq,
+            at: event.ts,
+            kind: 'context',
+            label: CONTEXT_LABEL,
+            // 归因是**事实**不是警告：info 让它在卡片里安静地待着
+            level: 'info',
+            // 说清这是 **input 段**：instructions 与 tools 是另外两个顶层字段，不在这个数里
+            // （旧版只写 "input …"，与下面那行"整条 = 指令 + 工具 + input 段"对不上号）
+            title: `第 ${data.turn} 轮第 ${data.step} 步的上下文：`
+              + `input 段 ${breakdown.input.tokens} token / ${breakdown.input.items} 条`,
+            reason: `${describeContext(breakdown)}（渲染版本 ${breakdown.renderVersion}）`,
+            quotes: [],
+            by: null,
+            fingerprint: null,
+            sid: null,
+            person: '',
+            chatType: '',
+            name: null,
+          });
+        }
       }
     }
 
@@ -4802,19 +5309,30 @@ class WebServerImpl implements WebServer {
     const memDir = memoriesDir(this.deps.dataDir);
     const diary = diaryDir(this.deps.dataDir);
 
-    /** 目录清单（按名倒序：流水账与日记都是按日期命名的，新的在前） */
-    const list = (dir: string): Array<{ name: string; bytes: number; mtime: string | null }> => {
+    /**
+     * 目录清单（按名倒序：流水账与日记都是按日期命名的，新的在前）。
+     *
+     * **每条都带上相对 `workspace/` 的 `path`**（2026-10-04 修）：过去这里只给 `name`，
+     * 于是"这个文件在哪个子目录"这件事只剩读取端知道，界面只能自己拼——
+     * 界面把 `episodes/` 那两组拼成了 `MEMORIES/<name>`，点开就得到一句
+     * 「记忆文件 MEMORIES/2026-10-04.md 不存在」（清单里列得出来、点开却说不存在，
+     * 是这类"同一份知识存两处"的典型下场）。现在**由列清单的人给出路径**，界面原样用。
+     */
+    const list = (
+      dir: string,
+      prefix: string,
+    ): Array<{ name: string; path: string; bytes: number; mtime: string | null }> => {
       let names: string[] = [];
       try {
         names = readdirSync(dir).filter((name) => !name.startsWith('.') && name.endsWith('.md')).sort().reverse();
       } catch {
         names = [];
       }
-      const out: Array<{ name: string; bytes: number; mtime: string | null }> = [];
+      const out: Array<{ name: string; path: string; bytes: number; mtime: string | null }> = [];
       for (const name of names) {
         const stat = statOrNull(join(dir, name));
         if (stat.content === null) continue;
-        out.push({ name, bytes: stat.bytes ?? 0, mtime: stat.mtime });
+        out.push({ name, path: `${prefix}${name}`, bytes: stat.bytes ?? 0, mtime: stat.mtime });
       }
       return out;
     };
@@ -4831,16 +5349,25 @@ class WebServerImpl implements WebServer {
       if (line.trim() !== '' && sections.length > 0) sections[sections.length - 1]!.lines += 1;
     }
 
-    const files = list(memDir).filter((entry) => entry.name !== 'facts.md');
-    const episodes = list(join(memDir, 'episodes'));
-    const archive = list(join(memDir, 'episodes', 'archive'));
-    const diaries = list(diary);
+    const files = list(memDir, `${MEMORY_DIR_NAME}/`).filter((entry) => entry.name !== 'facts.md');
+    const episodes = list(join(memDir, EPISODE_DIR_NAME), `${MEMORY_DIR_NAME}/${EPISODE_DIR_NAME}/`);
+    const archive = list(
+      join(memDir, EPISODE_DIR_NAME, EPISODE_ARCHIVE_DIR_NAME),
+      `${MEMORY_DIR_NAME}/${EPISODE_DIR_NAME}/${EPISODE_ARCHIVE_DIR_NAME}/`,
+    );
+    const diaries = list(diary, `${DIARY_DIR_NAME}/`);
 
     const head = {
       dir: memDir,
       // 固定相对路径：memoryView 拼的是字符串，交给 relative() 会被当成相对基准算错
       relative: 'workspace',
-      facts: { bytes: factsStat.bytes ?? 0, mtime: factsStat.mtime, sections },
+      // facts.md 也给 path（与其余三组同一口径）：界面上一处取值、一处使用
+      facts: {
+        path: `${MEMORY_DIR_NAME}/facts.md`,
+        bytes: factsStat.bytes ?? 0,
+        mtime: factsStat.mtime,
+        sections,
+      },
       files,
       episodes,
       archive,
@@ -4878,56 +5405,6 @@ class WebServerImpl implements WebServer {
     };
   }
 
-  // ── 静态文件 ──
-  private async handleStatic(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      throw new HttpError(405, 'method-not-allowed', '静态资源只接受 GET/HEAD');
-    }
-
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(pathname);
-    } catch {
-      throw badRequest('URL 编码非法');
-    }
-    if (decoded.includes('\0')) throw badRequest('路径含非法字符');
-
-    const rel = decoded === '/' ? 'index.html' : decoded.replace(/^\/+/u, '');
-    const target = resolve(this.webRoot, rel);
-    const relToRoot = relative(this.webRoot, target);
-    if (relToRoot === '' || relToRoot.startsWith('..') || isAbsolute(relToRoot)) {
-      throw new HttpError(403, 'forbidden', '路径越界：静态资源必须落在 web/ 目录内');
-    }
-
-    let file: string | null = null;
-    if (statOrNull(target).content !== null) file = target;
-    else if (extname(rel) === '') {
-      // 无扩展名的路径（hash 路由的深链）回落到 index.html；否则就是 404
-      const indexTarget = join(this.webRoot, 'index.html');
-      if (statOrNull(indexTarget).content !== null) file = indexTarget;
-    }
-
-    if (file === null) {
-      sendError(
-        res,
-        404,
-        'static-not-found',
-        `前端资源不存在：${rel}（web/ 目录缺失或未构建；前端是可选组件，进程照常运行）`,
-      );
-      return;
-    }
-
-    const body = statOrNull(file).content ?? '';
-    const type = MIME_TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream';
-    res.writeHead(200, {
-      'content-type': type,
-      'content-length': Buffer.byteLength(body),
-      'cache-control': 'no-cache',
-      'x-content-type-options': 'nosniff',
-    });
-    res.end(req.method === 'HEAD' ? undefined : body);
-  }
-
   // ── 事件写入（唯一写通道） ──
 
   /**
@@ -4963,9 +5440,10 @@ class WebServerImpl implements WebServer {
 /**
  * `child` 是不是落在 `dir` 里面（协议端的入口与安装目录的关系，见 buildProtocolSideView 的 installed 三态）。
  *
- * 两个细节都是实测口径：Windows 上路径**不区分大小写**（`C:\SnowLuma` 与 `c:\snowluma` 是同一个目录），
+ * 两个细节都是实测口径：Windows 上路径**不区分大小写**（`C:\path\to\snowluma` 与
+ * `c:\path\to\snowluma` 是同一个目录），
  * 而配置里手打的分隔符正反斜杠都有。比对前统一去掉尾部分隔符、按平台决定要不要小写；
- * 只比前缀是不够的（`C:\SnowLuma2` 也以 `C:\SnowLuma` 开头），所以要求后面紧跟一个分隔符。
+ * 只比前缀是不够的（`C:\path\to\snowluma2` 也以 `C:\path\to\snowluma` 开头），所以要求后面紧跟一个分隔符。
  */
 function isUnderDir(child: string, dir: string): boolean {
   if (dir.trim() === '') return false;
@@ -5169,7 +5647,8 @@ interface McpProbeOutcome {
  * 事件日志是唯一真相源，宁可这条测试在日志里不留痕（结果直接回给点按钮的人）。
  */
 class McpProbeHost implements McpConnectionHost {
-  readonly clientInfo = { name: 'irmia-agent', version: '0.1.0' };
+  // version 与 `main.ts` 的 AGENT_VERSION 同步（两处必须一起改）
+  readonly clientInfo = { name: 'irmia-agent', version: '0.1.0-beta.2' };
   readonly protocolVersion = DEFAULT_PROTOCOL_VERSION;
   readonly progressHardCapMs = 60_000;
   readonly defaultRequestTimeoutMs: number;
@@ -5364,7 +5843,8 @@ async function probeMcpServer(
 // ──────────────────────────────── 工厂 ────────────────────────────────
 
 /**
- * 建服务（不监听）。token 在这里落定：注入优先，否则读/生成 `data/.ui-token`（首启打印一次）。
+ * 建服务（不监听）。认证库在这里落定：注入了就用注入的，否则读
+ * `<dataDir>/.auth.json`（并兼容老实例的 `.ui-token`）——口径只有一份，在 `web/auth.ts`。
  */
 export function createWebServer(deps: WebServerDeps): WebServer {
   return new WebServerImpl(deps);

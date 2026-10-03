@@ -259,14 +259,44 @@ export interface AlertsConfig {
   rateLimitMin: number;
 }
 
-/** 观测前端与 webhook 的本地 HTTP 服务（design.md §4.15/§4.16） */
+/**
+ * 上下文审计（design §4.13 缓存三铁律的观测面，2026-10-03 加）。
+ *
+ * **只记 token 与结构事实，不涉及任何价格/货币概念**。两个阈值都是"保守"取向：
+ * 宁可少报一次缓存变化，也不要在每个 step 都喊狼来了——归因事实本身每步都记，
+ * 哨兵只在**真的失守**时记一条。
+ */
+export interface ContextAuditConfig {
+  /**
+   * 空闲判据的时间线（分钟，默认 30）。
+   *
+   * 比它更久没调用过模型之后，缓存前缀很可能已被服务端回收；但"久"本身不是破坏，
+   * 所以还要同时看到命中率塌陷（见 `cacheBreakHitDrop`）才记一条。
+   * 取 30 是因为它与心跳基线同量级：短于它的间隔里，命中率掉下去另有原因，不该算在"过期"头上。
+   */
+  cacheBreakIdleMin: number;
+  /**
+   * 命中率的相对跌幅门槛（0–1，默认 0.5）：本次命中率比上次**跌掉一半以上**才算塌陷。
+   * 取 0.5 是保守值——前缀只掉几条（模型偶尔少命中一点）不该报警。
+   */
+  cacheBreakHitDrop: number;
+}
+
+/**
+ * 本地 HTTP 服务（design.md §4.15）——**只有桌面 GUI 一个消费者**。
+ *
+ * 2026-10 删掉了两样东西，都别再长回来：
+ *   • `appMode`（启动时自动唤起 Edge `--app` 窗口）：它存在的唯一理由是那个网页观测台，
+ *     而观测台（`web/` 目录、`/` 静态分支）已经整个删除。GUI 是正经的原生窗口，
+ *     不需要"拿浏览器假装成一个应用"。（老配置里留着这个键**不会**让进程起不来：
+ *     解析器只读它认识的键，多余的一律安静忽略——见 config.ts 顶部的读取纪律。）
+ *   • 界面凭据走密码（`data/.auth.json`），不再是 `web.token` 那种共享 token。
+ */
 export interface WebConfig {
   /** 绑定地址：默认只绑回环 */
   host: string;
   /** 监听端口（默认 7788；改动需重启，不在热更白名单） */
   port: number;
-  /** GUI 模式：启动时自动唤起 Edge --app 独立窗口（1350×900），关闭窗口不影响进程 */
-  appMode: boolean;
 }
 
 /** 联系人表：会话标识（sid）→ 名字 */
@@ -406,7 +436,7 @@ export interface ChannelsConfig {
  * 这里只留**一个**人工干预的入口：路径。
  *
  * 为什么需要它：`deps.paths.<name>` 是探测三段顺序的**第一段**（用户指定 > 框架自装 > PATH）。
- * 没有它的话，一个人把 rg 装在 `C:\tools\rg\rg.exe` 而没加 PATH 时，
+ * 没有它的话，一个人把 rg 装在 `C:\path\to\rg.exe` 而没加 PATH 时，
  * 框架只能告诉他"未安装"——而"我明明装了"是最让人恼火的一类答复。
  * 显式指了却不可用时**不静默落到后两段**：那会变成"我配了却不生效"，
  * 比直接报错难查得多（见 src/deps/probe.ts）。
@@ -438,6 +468,8 @@ export interface AppConfig {
   deps: DepsConfig;
   channels: ChannelsConfig;
   alerts: AlertsConfig;
+  /** 上下文审计阈值（缓存破坏哨兵）：默认保守，见 ContextAuditConfig */
+  contextAudit: ContextAuditConfig;
   web: WebConfig;
   /** IANA 时区名（operations.md §2：budget/rollover 的"今日"按它解释） */
   timezone: string;
@@ -539,7 +571,11 @@ function buildDefaults(dir: string): AppConfig {
       },
     },
     alerts: { rateLimitMin: 30 },
-    web: { host: '127.0.0.1', port: 7788, appMode: false },
+    contextAudit: {
+      cacheBreakIdleMin: 30,
+      cacheBreakHitDrop: 0.5,
+    },
+    web: { host: '127.0.0.1', port: 7788 },
     timezone: systemTimezone(),
   };
 }
@@ -790,6 +826,15 @@ function defaultDocument(dir: string): JsonObject {
         'rateLimitMin：同类告警限流窗口（分钟）。',
       ],
       rateLimitMin: d.alerts.rateLimitMin,
+    },
+    contextAudit: {
+      $comment: [
+        '上下文审计：每个 model call 记一条上下文构成（token，不含任何计价），并在缓存前缀真失守时记一条。',
+        'cacheBreakIdleMin：空闲多久之后检查"命中率塌陷"（分钟）。',
+        'cacheBreakHitDrop：命中率相对跌幅门槛（0–1），跌掉这么多才算塌陷。',
+      ],
+      cacheBreakIdleMin: d.contextAudit.cacheBreakIdleMin,
+      cacheBreakHitDrop: d.contextAudit.cacheBreakHitDrop,
     },
     timezone: d.timezone,
   };
@@ -1261,15 +1306,29 @@ function parseAppConfig(doc: JsonObject, dir: string): AppConfig {
   };
 
   const webRaw = objectOr(doc['web'], 'web');
+  // 只读认识的键。老配置里可能还留着 `appMode`（那个网页观测台时代的开关），
+  // **安静忽略**：为一个已经删掉的功能让整台实例起不来，是拿人的时间给历史陪葬。
   const web: WebConfig = {
     host: pickString(webRaw['host'], 'web.host', base.web.host) ?? '127.0.0.1',
     port: pickInt(webRaw['port'], 'web.port', base.web.port, 1, 65535) ?? 7788,
-    appMode: pickBoolean(webRaw['appMode'], 'web.appMode', base.web.appMode),
+  };
+
+  // 上下文审计：只影响"要不要记一条哨兵事件"，与运行行为无关，所以两个阈值都夹在合法区间里
+  const auditRaw = objectOr(doc['contextAudit'], 'contextAudit');
+  const contextAudit: ContextAuditConfig = {
+    // 下限 1 分钟：0 会让"每次调用都算空闲过期"，那不是哨兵是刷屏
+    cacheBreakIdleMin: pickInt(
+      auditRaw['cacheBreakIdleMin'], 'contextAudit.cacheBreakIdleMin', base.contextAudit.cacheBreakIdleMin, 1,
+    ),
+    // 0 会让"命中率不涨就算塌陷"，1 则要求跌到 0——两端都没有意义
+    cacheBreakHitDrop: pickRatio(
+      auditRaw['cacheBreakHitDrop'], 'contextAudit.cacheBreakHitDrop', base.contextAudit.cacheBreakHitDrop,
+    ),
   };
 
   return {
     schemaVersion, dataDir, models, budget, wake, vision, speak, persona, paths, tools, deps, channels,
-    alerts, web, timezone,
+    alerts, contextAudit, web, timezone,
   };
 }
 

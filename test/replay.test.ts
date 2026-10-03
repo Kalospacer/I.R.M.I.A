@@ -20,6 +20,7 @@ import { EventLog } from '../src/log/event-log.ts';
 import type { AppEvent, ModelLane, Projection } from '../src/log/types.js';
 import { defaultVisibility } from '../src/log/types.ts';
 import type { DsClient, DsRequest, DsStreamResult } from '../src/model/ds-client.ts';
+import { NOW_LAYER_BANNER } from '../src/model/render.ts';
 import { loadPersona } from '../src/persona/loader.ts';
 import { runTurn, type AgentLoopDeps, type AgentLoopPersona } from '../src/runtime/agent-loop.ts';
 import { buildReplayReport, formatReplaySummary, locateStep } from '../src/runtime/replay.ts';
@@ -169,6 +170,9 @@ async function makeHarness(t: TestContext): Promise<Harness> {
         wakeMessage: null,
         wakeChannel: null,
       },
+      // 本轮固定块（v29/B2）：与真循环同一形状——宿主在轮首把 STATE / 关系档案装好递进来。
+      // 重放侧由 `rebuildRenderedRequest` 用**当前**人格资产重建同一份（见 runtime/replay.ts）。
+      turnBlock: { state: persona.state, relationship: null },
     }),
   };
 }
@@ -311,8 +315,15 @@ test('replay --diff：同输入下指令一致，右栏用当前时刻渲染只�
   const report = built.report;
 
   assert.equal(report.diff.instructionsChanged, false, '人格与任务卡没变 → instructions 一致');
-  assert.equal(report.diff.changedItems, 1, '唯一差异是状态层的时间行');
-  assert.equal(report.diff.firstDifference?.index, 0);
+  assert.equal(report.diff.changedItems, 1, '唯一差异是此刻层的时间行');
+  // 差异落在**此刻层**那一条上（v29/B2 起此刻层不再是第 0 条：它前面还有长期记忆层与本轮固定块，
+  // 而这两条都与时刻无关）。按段头认层，不写下标——装配顺序一变，写死的下标就成了假断言。
+  const at = report.diff.firstDifference?.index ?? -1;
+  const changedItem = report.request.input[at] as { content?: string } | undefined;
+  assert.ok(
+    changedItem?.content?.startsWith(NOW_LAYER_BANNER) === true,
+    `分叉的那一条必须是此刻层：@${at} ${JSON.stringify(changedItem).slice(0, 120)}`,
+  );
   // 那一行现在**本机时间在前**（2026-10-02 起）：左栏是当时的时刻，右栏是"用当前时刻重渲"，
   // 只有它分叉（UTC 原文被摘要行截断，所以断言认本机时间那一段）
   assert.match(report.diff.firstDifference?.left ?? '', /时刻：2026-03-01 17:00:00/u);

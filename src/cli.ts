@@ -535,6 +535,10 @@ export function summarizeEvent(event: AppEvent): string {
       return `未批准、未拒绝：${clip(event.data.question, 40)}（等了 ${Math.round(event.data.waitedMs / 60_000)} 分钟没人答）`;
     case 'model/degraded': return `${event.data.lane} · ${clip(event.data.reason, 60)}`;
     case 'model/restored': return `${event.data.lane} 已恢复`;
+    case 'auth/password-set':
+      return `${event.data.action === 'setup' ? '首次设密码' : '改密码'}（by ${event.data.by}）`
+        + `${event.data.legacyTokenDisabled ? ' · 旧 token 已停用' : ''}`
+        + `${event.data.sessionsRevoked > 0 ? ` · 失效 ${event.data.sessionsRevoked} 条旧会话` : ''}`;
     // 新增事件类型在此显式落进 default，和 fold.ts 同一态度：不静默吞掉，但也绝不因此崩
     default: return clip(JSON.stringify(raw) ?? String(raw));
   }

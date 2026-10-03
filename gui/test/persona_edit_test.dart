@@ -53,7 +53,7 @@ void main() {
       final path = req.uri.path;
       if (path == '/api/persona/files') {
         response.write(jsonEncode({
-          'root': 'C:/path/to/data/persona',
+          'root': 'D:/irmia/data/persona',
           'files': [
             for (final entry in contents.entries)
               {

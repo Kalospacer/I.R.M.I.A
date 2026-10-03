@@ -64,10 +64,10 @@ export const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
 export const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = ['2025-06-18', '2025-03-26', '2024-11-05'];
 
-/** clientInfo（握手时上报；server 侧日志靠它辨认调用方） */
+/** clientInfo（握手时上报；server 侧日志靠它辨认调用方）。version 与 main.ts 的 AGENT_VERSION 同步 */
 export const DEFAULT_CLIENT_INFO: { readonly name: string; readonly version: string } = {
   name: 'irmia-agent',
-  version: '0.1.0',
+  version: '0.1.0-beta.2',
 };
 
 /** 每请求软超时：progress 通知可重置这个时钟 */

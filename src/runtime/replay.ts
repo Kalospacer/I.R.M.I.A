@@ -25,7 +25,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import type { AppEvent, ModelLane } from '../log/types.js';
+import type { AppEvent, MemorySelected, ModelLane } from '../log/types.js';
 import type { InputItem, RenderPersona, RenderedRequest } from '../model/render.js';
 import { NOW_LAYER_BANNER, RENDER_VERSION, clipTaskTitle, inputContentText, wakeTitle } from '../model/render.ts';
 import type { ContactFacts } from '../model/self-brief.ts';
@@ -33,11 +33,13 @@ import { collectSessions, parseAliases } from '../channel/sessions.ts';
 import { CONFIG_FILE_NAME, loadConfig, systemTimezone } from '../config/config.ts';
 import { readEventsReadOnly } from '../log/read-only.ts';
 import { loadPersona } from '../persona/loader.ts';
+import { readExcerpt, readMemoryIndexTextReadOnly, renderSelectedMemory, type MemoryExcerpt } from '../persona/memory-injection.ts';
 import { relationshipForWake } from '../persona/relationship.ts';
 import { catalogToolSpecs } from '../tools/catalog.ts';
 import { sha256Hex } from '../persona/versions.ts';
 import { fold } from '../state/fold.ts';
 import { deriveRequest } from './agent-loop.ts';
+import { isSlashCommandEvent } from './slash-commands.ts';
 import { EVENT_LOG_DIR_NAME } from './recover.ts';
 
 // ──────────────────────────────── 定位 ────────────────────────────────
@@ -88,9 +90,15 @@ export function locateStep(events: readonly AppEvent[], turn: number, step: numb
   // 归属过滤（design §4.21）：重建「这一次调用当时看到了什么」，就必须用与运行期同一份可见性——
   // 顶层 turn 的上下文里没有子代理链的事件（那是另一条 turn 链），子代理也看不见父历史
   // （它从空事件序列起）。少这一刀，重建结果会多出一批当时根本没进上下文的事件。
+  //
+  // 第二刀与运行期**同源**（`real-loop.ts` 的 `contextEventFilter`）：整条就是一条指令的
+  // `wake/manual` 也不在她的上下文里（B1 第二步）。判据引的是同一个 `isSlashCommandEvent`，
+  // 两处各写一遍迟早会漂移成"重建出来的请求比当时多一条消息"。
   const scope = stepStart.parentCallId;
   const eventsBefore = events.filter(
-    (event) => event.seq < stepStart.seq && event.parentCallId === scope,
+    (event) => event.seq < stepStart.seq
+      && event.parentCallId === scope
+      && !isSlashCommandEvent(event),
   );
 
   // 该 turn 的认领：取**第一笔**。一个 turn 可以分批认领（开头一笔 + 中途被她看见的插话各一笔，
@@ -266,6 +274,18 @@ export interface RebuildOptions {
     contacts?: ReadonlyMap<string, string>;
     aliases?: ReadonlyMap<string, string>;
   };
+  /**
+   * 数据目录（v29/B2）：重建"本轮固定块"里那段**选中的记忆正文**时要从盘上按 `path:line` 现取。
+   *
+   * 不给 = 那一段不出现（与"当时没有选材事件"同一条路径）。给了它，正文与运行期同源：
+   * 都是从她自己的记忆文件里、那一条所在的行读出来的。
+   */
+  dataDir?: string;
+  /**
+   * 记忆索引文本（长期记忆层那一段）。与人格资产同一条限制：它是**文件**，
+   * 重建时读到的是现在这份。不给 = 那一段不出现。
+   */
+  memoryIndex?: string | null;
 }
 
 /**
@@ -301,9 +321,66 @@ export function rebuildRenderedRequest(
     taskCard: position.taskCard,
     now: nowOverride ?? options.now ?? position.stepStart.ts,
     model: position.stepStart.data.model,
+    // **本轮固定块**（v29/B2）：与运行期同一形状——`[当前状态]` + 关系档案 + 本轮选中的记忆正文。
+    // 前两样取**当前**人格资产（与 instructions 的重建口径一致：日志只留聚合哈希，
+    // 逐文件历史不可解，所以"人格层的重建"本就是现在这份）；
+    // 第三样取自 `memory/selected` 事件——那是"当时选了哪几条"的唯一记录。
+    turnBlock: {
+      state: options.persona.state,
+      relationship: options.persona.relationship ?? null,
+      memory: selectedMemoryTextOf(position, options),
+    },
+    // 记忆索引（长期记忆层那一段）：与人格资产同一条限制——它是个**文件**，重建读到的是现在这份。
+    // 走只读那条路（readMemoryIndexTextReadOnly）：重建不能创建文件，"只读重建"是这个模块的承诺。
+    memoryIndex: options.memoryIndex ?? null,
     // 软提示不落库（见文件头）：这里只能是 null，并在报告里明说
     softHint: null,
   });
+}
+
+/**
+ * 本轮的固定块里那一段"选中的记忆正文"。
+ *
+ * 选**哪几条**：只认 `memory/selected` 事件——这是可重放的地基（docs/memory-injection.md §4）：
+ * "这一轮选了哪几条"如果是运行期临时算的，事后重建就得重算一遍，而重算要看**现在**的索引文件
+ * （她随时可能改自己的记忆），重建结果与当时就对不上了。
+ *
+ * 正文从盘上按 `path:line` 现取：与运行期同一份素材（同一条纪律——正文永远在文件里，
+ * 上下文里只有指针）。取不到那一条（文件被改、行号漂了）就跳过，不臆造内容。
+ */
+function selectedMemoryTextOf(position: ReplayPosition, options: RebuildOptions): string | null {
+  if (options.dataDir === undefined) return null;
+  const selection = lastMemorySelection(position);
+  if (selection === null) return null;
+  const excerpts: MemoryExcerpt[] = [];
+  for (const entry of selection.selected) {
+    const excerpt = readExcerpt(options.dataDir, {
+      path: entry.path,
+      line: entry.line,
+      summary: entry.summary,
+      pinned: entry.pinned,
+    });
+    if (excerpt !== null) excerpts.push(excerpt);
+  }
+  const text = renderSelectedMemory(excerpts);
+  return text === '' ? null : text;
+}
+
+/**
+ * 取该 turn 的选材结论（**最后一条** `memory/selected`）；没有就是 null（那一轮没注入记忆）。
+ *
+ * 选材事件在**轮首**写下，所以正常情形下它落在 `eventsBefore` 里（seq 小于该 turn 的每个
+ * step/start）。取"最后一条"与运行期的读取口径一致：崩溃后重投同一个 turn 时可能再写一条，
+ * 两条里最后那条才是这一轮实际用的。
+ */
+export function lastMemorySelection(position: ReplayPosition): MemorySelected['data'] | null {
+  let found: MemorySelected['data'] | null = null;
+  for (const event of position.eventsBefore) {
+    if (event.type === 'memory/selected' && event.data.turn === position.turn) {
+      found = event.data as MemorySelected['data'];
+    }
+  }
+  return found;
 }
 
 // ──────────────────────────────── 并排对照 ────────────────────────────────
@@ -387,9 +464,21 @@ function describeItem(item: InputItem): string {
   }
 }
 
-/** 请求体字节数：与发送前序列化同一口径（JSON UTF-8），缓存命中按前缀字节判定 */
+/**
+ * 请求体字节数：与发送前序列化同一口径（JSON UTF-8），缓存命中按前缀字节判定。
+ *
+ * 只数**发往模型的那四个键**（model / instructions / input / tools）：`RenderedRequest` 上
+ * 还有 2026-10-03 加的 `context`（渲染副产物，见 model/context-audit.ts），而
+ * `agent-loop` 的 `toDsRequest` 显式装配时并不会把它发出去——把它算进"请求体字节"，
+ * 这个数就不再是缓存前缀的那个数了。
+ */
 export function jsonBytes(request: RenderedRequest): number {
-  return Buffer.byteLength(JSON.stringify(request), 'utf8');
+  return Buffer.byteLength(JSON.stringify({
+    model: request.model,
+    instructions: request.instructions,
+    input: request.input,
+    tools: request.tools,
+  }), 'utf8');
 }
 
 export function formatRequestDiff(diff: RequestDiff): string[] {
@@ -549,13 +638,21 @@ export async function buildReplayReport(
 
   const request = rebuildRenderedRequest(
     located,
-    { persona, tools, timezone, ...(contactGate === undefined ? {} : { contact: contactGate }) },
+    {
+      persona, tools, timezone,
+      // v29/B2：固定块里那段"选中的记忆正文"要从盘上现取（`memory/selected` 只记指针）
+      dataDir,
+      memoryIndex: readMemoryIndexTextReadOnly(dataDir),
+      ...(contactGate === undefined ? {} : { contact: contactGate }),
+    },
   );
   const compareRequest = rebuildRenderedRequest(
     located,
     {
       persona, tools, timezone,
       now: options.compareNow ?? new Date().toISOString(),
+      dataDir,
+      memoryIndex: readMemoryIndexTextReadOnly(dataDir),
       ...(contactGate === undefined ? {} : { contact: contactGate }),
     },
   );
@@ -571,6 +668,12 @@ export async function buildReplayReport(
     // 「未知」读成"当时就是这样"——那是把重建的局限当成事实。
     '此刻层的「本机」「用度」只存在于运行期（进程/磁盘/投影的瞬时值不落日志）：'
     + '重建结果里它们写「未知」或不出现，与当时的真值不同；要看真值请查 step/start 前后的 budget/consumed 事件与进程日志',
+    // 本轮固定块（B2）里那一段的两半来路不同，各自说清
+    '本轮固定块里的「选中的记忆正文」按 `memory/selected` **当时选的那几条**从盘上现取正文；'
+    + '正文若已被她改写，读回来的是现在的内容——选中哪几条是当时的事实，正文本身取现在这份',
+    '长期记忆层里的**记忆索引**（MEMORIES/INDEX.md 的渲染形态）与人格资产同一条限制：'
+    + '它是个文件，重建时读到的是现在这份；索引只含指针（路径 + 一行摘要），'
+    + '所以漂移的范围是那一行摘要，不是记忆正文',
   ];
   if (!personaMatches) {
     notes.push(`当时的人格资产（${recordedPersonaHash.slice(0, 8)}）与当前（${current.personaHash.slice(0, 8)}）不同：`

@@ -131,11 +131,9 @@ async function setup(
   const dir = mkdtempSync(join(tmpdir(), 'irmia-side-'));
   const dataDir = join(dir, 'data');
   const personaRoot = join(dataDir, 'persona');
-  const webRoot = join(dir, 'web');
   const serviceDir = join(dir, 'snowluma');
   const configPath = join(dir, CONFIG_FILE_NAME);
   mkdirSync(dataDir, { recursive: true });
-  mkdirSync(webRoot, { recursive: true });
   mkdirSync(serviceDir, { recursive: true });
 
   const doc: JsonObject = {
@@ -165,7 +163,6 @@ async function setup(
     timers,
     now,
     uiToken: TEST_TOKEN,
-    webRoot,
     configPath,
     port: 0,
     out: () => undefined,
@@ -533,7 +530,7 @@ test('PUT 的入参校验：空 dir / 拼错的字段名 / 非布尔，一律当
   assert.equal(typo.status, 400);
   assert.equal(errorOf(typo).code, 'unknown-field');
 
-  const notBool = await call(fx, '/api/protocol-side/config', { method: 'PUT', body: { dir: 'C:/x', autoStart: 'yes' } });
+  const notBool = await call(fx, '/api/protocol-side/config', { method: 'PUT', body: { dir: 'D:/x', autoStart: 'yes' } });
   assert.equal(notBool.status, 400);
 
   const empty = await call(fx, '/api/protocol-side/config', { method: 'PUT', body: {} });
@@ -549,7 +546,7 @@ test('PUT：写出非法配置要回滚原文件（复核不通过就不许留�
   const broken = `${JSON.stringify({ channels: 'not-an-object' }, null, 2)}\n`;
   writeFileSync(fx.configPath, broken, 'utf8');
 
-  const res = await call(fx, '/api/protocol-side/config', { method: 'PUT', body: { dir: 'C:/x' } });
+  const res = await call(fx, '/api/protocol-side/config', { method: 'PUT', body: { dir: 'D:/x' } });
   assert.equal(res.status, 400);
   assert.match(errorOf(res).message, /不是对象/u);
   assert.equal(readFileSync(fx.configPath, 'utf8'), broken, '失败时盘上那份要一个字节都不动');

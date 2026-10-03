@@ -741,7 +741,8 @@ class _SessionLine extends StatelessWidget {
 
 // ──────────────────── 框架提示（GET /api/framework-notes） ────────────────────
 
-/// 一条框架提示：注入预警（外部消息里有想指挥她的迹象）或告警。
+/// 一条框架提示：注入预警（外部消息里有想指挥她的迹象）、告警，
+/// 以及 2026-10-03 起的上下文审计两类（缓存破坏哨兵 / 上下文归因）。
 class _FrameworkNote {
   const _FrameworkNote({
     required this.kind,
@@ -759,19 +760,23 @@ class _FrameworkNote {
     required this.at,
   });
 
-  /// `injection` / `alarm`（未知值按告警处理：宁可把它当回事，也别悄悄吞掉）
+  /// `injection` / `alarm` / `cache-break` / `context`。
+  ///
+  /// **原样保留**后端给的值（不再折成 injection|alarm 两态）：多出来的两类要按各自的语义
+  /// 决定来源行怎么写，折掉就分不出来了。认不出的值按"框架自身的一条提示"渲染——
+  /// 宁可多显示一条，也别把框架做过的事悄悄吞掉。
   final String kind;
 
   /// 类别词，由后端给（界面不自己维护第二份词表）
   final String label;
 
-  /// `info` / `warn` / `critical`：两种类别共用一套等级，取色只看它
+  /// `info` / `warn` / `critical`：几种类别共用一套等级，取色只看它
   final String level;
 
   /// 一句说明
   final String title;
 
-  /// 判定的理由（只有注入预警有）
+  /// 判定的理由：注入预警是"为什么觉得它想指挥她"；缓存破坏/上下文归因是这一条的事实摘要
   final String reason;
 
   /// 外部原文里最可疑的几个片段（后端已截断）
@@ -797,8 +802,10 @@ class _FrameworkNote {
     }
 
     final quotes = map['quotes'];
+    final kind = text('kind');
     return _FrameworkNote(
-      kind: text('kind') == 'injection' ? 'injection' : 'alarm',
+      // 认不出就退回 'alarm' 的老口径（"框架自身的一条提示"），不丢条目
+      kind: kind.isEmpty ? 'alarm' : kind,
       label: text('label'),
       level: text('level'),
       title: text('title'),
@@ -816,6 +823,11 @@ class _FrameworkNote {
 
   bool get isAlarm => kind == 'alarm';
 
+  /// 这一条讲的是**框架自身**的事（告警 / 缓存破坏 / 上下文归因），还是**某个外部会话**的事（注入预警）。
+  ///
+  /// 只有注入预警挂在一个会话上；后三类没有会话可指，来源一律照实说"框架自身"。
+  bool get fromFramework => kind != 'injection';
+
   /// 等级词。写出来而不只靠颜色：色盲、截图、单色打印都不能丢信息（copy-guide §二的精神）
   String get levelLabel => switch (level) {
         'critical' => '严重',
@@ -824,7 +836,8 @@ class _FrameworkNote {
         _ => level.isEmpty ? '未知等级' : level,
       };
 
-  /// 徽章文案：类别 + （告警才有的）等级
+  /// 徽章文案：类别 + （告警才有的）等级。其余三类只摆类别词——
+  /// 它们各自的等级是固定的（注入预警恒 warn、归因恒 info），再缀一个等级只是噪音。
   String get badgeText {
     if (!isAlarm) return label.isEmpty ? '框架提示' : label;
     return label.isEmpty ? levelLabel : '$label · $levelLabel';
@@ -838,10 +851,10 @@ class _FrameworkNote {
         _ => scheme.onSurfaceVariant,
       };
 
-  /// 来源一行：哪个会话、谁、判定来自哪一级；告警没有会话，来源就是框架自身。
+  /// 来源一行：哪个会话、谁、判定来自哪一级；框架自身的事没有会话。
   /// 名字解析不出就退回 openid（与外部会话卡、与 `render.ts` 同一条纪律：不编名字）。
   String get sourceLine {
-    if (isAlarm) {
+    if (fromFramework) {
       return fingerprint == null ? '来源：框架自身' : '来源：框架自身 · $fingerprint';
     }
     final who = name ?? person;
@@ -859,11 +872,12 @@ class _FrameworkNote {
   }
 }
 
-/// 「框架提示」卡：框架替她留意到的事——注入预警与告警。
+/// 「框架提示」卡：框架替她留意到的事——注入预警、告警，以及上下文审计的两类
+/// （缓存破坏哨兵 / 每一步的上下文归因）。
 ///
-/// 为什么要它：这两类事都写在事件日志里（`injection/flagged` / `alarm/sent`），
-/// 但那是几万条内部簿记中间的两行，人不会去翻。框架提示了她、或者框架自己出了事，
-/// 用户得在这块屏幕上看得见。
+/// 为什么要它：这几类事都写在事件日志里（`injection/flagged` / `alarm/sent` /
+/// `budget/consumed{context,cacheBreak}`），但那是几万条内部簿记中间的两行，人不会去翻。
+/// 框架提示了她、或者框架自己出了事，用户得在这块屏幕上看得见。
 class _FrameworkNotesCard extends StatelessWidget {
   const _FrameworkNotesCard({
     required this.notes,

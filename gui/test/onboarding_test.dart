@@ -108,7 +108,7 @@ void main() {
         response.write(jsonEncode(keys));
       } else if (path == '/api/persona/files') {
         response.write(jsonEncode({
-          'root': 'C:/path/to/data/persona',
+          'root': 'D:/irmia/data/persona',
           'files': [
             for (final entry in persona.entries)
               {

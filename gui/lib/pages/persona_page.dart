@@ -386,22 +386,24 @@ class _PersonaPageState extends State<PersonaPage> {
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       if (saving) const LinearProgressIndicator(minHeight: 2),
       Expanded(
-        child: Scrollbar(
-          controller: _editorScroll,
-          child: TextField(
-            controller: _editor,
-            scrollController: _editorScroll,
-            maxLines: null,
-            expands: true,
-            textAlignVertical: TextAlignVertical.top,
-            keyboardType: TextInputType.multiline,
-            style: _mono.copyWith(fontSize: 12.5, height: 1.7, color: scheme.onSurface),
-            decoration: const InputDecoration(
-              border: InputBorder.none,
-              isDense: true,
-              contentPadding: EdgeInsets.fromLTRB(14, 12, 14, 14),
-              hintText: '（内容为空）',
-            ),
+        // **不要再套一层 Scrollbar**（2026-10-04 撤掉）：Windows 上 Flutter 已经自己给每个
+        // 纵向 Scrollable 套了一条（MaterialScrollBehavior.buildScrollbar 的 windows 分支），
+        // 包装点在 Scrollable.build 里。再套一层就是两条挂在**同一个**滚动位置上，
+        // 并排画出来（用户 ② 报的"右边有两条滚动条"）。
+        // `_editorScroll` 仍然要留给 TextField：`_seedEditor` 换文件时要 jumpTo(0)。
+        child: TextField(
+          controller: _editor,
+          scrollController: _editorScroll,
+          maxLines: null,
+          expands: true,
+          textAlignVertical: TextAlignVertical.top,
+          keyboardType: TextInputType.multiline,
+          style: _mono.copyWith(fontSize: 12.5, height: 1.7, color: scheme.onSurface),
+          decoration: const InputDecoration(
+            border: InputBorder.none,
+            isDense: true,
+            contentPadding: EdgeInsets.fromLTRB(14, 12, 14, 14),
+            hintText: '（内容为空）',
           ),
         ),
       ),

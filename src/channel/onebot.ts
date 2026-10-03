@@ -213,7 +213,7 @@ export function parseCqMessage(raw: string): OneBotSegment[] {
  *
  * 用户 2026-10-02 的口径："群昵称我认为是应该读的，因为有助于快速识别身份。其他太长的 id
  * 反而没意义。" —— 所以昵称要读、要显示（`sender.card` 是这个群里的显示名，优先；
- * 退到 `sender.nickname`）；但它**只是显示**：谁都能把自己改成"owner"，
+ * 退到 `sender.nickname`）；但它**只是显示**：谁都能把自己改成"用户（OWNER）"，
  * 身份判定永远按 id 走（契约里 `nickname` 的注释与 self-brief 那一段都写着这一条）。
  */
 function nicknameOf(event: Record<string, unknown>): { nickname?: string } {

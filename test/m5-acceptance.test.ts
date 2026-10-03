@@ -45,8 +45,8 @@ import { EventLog } from '../src/log/event-log.ts';
 import type { AppEvent, ModelLane, Projection, TurnEndReason } from '../src/log/types.ts';
 import { defaultVisibility } from '../src/log/types.ts';
 import type { DsClient, DsOutputItem, DsRequest, DsResponse, DsStreamResult, DsUsage } from '../src/model/ds-client.ts';
-import { NOW_LAYER_BANNER, render, RENDER_VERSION } from '../src/model/render.ts';
-import type { RenderedRequest, RenderPersona } from '../src/model/render.ts';
+import { NOW_LAYER_BANNER, TURN_BLOCK_BANNER, render, RENDER_VERSION } from '../src/model/render.ts';
+import type { RenderedRequest, RenderPersona, TurnBlockFacts } from '../src/model/render.ts';
 import { ensurePersonaSeeds, loadPersona, type PersonaAssets } from '../src/persona/loader.ts';
 import { deriveRequest, runTurn, type AgentLoopPersona } from '../src/runtime/agent-loop.ts';
 import { MODEL_GATE_HINT_CHARS, NecessityGate, type NecessityVerdict } from '../src/runtime/necessity-gate.ts';
@@ -213,6 +213,11 @@ interface HarnessOptions {
   withNecessityGate?: boolean;
   /** light 判定门的脚本（ds.generate） */
   generateScript?: ScriptedResponse[];
+  /**
+   * 本轮固定块的覆盖点（B2）。缺省 = `{state: PERSONA.state, relationship: null}`，
+   * 与真循环的宿主装配同形；传 `null` 用于测"没有固定块"的场景。
+   */
+  turnBlock?: TurnBlockFacts | null;
 }
 
 interface Harness {
@@ -301,6 +306,9 @@ async function makeHarness(t: TestContext, opts: HarnessOptions): Promise<Harnes
     workspaceRoot,
     // destructive 默认不列（§4.10 第三级门）；本套件要测 write_persona，故显式开启
     modelVisibility: { includeDestructive: true },
+    // 本轮固定块（B2）：素材由**宿主**在轮首读一次（real-loop 的 turnBlockFacts 同一形状）。
+    // 这里是测试替身，所以直接取 PERSONA.state——覆盖点留给需要"固定块为空/换一份"的用例。
+    turnBlock: opts.turnBlock ?? { state: PERSONA.state, relationship: null },
     ...(opts.necessityGate !== undefined ? { necessityGate: opts.necessityGate } : {}),
   }, wakeEvents);
 
@@ -355,26 +363,53 @@ function isNowLayer(item: unknown): boolean {
 }
 
 /**
- * 历史段（跨轮可命中的部分）：此刻层之前的一切。
+ * 本轮固定块判据（v29/B2）：`STATE.md` 与关系档案在这一层，位置是**历史之后、此刻层之前**。
  *
- * 此刻层之后只可能是本轮新输入（render 只在末尾追加 wakeEvent），所以中一刀切在时刻行上。
+ * 为什么单独认这一层：它一次改造的全部意义就在"一轮之内逐字节不变"——
+ * 认不出来就没法断言这件事（M5-10 那一组用例是它的正面断言）。
+ */
+function isTurnBlock(item: unknown): boolean {
+  if (typeof item !== 'object' || item === null) return false;
+  const it = item as { type?: unknown; role?: unknown; content?: unknown };
+  return it.type === 'message' && it.role === 'developer'
+    && typeof it.content === 'string' && it.content.startsWith(TURN_BLOCK_BANNER);
+}
+
+/** 本轮固定块文本（STATE / 关系档案 / 本轮选中的记忆都在里面）；缺了就是渲染层出了问题 */
+function turnBlockOf(request: CacheShape): string {
+  const found = inputItemsOf(request).find(isTurnBlock) as { content: string } | undefined;
+  assert.ok(found, '请求里必须有本轮固定块');
+  return found.content;
+}
+
+/**
+ * 历史段（跨轮可命中的部分）：记忆层 + 事件流——即**固定块与此刻层之前**的一切。
+ *
+ * v29/B2 起固定块夹在历史与此刻层之间，它属于"一轮一变"的那一段，不是跨步命中的单元，
+ * 所以这里要把它排除掉（它自己另由 M5-10 的"同一轮相邻两步"那条用例钉住）。
  */
 function historyItemsOf(request: CacheShape): readonly unknown[] {
   const items = inputItemsOf(request);
   const nowIndex = items.findIndex(isNowLayer);
-  return nowIndex === -1 ? items : items.slice(0, nowIndex);
+  const head = nowIndex === -1 ? items : items.slice(0, nowIndex);
+  return head.filter(item => !isTurnBlock(item));
 }
 
-/** 此刻层文本（STATE 与任务卡都在里面）；缺了就是渲染层出了问题 */
+/** 此刻层文本（时刻 / 本机 / 联络 / 任务卡）；缺了就是渲染层出了问题 */
 function nowLayerOf(request: CacheShape): string {
   const found = inputItemsOf(request).find(isNowLayer) as { content: string } | undefined;
   assert.ok(found, '请求里必须有此刻层');
   return found.content;
 }
 
-/** 摘掉此刻层后的字节（比"除此刻层外一切冻结"时用） */
+/**
+ * 摘掉此刻层后的字节（比"除此刻层外一切冻结"时用）。
+ *
+ * v29 起**固定块也摘掉**：它与此刻层一样不属于"跨步/跨轮命中单元"。剩下的那份是
+ * 记忆层 + 事件流——M5-10/M5-11/M5-12 要钉的正是它。
+ */
 function withoutNowBytes(request: CacheShape): string {
-  return bytesOf(inputItemsOf(request).filter(item => !isNowLayer(item)));
+  return bytesOf(inputItemsOf(request).filter(item => !isNowLayer(item) && !isTurnBlock(item)));
 }
 
 /** 两项 item 序列的公共前缀长度（逐项 JSON 逐字节比较） */
@@ -446,6 +481,9 @@ describe('M5-1 人格连续性：压缩 / 崩溃恢复后的首个 turn', () => 
       taskCard: taskCardOf(2, 1),
       now: NOW_FIXED,
       model: 'fake-heavy',
+      // v29/B2：状态由**宿主编成固定块**递进来（渲染层不自己从 persona 取——那是运行期的装配责任）。
+      // 重放走的是同一条路：replay 从人格资产 + `memory/selected` 重建这一份（runtime/replay.ts）。
+      turnBlock: { state: PERSONA.state, relationship: null },
     });
 
     // ① 人格常驻层在最前，且顺序 IDENTITY → CONSTITUTION → STYLE
@@ -455,7 +493,7 @@ describe('M5-1 人格连续性：压缩 / 崩溃恢复后的首个 turn', () => 
     const iStyle = request.instructions.indexOf(PERSONA.style);
     assert.ok(iId === 0 && iCons > iId && iStyle > iCons, '人格常驻层顺序：IDENTITY → CONSTITUTION → STYLE');
 
-    // ② 摘要进记忆层（input 头部，跨轮稳定），STATE 与时刻在尾部此刻层（v4 布局）
+    // ② 摘要进记忆层（input 头部，跨轮稳定）；STATE 进**本轮固定块**（历史之后、此刻层之前，v29）
     const memory = request.input[0] as { type: string; role: string; content: string };
     assert.equal(memory.type, 'message');
     assert.equal(memory.role, 'developer');
@@ -465,10 +503,17 @@ describe('M5-1 人格连续性：压缩 / 崩溃恢复后的首个 turn', () => 
     );
     assert.ok(memory.content.includes('早期历史摘要：在搭 M5 验收'));
 
+    // 固定块在历史之后、此刻层之前（这是 B2 的位置契约），STATE 在里面、**不在**此刻层
+    const blockIndex = request.input.findIndex(isTurnBlock);
+    const nowIndex = request.input.findIndex(isNowLayer);
+    assert.ok(blockIndex > 0, '固定块必须在历史之后');
+    assert.ok(blockIndex < nowIndex, '固定块必须在此刻层之前');
+    assert.ok(turnBlockOf(request).includes(`[当前状态]\n${PERSONA.state}`), 'STATE 注入在本轮固定块里');
+    assert.ok(!nowLayerOf(request).includes('[当前状态]'), '此刻层不再背 STATE（B2 的全部意义）');
+
     const now = nowLayerOf(request);
     assert.ok(now.startsWith(NOW_LAYER_BANNER), '此刻层以段头两行开头（v23 的声明式字段层）');
     assert.ok(now.includes(`\n时刻：`), '字段表的第一项是时刻');
-    assert.ok(now.includes(`[当前状态]\n${PERSONA.state}`), 'STATE 注入在尾部此刻层');
 
     // ③ 遮蔽区正文一个字节都不许出现
     assert.ok(
@@ -528,6 +573,8 @@ describe('M5-1 人格连续性：压缩 / 崩溃恢复后的首个 turn', () => 
         now: () => NOW_FIXED,
         timezone: TZ,
         workspaceRoot: dir,
+        // 与真循环同一形状：固定块由宿主在轮首装好（这里就是 PERSONA.state）
+        turnBlock: { state: PERSONA.state, relationship: null },
       }, [wakeEvent]);
       assert.deepEqual(reason, { kind: 'completed' });
     } finally {
@@ -537,8 +584,8 @@ describe('M5-1 人格连续性：压缩 / 崩溃恢复后的首个 turn', () => 
     const request = requests[0];
     assert.ok(request, '恢复后的首个 turn 必须真的发起模型调用');
     assert.ok(instructionsOf(request).startsWith(PERSONA.identity), '恢复后首 turn 仍以 IDENTITY 开头');
-    const now = nowLayerOf(request);
-    assert.ok(now.includes('[当前状态]'), 'STATE 注入在尾部此刻层');
+    assert.ok(turnBlockOf(request).includes('[当前状态]'), 'STATE 注入在本轮固定块里');
+    assert.ok(!nowLayerOf(request).includes('[当前状态]'), '此刻层不再背 STATE（B2）');
     assert.ok(bytesOf(request.input).includes('崩溃前那一刻的输入'), '崩溃前的输入必须回到上下文里');
   });
 });
@@ -926,6 +973,8 @@ describe('M5-10 前缀命中：连续 step 的历史段逐字节冻结', () => {
       timezone: TZ,
       model: 'fake-heavy',
       lane: 'heavy' as const,
+      // v29/B2：状态在**本轮固定块**里，素材由宿主轮首给（见 real-loop 的 turnBlockFacts）
+      turnBlock: { state: PERSONA.state, relationship: null },
     };
     const a: RenderedRequest = render({ ...base, now: '2026-02-14T10:00:00.000+08:00' });
     const b: RenderedRequest = render({ ...base, now: '2026-02-14T10:00:07.000+08:00' });
@@ -933,11 +982,87 @@ describe('M5-10 前缀命中：连续 step 的历史段逐字节冻结', () => {
     assert.equal(a.instructions, b.instructions, 'instructions 不含时钟');
     const nowText = nowLayerOf(a);
     assert.ok(nowText.startsWith(`${NOW_LAYER_BANNER}\n时刻：2026-02-14 10:00:00（周六 · ${TZ} · UTC+08:00）｜UTC 2026-02-14T10:00:00.000+08:00`));
+    // 固定块也随时钟冻结：状态与记忆在"轮"这一档上，与 step 的时刻无关
+    assert.equal(turnBlockOf(a), turnBlockOf(b), '固定块不随时钟变化（它一轮一变，不一步一变）');
+    assert.equal(a.context.state?.hash, b.context.state?.hash);
     assert.equal(
       withoutNowBytes(a),
       withoutNowBytes(b),
       '除此刻层外，任何字节都不得随时钟变化（KV 前缀的最后一道防线）',
     );
+  });
+
+  /**
+   * v29/B2 的核心契约（这一版买到的就是它）：**同一轮内相邻两步**的请求，
+   * 除此刻层那一条之外逐字节相同，且固定块在两步里位置与内容一致。
+   *
+   * 为什么必须钉住：改造前状态挤在此刻层里，整份 `STATE.md` 每步重新编码
+   *（实测 `context.now` 约 3955 token/步，其中 STATE 3845）。这条断言就是"不再重发"的可执行形式：
+   * 两步之间**第一处不同必须落在此刻层**，而不是像改造前那样落在历史之后的第一个字节上。
+   */
+  test('同一轮相邻两步：除此刻层外逐字节相同，固定块位置与内容一致（B2）', async (t) => {
+    resetFactory();
+    const STEPS = 3;
+    const script: ScriptedResult[] = [
+      { text: '第 1 步：先看一眼。', toolCalls: [{ callId: 'c1', name: 'read_file', arguments: JSON.stringify({ file_path: 'README.md' }) }] },
+      { text: '第 2 步：再看一处。', toolCalls: [{ callId: 'c2', name: 'read_file', arguments: JSON.stringify({ file_path: 'README.md' }) }] },
+      { text: '看完了，收尾。', toolCalls: [] },
+    ];
+    const h = await makeHarness(t, { script });
+    for (let i = 0; i < 4; i++) {
+      h.append('message/user', { text: `历史输入 ${i}`, source: 'human' });
+      h.append('message/assistant', { text: `历史回复 ${i}`, toolCalls: [] });
+    }
+    const wake = h.append('wake/manual', { note: '盯备份' });
+    assert.deepEqual(await h.turn([wake]), { kind: 'completed' });
+    assert.equal(h.requests.length, STEPS);
+
+    const blocks = h.requests.map(r => turnBlockOf(r));
+    /**
+     * "此刻层之外那一串"：记忆层 + 事件流 + 固定块（按请求里的顺序）。
+     *
+     * 为什么比较它而不是整个 input：每一步都会往历史里追加自己产生的 assistant / 工具调用 /
+     * 工具回执（**正常追加**，不是抖动）。所以"除此刻层外逐字节相同"的正确形式是
+     * **前缀关系**：上一步那一串必须逐字节是这一步那一串的前缀，新条目只出现在尾巴上。
+     */
+    const outside = (r: (typeof h.requests)[number]): unknown[] =>
+      inputItemsOf(r).filter(item => !isNowLayer(item));
+    for (let i = 1; i < STEPS; i++) {
+      assert.equal(blocks[i], blocks[0], `第 ${i + 1} 步的固定块必须与首步逐字节相同`);
+      assert.ok(blocks[i]!.includes(`[当前状态]\n${PERSONA.state}`), '状态在固定块里');
+      assert.ok(!nowLayerOf(h.requests[i]!).includes('[当前状态]'), '此刻层里没有状态');
+
+      const prev = outside(h.requests[i - 1]!);
+      const next = outside(h.requests[i]!);
+      assert.ok(next.length > prev.length, `第 ${i + 1} 步：此刻层之外只许追加`);
+      // 位置契约：固定块恒在**历史之后**——它是最后一条，或后面只跟本轮新输入
+      // （首步的本轮新输入排在固定块之后，第 2 步起它已经在历史里了）。
+      const at = next.findIndex(isTurnBlock);
+      assert.ok(
+        at >= next.length - 2,
+        `第 ${i + 1} 步：固定块必须落在历史之后（它在第 ${at} 条 / 共 ${next.length} 条）`,
+      );
+
+      // 把这些会挪位的固定块摘掉，剩下的（记忆层 + 事件流）才是真正逐字节冻结的那一串
+      const history = (r: (typeof h.requests)[number]): unknown[] =>
+        outside(r).filter(item => !isTurnBlock(item));
+      const prevHistory = history(h.requests[i - 1]!);
+      const nextHistory = history(h.requests[i]!);
+      const frozen = commonItemPrefix(prevHistory, nextHistory);
+      assert.equal(
+        frozen,
+        prevHistory.length,
+        `第 ${i + 1} 步：上一步的历史必须逐字节冻结（抖动只许出现在此刻层）\n`
+        + `@${frozen} 上一步：${bytesOf(prevHistory[frozen])}\n@${frozen} 这一步：${bytesOf(nextHistory[frozen])}`,
+      );
+      // 固定块在两步里的落点相同：都在"历史末尾、此刻层之前"（前面已经断言内容逐字节相同）
+      const blockAt = inputItemsOf(h.requests[i]!).findIndex(isTurnBlock);
+      assert.ok(blockAt >= 0, '固定块在请求里');
+      assert.ok(isNowLayer(inputItemsOf(h.requests[i]!)[blockAt + 1]), '固定块之后紧挨着此刻层');
+    }
+    // 抖动确实只在"每个 step 本就该变"的那一条上（时刻 + 任务卡的步数）
+    const nowVariants = new Set(h.requests.map(r => nowLayerOf(r)));
+    assert.equal(nowVariants.size, STEPS, '此刻层逐 step 变化');
   });
 });
 

@@ -76,7 +76,7 @@ Map<String, dynamic> _sessions() => {
       'unreadTotal': 3,
     };
 
-/// 一条注入预警 + 一条严重告警
+/// 一条注入预警 + 一条严重告警 + 上下文审计两类（缓存破坏哨兵 / 上下文归因）
 Map<String, dynamic> _notes() => {
       'notes': [
         {
@@ -93,8 +93,26 @@ Map<String, dynamic> _notes() => {
           'by': null, 'fingerprint': 'webhook-fail:abc',
           'sid': null, 'person': '', 'chatType': '', 'name': null,
         },
+        // 2026-10-03：缓存破坏哨兵（真失守时才记一条）
+        {
+          'seq': 89, 'at': '2026-09-29T21:00:00.000Z', 'kind': 'cache-break', 'label': '缓存破坏',
+          'level': 'warn', 'title': '缓存前缀失守：人格文件变更',
+          'reason': '缓存前缀失守（persona）：人格文件被改写（IDENTITY / CONSTITUTION / STYLE）'
+              '——常驻前缀从第一个字节起失守。距上次调用 2 分钟，本次 input 170000 token，缓存命中 3.0%。',
+          'quotes': <dynamic>[], 'by': null, 'fingerprint': null,
+          'sid': null, 'person': '', 'chatType': '', 'name': null,
+        },
+        // 同一天：每一步一条的上下文归因（info，安静地待着）
+        {
+          'seq': 88, 'at': '2026-09-29T20:59:00.000Z', 'kind': 'context', 'label': '上下文',
+          'level': 'info', 'title': '第 12 轮第 3 步的上下文：input 170000 token / 260 条',
+          'reason': '指令 0.7万 · 工具 0.4万×22 · 记忆 0.2万 · 历史 15.2万/255 条 · 此刻层 0.3万 · 合计 16.8万'
+              '（渲染版本 28）',
+          'quotes': <dynamic>[], 'by': null, 'fingerprint': null,
+          'sid': null, 'person': '', 'chatType': '', 'name': null,
+        },
       ],
-      'count': 2, 'limit': 20,
+      'count': 4, 'limit': 20,
     };
 
 _FakeApi _apiWith({
@@ -190,8 +208,47 @@ void main() {
 
     expect(find.text('告警 · 严重'), findsOneWidget, reason: '等级不只靠颜色说');
     expect(find.text('告警出口连续失败'), findsOneWidget);
-    expect(find.textContaining('来源：框架自身'), findsOneWidget);
+    expect(find.textContaining('来源：框架自身'), findsWidgets);
     expect(find.textContaining('webhook-fail:abc'), findsOneWidget, reason: '指纹是排障时对上告警目录的东西');
+  });
+
+  // ── 上下文审计（2026-10-03）：缓存破坏哨兵与每一步的上下文归因 ──
+
+  testWidgets('框架提示卡：缓存破坏哨兵摆出类别与判据（来源照实说"框架自身"）', (tester) async {
+    await _pump(tester, _apiWith());
+
+    expect(find.text('缓存破坏'), findsOneWidget);
+    expect(find.text('缓存前缀失守：人格文件变更'), findsOneWidget);
+    expect(find.textContaining('IDENTITY / CONSTITUTION / STYLE'), findsOneWidget,
+        reason: '判据要摆出来：只说"缓存坏了"没法判断该不该管');
+    expect(find.textContaining('缓存命中 3.0%'), findsOneWidget);
+  });
+
+  testWidgets('框架提示卡：上下文归因带自己的徽章、一句摘要与时刻', (tester) async {
+    await _pump(tester, _apiWith());
+
+    expect(find.text('上下文'), findsOneWidget, reason: '归因有自己的类别徽章，不并进"告警"');
+    expect(find.text('第 12 轮第 3 步的上下文：input 170000 token / 260 条'), findsOneWidget);
+    expect(find.textContaining('历史 15.2万/255 条'), findsOneWidget, reason: '分段构成要能一眼扫到');
+    expect(find.textContaining('渲染版本 28'), findsOneWidget);
+  });
+
+  testWidgets('框架提示卡：认不出的 kind 按"框架自身的一条提示"渲染，不吞条目', (tester) async {
+    await _pump(tester, _apiWith(notes: {
+      'notes': [
+        {
+          'seq': 5, 'at': '2026-09-29T19:00:00.000Z', 'kind': 'something-new', 'label': '新类别',
+          'level': 'info', 'title': '以后加的类别', 'reason': '', 'quotes': <dynamic>[],
+          'by': null, 'fingerprint': null,
+          'sid': null, 'person': '', 'chatType': '', 'name': null,
+        },
+      ],
+      'count': 1, 'limit': 20,
+    }));
+
+    expect(find.text('新类别'), findsOneWidget);
+    expect(find.text('以后加的类别'), findsOneWidget);
+    expect(find.textContaining('来源：框架自身'), findsOneWidget);
   });
 
   testWidgets('框架提示卡：没有提示时给一行灰字（空是常态，不是异常）', (tester) async {

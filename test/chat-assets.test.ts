@@ -1,236 +1,232 @@
 /**
- * 首页资源测试 — web/index.html 主壳 + 各页面模块（web/pages/*.js）
+ * 网页聊天版已删除 —— 但**它当年读的那些端点一个都没少**。
  *
- * 首页从「单页聊天版」搬进主壳之后，这条测试改盯新结构：壳负责路由/令牌门/品牌区，
- * 页面模块只管自己那一块。验收意图一条不减：
- *   ① 体积：壳骨架 + 聊天页六件套总计 <150KB（首屏必须轻，这一页不该有构建负担）；
- *   ② 零外链：除 127.0.0.1 外不出现任何外部 URL（零 CDN、零字体、零图床）；
- *   ③ 人话纪律：index.html 的**可见文案**里不出现工程师词汇（注释不算）；
- *   ④ 路由存在性：起真实的 web 服务，`/` 给主壳、`/ops.html` 仍给运维台、
- *      `/pages/*.js` 能被浏览器直接取到（模块是运行时 import 的，静态通道得通）。
+ * ## 这份文件原来测什么，为什么现在测这个
  *
- * 另有 test/chat-visual.test.ts 管聊天页的「皮」，test/web-assets.test.ts 管运维台三件套。
+ * 原来它逐条断言 `web/index.html + shell.js + pages/chat.js` 的字节：对话条目的四种颜色、
+ * 令牌门归壳、状态词表不进聊天页……网页整个删掉之后，那些断言的主语（那几个文件）
+ * 不复存在，留着一份读不到文件的测试只是自欺。
+ *
+ * 但删掉一张脸**不该顺手删掉后台**。当年那一整屏内容是从这几条端点拼出来的，而 GUI 现在
+ * 读的是同一批：`/api/stats/dashboard` 喂状态句、`/api/events` + SSE 喂对话与日志、
+ * `/api/persona/files` 喂人格页、`/api/commands/*` 是唯一的写通道。所以这份文件改成
+ * 断言**这些契约还在、还是原来那个形状**——把"页面没了"和"数据源没了"这两件事分开钉死。
+ *
+ * 另外钉两条这轮的行为变更：
+ *   · SSE 的 `?token=` 后门关了（网页删掉之后它唯一的理由——浏览器 EventSource——
+ *     也不存在了；凭据出现在 URL 里会被各处日志顺手记下来）；
+ *   · `/api/events/stream` 走 Authorization 头照旧可用。
  */
 
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import test, { after, before } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import test, { type TestContext } from 'node:test';
 
 import { defaultConfig } from '../src/config/config.ts';
 import { EventLog } from '../src/log/event-log.ts';
-import { emptyProjection } from '../src/log/types.ts';
+import { defaultVisibility, emptyProjection, type AppEvent } from '../src/log/types.ts';
 import { ensurePersonaSeeds } from '../src/persona/loader.ts';
+import { applyOne, finalizePressure } from '../src/state/fold.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
 import { startWebServer, type WebServer } from '../src/web/server.ts';
 
 // ──────────────────────────────── 脚手架 ────────────────────────────────
 
-/** 真实前端目录（不是 fixture）：这一份测试要验的正是"交付到浏览器的字节" */
-const WEB_DIR = fileURLToPath(new URL('../web/', import.meta.url));
-
-/** 壳骨架 + 聊天页（含它依赖的公共基元）：首屏真会拉下来的那几份 */
-const CHAT_ASSETS = [
-  'index.html',
-  'shell.js',
-  'shell.css',
-  'chat.css',
-  'pages/chat.js',
-  'pages/_kit.js',
+const T0 = new Date('2026-02-14T10:00:00.000Z');
+const TEST_TOKEN = 'test-token-0123456789abcdef';
+/** 当年聊天版用过的那批数据源；一条都不能少 */
+const CHAT_ENDPOINTS = [
+  '/api/projection',
+  '/api/stats/dashboard',
+  '/api/events?limit=5',
+  '/api/budget',
+  '/api/persona/files',
+  '/api/persona/file?path=IDENTITY.md',
+  '/api/config',
+  '/api/doctor',
+  '/api/memory',
+  '/api/skills',
+  '/api/framework-notes',
 ] as const;
 
-const TEST_TOKEN = 'test-token-chat-0123456789';
-const MAX_BYTES = 150 * 1024;
+interface Rig {
+  dir: string;
+  dataDir: string;
+  server: WebServer;
+  base: string;
+  append(type: string, data: unknown): AppEvent;
+  headers: Record<string, string>;
+}
 
-/** 工程师词汇表：这些词一旦出现在可见文案里，就说明翻译层漏了 */
-const ENGINEER_WORDS = ['水位', '命中率', '投影', '水印'];
-
-const bodies = new Map<string, string>();
-
-let server: WebServer | undefined;
-let log: EventLog | undefined;
-let tmpDir = '';
-let base = '';
-
-before(async () => {
-  for (const name of CHAT_ASSETS) {
-    bodies.set(name, readFileSync(join(WEB_DIR, name), 'utf8'));
-  }
-
-  tmpDir = mkdtempSync(join(tmpdir(), 'irmia-chat-'));
-  const dataDir = join(tmpDir, 'data');
-  mkdirSync(dataDir, { recursive: true });
+async function rig(t: TestContext): Promise<Rig> {
+  const dir = mkdtempSync(join(tmpdir(), 'irmia-chatwire-'));
+  const dataDir = join(dir, 'data');
   ensurePersonaSeeds(dataDir);
-  log = await EventLog.open(join(dataDir, 'events'));
-  const now = (): Date => new Date();
-  server = await startWebServer({
+  const log = await EventLog.open(join(dataDir, 'events'));
+  const projection = emptyProjection();
+  const now = (): Date => T0;
+
+  const append = (type: string, data: unknown): AppEvent => {
+    const event = {
+      seq: log.nextSeq(),
+      ts: T0.toISOString(),
+      type,
+      data,
+      visibility: defaultVisibility(type),
+      origin: 'test/chat-wire',
+    } as unknown as AppEvent;
+    log.append(event, { sync: true });
+    applyOne(projection, event);
+    finalizePressure(projection, event.ts);
+    return event;
+  };
+
+  const server = await startWebServer({
     log,
-    projection: emptyProjection(),
-    config: defaultConfig(tmpDir),
+    projection,
+    config: defaultConfig(dir),
     personaRoot: join(dataDir, 'persona'),
     dataDir,
     timers: new TimerStore(join(dataDir, 'timers.json'), { now }),
     now,
     uiToken: TEST_TOKEN,
-    webRoot: WEB_DIR,
     port: 0,
-    configPath: join(tmpDir, 'config.json'),
+    ssePollMs: 20,
     out: () => undefined,
   });
-  base = server.url();
-});
 
-after(async () => {
-  await server?.close();
-  log?.close();
+  t.after(async () => {
+    await server.close();
+    log.close();
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* Windows 上偶发的句柄占用：清理失败不影响断言结论 */
+    }
+  });
+
+  return {
+    dir,
+    dataDir,
+    server,
+    base: server.url(),
+    append,
+    headers: { authorization: `Bearer ${TEST_TOKEN}` },
+  };
+}
+
+async function getJson(base: string, path: string, headers: Record<string, string>): Promise<{ status: number; body: unknown }> {
+  const response = await fetch(`${base}${path}`, { headers });
+  const text = await response.text();
+  let body: unknown = null;
   try {
-    rmSync(tmpDir, { recursive: true, force: true });
+    body = JSON.parse(text);
   } catch {
-    /* Windows 上偶发的句柄占用：清理失败不影响断言结论 */
+    body = null;
   }
-});
-
-function body(name: (typeof CHAT_ASSETS)[number]): string {
-  const text = bodies.get(name);
-  assert.ok(text !== undefined, `${name} 尚未读取`);
-  return text;
+  return { status: response.status, body };
 }
 
-/** 剥掉注释与标签，只留下人真正会读到的文案 */
-function visibleText(html: string): string {
-  return html
-    .replace(/<!--[\s\S]*?-->/gu, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gu, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gu, ' ')
-    .replace(/<[^>]+>/gu, ' ')
-    .replace(/\s+/gu, ' ');
-}
+// ──────────────────────────────── ① 数据源一条都没少 ────────────────────────────────
 
-// ──────────────────────────────── ① 体积 ────────────────────────────────
+test('当年喂那几页的端点全部照旧 200（删的是脸，不是后台）', async (t) => {
+  const r = await rig(t);
+  r.append('wake/manual', { note: '让 dashboard 有东西可算' });
 
-test('主壳与聊天页六件套齐全，总计 <150KB', () => {
-  let total = 0;
-  for (const name of CHAT_ASSETS) {
-    const text = body(name);
-    assert.ok(text.length > 0, `${name} 不应为空`);
-    total += Buffer.byteLength(text, 'utf8');
-  }
-  assert.ok(total < MAX_BYTES, `六件套共 ${total} 字节，应小于 ${MAX_BYTES}`);
-});
-
-test('ops.html 与运维台三件套仍在（首页换壳没有把老页面弄丢）', () => {
-  const ops = readFileSync(join(WEB_DIR, 'ops.html'), 'utf8');
-  assert.ok(ops.includes('/app.css'), 'ops.html 应继续引用 app.css（绝对路径，改名后不受影响）');
-  assert.ok(ops.includes('/app.js'), 'ops.html 应继续引用 app.js');
-  assert.ok(ops.includes('运维台'), 'ops.html 应仍是运维台');
-});
-
-// ──────────────────────────────── ② 零外链 ────────────────────────────────
-
-test('不引用任何外部 URL（零 CDN、零字体、零图床）', () => {
-  for (const name of CHAT_ASSETS) {
-    const matches = [...body(name).matchAll(/https?:\/\/[^\s"'`)<>]*/gu)].map((match) => match[0]);
-    const external = matches.filter((url) => !/^https?:\/\/(127\.0\.0\.1|localhost)([:/]|$)/u.test(url));
-    assert.deepEqual(external, [], `${name} 出现了外部 URL`);
+  for (const path of CHAT_ENDPOINTS) {
+    const res = await getJson(r.base, path, r.headers);
+    assert.equal(res.status, 200, `${path} 必须还在（GUI 读的是同一批）`);
+    assert.notEqual(res.body, null, `${path} 必须回 JSON`);
   }
 });
 
-test('index.html 只引用同源的样式与脚本（壳自己一份，页面模块运行时 import）', () => {
-  const html = body('index.html');
-  for (const href of ['/app.css', '/shell.css', '/chat.css', '/pages/overview.css']) {
-    assert.ok(html.includes(`href="${href}"`), `主壳应引用 ${href}`);
+test('写通道照旧：那三条命令还在危险短语表里，wake 落 wake/manual', async (t) => {
+  const r = await rig(t);
+
+  for (const command of ['wake', 'review-resolve', 'answer']) {
+    const response = await fetch(`${r.base}/api/commands/${command}`, {
+      method: 'POST',
+      headers: { ...r.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ note: 'x', answer: 'y', callId: 'c1', outcome: 'succeeded' }),
+    });
+    // 未知命令会 404 unknown-command；这三条要么成功要么如实报错，但**绝不能是"没这条命令"**
+    const text = await response.text();
+    assert.equal(text.includes('unknown-command'), false, `${command} 不该变成未知命令`);
   }
-  assert.match(html, /<script type="module" src="\/shell\.js"><\/script>/u);
-  assert.ok(!/<(script|link)[^>]+(?:src|href)="(?:https?:)?\/\//u.test(html), '不应有外链资源');
+
+  const wake = await fetch(`${r.base}/api/commands/wake`, {
+    method: 'POST',
+    headers: { ...r.headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ note: '界面还在用这条路' }),
+  });
+  assert.equal(wake.status, 200);
+  assert.equal(((await wake.json()) as { type: string }).type, 'wake/manual');
 });
 
-// ──────────────────────────────── ③ 人话纪律 ────────────────────────────────
+test('对话的形状仍在：message/assistant 与 message/user 都在事件流里（页面自己不再映射）', async (t) => {
+  const r = await rig(t);
+  r.append('message/user', { text: '你好', source: 'manual', attachments: [] });
+  r.append('message/assistant', { text: '我在。', toolCalls: [], spoke: true });
 
-test('可见文案里没有工程师词汇（注释不算）', () => {
-  const text = visibleText(body('index.html'));
-  const offenders = ENGINEER_WORDS.filter((word) => text.includes(word));
-  assert.deepEqual(offenders, [], `可见文案出现了工程师词汇：${offenders.join('、')}`);
-  for (const word of ['seq', 'turn', 'lane']) {
-    assert.ok(!new RegExp(`\\b${word}\\b`, 'iu').test(text), `可见文案出现了工程师词汇 ${word}`);
-  }
+  const res = await getJson(r.base, '/api/events?limit=10', r.headers);
+  const events = (res.body as { events: AppEvent[] }).events;
+  assert.deepEqual(events.map((event) => event.type), ['message/user', 'message/assistant']);
+  // 状态句由界面翻译，服务端只给状态机那一格（GUI 的 humanState 读它）
+  const dash = await getJson(r.base, '/api/stats/dashboard', r.headers);
+  assert.equal(typeof (dash.body as { state: string }).state, 'string');
+  assert.equal(typeof (dash.body as { stateText: string }).stateText, 'string');
 });
 
-test('主壳：七个页面槽位 + 导航项 + 令牌门 + 徽章位齐全', () => {
-  const html = body('index.html');
-  for (const page of ['overview', 'chat', 'persona', 'channels', 'extensions', 'logs', 'settings']) {
-    assert.ok(html.includes(`id="page-${page}"`), `内容区缺少 ${page} 页槽位`);
-    assert.ok(html.includes(`data-page="${page}"`), `导航缺少 ${page} 入口`);
+// ──────────────────────────────── ② SSE 契约 ────────────────────────────────
+
+test('SSE：凭 Authorization 头照旧可用，帧字段没变（先接流、再由尾部轮询推出来）', async (t) => {
+  const r = await rig(t);
+
+  const response = await fetch(`${r.base}/api/events/stream`, { headers: r.headers });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type') ?? '', /text\/event-stream/u);
+
+  const reader = response.body!.getReader();
+  t.after(() => {
+    void reader.cancel();
+  });
+
+  // 接上之后再落库：实时那条路由尾部轮询推出来（补拉那条在 web-server.test.ts 里单独验）
+  r.append('wake/manual', { note: '接上之后来的' });
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const frames: string[] = [];
+  // 流的第一帧永远是 `retry: 3000`（SSE 重连建议），事件帧才算数
+  while (frames.length < 1) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    let idx = buffer.indexOf('\n\n');
+    while (idx >= 0) {
+      const frame = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      if (frame.startsWith('event:')) frames.push(frame);
+      idx = buffer.indexOf('\n\n');
+    }
   }
-  assert.ok(html.includes('id="sh-gate"'), '令牌门应归壳统一管');
-  assert.ok(html.includes('id="sh-badge-chat"'), '聊天项应有徽章位（未读计数）');
-  assert.ok(html.includes('id="sh-badge-logs"'), '日志项应有徽章位');
-  assert.ok(html.includes('sh-badge-warn'), '日志项徽章应是 warn 款（红点）');
-  assert.ok(html.includes('data-theme='), '明暗双模应挂在根元素 data-theme 上');
+  assert.equal(frames.length, 1, '应至少收到一帧事件');
+  assert.match(frames[0]!, /^event: wake\/manual\nid: 1\n/u, '帧形状：event 名 + id + data');
+
+  const payload = JSON.parse(frames[0]!.split('data: ')[1]!) as AppEvent;
+  assert.equal(payload.seq, 1);
+  assert.equal(payload.type, 'wake/manual');
+  assert.equal(payload.visibility, 'model');
 });
 
-test('聊天页：只剩对话流 / 确认卡片 / 输入行，且不在页内查全局 id', () => {
-  const js = body('pages/chat.js');
-  for (const anchor of ['id="c-feed"', 'id="c-list"', 'id="c-guide"', 'id="c-cards"', 'id="c-input"', 'id="c-send"']) {
-    assert.ok(js.includes(anchor), `聊天页模板缺少 ${anchor}`);
-  }
-  assert.ok(js.includes('placeholder="输入消息…"'), '输入框占位符应是界面文案（走 copy-guide 词表）');
-  assert.ok(js.includes('data-state="loading"'), '应有加载态');
-  assert.match(js, /data-slot="empty"/u);
-  assert.match(js, /data-slot="data"/u);
+test('SSE 的 ?token= 后门已关闭（凭据只认头）', async (t) => {
+  const r = await rig(t);
 
-  // 顶栏与令牌门都归了壳：聊天页里不许再出现它们
-  for (const gone of ['c-top', 'c-avatar', 'c-menu', 'c-gate', 'c-modal']) {
-    assert.ok(!js.includes(gone), `聊天页不该再保留 ${gone}（已在壳里）`);
-  }
-  // 页面模块只在自己的容器里查元素：document.getElementById 一处都不该有
-  assert.ok(!js.includes('document.getElementById'), '页面模块应只做容器内查询（el.querySelector）');
-  assert.ok(js.includes("R.querySelector(`#${id}`)"), '页内查询应走容器根节点');
-});
+  const viaQuery = await getJson(r.base, `/api/events/stream?token=${TEST_TOKEN}`, {});
+  assert.equal(viaQuery.status, 401, 'URL 里的凭据不再算数');
 
-test('事件映射写在 pages/chat.js 里，状态句翻译层归壳的 shell.js', () => {
-  const js = body('pages/chat.js');
-  // 事件 → 对话的映射：她说的、你说的、别人说的、系统灰字
-  for (const type of ["'message/assistant'", "'message/user'", "'wake/manual'", "'wake/channel'", "'wake/timer'", "'wake/heartbeat'"]) {
-    assert.ok(js.includes(type), `事件映射缺少 ${type}`);
-  }
-  assert.ok(js.includes('spoke === true'), '沉默的心跳不该上屏');
-  for (const endpoint of ["'/api/projection'", '/api/events?limit=', "'/api/events/stream'", "'/api/persona/files'"]) {
-    assert.ok(js.includes(endpoint), `缺少数据来源 ${endpoint}`);
-  }
-  for (const command of ["'/api/commands/wake'", "'/api/commands/review-resolve'", "'/api/commands/answer'"]) {
-    assert.ok(js.includes(command), `缺少写命令 ${command}`);
-  }
-
-  // 状态词表（docs/copy-guide.md 第二节）是壳的品牌区在说，不在聊天页里重复一遍
-  const shell = body('shell.js');
-  for (const phrase of ['执行中', '就绪', '休眠中', '降级运行', '已暂停（预算耗尽）', '待确认', '连接中断']) {
-    assert.ok(shell.includes(phrase), `壳的状态词表缺少文案：${phrase}`);
-  }
-  for (const spoken of ['我在干活呢', '我在打盹', '我在呢', '连不上她了', '预算花完了']) {
-    assert.ok(!shell.includes(spoken), `壳的品牌区不该再出现口语化状态句：${spoken}`);
-  }
-  assert.ok(shell.includes('irmia.ui.token'), '令牌应复用运维台的 localStorage 键');
-  assert.ok(shell.includes("ctx.api('/api/stats/dashboard')"), '壳应自己轮询仪表盘喂品牌区');
-});
-
-// ──────────────────────────────── ④ 真实服务上的路由 ────────────────────────────────
-
-test('真实服务：/ 给主壳、/ops.html 给运维台、/pages/*.js 可被取到，都 200', async () => {
-  const home = await fetch(`${base}/`);
-  assert.equal(home.status, 200, '/ 应可访问');
-  const homeText = await home.text();
-  assert.ok(homeText.includes('/shell.js'), '/ 应是主壳');
-
-  const ops = await fetch(`${base}/ops.html`);
-  assert.equal(ops.status, 200, '/ops.html 应可访问');
-  const opsText = await ops.text();
-  assert.ok(opsText.includes('/app.js'), '/ops.html 应是运维台');
-
-  // 页面模块是运行时 import 的：静态通道得能取到，否则一切白说
-  for (const name of [...CHAT_ASSETS, 'pages/overview.js', 'pages/persona.js']) {
-    const res = await fetch(`${base}/${name}`);
-    assert.equal(res.status, 200, `/${name} 应可访问`);
-  }
+  const anon = await getJson(r.base, '/api/events/stream', {});
+  assert.equal(anon.status, 401);
 });

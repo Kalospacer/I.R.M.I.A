@@ -11,6 +11,8 @@
 import { readdirSync, readFileSync } from 'node:fs';
 
 const dataDir = process.argv[2] ?? 'data';
+// 档案属于谁：由使用者的联系人表决定，脚本里不写死某个具体的人。要查别人就把这一行换掉。
+const OWNER = 'OWNER';
 const { render } = await import('../dist/model/render.js');
 const { loadPersona, loadRelationship } = await import('../dist/persona/loader.js');
 
@@ -29,13 +31,13 @@ for (const f of readdirSync(dir).filter((x) => x.endsWith('.jsonl')).sort()) {
 events.sort((a, b) => a.seq - b.seq);
 
 const persona = loadPersona(dataDir);
-const wake = events.find((e) => e.type === 'wake/manual' && e.data.person === 'owner');
+const wake = events.find((e) => e.type === 'wake/manual' && e.data.person === OWNER);
 if (!wake) {
   console.log('日志里没有带人的手动唤醒');
   process.exit(0);
 }
 
-const content = loadRelationship(dataDir, 'owner');
+const content = loadRelationship(dataDir, OWNER);
 const base = {
   events: events.filter((e) => e.seq < wake.seq),
   persona,
@@ -49,7 +51,7 @@ const base = {
   contact: { qqOfficial: true, onebot: false, alertWebhook: false, wakeChannel: null },
 };
 
-const withRel = render({ ...base, persona: { ...persona, relationship: { who: 'owner', content } } });
+const withRel = render({ ...base, persona: { ...persona, relationship: { who: OWNER, content } } });
 const without = render({ ...base, persona: { ...persona, relationship: null } });
 
 const key = (it) => JSON.stringify(it);

@@ -200,14 +200,14 @@ test('deps.paths：三个键各自独立、相对路径以配置目录为基准�
   await writeRawConfig(dir, {
     deps: {
       $comment: '外部依赖的用户指定路径',
-      paths: { rg: 'tools/rg.exe', es: '   ', pwsh: 'C:\\tools\\pwsh7\\pwsh.exe' },
+      paths: { rg: 'tools/rg.exe', es: '   ', pwsh: 'C:\\path\\to\\pwsh.exe' },
     },
   });
 
   const { config } = await loadConfig(dir);
   // 相对路径解析成绝对路径（与 dataDir / paths.workspaceAllowlist 同一口径）
   assert.equal(config.deps.paths.rg, join(dir, 'tools', 'rg.exe'));
-  assert.equal(config.deps.paths.pwsh, 'C:\\tools\\pwsh7\\pwsh.exe', '绝对路径原样保留');
+  assert.equal(config.deps.paths.pwsh, 'C:\\path\\to\\pwsh.exe', '绝对路径原样保留');
   assert.equal(config.deps.paths.es, undefined, '只有空白等于没写（不干预），而不是把它当路径去 spawn');
 });
 
@@ -239,14 +239,14 @@ test('deps.paths.<name> 类型错就报错，不静默丢掉', async (t) => {
 test('channels.onebot.managed：读得回来（kind 缺省 snowluma、autoStart 缺省不物化）', async (t) => {
   const dir = await freshDir(t);
   await writeRawConfig(dir, {
-    channels: { onebot: { enabled: true, managed: { dir: 'C:\\SnowLuma' } } },
+    channels: { onebot: { enabled: true, managed: { dir: 'C:\\path\\to\\snowluma' } } },
   });
 
   const { config } = await loadConfig(dir);
   const managed = config.channels.onebot.managed;
   assert.ok(managed !== undefined, 'managed 必须能被读回来——写进去读不回来就是"配了却不生效"');
   assert.equal(managed.kind, 'snowluma', 'kind 缺省时补默认（目前只有一个取值）');
-  assert.equal(managed.dir, 'C:\\SnowLuma');
+  assert.equal(managed.dir, 'C:\\path\\to\\snowluma');
   // 目录**不在解析期**解析：它有"相对 dataDir"的语义，而解析期只有配置文件所在目录
   // （归一化交给写入侧与 main.ts 的 resolveServiceDir）
   assert.equal(managed.autoStart, undefined, '没写 autoStart 就不要物化出一个 true：那样 configHash 再也分不出写没写过');
@@ -281,7 +281,7 @@ test('channels.onebot.managed：dir 缺失/为空当场报错，不静默丢掉�
 
 test('channels.onebot.managed：kind 只认 snowluma（别的名字说明他期待了另一套启动方式）', async (t) => {
   const dir = await freshDir(t);
-  await writeRawConfig(dir, { channels: { onebot: { managed: { kind: 'napcat', dir: 'C:\\NapCat' } } } });
+  await writeRawConfig(dir, { channels: { onebot: { managed: { kind: 'napcat', dir: 'D:\\NapCat' } } } });
 
   await assert.rejects(
     () => loadConfig(dir),

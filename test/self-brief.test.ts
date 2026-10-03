@@ -210,7 +210,7 @@ describe('装置自述 · 静态常量', () => {
         person: 'OPENID-OWNER', lastText: '弥亚小姐在吗', lastSeenAt: '2026-10-01T16:42:00.000Z',
         messages: 3, label: null, readUpToSeq: 0, unread: 0,
       }],
-      contacts: new Map([['qq:c2c:OWNER', 'owner']]),
+      contacts: new Map([['qq:c2c:OWNER', '用户（OWNER）']]),
       wakeMessage: {
         channel: 'qq-official', chatType: 'c2c', chatId: 'OWNER', person: 'OPENID-OWNER',
         mentionsMe: true,

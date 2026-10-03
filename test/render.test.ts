@@ -15,7 +15,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { NOW_LAYER_BANNER, RENDER_VERSION, render, renderWake } from '../src/model/render.ts';
+import { NOW_LAYER_BANNER, RENDER_VERSION, TURN_BLOCK_BANNER, render, renderWake } from '../src/model/render.ts';
 import type {
   InputItem, MachineFacts, RenderImageRef, RenderInput, RenderPersona, RenderedRequest, UsageFacts,
 } from '../src/model/render.ts';
@@ -118,6 +118,18 @@ interface RenderOverrides {
   injection?: readonly InjectionWarnFacts[] | null;
   loadImage?: ((ref: RenderImageRef) => string | null) | null;
   maxContextImages?: number;
+  /** 尾部插播（软阈值提示 / 钩子注入）：2026-10-03 起由渲染层追加，归因要数到它 */
+  softHint?: string | null;
+  /**
+   * v29 起：`STATE.md` / 关系档案不再在此刻层，而在**本轮固定块**里（历史之后、此刻层之前）。
+   * 渲染层不自己从 persona 取状态（那是宿主一轮读一次的快照）——所以这里显式给。
+   *
+   * 默认值 = 把 `persona.state` 与 `persona.relationship` 装进固定块：绝大多数用例关心的是
+   * "状态有没有进上下文"，而不是"谁把它递进去的"；要测"没给固定块"的场景就传 `null`。
+   */
+  turnBlock?: RenderInput['turnBlock'];
+  /** 记忆索引（长期记忆层那一段）：默认 null（没有索引时该段整体不出现） */
+  memoryIndex?: string | null;
 }
 
 function renderOnce(
@@ -126,9 +138,16 @@ function renderOnce(
 ): RenderedRequest {
   const loadImage = extra.loadImage ?? o.loadImage ?? null;
   const maxContextImages = extra.maxContextImages ?? o.maxContextImages;
+  const persona = o.persona ?? BASE_PERSONA;
+  const turnBlock = o.turnBlock === undefined
+    ? {
+      state: persona.state,
+      relationship: persona.relationship ?? null,
+    }
+    : o.turnBlock;
   return render({
     events: o.events ?? [],
-    persona: o.persona ?? BASE_PERSONA,
+    persona,
     tools: o.tools ?? DEFAULT_TOOLS,
     wakeEvent: o.wakeEvent ?? null,
     taskCard: o.taskCard ?? null,
@@ -145,6 +164,9 @@ function renderOnce(
     injection: o.injection ?? null,
     loadImage,
     ...(maxContextImages === undefined ? {} : { maxContextImages }),
+    softHint: o.softHint ?? null,
+    memoryIndex: o.memoryIndex ?? null,
+    turnBlock,
   });
 }
 
@@ -194,33 +216,51 @@ function isNowLayer(it: InputItem): boolean {
   return it.type === 'message' && it.role === 'developer' && it.content.startsWith(NOW_LAYER_BANNER);
 }
 
-/** 此刻层以外的一切：换 now / timezone / 联络事实都不该动它——这是缓存能命中的前提 */
-function withoutNow(r: RenderedRequest): string {
-  return JSON.stringify(r.input.filter(i => !isNowLayer(i)));
+/**
+ * 本轮固定块判据（v29/B2）：`STATE.md` 与关系档案在这一层，位置是**历史之后、此刻层之前**。
+ * 与此刻层同一条做法——按段头认层，不按索引认。
+ */
+function isTurnBlock(it: InputItem): boolean {
+  return it.type === 'message' && it.role === 'developer' && it.content.startsWith(TURN_BLOCK_BANNER);
 }
 
 /**
- * 上下文里两处 developer 的合并文本：尾部此刻层（时刻 / 联络 / STATE / 关系 / 任务卡）在前，
- * 头部长期记忆层（技能目录 + 摘要）在后——顺序沿用旧的「状态层」语义（时刻进 → 摘要出）。
+ * 此刻层以外的一切：换 now / timezone / 联络事实都不该动它——这是缓存能命中的前提。
  *
- * 真实请求里它们的物理位置是反的（稳定在前、易变在后，这是缓存纪律），这里只负责把两层
+ * v29 起固定块也摘掉：它与此刻层一样是"框架给的、位置在历史之后"的那类，只是变化节奏是**轮**
+ * 而不是**步**。"一步之内除此刻层外逐字节不变"由 m5-acceptance 的专项用例钉住，
+ * 这里这条管的是"换事实不该动记忆层与事件流"。
+ */
+function withoutNow(r: RenderedRequest): string {
+  return JSON.stringify(r.input.filter(i => !isNowLayer(i) && !isTurnBlock(i)));
+}
+
+/**
+ * 上下文里 developer 各层的合并文本：此刻层（时刻 / 联络 / 任务卡）在前，
+ * 尾部长期记忆层（技能目录 + 摘要）在后——顺序沿用旧的「状态层」语义（时刻进 → 摘要出）。
+ *
+ * v29 起状态与关系档案在**固定块**里，所以它也要合进来：`stateLayer` 这条断言口径问的是
+ * "这几样在不在上下文里、彼此的先后如何"，而不是"具体在哪一层"（分层另有专项测试）。
+ *
+ * 真实请求里它们的物理位置是反的（稳定在前、易变在后，这是缓存纪律），这里只负责把各层
  * 内容合起来供断言看；缓存那一条另有专项测试守着。
  */
 function stateLayer(r: RenderedRequest): string {
   const now = r.input.filter(isNowLayer).map(i => (i as MessageItem).content);
+  const block = r.input.filter(isTurnBlock).map(i => (i as MessageItem).content);
   const memory = r.input.filter(isMemoryLayer).map(i => (i as MessageItem).content);
-  assert.ok(now.length + memory.length > 0, '请求里必须有 developer 层');
-  return [...now, ...memory].join('\n\n');
+  assert.ok(now.length + block.length + memory.length > 0, '请求里必须有 developer 层');
+  return [...now, ...block, ...memory].join('\n\n');
 }
 
 /**
- * 事件流渲染出来的 item（跳过长期记忆层与尾部此刻层）。
+ * 事件流渲染出来的 item（跳过长期记忆层、本轮固定块与尾部此刻层）。
  *
  * 不能按 role 排 developer：事件流自己也产出 developer 模板（策略拒绝 / 工具清单变更 /
  * 等待人工回答），它们必须留在断言视野里。
  */
 function eventItems(r: RenderedRequest): InputItem[] {
-  return r.input.filter(item => !isMemoryLayer(item) && !isNowLayer(item));
+  return r.input.filter(item => !isMemoryLayer(item) && !isNowLayer(item) && !isTurnBlock(item));
 }
 
 /**
@@ -306,7 +346,7 @@ function buildMixedLog(): AppEvent[] {
 
   push(
     evt<SessionStart>('session/start', {
-      pid: 4242, cwd: 'C:\\agent', version: '0.1.0', schemaVersion: '1', configHash: 'h0',
+      pid: 4242, cwd: 'D:\\agent', version: '0.1.0', schemaVersion: '1', configHash: 'h0',
     }),
     evt<TurnStart>('turn/start', { turn: 1 }),
     evt<StepStart>('step/start', {
@@ -477,8 +517,8 @@ const GB = 1024 ** 3;
 const MACHINE_A: MachineFacts = {
   platform: 'Windows 10.0.26200 x64',
   uptimeMs: 3 * 3_600_000 + 12 * 60_000,
-  workspaceRoot: 'C:\\path\\to\\data\\workspace',
-  disk: { path: 'C:\\path\\to\\data\\workspace', freeBytes: Math.round(41.8 * GB), totalBytes: 800 * GB },
+  workspaceRoot: 'C:\\path\\to\\workspace',
+  disk: { path: 'C:\\path\\to\\workspace', freeBytes: Math.round(41.8 * GB), totalBytes: 800 * GB },
 };
 
 /** 另一组本机事实：只在"换了事实就换字节"那一条里用 */
@@ -629,7 +669,7 @@ describe('此刻层 · 声明式字段（v23）', () => {
     assert.equal(
       lines[3],
       '本机：Windows 10.0.26200 x64 · 进程已运行 3 小时 12 分钟'
-      + ' · 工作根 C:\\path\\to\\data\\workspace · 磁盘剩余 41.8 GB（可用 5.2%）',
+      + ' · 工作根 C:\\path\\to\\workspace · 磁盘剩余 41.8 GB（可用 5.2%）',
     );
     assert.equal(lines[4], '通道：', '通道那一行的值是整段联络方式（多行），所以标签单独占一行');
     assert.equal(fieldLine(r, '会话：'), '会话：1 个群聊、1 个单聊；未读 12 条');
@@ -656,8 +696,9 @@ describe('此刻层 · 声明式字段（v23）', () => {
       if (i > 0) assert.ok(index > alertOrder[i - 1]!, '字段顺序错位');
     }
 
-    // 原有三段一字未改（长、且已有测试锁着），仍跟在字段之后
-    assert.ok(envLayer(r).includes('\n\n[当前状态]\nSTATE 段：正在搭 render 层。'));
+    // 状态与关系档案（长、且已有测试锁着）一字未改——v29 起它们在**本轮固定块**里，
+    // 不再跟着此刻层的字段表走；这里改按"上下文里那一整段"取（stateLayer 会把两层合起来看）。
+    assert.ok(stateLayer(r).includes('\n\n[当前状态]\nSTATE 段：正在搭 render 层。'));
   });
 
   test('原 renderAskNote / renderMentionNote 的正文逐字保留，且各自只出现一次', () => {
@@ -727,7 +768,7 @@ describe('此刻层 · 声明式字段（v23）', () => {
 
   test('缺省路径：取不到的事实写"未知"或整项省略，不抛、不出现 NaN', () => {
     const bare = envLayer(renderOnce());
-    assert.ok(bare.includes(`\n本机：未知\n`), '没给本机事实就直说未知，不许编一个"看起来没事"');
+    assert.ok(bare.includes(`本机：未知`), '没给本机事实就直说未知，不许编一个"看起来没事"');
     assert.ok(!bare.includes('用度：'), 'v24：连"未知"都不写——这一行默认整个不出现');
     assert.ok(!bare.includes('NaN'));
 
@@ -735,7 +776,7 @@ describe('此刻层 · 声明式字段（v23）', () => {
     const noDisk = envLayer(renderOnce({ machine: { ...MACHINE_A, disk: null } }));
     assert.ok(noDisk.includes('本机：Windows 10.0.26200 x64 · 进程已运行 3 小时 12 分钟'), noDisk);
     assert.ok(!noDisk.includes('磁盘剩余'), '读不到磁盘就不写磁盘那一项');
-    assert.ok(envLayer(renderOnce({ machine: {} })).includes('\n本机：未知\n'), '一项都给不出时是未知');
+    assert.ok(envLayer(renderOnce({ machine: {} })).includes('本机：未知'), '一项都给不出时是未知');
 
     // 坏值（NaN / total 为 0 / 负数）不许渲染成磁盘信息，更不许出现 NaN
     for (const disk of [
@@ -837,8 +878,7 @@ describe('此刻层 · `用度：` 只在告警时出现（v24）', () => {
     const last = r.input[r.input.length - 1];
     assert.ok(last !== undefined);
     assert.equal(last.type, 'message');
-    const done = r.input.filter(i => i.type === 'message' && String(i.content).startsWith(NOW_LAYER_BANNER));
-    assert.equal(done.length, 1, '此刻层只有一个 item');
+    const done = r.input.filter(i => i.type === 'message' && String(i.content).startsWith(NOW_LAYER_BANNER));    assert.equal(done.length, 1, '此刻层只有一个 item');
     assert.equal(last.content, now, '此刻层就是最后一条');
   });
 
@@ -870,7 +910,7 @@ describe('此刻层 · `用度：` 只在告警时出现（v24）', () => {
  */
 describe('此刻层 · 注入预警（v25）', () => {
   const c2c: InjectionWarnFacts = {
-    who: 'owner', chatType: 'c2c', person: 'OPENID_A', count: 2, lastTs: '2020-06-01T08:48:00.000Z',
+    who: '用户（OWNER）', chatType: 'c2c', person: 'OPENID_A', count: 2, lastTs: '2020-06-01T08:48:00.000Z',
   };
   const group: InjectionWarnFacts = {
     who: '技术群', chatType: 'group', person: 'OPENID_X', count: 1, lastTs: '2020-06-01T06:00:00.000Z',
@@ -892,7 +932,7 @@ describe('此刻层 · 注入预警（v25）', () => {
     assert.ok(now.includes('预警：\n[框架提示] 最近 24 小时里有外部消息带着想指挥你的迹象'), now);
     assert.ok(now.includes('那几句话已经附在各自那条消息旁边了。'), '要说清那句话在哪儿，她才知道去看');
     assert.ok(now.includes('历史（最近 24 小时）：'), '用户给的那行标题逐字在');
-    assert.ok(now.includes('· owner（单聊） —— 曾试图打探/注入 2 次（最近一次 12 分钟前）'), now);
+    assert.ok(now.includes('· 用户（OWNER）（单聊） —— 曾试图打探/注入 2 次（最近一次 12 分钟前）'), now);
     assert.ok(now.includes('· 技术群（群聊）· OPENID_X —— 曾试图打探/注入 1 次（最近一次 3 小时前）'), now);
     const tail = '怎么看、要不要理、要不要点破，都由你。';
     assert.ok(now.includes(tail), '框架给事实，反应归她——这句是那条款的落点');
@@ -971,15 +1011,15 @@ describe('铁律 3 · 思维链按 Responses API 回传', () => {
       type: 'reasoning',
       content: [{ type: 'reasoning_text', text: `误标可见的推理 ${REASONING_MARKER}` }],
     });
-    // 布局（v4）：记忆层 → 事件流 → 此刻层。本例无技能目录无摘要，记忆层为空所以不出现。
+    // 布局（v29/B2）：事件流 → **本轮固定块** → 此刻层。本例无技能目录无摘要，记忆层为空所以不出现。
     assert.deepEqual(
       r.input.map(i => (i.type === 'message' ? `${i.role}:${i.content}` : i.type)),
       [
         'user:在？',
         'reasoning',
         'assistant:在。',
-        `developer:${NOW_LAYER_BANNER}\n时刻：2020-06-01 17:00:00（周一 · ${TZ} · UTC+08:00）｜UTC ${NOW_A}\n本机：未知`
-          + '\n\n[当前状态]\nSTATE 段：正在搭 render 层。',
+        `developer:${TURN_BLOCK_BANNER}\n\n[当前状态]\nSTATE 段：正在搭 render 层。`,
+        `developer:${NOW_LAYER_BANNER}\n时刻：2020-06-01 17:00:00（周一 · ${TZ} · UTC+08:00）｜UTC ${NOW_A}\n本机：未知`,
       ],
     );
   });
@@ -1032,7 +1072,10 @@ describe('铁律 3 · 配对完整', () => {
     const r = renderOnce({ events: [orphan] });
     assert.ok(!dumpInput(r).includes('ORPHAN-CONTENT'));
     assert.ok(!dumpInput(r).includes('orphan-1'));
-    assert.equal(r.input.length, 1, '只剩此刻层（本例没有技能目录也没有摘要，记忆层为空）');
+    // 本例没有技能目录也没有摘要（记忆层为空）、没有本轮输入：只剩固定块与此刻层两条 developer
+    // （v29 起固定块是**历史之后**那一条，见 m5-acceptance 的"同一轮相邻两步"用例）
+    assert.equal(r.input.length, 2, '只剩固定块 + 此刻层');
+    assert.deepEqual(eventItems(r), [], '事件流一条都没渲染出来');
     assertPaired(r);
   });
 
@@ -1176,7 +1219,10 @@ describe('铁律 4 · 遮蔽点冻结', () => {
       evt<CompactionSummary>('compaction/summary', { coveredUpToSeq: 2, summary: '摘要正文A' }, { seq: 2 }),
     ];
     const r = renderOnce({ events });
-    assert.equal(r.input.length, 2, '只有两个 developer 层：被覆盖输入 + 摘要事件都不作为事件流 item');
+    // 两条 developer 层：固定块（本轮状态）+ 此刻层。被覆盖的输入与摘要事件都不作为事件流 item
+    // ——摘要本身在**记忆层**里（本例有摘要，所以记忆层也在），只是不再是"事件流 item"。
+    assert.equal(eventItems(r).length, 0, '遮蔽点与它覆盖的输入都不进事件流');
+    assert.equal(asMessage(r.input[0], 'input[0]').content.includes('[早期历史摘要 · 覆盖至 seq 2]'), true);
     assertPaired(r);
   });
 });
@@ -1551,16 +1597,16 @@ test('wake/heartbeat 报"已安静"，分钟/秒分档', () => {
     // 界面消息：带来源标注，不再是"无头无主的一句话"——她得能判断这话是谁递的
     assert.equal(renderWake(manual), '[界面消息] 手动戳一下', '无署名时也直说是界面消息');
     assert.equal(
-      renderWake(evt<WakeManual>('wake/manual', { note: '在吗', person: 'owner' })),
-      '[界面消息 · owner] 在吗',
+      renderWake(evt<WakeManual>('wake/manual', { note: '在吗', person: 'OWNER' })),
+      '[界面消息 · OWNER] 在吗',
     );
     assert.equal(
       renderWake(
-        evt<WakeManual>('wake/manual', { note: '在吗', person: 'owner' }, { seq: 42 }),
+        evt<WakeManual>('wake/manual', { note: '在吗', person: 'OWNER' }, { seq: 42 }),
         undefined,
         new Set([42]),
       ),
-      '[界面消息 · owner · 重投] 在吗',
+      '[界面消息 · OWNER · 重投] 在吗',
       '重投的输入要标出来：重启打断一个 turn 后，重放的字节与首次完全相同，她会当成新话重新作答',
     );
     // 非 wake 类型不走这个出口
@@ -1708,27 +1754,117 @@ describe('铁律 6 · 组装顺序', () => {
   test('STATE 段为空时不出现 [当前状态] 段', () => {
     const st = stateLayer(renderOnce({ persona: { ...BASE_PERSONA, state: '   ' } }));
     assert.ok(!st.includes('[当前状态]'));
-    assert.equal(st, `${NOW_LAYER_BANNER}\n时刻：2020-06-01 17:00:00（周一 · ${TZ} · UTC+08:00）｜UTC ${NOW_A}\n本机：未知`);
+    // 状态为空 → 固定块整块不出现（不写空段），上下文里只剩此刻层这一条
+    const r = renderOnce({ persona: { ...BASE_PERSONA, state: '   ' } });
+    assert.deepEqual(r.input.map(i => (i.type === 'message' ? i.role : i.type)), ['developer']);
+    assert.equal(
+      st,
+      `${NOW_LAYER_BANNER}\n时刻：2020-06-01 17:00:00（周一 · ${TZ} · UTC+08:00）｜UTC ${NOW_A}\n本机：未知`,
+    );
   });
 
-  test('input 装配：稳定层打头 → 未遮蔽事件 → 此刻层 → 本轮新输入收尾', () => {
+  test('input 装配：稳定层打头 → 未遮蔽事件 → 本轮固定块 → 此刻层 → 本轮新输入收尾', () => {
     const events = buildMixedLog();
     const wake = lastEvent(events);
     const r = renderOnce({ events, wakeEvent: wake });
     const last = asMessage(r.input[r.input.length - 1], '末项');
     assert.equal(last.role, 'user');
     assert.equal(last.content, renderWake(wake), '尾部是本轮新输入');
-    // 事件流从稳定层之后开始；此刻层紧随事件流，不插在历史中间
+    // 事件流从稳定层之后开始；固定块与此刻层都排在整段历史之后，且**固定块在固定块之前**
     assert.equal(asMessage(eventItems(r)[0], '事件流第 1 条').content, '看下 D 盘备份状态');
+    const blockIndex = r.input.findIndex(isTurnBlock);
     const nowIndex = r.input.findIndex(isNowLayer);
-    assert.equal(nowIndex, r.input.length - 2, '此刻层紧挨本轮输入，在整段历史之后');
+    assert.equal(blockIndex, r.input.length - 3, '固定块在历史之后（B2）');
+    assert.equal(nowIndex, blockIndex + 1, '此刻层紧随固定块，在整段历史之后');
+    assert.equal(nowIndex, r.input.length - 2, '此刻层紧挨本轮输入');
     assertPaired(r);
   });
 
-  test('无事件且无 wake 时 input 只有此刻层', () => {
+  test('无事件且无 wake 时 input 只有固定块与此刻层', () => {
     const r = renderOnce({ events: [], wakeEvent: null });
-    assert.equal(r.input.length, 1);
+    assert.equal(r.input.length, 2);
     assert.equal(asMessage(r.input[0], 'input[0]').role, 'developer');
+    assert.ok(isTurnBlock(r.input[0]!), '稳定块打头');
+    assert.ok(isNowLayer(r.input[1]!), '此刻层收尾');
+  });
+
+  test('v29/B2：固定块的段头逐字、三项顺序固定、空项不出现', () => {
+    assert.equal(
+      TURN_BLOCK_BANNER,
+      '————————————————以下为框架提供的本轮固定块————————————————————\n'
+      + '（这一轮里不会再变的状态与记忆：装置给的，不是谁在跟你说话；变化要等下一轮）',
+      '段头是判层的唯一依据，逐字锁住',
+    );
+    const r = renderOnce({
+      persona: { ...BASE_PERSONA, relationship: { who: 'YG', content: '  他只有一个名字。  ' } },
+      turnBlock: {
+        state: 'STATE 段：正在搭 render 层。',
+        relationship: { who: 'YG', content: '  他只有一个名字。  ' },
+        memory: '## 本轮选中的记忆（正文）\n（示例）\n\n## MEMORIES/facts.md:12\n12| 用户周五下午开例会',
+      },
+    });
+    const block = asMessage(r.input.find(isTurnBlock), '固定块').content;
+    const i1 = block.indexOf('[当前状态]');
+    const i2 = block.indexOf('[关系档案 · YG]');
+    const i3 = block.indexOf('## 本轮选中的记忆（正文）');
+    assert.ok(i1 > 0 && i2 > i1 && i3 > i2, '顺序：当前状态 → 关系档案 → 本轮选中的记忆');
+    assert.ok(block.includes('[当前状态]\nSTATE 段：正在搭 render 层。'), '状态正文去掉首尾空白');
+    assert.ok(block.includes('[关系档案 · YG]\n他只有一个名字。'), '档案正文去掉首尾空白');
+
+    // 三项里有空的：整段不出现（不写空段），而不是留一行 `[关系档案 · ]`
+    const noRel = asMessage(renderOnce({ turnBlock: { state: '只有状态' } }).input[0]!, '固定块').content;
+    assert.ok(!noRel.includes('[关系档案'), '没命中档案就不写那一段');
+    assert.ok(!noRel.includes('本轮选中的记忆'), '没选记忆就不写那一段');
+
+    // 一项都没有：整块不出现
+    assert.equal(
+      renderOnce({ persona: { ...BASE_PERSONA, state: '' }, turnBlock: null }).input
+        .filter(isTurnBlock).length,
+      0,
+      '素材全空时不留空块',
+    );
+  });
+
+  test('v29/B2：同一轮相邻两步——固定块逐字节相同，只有此刻层变', () => {
+    const events = buildMixedLog();
+    // 一轮之内的两步：事件集相同、now 不同、任务卡的 step 不同（运行期的真实形状）。
+    // **固定块的素材是同一份**——它是宿主在轮首读一次的快照，两步各读一次就不是这个契约了。
+    const turnBlock = {
+      state: 'STATE 段：正在搭 render 层。',
+      relationship: { who: 'YG', content: '他只有一个名字。' },
+      memory: '## 本轮选中的记忆（正文）\n（示例）',
+    };
+    const step1 = renderOnce({
+      events, turnBlock, now: NOW_A, taskCard: { title: '补 B2', turn: 5, step: 1, todoOpen: ['索引'] },
+    });
+    const step2 = renderOnce({
+      events, turnBlock, now: NOW_B, taskCard: { title: '补 B2', turn: 5, step: 2, todoOpen: ['索引'] },
+    });
+
+    // ① 两步里固定块的位置与字节都一致
+    assert.equal(step1.input.findIndex(isTurnBlock), step2.input.findIndex(isTurnBlock), '位置一致');
+    const b1 = asMessage(step1.input.find(isTurnBlock), '固定块');
+    const b2 = asMessage(step2.input.find(isTurnBlock), '固定块');
+    assert.equal(b1.content, b2.content, '固定块在一轮之内逐字节不变（这是这一版买到的东西）');
+    assert.equal(step1.context.state.hash, step2.context.state.hash, '归因里的固定块哈希相等');
+    assert.equal(step1.context.state.tokens, step2.context.state.tokens);
+
+    // ② 除此刻层那一条之外，两步的 input 逐字节相同（KV 前缀能一直命中到固定块末尾）
+    const strip = (r: RenderedRequest): string => JSON.stringify(r.input.filter(i => !isNowLayer(i)));
+    assert.equal(strip(step1), strip(step2), '除此刻层外逐字节相同');
+
+    // ③ 逐项公共前缀：正好停在**此刻层**那一条上（而不是像改造前那样停在历史之后）
+    const json = (item: InputItem): string => JSON.stringify(item);
+    let common = 0;
+    while (common < step1.input.length && common < step2.input.length
+      && json(step1.input[common]!) === json(step2.input[common]!)) common += 1;
+    assert.ok(isNowLayer(step2.input[common]!), `第一处不同必须是此刻层，实际是 ${json(step2.input[common]!)}`);
+    assert.ok(common >= 2, '公共前缀至少穿过固定块那一条');
+    assert.ok(json(step2.input[common]!).includes('已 2 步'), '此刻层确实随 step 变（任务卡的步数）');
+
+    // ④ 此刻层本身没变的那部分（时刻以外的字段）不该被固定块的内容污染
+    assert.equal(stateLayer(step1).includes('[当前状态]'), true);
+    assert.equal(envLayer(step1).includes('[当前状态]'), false, '状态不在此刻层里了（B2）');
   });
 
   test('tools 映射为 function 形状且字段不丢；model 原样透传', () => {
@@ -1772,8 +1908,10 @@ describe('铁律 7 · interrupted 的 assistant 消息', () => {
     ];
     const r = renderOnce({ events });
     assert.deepEqual(assistantTexts(r), []);
-    assert.equal(r.input.length, 1, '空发言不得产生空 content item');
-    assert.equal(asMessage(r.input[0], 'input[0]').role, 'developer', '此刻层仍在');
+    assert.deepEqual(eventItems(r), [], '空发言不得产生空 content item');
+    // 只剩两条 developer 层：本轮固定块（状态）+ 此刻层
+    assert.equal(r.input.length, 2);
+    assert.ok(r.input.every(i => i.type === 'message' && i.role === 'developer'), '此刻层仍在');
   });
 });
 
@@ -1822,7 +1960,8 @@ describe('可见性单向承诺与固定模板', () => {
     assert.ok(!dump.includes('INTERNAL-ASSISTANT-LEAK'));
     assert.ok(!dump.includes('int-1'));
     assert.ok(!dump.includes('工具清单变更'), 'internal 的 developer/message 同样不进');
-    assert.equal(r.input.length, 1, '只有此刻层');
+    assert.deepEqual(eventItems(r), [], 'internal 事件一条都不进事件流');
+    assert.equal(r.input.length, 2, '只剩固定块与此刻层两条 developer');
   });
 
   test('v32：channel/message 与 channel/read 的默认可见性是 internal（不进上下文、不唤醒）', () => {
@@ -1883,9 +2022,12 @@ describe('可见性单向承诺与固定模板', () => {
     assert.ok(texts.includes('developer:[人工确认] 调用 c9 的实际结局：partial。备份了一半'));
   });
 
-  test('request 形状：model / instructions / input / tools 四键齐备', () => {
+  test('request 形状：model / instructions / input / tools 四键齐备（外加渲染副产物 context）', () => {
     const r = renderOnce({});
-    assert.deepEqual(Object.keys(r).sort(), ['input', 'instructions', 'model', 'tools']);
+    // `context` 是 2026-10-03 加的**渲染副产物**（上下文归因），不是发往模型的那四个键之一：
+    // 发送形状由 agent-loop 的 toDsRequest 显式装配（它只挑 model/input/instructions/tools），
+    // 所以多出这一键不会改变请求字节——这里把它一并锁住，免得以后有人以为它是发出去的字段。
+    assert.deepEqual(Object.keys(r).sort(), ['context', 'input', 'instructions', 'model', 'tools']);
     for (const it of r.input) {
       assert.ok(typeof it === 'object' && it !== null);
       assert.ok(['message', 'function_call', 'function_call_output'].includes(it.type));

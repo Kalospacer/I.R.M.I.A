@@ -82,10 +82,7 @@ interface Rig {
 async function rig(t: TestContext, withNotify: boolean): Promise<Rig> {
   const dir = mkdtempSync(join(tmpdir(), 'irmia-speak-wire-'));
   const dataDir = join(dir, 'data');
-  const webRoot = join(dir, 'web');
   mkdirSync(dataDir, { recursive: true });
-  mkdirSync(webRoot, { recursive: true });
-  writeFileSync(join(webRoot, 'index.html'), '<!doctype html><title>t</title>', 'utf8');
 
   const log = await EventLog.open(join(dataDir, 'events'));
   const projection = emptyProjection();
@@ -102,7 +99,6 @@ async function rig(t: TestContext, withNotify: boolean): Promise<Rig> {
     timers,
     now: () => new Date(),
     uiToken: TEST_TOKEN,
-    webRoot,
     port: 0,
     out: () => undefined,
     ...(withNotify

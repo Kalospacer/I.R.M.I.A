@@ -93,7 +93,6 @@ async function setup(t: TestContext): Promise<Fixture> {
     registry,
     skillsRoot,
     uiToken: TEST_TOKEN,
-    webRoot: join(dir, 'web'),
     configPath,
     port: 0,
     out: (line) => { logLines.push(line); },
@@ -611,7 +610,7 @@ test('mcp-save：写入 config.mcp.servers，界面上的 enabled 落成配置�
     name: 'filesystem',
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-filesystem'],
-    env: { ROOT: 'C:/work' },
+    env: { ROOT: 'D:/work' },
     enabled: true,
   });
   assert.equal(added.status, 200, added.text);
@@ -621,7 +620,7 @@ test('mcp-save：写入 config.mcp.servers，界面上的 enabled 落成配置�
   assert.equal(servers[0]?.['name'], 'filesystem');
   assert.equal(servers[0]?.['command'], 'npx');
   assert.deepEqual(servers[0]?.['args'], ['-y', '@modelcontextprotocol/server-filesystem']);
-  assert.deepEqual(servers[0]?.['env'], { ROOT: 'C:/work' });
+  assert.deepEqual(servers[0]?.['env'], { ROOT: 'D:/work' });
   assert.equal('disabled' in (servers[0] ?? {}), false, 'enabled: true = 配置里不出现 disabled 这个键');
   assert.equal((added.body as { restartRequired?: boolean }).restartRequired, true, 'MCP 池在启动期建，改动要重启才接管');
 
@@ -641,12 +640,12 @@ test('mcp-save：写入 config.mcp.servers，界面上的 enabled 落成配置�
 
   // 未在界面上暴露的字段不该被顺手抹掉（编辑一个服务不等于重置它）
   const doc2 = fx.configDoc() as { mcp: { servers: Array<Record<string, unknown>> } };
-  doc2.mcp.servers[0]!['cwd'] = 'C:/work';
+  doc2.mcp.servers[0]!['cwd'] = 'D:/work';
   doc2.mcp.servers[0]!['toolDefaults'] = { sideEffect: 'none' };
   writeFileSync(fx.configPath, `${JSON.stringify(doc2, null, 2)}\n`, 'utf8');
   await command(fx, 'mcp-save', { name: 'filesystem', command: 'node', args: ['server.mjs'], env: {}, enabled: true });
   const kept = (fx.configDoc() as { mcp: { servers: Array<Record<string, unknown>> } }).mcp.servers[0]!;
-  assert.equal(kept['cwd'], 'C:/work', 'cwd 这类高级设置要原样保留');
+  assert.equal(kept['cwd'], 'D:/work', 'cwd 这类高级设置要原样保留');
   assert.deepEqual(kept['toolDefaults'], { sideEffect: 'none' });
 });
 
@@ -856,7 +855,7 @@ test('/api/mcp：视图带上 env / 工具描述 / 运行计数（界面要用�
     name: 'demo',
     command: 'node',
     args: ['server.mjs'],
-    env: { ROOT: 'C:/work' },
+    env: { ROOT: 'D:/work' },
     enabled: true,
   });
   const view = (await call(fx, '/api/mcp')).body as {
@@ -864,7 +863,7 @@ test('/api/mcp：视图带上 env / 工具描述 / 运行计数（界面要用�
     runningCount: number;
   };
   assert.equal(view.servers.length, 1);
-  assert.deepEqual(view.servers[0]?.env, { ROOT: 'C:/work' });
+  assert.deepEqual(view.servers[0]?.env, { ROOT: 'D:/work' });
   assert.equal(view.servers[0]?.disabled, false);
   assert.equal(view.servers[0]?.runningNow, false, '日志里没有它的启动记录，"在跑"就不能成立');
   assert.equal(view.runningCount, 0);

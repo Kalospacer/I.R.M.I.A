@@ -401,7 +401,7 @@ export function judgeCandidate(
  *   · `extraSearchDirs`：系统的常见安装位置（只在前两段都没命中时才试）。
  *
  * 返回 `attempts` 是为了让报告能说清"试过哪几个地方"——用户看到
- * 「未安装（已试：config 未指定 / C:\...\tools\rg / PATH 上的 rg.exe）」才知道下一步动哪里。
+ * 「未安装（已试：config 未指定 / D:\...\tools\rg / PATH 上的 rg.exe）」才知道下一步动哪里。
  */
 export interface DependencyProbeOutcome {
   name: DepName;

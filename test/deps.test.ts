@@ -173,16 +173,16 @@ describe('依赖探测：三段顺序（config → 自装目录 → PATH）', ()
   it('config 指定的路径最先（人明确指过就以他为准）', async () => {
     const seen: string[] = [];
     const outcome = await probeWith('rg', {
-      configPath: 'C:\\tools\\rg\\rg.exe',
+      configPath: 'C:\\path\\to\\rg.exe',
       managedDir,
-      answers: { 'C:\\tools\\rg\\rg.exe': 'ripgrep 15.1.0', 'rg.exe': 'ripgrep 14.0.0' },
+      answers: { 'C:\\path\\to\\rg.exe': 'ripgrep 15.1.0', 'rg.exe': 'ripgrep 14.0.0' },
       files: [`${managedDir}\\rg.exe`],
     }, seen);
     assert.equal(outcome.status, 'ready');
     assert.equal(outcome.source, 'config');
-    assert.equal(outcome.path, 'C:\\tools\\rg\\rg.exe');
+    assert.equal(outcome.path, 'C:\\path\\to\\rg.exe');
     assert.equal(outcome.version, '15.1.0');
-    assert.deepEqual(seen, ['C:\\tools\\rg\\rg.exe'], '命中第一段就不该再碰后两段');
+    assert.deepEqual(seen, ['C:\\path\\to\\rg.exe'], '命中第一段就不该再碰后两段');
   });
 
   it('config 没指定时先看自装目录（一键安装的落点），命中就不去 PATH', async () => {
@@ -225,14 +225,14 @@ describe('依赖探测：三段顺序（config → 自装目录 → PATH）', ()
   it('**config 指定的路径坏了不许静默落到 PATH**：如实报错，且 PATH 上的同名程序一次都没被碰', async () => {
     const seen: string[] = [];
     const outcome = await probeWith('rg', {
-      configPath: 'C:\\Broken\\rg.exe',
+      configPath: 'D:\\Broken\\rg.exe',
       managedDir,
       answers: { 'rg.exe': 'ripgrep 15.1.0' },
     }, seen);
     assert.equal(outcome.status, 'missing');
-    assert.deepEqual(seen, ['C:\\Broken\\rg.exe'], '用户指定优先且排他：不许被 PATH 顶替');
+    assert.deepEqual(seen, ['D:\\Broken\\rg.exe'], '用户指定优先且排他：不许被 PATH 顶替');
     assert.match(outcome.reason, /配置里指定/u);
-    assert.match(outcome.attempts.join(' '), /C:\\Broken\\rg\.exe/u);
+    assert.match(outcome.attempts.join(' '), /D:\\Broken\\rg\.exe/u);
   });
 
   it('一个候选都没有时：状态是未安装，reason 里列出试过哪几处（下一步该动哪里）', async () => {

@@ -1,26 +1,35 @@
 {
   "$comment": [
-    "Irmia Agent 配置（M2 最小子集：JSON 语法子集，语义对齐 docs/operations.md §1）",
+    "Irmia Agent 出厂配置（便携包首启用的就是这份）。",
     "以 \"$\" 开头的键是注释，加载时忽略；删掉它们不影响运行。",
     "密钥不落配置文件：apiKeyEnv 只写环境变量名，密钥值放进程环境里。",
-    "本文件缺失时会自动重建；字段缺失时按默认值补齐，但不会自动改写你写过的文件。",
-    "用法：把本文件复制成 config.json 再改（config.json 不进版本库）。",
-    "相对路径（dataDir / paths.workspaceAllowlist）以**本配置文件所在目录**为基准解析。"
+    "本文件缺失或字段缺失时会按代码默认值补齐，但不会自动改写你写过的字段。"
   ],
   "schemaVersion": 1,
-  "dataDir": "./data",
+  "dataDir": "data",
+  "web": {
+    "$comment": [
+      "本地服务监听地址与端口：界面（gui\\irmia_gui.exe）也读这个端口（启动器把它作为 IRMIA_WEB_PORT 传给后端）。",
+      "port 被别的程序占用时，改成别的值（例如 7801）保存即可，界面端口跟着走，不用改别的地方。",
+      "host 留 127.0.0.1 = 只允许本机访问；写 0.0.0.0 会把本地服务暴露到局域网，别这么干。"
+    ],
+    "host": "127.0.0.1",
+    "port": 7788
+  },
   "models": {
     "$comment": [
       "heavy = turn 主循环；light = 必要性判断/摘要/守卫分类；degraded = 降级链备用路由（不写即不启用）。",
-      "baseUrl 是 API 根地址（不含 /responses）。"
+      "baseUrl 是 API 根地址（不含 /responses）；model 填服务商的模型名。",
+      "下面三行是**示例值**：换成你自己的服务商与模型名再启动。apiKeyEnv 只写环境变量名，",
+      "密钥的值放进程环境里（或启动后在界面里填），不落这个文件。"
     ],
     "heavy": {
-      "model": "deepseek-flash",
+      "model": "deepseek-chat",
       "baseUrl": "https://api.deepseek.com",
       "apiKeyEnv": "IRMIA_API_KEY"
     },
     "light": {
-      "model": "deepseek-flash",
+      "model": "deepseek-chat",
       "baseUrl": "https://api.deepseek.com",
       "apiKeyEnv": "IRMIA_API_KEY"
     }
@@ -29,30 +38,33 @@
     "$comment": [
       "三层刹车 + 每日额度 + 软阈值（design.md §4.6）。全部跨重启累计。",
       "softRatio：达到 上限×ratio 时先提示模型收尾，越过才硬停。",
-      "taskTokens / dailyTokens 的口径都是**未扣缓存**的 token 数（含 cacheHit）——真实花销比这个数字小，所以上限按这个口径定（2026-10-03 把 dailyTokens 抬到 1e8；当时缓存命中率约 92%）。"
+      "taskTokens / dailyTokens 的口径是**未扣缓存**的 token 数（含 cacheHit）：真实花销比这个数字小。",
+      "按自己的用量调；调大之前先想清楚\"一天烧到多少我能接受\"。"
     ],
     "stepTools": 20,
     "turnSteps": 30,
-    "taskTokens": 100000000,
-    "dailyTokens": 100000000,
+    "taskTokens": 500000,
+    "dailyTokens": 2000000,
     "softRatio": 0.8,
     "failStreakMax": 5
   },
   "wake": {
     "$comment": [
-      "心跳基线 30 分钟，空拍按 2^n 退避、封顶 8 倍，压力高则压缩；任何外部事件到达即复位（design.md §4.12）。",
-      "heartbeatFloorMin / heartbeatCeilMin：间隔的实际上下限（分钟）。退避再深也不超过 60 分钟不露面，压力再大也不短于 10 分钟一拍。"
+      "心跳基线 30 分钟，空拍按 2^n 退避、封顶 8 倍；任何外部事件到达即复位（design.md §4.12）。",
+      "heartbeatFloorMin / heartbeatCeilMin：间隔的实际上下限（分钟）。退避再深也不超过 60 分钟不露面，压力再大也不短于 10 分钟一拍。",
+      "memoryMaintainCron：每日记忆整理的 cron（五段：分 时 日 月 周）；空串关闭该任务。"
     ],
     "heartbeatBaselineMin": 30,
     "idleBackoffMax": 8,
     "heartbeatFloorMin": 10,
-    "heartbeatCeilMin": 60
+    "heartbeatCeilMin": 60,
+    "memoryMaintainCron": "0 4 * * *"
   },
   "vision": {
     "$comment": [
       "图片进上下文的两个出口：聊天图片直接进上下文（模型亲眼看），以及 vision_read 的文字转述。",
-      "imagesToContext：默认 true。开 = QQ 发来的图片直接进上下文（最多 maxContextImages 张），且 vision_read 可用 inline 参数把指定图放进上下文；关 = 图片一律不进，只剩地址与转述。",
-      "maxContextImages：同时待在上下文里的图片张数上限（默认 2）。图片每轮都要重发，留太多等于每轮都为旧图付费。"
+      "imagesToContext：开 = 聊天里的图片直接进上下文（最多 maxContextImages 张）。",
+      "maxContextImages：同时待在上下文里的图片张数上限。图片每轮都要重发，留太多等于每轮都为旧图付费。"
     ],
     "imagesToContext": true,
     "maxContextImages": 2
@@ -60,76 +72,88 @@
   "speak": {
     "$comment": [
       "发言节奏（speak 的拆条投递）：段与段之间按「这一段要打多久」隔开，界面与 IM 同一个节奏。",
-      "typingEffect：默认 true。关掉则所有段立刻发完，没有「人在打字」的体感。",
-      "charsPerMinute：打字速度（默认 90 字/分钟，中文手机输入的常见速度）。调大说得更快，范围 30~600。",
-      "说话期间人又从聊天框或 QQ 发来消息时，speak 会立刻停下（已发出的收不回来，没发的不发）。"
+      "typingEffect：关掉则所有段立刻发完，没有「人在打字」的体感。",
+      "charsPerMinute：打字速度（默认 90 字/分钟），范围 30~600。"
     ],
     "typingEffect": true,
     "charsPerMinute": 90
   },
+  "persona": {
+    "$comment": [
+      "人格连续性与上下文压缩（design.md §4.11/§4.13）。",
+      "owner：档案标识。你在聊天框说话时它会作为 person 注入，于是 persona/RELATIONSHIPS/<owner>.md 每轮自动进上下文。",
+      "  它是**文件名**，不是昵称展示位——写什么就得有同名文件（含空格与大小写）。默认 owner。",
+      "contacts：联系人表（会话 sid → 名字）。聊天平台不给昵称、也没有查成员的接口，",
+      "  所以「这个会话是谁」这类知识只能在这里声明；它优先于她自己记的 MEMORIES/aliases.md。",
+      "compactionThresholdTokens：可见历史估算超过它就压一次。用代码默认值起步，觉得压得太勤再往上调。"
+    ],
+    "compactionThresholdTokens": 32000,
+    "handoffBudgetTokens": 4096,
+    "handoffFoldTokens": 1024,
+    "owner": "owner",
+    "contacts": {}
+  },
   "paths": {
     "$comment": [
-      "工作目录白名单：文件操作解析后必须落在其中任一目录内；空数组 = 一个都不允许。"
+      "工作目录白名单：文件操作解析后必须落在其中任一目录内；空数组 = 一个都不允许。",
+      "data\\workspace 是后端在数据目录下建的工作根（注意 JSON 里的反斜杠要写两个）。"
     ],
     "workspaceAllowlist": [
-      "./workspace"
+      "data\\workspace"
     ]
   },
   "tools": {
     "$comment": [
-      "destructive 工具开关，三态：false 全关（默认）/ true 全开 / 数组只开名单内的（如 [\"pwsh\",\"http_post\"]）。",
-      "「危险」在系统里的含义是\"崩溃后不可自动重试\"，不代表开关可以随手打开。"
+      "destructive 工具开关，三态：false 全关（出厂值）/ true 全开 / 数组只开名单内的（如 [\"pwsh\",\"http_post\"]）。",
+      "「危险」在系统里的含义是\"崩溃后不可自动重试\"，不代表开关可以随手打开：",
+      "  确认你知道它会在这台机器上做什么，再按需放开名单，别整体打开。",
+      "planMode：开启后 destructive 调用先落 plan/pending 等人工批准，批准一次只放行一次。"
     ],
-    "destructiveEnabled": true,
-    "disabled": [],
-    "groupSceneHardRefusal": false
+    "destructiveEnabled": false,
+    "planMode": false,
+    "askHumanTimeoutMin": 30,
+    "disabled": []
   },
   "deps": {
     "$comment": [
-      "外部依赖（pwsh 7 / ripgrep / es.exe）的用户指定路径 —— 探测顺序的第一段：用户指定 > 框架自装目录 <dataDir>/tools/<name> > PATH。",
-      "不写就走后两段；写了一个不可用的路径**不会**静默退回 PATH，而是如实报「你指的那个用不了」——「我配了却不生效」是最难查的一类故障。",
-      "rg 与 es 可以在 GUI 设置页「外部依赖」一键安装（下载官方包解压到 <dataDir>/tools/<name>/，装完就地复检、不必重启进程）。",
-      "pwsh 7 需要人工安装（winget install Microsoft.PowerShell）——它的 Windows 分发是 MSI/winget/商店包，静默安装要提权，无人值守进程里弹 UAC 只会卡住。"
+      "外部依赖（pwsh 7 / ripgrep / es.exe）的用户指定路径——探测顺序的第一段：用户指定 > 框架自装目录 <dataDir>/tools/<name> > PATH。",
+      "不写就走后两段；写了一个不可用的路径**不会**静默退回 PATH，而是如实报「你指的那个用不了」。",
+      "rg 与 es 可以在 GUI 设置页「外部依赖」一键安装；pwsh 7 需要人工安装（winget install Microsoft.PowerShell）。"
     ],
     "paths": {}
   },
-  "persona": {
-    "$comment": [
-      "owner：本机用户的档案标识。你在聊天框说话时它会作为 person 注入那一轮，",
-      "于是 persona/RELATIONSHIPS/<owner>.md 每轮自动进上下文（人格的唤醒路由）。",
-      "它是文件名，不是昵称展示位——写什么就得有同名文件（含空格与大小写）。默认 owner。",
-      "contacts：联系人表（会话 sid → 名字）。QQ 不给昵称、也没有查成员的接口，",
-      "所以「这个 QQ 会话是某个人」这类知识只能在这里声明；它优先于她自己记的 MEMORIES/aliases.md。",
-      "compactionThresholdTokens：可见历史估算超过它就压一次。2026-10-04 定稿：32000 太低，抬到 100000（代码默认值仍是 32000，这里显式覆盖）。"
-    ],
-    "owner": "owner",
-    "contacts": {},
-    "compactionThresholdTokens": 100000
-  },
   "channels": {
     "$comment": [
-      "QQ 官方 Bot API：要填的是 AppID 与 AppSecret 这两把密钥的**值**，在 GUI「消息适配器 → QQ 官方」的两个输入框里填，存进 data/.keys.json（不进这个文件）。",
-      "groupBatchMinutes：群消息攒批窗口（分钟）。单聊是有人直接跟你说话，每句都及时看；群聊的一条 @ 常常只是半句话，攒到窗口再一起看。0 = 每条都唤醒。",
-      "OneBot 11 是另一条通道（连本机协议端的 ws 端口），不用官方 AppID/Secret。"
+      "IM 通道：QQ 官方 Bot API 与 OneBot 11（NapCat 等协议端）。两条都出厂关闭，配好密钥再打开。",
+      "mentionKeywords：**她被怎么称呼**（关键词匹配）。群里的人常不打 @ 直接喊名字，",
+      "  正文里出现这几个词就当作\"在叫她\"。出厂留空 = 只认平台的 @；第一次使用时界面会问一次，也可以随时改。",
+      "  这是关键词匹配，不做语义判断：填宽了会误唤醒、填窄了会漏——分寸由你定。",
+      "密钥不落配置文件：只写环境变量名，值放进程环境里（或界面里填，进 data/.keys.json）。"
     ],
+    "mentionKeywords": [],
     "qqOfficial": {
-      "enabled": true,
+      "$comment": [
+        "QQ 官方 Bot API：需要 AppID 与 AppSecret 两把密钥，在 GUI「消息适配器 → QQ 官方」里填。",
+        "groupBatchMinutes：群消息攒批窗口（分钟）。单聊每句都及时看；群聊的一条 @ 常常只是半句话，攒到窗口再一起看。0 = 每条都唤醒。",
+        "useMarkdown：发文本时用原生 markdown（msg_type=2）；拿不到该权限的机器人会被服务端拒绝，这里会自动降级为纯文本重发。"
+      ],
+      "enabled": false,
+      "appIdEnv": "QQ_BOT_APP_ID",
+      "clientSecretEnv": "QQ_BOT_CLIENT_SECRET",
+      "useMarkdown": true,
       "groupBatchMinutes": 3
     },
     "onebot": {
-      "enabled": true,
-      "managed": {
-        "dir": "./data/services/snowluma",
-        "kind": "snowluma",
-        "autoStart": true
-      }
-    },
-    "mentionKeywords": [
-      "伊尔弥亚",
-      "弥亚小姐",
-      "弥亚",
-      "魔神小姐"
-    ]
+      "$comment": [
+        "OneBot 11：连协议端的正向 ws 端口（wsUrl），不用官方 AppID/Secret。",
+        "tokenEnv 对应的环境变量为空时，按「协议端未开校验」匿名连接。",
+        "managed：写了就由框架拉起本机自己装的协议端（目前只认 snowluma）并接管 wsUrl 与 token。",
+        "  dir 是它的安装目录（绝对路径，或相对 dataDir）。**出厂不写这一段**：每个人装在哪不一样。"
+      ],
+      "enabled": false,
+      "wsUrl": "ws://127.0.0.1:3001",
+      "tokenEnv": "ONEBOT_ACCESS_TOKEN"
+    }
   },
   "alerts": {
     "$comment": [

@@ -362,12 +362,12 @@ test('她问人 ②：人答了 → human/answered{askSeq} 落库、出队，答
   await h.loop.tickOnce();
 
   const askSeq = (await h.ofType('human/asked'))[0]!.seq;
-  const outcome = await answer(h, '放到 C:\\backup\\irmia 下面', askSeq);
+  const outcome = await answer(h, '放到 C:\\backup\\app 下面', askSeq);
   assert.equal(outcome.ok, true, '台面上有一条提问，答复必须被接受');
 
   const answered = await h.ofType('human/answered');
   assert.equal(answered.length, 1);
-  assert.equal(answered[0]!.data.answer, '放到 C:\\backup\\irmia 下面');
+  assert.equal(answered[0]!.data.answer, '放到 C:\\backup\\app 下面');
   assert.equal(answered[0]!.data.askSeq, askSeq, '答复要指名道姓说清答的是哪一条（台面上可能有两条）');
   assert.equal(answered[0]!.data.question, '备份目录放哪儿？', '答复里带上原问题：日志自解释，不必回头查配对');
 
@@ -377,7 +377,7 @@ test('她问人 ②：人答了 → human/answered{askSeq} 落库、出队，答
   // 与现有注入同路：human/answered 渲染成「人工回答」的那条 user 消息
   const texts = renderedTexts(h, await h.events());
   assert.ok(
-    texts.some(item => item.role === 'user' && item.text.includes('[人工回答] 放到 C:\\backup\\irmia 下面')),
+    texts.some(item => item.role === 'user' && item.text.includes('[人工回答] 放到 C:\\backup\\app 下面')),
     '答复必须出现在她下一拍的上下文里（与 renderContactNote 那类注入同路，不另造机制）',
   );
   // 答掉之后此刻层那段小结自然消失（它说的是状态，不是历史）

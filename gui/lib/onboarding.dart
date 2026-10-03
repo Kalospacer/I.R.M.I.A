@@ -33,9 +33,9 @@ import 'ui_state.dart';
 /// 以前只写了后者，于是名字从来没被真正配置过：换个人装这个框架，界面照样管他的 agent
 /// 叫伊尔弥亚（那些字面量的来历与现在的口径见 her_name.dart）。
 ///
-/// 为什么引导排在 `TokenGate` **之后**（见 app.dart 的接线）：`/api/*` 全部要 Bearer token
-/// （server.ts:2129），没有 token 连 `/api/config` 都读不到——密钥与配置一个字节也写不进去。
-/// 所以 token 门是第一步，token 有了才谈得上"引导她把第一次配置做完"。
+/// 为什么引导排在 `AuthGate` **之后**（见 app.dart 的接线）：`/api/*` 全部要会话凭据，
+/// 没有它连 `/api/config` 都读不到——密钥与配置一个字节也写不进去。
+/// 所以那道门（首次设密码 / 登录）是第一步，凭据有了才谈得上"引导她把第一次配置做完"。
 
 /// 「引导已经出现过」这个事实的存放键（`ui-state.json`）
 const kOnboardingDoneFlag = 'onboarding-done';

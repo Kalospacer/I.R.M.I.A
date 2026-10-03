@@ -98,9 +98,14 @@ class _MemoryPageState extends State<MemoryPage> {
 
   /// 分组：事实在最前（它才是"记忆"的主体），流水账与日记按时间倒序
   List<_MemoryGroup> _groups() {
-    _MemoryEntry entryOf(Map<String, dynamic> raw) => _MemoryEntry(
+    /// 清单里给了 `path` 就**原样用它**——文件在哪个子目录只有服务端知道
+    /// （它就是从那儿列出来的）。界面自己拼过一次，代价是"流水账"与"归档"两组
+    /// 少了 `episodes/` 那一层，点开就说文件不存在（2026-10-04 修的）。
+    /// `prefix` 只服务于**老服务端**（响应里没有 `path` 时）的兜底，取值与
+    /// `memoryView` 的分组一一对应。
+    _MemoryEntry entryOf(Map<String, dynamic> raw, String prefix) => _MemoryEntry(
           label: '${raw['name']}',
-          path: 'MEMORIES/${raw['name']}',
+          path: (raw['path'] as String?) ?? '$prefix${raw['name']}',
           bytes: (raw['bytes'] as num?)?.toInt() ?? 0,
           mtime: raw['mtime']?.toString(),
         );
@@ -114,7 +119,7 @@ class _MemoryPageState extends State<MemoryPage> {
         items: [
           _MemoryEntry(
             label: 'facts.md',
-            path: 'MEMORIES/facts.md',
+            path: (facts?['path'] as String?) ?? 'MEMORIES/facts.md',
             bytes: (facts?['bytes'] as num?)?.toInt() ?? 0,
             mtime: facts?['mtime']?.toString(),
           ),
@@ -128,29 +133,33 @@ class _MemoryPageState extends State<MemoryPage> {
       _MemoryGroup(
         title: '其他',
         note: '黑话表与表达风格观察',
-        items: [for (final raw in _listOf('files').whereType<Map>()) entryOf(raw.cast<String, dynamic>())],
+        items: [
+          for (final raw in _listOf('files').whereType<Map>())
+            entryOf(raw.cast<String, dynamic>(), 'MEMORIES/'),
+        ],
       ),
       _MemoryGroup(
         title: '流水账',
         note: '她随手记的当天经过；超过七天会被并进事实',
-        items: [for (final raw in _listOf('episodes').whereType<Map>()) entryOf(raw.cast<String, dynamic>())],
+        items: [
+          for (final raw in _listOf('episodes').whereType<Map>())
+            entryOf(raw.cast<String, dynamic>(), 'MEMORIES/episodes/'),
+        ],
       ),
       _MemoryGroup(
         title: '归档',
         note: '整理过的流水账原件，只留档不再注入',
-        items: [for (final raw in _listOf('archive').whereType<Map>()) entryOf(raw.cast<String, dynamic>())],
+        items: [
+          for (final raw in _listOf('archive').whereType<Map>())
+            entryOf(raw.cast<String, dynamic>(), 'MEMORIES/episodes/archive/'),
+        ],
       ),
       _MemoryGroup(
         title: '日记',
         note: '整理时写下的当天小结',
         items: [
           for (final raw in _listOf('diary').whereType<Map>())
-            _MemoryEntry(
-              label: '${raw['name']}',
-              path: 'diary/${raw['name']}',
-              bytes: (raw['bytes'] as num?)?.toInt() ?? 0,
-              mtime: raw['mtime']?.toString(),
-            ),
+            entryOf(raw.cast<String, dynamic>(), 'diary/'),
         ],
       ),
     ];

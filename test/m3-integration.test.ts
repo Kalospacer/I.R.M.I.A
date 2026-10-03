@@ -37,7 +37,7 @@ import { EventLog } from '../src/log/event-log.ts';
 import type { AppEvent, Projection } from '../src/log/types.ts';
 import { defaultVisibility } from '../src/log/types.ts';
 import { DsClient, DsClientError, type DsRequest, type DsStreamResult } from '../src/model/ds-client.ts';
-import { NOW_LAYER_BANNER } from '../src/model/render.ts';
+import { NOW_LAYER_BANNER, RENDER_VERSION } from '../src/model/render.ts';
 import type { PersonaAssets } from '../src/persona/loader.ts';
 import { BudgetGuard } from '../src/runtime/budget-guard.ts';
 import { RealLoop } from '../src/runtime/real-loop.ts';
@@ -431,7 +431,9 @@ test('M3-1 单步上限：超限调用记 over-limit 不执行，本 step 收束
 
   const alarms = alarmsOf(events);
   assert.equal(alarms.length, 1);
-  assert.match(alarms[0]!.title, /step 层/);
+  // 标题点名到**具体哪一档**并带上已用/上限（B3 后半：只说"预算耗尽"等于没说下一步）；
+  // 那五件事（哪一档/上限/已用/锁没锁循环/两条出路）在 budget-exhausted-advice.test.ts 里逐层钉住
+  assert.match(alarms[0]!.title, /预算耗尽（步内工具调用）：已用 2 \/ 上限 1/u);
 
   // step 层不锁循环：下一条输入照常起新 turn（它只结束"本 step"，不是全局暂停）
   harness.append('wake/manual', { note: '接着干' });
@@ -509,7 +511,7 @@ test('M3-5 硬停后 topup 恢复：暂停期间拒绝唤醒，加注后原地�
   const alarms = alarmsOf(events);
   assert.equal(alarms.length, 1, '撞刹车必须发一条告警');
   assert.equal(alarms[0]!.level, 'critical');
-  assert.match(alarms[0]!.title, /task 层/);
+  assert.match(alarms[0]!.title, /预算耗尽（任务 token）：已用 120 \/ 上限 100/u);
 
   const tokensAtHalt = harness.projection.budget.tokensTask;
   assert.equal(tokensAtHalt, 120);
@@ -707,7 +709,7 @@ test('M3-8 日额度：达到上限后拒绝唤醒且告警已发出，重复拍
   const alarms = alarmsOf(events);
   assert.equal(alarms.length, 1);
   assert.equal(alarms[0]!.level, 'critical');
-  assert.match(alarms[0]!.title, /daily 层/);
+  assert.match(alarms[0]!.title, /预算耗尽（每日 token）：已用 120 \/ 上限 100/u);
 
   // 下一拍：状态已在案，既不重复写事件也不重复告警（限流是第二道保险）
   await harness.loop.tickOnce();
@@ -906,14 +908,14 @@ test('F5 水位停滞：有输入进来却 10 分钟没有成功模型调用 →
   harness.append('budget/consumed', consumedData(120, 120));
   harness.append('wake/manual', { note: '等待处理' });
 
-  // ① 距上次成功只有 0 分钟：不算停滞
+  // ① 输入刚到：不算停滞
   await harness.loop.tickOnce();
   let alarms = alarmsOf(await harness.events());
   assert.equal(alarms.filter(alarm => alarm.title.includes('水位停滞')).length, 0);
   assert.equal(ofType(await harness.events(), 'turn/start').length, 0, '日额度阻塞：没有起 turn');
   assert.equal(harness.projection.pending.length, 1);
 
-  // ② 推进 11 分钟：超过 10 分钟阈值 → 停滞告警（循环被阻塞，输入一直没被处理）
+  // ② 推进 11 分钟：这条输入自己等了 11 分钟还没被处理 → 停滞告警
   harness.advanceMs(11 * 60_000);
   await harness.loop.tickOnce();
 
@@ -925,3 +927,258 @@ test('F5 水位停滞：有输入进来却 10 分钟没有成功模型调用 →
   assert.equal(harness.projection.pending.length, 1, '阻塞原因仍在：输入没有被处理');
   assert.equal(harness.model.requests.length, 0, '停滞场景里一次模型调用都没发生');
 });
+
+// ──────────── F5b 刷屏修复：正常空闲不是故障（2026-10-03 用户报的刷屏） ────────────
+//
+// 现象（data/events 里的真实记录）：每过一段正常空闲就稳定产出"警告 + 提示"一对——
+//   seq 16036 12:06:39 wake/heartbeat（安静 37.5 分钟）
+//   seq 16037 12:06:39 alarm/sent 水位停滞：37 分钟没有成功模型调用
+//   seq 16039 12:06:40 input/claimed（心跳被领走，根本没有失败）
+//   seq 16041 12:06:40 alarm/sent 已恢复: stall
+// 旧判据量的是"距上次成功模型调用的静默时长"，空闲期里它必然一直在长，于是**任何一条刚到
+// 的输入**（心跳，或用户在 14:13:22 发来的那句消息——14:13:23 就报"停滞 27 分钟"）
+// 都能把它顶过阈值：报的其实是"空闲被打破的那一瞬间"。现在改成给**输入自己**计时。
+
+test('F5b 正常空闲不报警：安静 43 分钟后心跳进来，不会报停滞（也不会紧接着报已恢复）', async (t) => {
+  const harness = await makeHarness(
+    t,
+    { dailyTokens: 10_000_000, taskTokens: 10_000_000, turnSteps: 50, softRatio: 0.99 },
+    [{ text: '在。', usage: { inputTokens: 10, outputTokens: 2, cachedTokens: 0, reasoningTokens: 0 } }],
+  );
+
+  // 一次成功的模型调用 → 之后是一段**没人找她**的空闲（心跳基线 30 分钟）
+  harness.append('wake/manual', { note: '在吗' });
+  await harness.loop.tickOnce();
+  assert.equal(harness.model.requests.length, 1, '先跑掉一个成功的 turn');
+
+  // 43 分钟里她一拍都没动过（真循环也照样在空转，什么都没发生）
+  harness.advanceMs(43 * 60_000);
+  await harness.loop.tickOnce();
+  assert.equal(
+    alarmsOf(await harness.events()).filter(alarm => alarm.title.includes('水位停滞')).length, 0,
+    '完全空闲、没有任何输入在等：静默不是故障',
+  );
+
+  // 心跳到达：它是框架在敲她，不是"有活干不出来"——它与判停在同一拍，等待时长 ≈ 0
+  harness.append('wake/heartbeat', { quietSeconds: 2580, idleTicks: 1, pressure: 0.05 });
+  await harness.loop.tickOnce();
+
+  const alarms = alarmsOf(await harness.events());
+  assert.equal(alarms.filter(alarm => alarm.title.includes('水位停滞')).length, 0, '心跳不能顶出停滞告警');
+  assert.equal(alarms.filter(alarm => alarm.title.startsWith('已恢复')).length, 0, '没有报警就不该有"已恢复"');
+});
+
+test('F5b 空闲 30 分钟后有人开口：那一刻不报停滞（原来正是在这一毫秒误报）', async (t) => {
+  const harness = await makeHarness(
+    t,
+    { dailyTokens: 10_000_000, taskTokens: 10_000_000, turnSteps: 50, softRatio: 0.99 },
+    [
+      { text: '在。', usage: { inputTokens: 10, outputTokens: 2, cachedTokens: 0, reasoningTokens: 0 } },
+      { text: '又怎么了。', usage: { inputTokens: 12, outputTokens: 2, cachedTokens: 0, reasoningTokens: 0 } },
+    ],
+  );
+  harness.append('wake/manual', { note: '在吗' });
+  await harness.loop.tickOnce();
+  assert.equal(harness.model.requests.length, 1);
+
+  // 真实记录里的形态：安静 27 分钟后用户 14:13:22 发来消息，14:13:23 报"停滞 27 分钟"
+  harness.advanceMs(27 * 60_000);
+  harness.append('wake/channel', {
+    channel: 'qq-official', chatType: 'c2c', person: 'P1', chatId: 'P1',
+    text: '又打错了hhh', messageId: 'm1', msgSeq: 1, dedupeKey: 'm1',
+  });
+  await harness.loop.tickOnce();
+
+  const alarms = alarmsOf(await harness.events());
+  assert.equal(alarms.filter(alarm => alarm.title.includes('水位停滞')).length, 0, '刚到的话不是"没被处理"');
+  assert.equal(harness.model.requests.length, 2, '这一拍照常把话接住了');
+});
+
+test('F5b 停滞恢复只报一次：同一次故障不会在每拍都说一遍"已恢复"', async (t) => {
+  const harness = await makeHarness(
+    t,
+    { dailyTokens: 100, taskTokens: 10_000_000, turnSteps: 50, softRatio: 0.99 },
+    [{ text: '处理完了。', usage: { inputTokens: 5, outputTokens: 1, cachedTokens: 0, reasoningTokens: 0 } }],
+  );
+  await harness.loop.tickOnce();
+  harness.append('budget/consumed', consumedData(120, 120));
+  harness.append('wake/manual', { note: '等一等' });
+
+  harness.advanceMs(11 * 60_000);
+  await harness.loop.tickOnce();
+  assert.equal(
+    alarmsOf(await harness.events()).filter(alarm => alarm.title.includes('水位停滞')).length, 1,
+    '真卡住：报警一次',
+  );
+
+  // 卡住的原因消失（人工加注解除日额度暂停）→ 输入被领走 → 报一次"已恢复"。
+  // 走 CLI 那条真实路径（看门文件 → 循环拾取 → budget/topped-up），而不是直接 append 事件：
+  // 判定器自己的加注累计也只有这条路会更新。
+  writeTopUpRequest(harness.dir, {
+    layer: 'daily',
+    addedTokens: 1_000_000,
+    by: 'tester',
+    ts: harness.clock.now.toISOString(),
+  }, harness.clock.now);
+  await harness.loop.tickOnce();
+  assert.equal(harness.projection.pending.length, 0, '加注之后输入被领走了');
+  await harness.loop.tickOnce();
+  assert.ok(
+    alarmsOf(await harness.events()).some(alarm => alarm.title === '已恢复：stall'),
+    '输入真的被处理之后要报一次恢复',
+  );
+
+  // 之后连续十拍一切正常：不该再冒出第二条"已恢复"（旧实现里每拍都会走到 ok()）
+  for (let i = 0; i < 10; i += 1) await harness.loop.tickOnce();
+  const recovered = alarmsOf(await harness.events()).filter(alarm => alarm.title === '已恢复：stall');
+  assert.equal(recovered.length, 1, `同一次故障只报一次恢复，实际 ${recovered.length} 次`);
+});
+
+test('F5b 故障没送达过就不报"已恢复"（不制造不存在的假事实）', async (t) => {
+  const harness = await makeHarness(t, {}, []);
+  const notifier = createNotifier({
+    config: { rateLimitMin: 30 },
+    dataDir: harness.dir,
+    emit: (type, data) => { harness.append(type, data); },
+    now: () => harness.clock.now,
+  });
+
+  // 第一次故障正常送达，恢复一次
+  await notifier.fail({ category: 'stall', level: 'warn', title: '水位停滞 1', body: 'x' });
+  await notifier.ok('stall');
+
+  // 第二次故障的所有告警都被限流压掉（窗口内）：人从来没被告知出过事
+  harness.clock.now = new Date(harness.clock.now.getTime() + 60_000);
+  await notifier.fail({ category: 'stall', level: 'warn', title: '水位停滞 2', body: 'y' });
+  await notifier.ok('stall');
+
+  const alarms = alarmsOf(await harness.events());
+  assert.equal(alarms.filter(alarm => alarm.title === '已恢复：stall').length, 1, '没报过的故障不配"已恢复"');
+});
+
+test('F5b 跨重启恢复配对：故障键与"这条是恢复通知"从 alarm/sent 折叠重建', async (t) => {
+  const harness = await makeHarness(t, {}, []);
+  const emit = (type: string, data: unknown): void => { harness.append(type, data); };
+
+  const first = createNotifier({
+    config: { rateLimitMin: 30 },
+    dataDir: harness.dir,
+    emit,
+    now: () => harness.clock.now,
+  });
+  await first.fail({ category: 'stall', level: 'warn', title: '水位停滞', body: '卡住了' });
+
+  // 进程重启（新实例、新内存）：故障登记从日志重建，恢复通知照样配得上那条报警
+  const events = await harness.events();
+  const second = createNotifier({
+    config: { rateLimitMin: 30 },
+    dataDir: harness.dir,
+    emit,
+    now: () => harness.clock.now,
+    history: events,
+  });
+  await second.ok('stall', '水位恢复正常：等待中的输入已被处理。');
+
+  const alarms = alarmsOf(await harness.events());
+  assert.equal(alarms.length, 2, '重启之后仍要发出这一次"已恢复"');
+  assert.equal(alarms[1]!.title, '已恢复：stall');
+});
+// ──────────────────────────────── F5b 结束 ────────────────────────────────
+
+// ──────────── 上下文审计：每步一条归因 + 只在真破坏时记一条哨兵（2026-10-03） ────────────
+
+test('上下文审计：每个 model call 记一条归因（挂在 budget/consumed 上，可见性 internal）', async (t) => {
+  const harness = await makeHarness(
+    t,
+    {},
+    [{ text: '好。', usage: { inputTokens: 120, outputTokens: 8, cachedTokens: 100, reasoningTokens: 0 } }],
+  );
+  harness.append('wake/manual', { note: '在吗' });
+  await harness.loop.tickOnce();
+
+  const consumed = ofType(await harness.events(), 'budget/consumed');
+  assert.equal(consumed.length, 1);
+  const facts = consumed[0]!.data.context;
+  assert.ok(facts !== undefined, '归因必须随每一次成功的模型调用落库');
+  assert.equal(facts.renderVersion, RENDER_VERSION);
+  // 每一步都记：instructions / tools / 记忆层 / 历史 / **本轮固定块** / 此刻层 / 本轮输入 都在
+  assert.ok(facts.instructions.tokens > 0);
+  assert.equal(facts.tools.count, 1);
+  assert.equal(facts.now.items, 1);
+  assert.equal(facts.wake.items, 1, '首 step 有本轮新输入');
+  // v29/B2：`state`（本轮固定块）是**可选**字段——旧记录里没有它。这一段必须被算进合计，
+  // 否则"分部与合计自洽"那条纪律当场失守（2026-10-04 用户就是照这个核对的）。
+  assert.ok(facts.state !== undefined, 'B2 之后每一步都该有固定块那一段');
+  assert.equal(
+    facts.input.items,
+    (facts.memory.items ?? 0) + (facts.history.items ?? 0) + (facts.state?.items ?? 0)
+      + (facts.now.items ?? 0) + (facts.wake.items ?? 0) + (facts.hint.items ?? 0),
+  );
+  assert.equal(
+    facts.input.tokens,
+    facts.memory.tokens + facts.history.tokens + (facts.state?.tokens ?? 0)
+      + facts.now.tokens + facts.wake.tokens + facts.hint.tokens,
+    'token 的合计也要与分部自洽',
+  );
+  // 可见性：internal —— 它**不进她的上下文**（不新增事件类型，可见性照 schema 表）
+  assert.equal(consumed[0]!.visibility, 'internal');
+  // 第一次调用没有可比的对象：没有哨兵
+  assert.equal(consumed[0]!.data.cacheBreak, undefined);
+});
+
+test('上下文审计：压缩改写长期记忆层 → 下一条 budget/consumed 带 memory 类别的哨兵', async (t) => {
+  const harness = await makeHarness(
+    t,
+    {},
+    [
+      { text: '第一轮。', usage: { inputTokens: 100, outputTokens: 5, cachedTokens: 80, reasoningTokens: 0 } },
+      { text: '第二轮。', usage: { inputTokens: 100, outputTokens: 5, cachedTokens: 10, reasoningTokens: 0 } },
+    ],
+  );
+  harness.append('wake/manual', { note: '第一次' });
+  await harness.loop.tickOnce();
+
+  // 压缩：遮蔽一段历史并改写 input[0] 的长期记忆层（摘要进去、被遮蔽的历史出来）
+  harness.append('compaction/summary', { coveredUpToSeq: harness.projection.lastSeq, summary: '早期历史的一句话。' });
+  harness.append('wake/manual', { note: '第二次' });
+  await harness.loop.tickOnce();
+
+  const consumed = ofType(await harness.events(), 'budget/consumed');
+  assert.equal(consumed.length, 2);
+  const breaker = consumed[1]!.data.cacheBreak;
+  assert.ok(breaker !== undefined, '记忆层被改写就是真破坏，必须记一条');
+  assert.equal(breaker.class, 'memory', '主类别取最早失守的那一段：记忆层在历史之前');
+  assert.ok(breaker.classes.includes('memory'));
+  assert.match(breaker.reason, /长期记忆层被改写/u);
+  // 判据与数字都在 reason 里（界面原样贴，不加工）
+  assert.match(breaker.reason, /距上次调用 \d+ 分钟/u);
+});
+
+test('上下文审计：正常追加尾巴（没有任何改写）不记哨兵——它只在真破坏时出现', async (t) => {
+  const harness = await makeHarness(
+    t,
+    {},
+    [
+      { text: '一', usage: { inputTokens: 100, outputTokens: 5, cachedTokens: 80, reasoningTokens: 0 } },
+      { text: '二', usage: { inputTokens: 100, outputTokens: 5, cachedTokens: 80, reasoningTokens: 0 } },
+      { text: '三', usage: { inputTokens: 100, outputTokens: 5, cachedTokens: 80, reasoningTokens: 0 } },
+    ],
+  );
+  // 同一个 turn 里连走三步：历史在长、此刻层每步都变——这些都不是破坏
+  harness.append('wake/manual', { note: '一件要分三步做完的事' });
+  harness.append('tool/call', {
+    turn: 1, step: 1, callId: 'c1', name: 'read_file', arguments: '{"file_path":"a"}', sideEffect: 'none',
+  });
+  await harness.loop.tickOnce();
+  harness.append('wake/manual', { note: '接着' });
+  await harness.loop.tickOnce();
+  harness.append('wake/manual', { note: '再接着' });
+  await harness.loop.tickOnce();
+
+  const consumed = ofType(await harness.events(), 'budget/consumed');
+  assert.ok(consumed.length >= 2, `至少两次调用才有"相邻可比"，实际 ${consumed.length}`);
+  for (const event of consumed.slice(1)) {
+    assert.equal(event.data.cacheBreak, undefined, '普通追加不该报缓存破坏（那会变成每步一条的刷屏）');
+  }
+});
+// ──────────────────────────────── 上下文审计结束 ────────────────────────────────

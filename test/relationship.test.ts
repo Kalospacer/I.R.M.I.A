@@ -52,13 +52,13 @@ after(() => {
 
 describe('关系档案路由 · 带人的三种来源', () => {
   test('手动唤醒（本机用户）：person 命中就注入', () => {
-    const dir = fixture({ owner: '# owner\n\n## 牵挂\n- 他还在改代码\n' });
+    const dir = fixture({ OWNER: '# OWNER\n\n## 牵挂\n- 他还在改代码\n' });
     const note = relationshipForWake(
-      wake('wake/manual', { note: '在吗', person: 'owner' }),
+      wake('wake/manual', { note: '在吗', person: 'OWNER' }),
       dir,
     );
     assert.ok(note, '用户在聊天框说话，档案必须进上下文');
-    assert.equal(note.who, 'owner');
+    assert.equal(note.who, 'OWNER');
     assert.ok(note.content.includes('他还在改代码'));
   });
 
@@ -78,7 +78,7 @@ describe('关系档案路由 · 带人的三种来源', () => {
   });
 
   test('不带人的唤醒一律不注入', () => {
-    const dir = fixture({ owner: '# x\n' });
+    const dir = fixture({ OWNER: '# x\n' });
     const withoutPerson: AppEvent[] = [
       wake('wake/manual', { note: '脚本注入' }),
       wake('wake/timer', { timerId: 't1', scheduledAt: 'x', firedAt: 'y' }),
@@ -117,14 +117,14 @@ describe('关系档案路由 · 边界', () => {
   });
 
   test('前后空白被裁掉后再找文件', () => {
-    const dir = fixture({ owner: '# x\n' });
-    assert.equal(relationshipForWake(wake('wake/manual', { note: 'x', person: '  owner  ' }), dir)?.who, 'owner');
+    const dir = fixture({ OWNER: '# x\n' });
+    assert.equal(relationshipForWake(wake('wake/manual', { note: 'x', person: '  OWNER  ' }), dir)?.who, 'OWNER');
   });
 });
 
 describe('ownerPersonOf · 手动唤醒该带谁', () => {
   test('正常取值去掉首尾空白', () => {
-    assert.equal(ownerPersonOf({ persona: { owner: ' owner ' } }), 'owner');
+    assert.equal(ownerPersonOf({ persona: { owner: ' OWNER ' } }), 'OWNER');
   });
 
   test('空串回落 "owner"（不因为一个空字段就变成没有用户）', () => {
@@ -136,10 +136,10 @@ describe('ownerPersonOf · 手动唤醒该带谁', () => {
 describe('带人入口 · 看门文件（CLI irmia wake）', () => {
   test('person 落进看门文件，人会被主进程拾取', () => {
     const dir = fixture();
-    const path = writeWakeNote(dir, { note: '在吗', person: 'owner' }, new Date('2026-10-01T00:00:00.000Z'));
+    const path = writeWakeNote(dir, { note: '在吗', person: 'OWNER' }, new Date('2026-10-01T00:00:00.000Z'));
     const payload = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
     assert.equal(payload['note'], '在吗');
-    assert.equal(payload['person'], 'owner');
+    assert.equal(payload['person'], 'OWNER');
   });
 
   test('不带人时不写 person 字段（脚本注入的形态）', () => {

@@ -4,8 +4,16 @@
  * 覆盖 docs/frontend.md §4 的读写 API 契约与 docs/design.md §4.15 的 webhook 边界：
  *   · 读：projection / events 分页 / SSE（含 Last-Event-ID 补拉）/ budget / persona / replay / dashboard
  *   · 写：wake、review-resolve、requeue、persona-approve、config-update、timer-cancel
- *   · 边界：无 token 401、错误形状统一（`{error:{code,message}}`）、body ≤64KB、每源令牌桶、
- *          静态路径穿越、X-Confirm 危险操作确认
+ *   · 边界：认证闸、错误形状统一（`{error:{code,message}}`）、body ≤64KB、每源令牌桶、
+ *          X-Confirm 危险操作确认
+ *
+ * 2026-10 起这份测试**不再有静态资源那一段**（`web/` 整个删除了，见 test/web-assets.test.ts）；
+ * 认证本身（密码 / 会话 / 退避 / 迁移 / 遗忘密码）单独立案在 test/web-auth.test.ts。
+ *
+ * 这里的夹具是**生产形态**：凭据文件已存在、`TEST_TOKEN` 是一条真会话。
+ * 为什么手工铺那份 `.auth.json` 而不调 `AuthStore.setup()`：一次 scrypt 要 ~60ms，
+ * 而这个文件有几十个夹具——那一项就能吃掉好几秒。手写同时把**盘上格式**钉死了一道。
+ * 迁移期那条路（老实例的 `data/.ui-token`）在 test/web-auth.test.ts 里覆盖。
  *
  * 三条纪律（与 test/cli-observe.test.ts 同源）：
  *   1. 一个用例一个独立临时目录：写命令会真写事件日志与配置文件，共用目录 = 用例互相污染；
@@ -14,7 +22,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, scryptSync } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -35,26 +43,48 @@ import { ensureMemorySeeds } from '../src/persona/memory-maintain.ts';
 import { applyOne, finalizePressure } from '../src/state/fold.ts';
 import { ToolRegistry } from '../src/tools/registry.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
+import { AUTH_FILE_NAME, SCRYPT_PARAMS, UI_TOKEN_FILE, readLegacyToken } from '../src/web/auth.ts';
+import { WebhookSecretStore } from '../src/web/webhook-secret.ts';
 import {
-  DASHBOARD_EVENT_WINDOW, UI_TOKEN_FILE, WEB_DIR_NAME, buildPersonaFiles, ensureUiToken,
-  startWebServer, type WebServer,
+  DASHBOARD_EVENT_WINDOW, buildPersonaFiles, instanceIdOf, startWebServer, type WebServer,
 } from '../src/web/server.ts';
 
 // ──────────────────────────────── 脚手架 ────────────────────────────────
 
 const T0 = new Date('2026-02-14T10:00:00.000Z');
-const TEST_TOKEN = 'test-token-0123456789abcdef';
+const TEST_TOKEN = 'test-session-token-0123456789abcdef';
+const TEST_PASSWORD = 'test-password-0123456789';
 const CONFIG_TEXT = `${JSON.stringify({
   $comment: ['手写注释：热更必须保住它'],
   schemaVersion: 1,
   budget: { softRatio: 0.8 },
 }, null, 2)}\n`;
 
+/** 整份文件共用一次 scrypt：夹具的差别只在数据目录，凭据形状完全一样 */
+const TEST_SALT = Buffer.from('00112233445566778899aabbccddeeff', 'hex');
+const TEST_HASH = scryptSync(TEST_PASSWORD, TEST_SALT, 32, {
+  N: SCRYPT_PARAMS.N, r: SCRYPT_PARAMS.r, p: SCRYPT_PARAMS.p,
+}).toString('hex');
+
+/** 铺一份"已经设过密码 + 有一条已知会话"的凭据文件（形状同 src/web/auth.ts 的 AuthFileV1） */
+function seedAuthFile(dataDir: string): void {
+  writeFileSync(join(dataDir, AUTH_FILE_NAME), `${JSON.stringify({
+    v: 1,
+    scrypt: { salt: TEST_SALT.toString('hex'), ...SCRYPT_PARAMS },
+    hash: TEST_HASH,
+    sessions: [{
+      id: 'aabbccddeeff0011',
+      hash: createHash('sha256').update(TEST_TOKEN, 'utf8').digest('hex'),
+      createdAt: T0.toISOString(),
+      label: 'test',
+    }],
+  }, null, 2)}\n`, 'utf8');
+}
+
 interface Fixture {
   dir: string;
   dataDir: string;
   personaRoot: string;
-  webRoot: string;
   configPath: string;
   log: EventLog;
   projection: Projection;
@@ -63,6 +93,8 @@ interface Fixture {
   server: WebServer;
   base: string;
   token: string;
+  /** webhook 专用凭据（`/webhook/*` 只认它；界面会话凭据在那条通道上是 401） */
+  hookToken: string;
   now(): Date;
   advance(ms: number): void;
   /** 写一条事件：与运行期同一纪律（承诺类同步落盘 + 进投影） */
@@ -82,18 +114,25 @@ async function setup(
   const dataDir = join(dir, 'data');
   const eventsDir = join(dataDir, 'events');
   const personaRoot = join(dataDir, 'persona');
-  const webRoot = join(dir, WEB_DIR_NAME);
   const configPath = join(dir, 'config.json');
 
   mkdirSync(dataDir, { recursive: true });
-  mkdirSync(webRoot, { recursive: true });
   writeFileSync(configPath, CONFIG_TEXT, 'utf8');
+  seedAuthFile(dataDir);
   ensurePersonaSeeds(dataDir);
 
   const log = await EventLog.open(eventsDir);
   const projection = emptyProjection();
   let nowMs = T0.getTime();
   const now = (): Date => new Date(nowMs);
+
+  // webhook 专用凭据（B9）：`/webhook/*` 只认它。夹具里先轮换出一份已知的——**不走命令**，
+  // 因为那条路会往事件日志里落一条 auth/webhook-token-rotated，而这里的用例要数事件条数。
+  // 命令本身（含事件与 X-Confirm）在 test/webhook-secret.test.ts 里立案。
+  const hookStore = new WebhookSecretStore({ dataDir, now });
+  const hookMinted = hookStore.rotate('test');
+  if (!hookMinted.ok) throw new Error('夹具生成 webhook 凭据失败');
+  const hookToken = hookMinted.token;
 
   const append = (type: string, data: unknown): AppEvent => {
     const event = {
@@ -131,8 +170,9 @@ async function setup(
     timers,
     now,
     notifier,
-    uiToken: TEST_TOKEN,
-    webRoot,
+    // 密码已设、会话已在盘上（seedAuthFile）；不再注入遗留 token —— 那条迁移路在 web-auth.test.ts 里验
+    uiToken: null,
+    webhookSecret: hookStore,
     configPath,
     port: 0,
     ssePollMs: 20,
@@ -155,7 +195,6 @@ async function setup(
     dir,
     dataDir,
     personaRoot,
-    webRoot,
     configPath,
     log,
     projection,
@@ -164,6 +203,7 @@ async function setup(
     server,
     base: server.url(),
     token: TEST_TOKEN,
+    hookToken,
     now,
     advance: (ms: number) => {
       nowMs += ms;
@@ -251,23 +291,37 @@ async function rawGet(fx: Fixture, rawPath: string): Promise<{ status: number; t
   });
 }
 
-// ──────────────────────────────── token 流程 ────────────────────────────────
+// ──────────────────────────────── 遗留 token（迁移期） ────────────────────────────────
 
-test('token：首启生成并打印一次，二次调用只读文件不再打印', async (t) => {
+test('遗留 token：只读、不再生成；太短视为损坏', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'irmia-web-token-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
 
-  const printed: string[] = [];
-  const first = ensureUiToken(dir, (line) => printed.push(line));
-  assert.equal(first.created, true);
-  assert.equal(first.token.length, 64); // 32 字节 → 64 位 hex
-  assert.equal(printed.filter((line) => line.includes(first.token)).length, 1, '只打印一次');
-  assert.equal(readFileSync(join(dir, UI_TOKEN_FILE), 'utf8').trim(), first.token);
+  // 新实例**不再生成**这个文件（"首次启动要人设密码"这条路上不该同时挂着第二把钥匙）
+  assert.equal(readLegacyToken(dir), null, '文件不存在就是没有');
+  assert.equal(existsSync(join(dir, UI_TOKEN_FILE)), false, '读一次不会顺手造出文件来');
 
-  const second = ensureUiToken(dir, (line) => printed.push(line));
-  assert.equal(second.created, false);
-  assert.equal(second.token, first.token);
-  assert.equal(printed.length, 2, '第二次不再打印（只有首启的两行）');
+  writeFileSync(join(dir, UI_TOKEN_FILE), `${'a'.repeat(64)}\n`, 'utf8');
+  assert.equal(readLegacyToken(dir), 'a'.repeat(64), '够长就用它（老实例照旧能进）');
+
+  // 手改坏的半截 token 不能当成一把能开的锁
+  writeFileSync(join(dir, UI_TOKEN_FILE), 'short\n', 'utf8');
+  assert.equal(readLegacyToken(dir), null, '短于 16 字符视为损坏');
+
+  // 认证库那份文件是另一个东西，这里不该被牵扯
+  assert.equal(existsSync(join(dir, AUTH_FILE_NAME)), false, '只有旧 token 时不算"已设密码"');
+});
+
+test('实例标识：同一条数据目录的不同写法算同一个（界面存凭据靠它）', () => {
+  const a = instanceIdOf('127.0.0.1', 7788, 'C:\\data\\app');
+  const b = instanceIdOf('127.0.0.1', 7788, 'C:\\data\\app\\');
+  assert.equal(a, b, '尾部斜杠不该让人"换一个写法就认不出自己的凭据"');
+  if (process.platform === 'win32') {
+    assert.equal(instanceIdOf('127.0.0.1', 7788, 'c:\\DATA\\APP'), a, 'Windows 路径不区分大小写');
+  }
+  assert.notEqual(a, instanceIdOf('127.0.0.1', 7788, 'C:\\data\\other'), '不同数据目录 = 不同实例');
+  assert.notEqual(a, instanceIdOf('127.0.0.1', 7789, 'C:\\data\\app'), '不同端口 = 不同实例');
+  assert.match(a, /^127\.0\.0\.1:7788#[0-9a-f]{16}$/u);
 });
 
 // ──────────────────────────────── 读接口 ────────────────────────────────
@@ -333,8 +387,9 @@ test('SSE：凭 Last-Event-ID 补拉，然后实时广播新事件', async (t) =
   fx.append('wake/manual', { note: '第二条' });
   fx.append('wake/manual', { note: '第三条' });
 
-  const response = await fetch(`${fx.base}/api/events/stream?token=${TEST_TOKEN}`, {
-    headers: { 'last-event-id': '1' },
+  // SSE 也走 Authorization 头（`?token=` 那条后门随网页界面一起删掉了，见下面的用例）
+  const response = await fetch(`${fx.base}/api/events/stream`, {
+    headers: { 'last-event-id': '1', authorization: `Bearer ${TEST_TOKEN}` },
   });
   assert.equal(response.status, 200);
   assert.match(response.headers.get('content-type') ?? '', /text\/event-stream/u);
@@ -450,7 +505,12 @@ test('GET /api/budget：today 与 7d 两条时间口径', async (t) => {
     turns: Array<{ turn: number; input: number; output: number }>;
     month: { tokens: number; turns: number; avgPerTurn: number };
     layers: Array<{ layer: string }>;
+    metricNote: string;
   };
+  // 口径那一句话必须跟着数字一起给（2026-10-04）：上限数的是**未扣缓存**的 token，
+  // 不写清楚，第一次看到"今日用量 34599.9k"的人只会以为框架在乱算
+  assert.match(todayBody.metricNote, /未扣缓存/u);
+  assert.match(todayBody.metricNote, /不是同一个数/u);
   assert.equal(todayBody.today.tokens, 150);
   assert.equal(todayBody.daily.length, 1, 'today 只看今天一天');
   assert.equal(todayBody.hourly.length, 24, '弹层里的“24 小时”图与总览同源');
@@ -532,8 +592,7 @@ test('GET /api/replay：重建请求体并给出三指纹与当时用量', async
     dataDir: fx.dataDir,
     timers: fx.timers,
     now: fx.now,
-    uiToken: TEST_TOKEN,
-    webRoot: fx.webRoot,
+    uiToken: null,
     configPath: fx.configPath,
     port: 0,
     ssePollMs: 20,
@@ -643,7 +702,7 @@ test('无 token / 错 token：/api 一律 401，错误形状统一', async (t) =
   assert.equal(commandAnon.status, 401);
 
   const streamAnon = await call(fx, '/api/events/stream', { token: null });
-  assert.equal(streamAnon.status, 401, 'SSE 同样要凭证（可用 ?token=）');
+  assert.equal(streamAnon.status, 401, 'SSE 同样要凭证（只认 Authorization 头）');
 
   const unknown = await call(fx, '/api/nope');
   assert.equal(unknown.status, 404);
@@ -651,6 +710,39 @@ test('无 token / 错 token：/api 一律 401，错误形状统一', async (t) =
 
   const wrongMethod = await call(fx, '/api/commands/wake');
   assert.equal(wrongMethod.status, 405);
+});
+
+test('认证失败的 401 里带着实例标识（界面靠它去对的地方读自己那份凭据）', async (t) => {
+  const fx = await setup(t);
+
+  const anon = await call(fx, '/api/projection', { token: null });
+  assert.equal(anon.status, 401);
+  const body = anon.body as { instance?: unknown };
+  assert.equal(
+    body.instance,
+    instanceIdOf('127.0.0.1', fx.server.port(), fx.dataDir),
+    '实例标识必须与"这台服务真正在用的 host:port + 数据目录"一致',
+  );
+
+  // 成功的读端点不该顺手也塞一份（它本来就是给"进不去的人"看的）
+  const ok = await call(fx, '/api/projection');
+  assert.equal(ok.status, 200);
+  assert.equal((ok.body as { instance?: unknown }).instance, undefined);
+});
+
+test('SSE 的 ?token= 后门已关闭：查询串里的凭据不再算数', async (t) => {
+  const fx = await setup(t);
+
+  const viaQuery = await call(fx, `/api/events/stream?token=${TEST_TOKEN}`, { token: null });
+  assert.equal(viaQuery.status, 401, '凭证只认 Authorization 头（URL 里的凭据会被各处日志顺手记下来）');
+  assert.equal(errorOf(viaQuery).code, 'unauthorized');
+
+  // 同一条路走头就是通的（证明拦的是"凭证放哪儿"，不是"SSE 不给用"）
+  const viaHeader = await fetch(`${fx.base}/api/events/stream`, {
+    headers: { authorization: `Bearer ${TEST_TOKEN}` },
+  });
+  assert.equal(viaHeader.status, 200);
+  await viaHeader.body?.cancel();
 });
 
 // ──────────────────────────────── 写命令 ────────────────────────────────
@@ -813,6 +905,38 @@ test('POST /api/commands/persona-approve：应用提案、删提案、落 person
   assert.equal(readFileSync(join(fx.personaRoot, 'STATE.md'), 'utf8').includes('新的当前状态'), false);
 });
 
+test('GET /api/config?source=saved：设置页读的是盘上那份，还没生效的字段如实列出来', async (t) => {
+  const fx = await setup(t);
+  const effectiveBody = (await call(fx, '/api/config')).body as { budget: { softRatio: number } };
+
+  // 直接把盘上那份改掉，模拟"上次保存过、但进程还没重启"（这正是用户报的那个现场）
+  const doc = JSON.parse(readFileSync(fx.configPath, 'utf8')) as {
+    budget: { softRatio: number; $comment?: unknown };
+  };
+  doc.budget.softRatio = 0.5;
+  writeFileSync(fx.configPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
+
+  const saved = await call(fx, '/api/config?source=saved');
+  assert.equal(saved.status, 200);
+  const body = saved.body as {
+    budget: { softRatio: number };
+    $pending: { source: string; restartRequired: string[] };
+  };
+  assert.equal(body.budget.softRatio, 0.5, '编辑口径 = 盘上那份（否则保存完回读会把手输的值冲掉）');
+  assert.equal(body.$pending.source, 'saved');
+  assert.deepEqual(body.$pending.restartRequired, ['budget.softRatio'], '与生效值不同的字段要列出来');
+  assert.equal(
+    Object.keys(body).filter((key) => key.startsWith('$')).join(','),
+    '$pending',
+    '$ 注释键不进结果（带进来会让每一行都挂上"尚未生效"）',
+  );
+
+  // 默认那条没有被改掉：它回答的仍是"现在按什么跑"（引导、频道页、「她怎么被称呼」都用它）
+  const again = (await call(fx, '/api/config')).body as { budget: { softRatio: number } };
+  assert.equal(again.budget.softRatio, effectiveBody.budget.softRatio, '盘上改了不等于生效了');
+  assert.notEqual(again.budget.softRatio, 0.5, '这一对不同，正是"需重启"那枚徽章的判据');
+});
+
 test('POST /api/commands/config-update：写回配置、保注释、非法值回滚、危险字段要字段短语', async (t) => {
   const fx = await setup(t);
 
@@ -822,9 +946,12 @@ test('POST /api/commands/config-update：写回配置、保注释、非法值回
     body: { fields: { 'budget.softRatio': 0.9 } },
   });
   assert.equal(ok.status, 200);
-  const okBody = ok.body as { fields: string[]; configHash: string };
+  const okBody = ok.body as { fields: string[]; configHash: string; requiresRestart: boolean };
   assert.deepEqual(okBody.fields, ['budget.softRatio']);
   assert.match(okBody.configHash, /^[0-9a-f]{64}$/u);
+  // 这一次改动**没有生效**（热更白名单是空的，见 src/config/watcher.ts 的文件头）：
+  // 响应与事件都必须把这层意思说出口，否则界面与日志都会把它当成"已经按新值跑了"
+  assert.equal(okBody.requiresRestart, true);
 
   const written = readFileSync(fx.configPath, 'utf8');
   assert.equal((JSON.parse(written) as { budget: { softRatio: number } }).budget.softRatio, 0.9);
@@ -832,7 +959,13 @@ test('POST /api/commands/config-update：写回配置、保注释、非法值回
 
   const last = (await fx.readAll()).at(-1)!;
   assert.equal(last.type, 'config/changed');
-  assert.deepEqual(last.data, { fields: ['budget.softRatio'], configHash: okBody.configHash });
+  // 事件里的 configHash 是**生效那一份**的指纹（不是盘上那份的新指纹）：
+  // `config/changed` 的语义是"现在按什么跑"，而这一次跑的仍是旧值
+  assert.deepEqual(last.data, {
+    fields: ['budget.softRatio'],
+    configHash: okBody.configHash,
+    requiresRestart: true,
+  });
 
   // 非法值（softRatio 必须落在 (0,1]）：写盘后校验失败 → 回滚，不留半截配置
   const bad = await call(fx, '/api/commands/config-update', {
@@ -1118,7 +1251,7 @@ test('POST /api/commands/dep-install：非法依赖名被拒绝（并列出合�
 
 // ──────────────────────────────── webhook ────────────────────────────────
 
-test('webhook：Bearer 校验、落 wake/webhook、内容哈希幂等键、敏感头抹除', async (t) => {
+test('webhook：只认专用凭据、落 wake/webhook、内容哈希幂等键、敏感头抹除', async (t) => {
   const fx = await setup(t);
   const body = '{"event":"deploy","ok":true}';
 
@@ -1126,7 +1259,13 @@ test('webhook：Bearer 校验、落 wake/webhook、内容哈希幂等键、敏�
   assert.equal(anon.status, 401);
   assert.equal(errorOf(anon).code, 'unauthorized');
 
-  const res = await call(fx, '/webhook/deploy', { method: 'POST', rawBody: body });
+  // 收窄（B9）：界面会话凭据在这条通道上是 401 —— 它只够投递的那些事，不该挂界面的全部权限
+  const session = await call(fx, '/webhook/deploy', { method: 'POST', rawBody: body });
+  assert.equal(session.status, 401, '会话凭据不再能打 /webhook/*');
+  assert.match(errorOf(session).message, /只认 webhook 专用凭据/u);
+  assert.equal((await fx.readAll()).length, 0, '被拒的投递不落任何事件');
+
+  const res = await call(fx, '/webhook/deploy', { method: 'POST', rawBody: body, token: fx.hookToken });
   assert.equal(res.status, 200);
   const events = await fx.readAll();
   assert.equal(events.length, 1);
@@ -1140,17 +1279,17 @@ test('webhook：Bearer 校验、落 wake/webhook、内容哈希幂等键、敏�
   assert.equal(fx.projection.pending.length, 1);
 
   // 客户端重试同一条回调：同内容 → 同一幂等键 → 被 fold 丢弃
-  await call(fx, '/webhook/deploy', { method: 'POST', rawBody: body });
+  await call(fx, '/webhook/deploy', { method: 'POST', rawBody: body, token: fx.hookToken });
   assert.equal(fx.projection.pending.length, 1, '重复回调无害（幂等去重）');
 
-  const get = await call(fx, '/webhook/deploy');
+  const get = await call(fx, '/webhook/deploy', { token: fx.hookToken });
   assert.equal(get.status, 405);
 });
 
 test('webhook：body 超过 64KB 返回 413', async (t) => {
   const fx = await setup(t);
   const huge = 'x'.repeat(70 * 1024);
-  const res = await call(fx, '/webhook/big', { method: 'POST', rawBody: huge });
+  const res = await call(fx, '/webhook/big', { method: 'POST', rawBody: huge, token: fx.hookToken });
   assert.equal(res.status, 413);
   assert.equal(errorOf(res).code, 'payload-too-large');
   assert.equal((await fx.readAll()).length, 0, '超限的 body 不落任何事件');
@@ -1158,48 +1297,58 @@ test('webhook：body 超过 64KB 返回 413', async (t) => {
 
 test('webhook：每源令牌桶限流（容量用尽返回 429）', async (t) => {
   const fx = await setup(t, { webhookRate: { capacity: 1, refillPerSec: 0 } });
-  const first = await call(fx, '/webhook/a', { method: 'POST', rawBody: '{"n":1}' });
+  const first = await call(fx, '/webhook/a', { method: 'POST', rawBody: '{"n":1}', token: fx.hookToken });
   assert.equal(first.status, 200);
-  const second = await call(fx, '/webhook/a', { method: 'POST', rawBody: '{"n":2}' });
+  const second = await call(fx, '/webhook/a', { method: 'POST', rawBody: '{"n":2}', token: fx.hookToken });
   assert.equal(second.status, 429);
   assert.equal(errorOf(second).code, 'rate-limited');
   assert.equal(second.headers.get('retry-after'), '1');
   assert.equal((await fx.readAll()).length, 1, '被限流的回调不落事件');
 });
 
-// ──────────────────────────────── 静态资源 ────────────────────────────────
+// ──────────────────────────────── 网页观测台已删除 ────────────────────────────────
 
-test('静态服务：首页、MIME、SPA 回落与路径穿越防护', async (t) => {
+test('不再服务任何网页：/ 与一切旧静态路径都回 no-web-ui（不是 404 得莫名其妙）', async (t) => {
   const fx = await setup(t);
-  writeFileSync(join(fx.webRoot, 'index.html'), '<!doctype html><title>运维台</title>', 'utf8');
-  writeFileSync(join(fx.webRoot, 'app.js'), 'export const x = 1;\n', 'utf8');
+  // 故意在工作目录里放一个同名文件：如果还有静态分支，它会被服务出来
+  writeFileSync(join(fx.dir, 'index.html'), '<!doctype html><title>应该没人读我</title>', 'utf8');
+
+  const paths = [
+    '/', '/index.html', '/ops.html', '/app.js', '/app.css', '/shell.js', '/shell.css',
+    '/pages/overview.js', '/pages/chat.js', '/chat', '/events', '/nope.txt',
+  ];
+  for (const path of paths) {
+    const res = await call(fx, path, { token: null });
+    assert.equal(res.status, 404, `${path} 不该再吐任何文件`);
+    assert.equal(errorOf(res).code, 'no-web-ui', `${path} 的错误码要说明"这儿没有网页"`);
+    assert.equal(errorOf(res).message, '本框架不提供网页界面；桌面界面请用 GUI。');
+    assert.match(res.headers.get('content-type') ?? '', /application\/json/u, '只吐 JSON，绝不吐 HTML');
+  }
+
+  // 进程照常跑：同一台服务上的 /api/* 与 /webhook/* 一点没受影响
+  const api = await call(fx, '/api/projection');
+  assert.equal(api.status, 200);
+  const hook = await call(fx, '/webhook/whatever', { method: 'POST', body: { hello: 'world' }, token: fx.hookToken });
+  assert.equal(hook.status, 200);
+});
+
+test('旧静态路径不再有路径穿越面：编码的点段/空字节都落在同一条 no-web-ui 上', async (t) => {
+  const fx = await setup(t);
   writeFileSync(join(fx.dir, 'secret.txt'), '不该被读到\n', 'utf8');
 
-  const index = await call(fx, '/', { token: null });
-  assert.equal(index.status, 200);
-  assert.match(index.headers.get('content-type') ?? '', /text\/html/u);
-  assert.match(index.text, /运维台/u, '静态资源不需要 token（页面自己去粘贴 token）');
-
-  const script = await call(fx, '/app.js', { token: null });
-  assert.equal(script.status, 200);
-  assert.match(script.headers.get('content-type') ?? '', /text\/javascript/u);
-
-  const spa = await call(fx, '/events', { token: null });
-  assert.equal(spa.status, 200, 'hash 路由的深链回落到 index.html');
-
+  // 过去这条要靠 `relative()` 判定越界并回 403；现在连"读文件"这件事都没有了
   const traversal = await rawGet(fx, '/%2e%2e%2fsecret.txt');
-  assert.equal(traversal.status, 403, '编码后的 .. 不能越出 web/');
-  assert.equal(traversal.text.includes('不该被读到'), false);
+  assert.equal(traversal.text.includes('不该被读到'), false, 'secret 绝不能出现在响应里');
+  assert.equal(traversal.status, 404);
+  assert.match(traversal.text, /no-web-ui/u);
 
-  // fetch/URL 会先把 `..` 段归一化掉（/../secret.txt → /secret.txt），于是它落在 web/ 内的不存在路径上
   const normalized = await call(fx, '/%2e%2e/secret.txt', { token: null });
-  assert.equal(normalized.text.includes('不该被读到'), false, '无论哪一层拦下，secret 都不能被读到');
+  assert.equal(normalized.text.includes('不该被读到'), false);
 
-  const missing = await call(fx, '/nope.txt', { token: null });
-  assert.equal(missing.status, 404);
-
+  // 非 GET 也不再是"静态资源只接受 GET/HEAD"的 405——那条分支已经不存在了
   const post = await call(fx, '/index.html', { method: 'POST', token: null, rawBody: 'x' });
-  assert.equal(post.status, 405);
+  assert.equal(post.status, 404);
+  assert.equal(errorOf(post).code, 'no-web-ui');
 });
 
 // ──────────────────────────────── 常量守卫 ────────────────────────────────
@@ -1219,7 +1368,7 @@ test('GET /api/memory：facts 分区、流水账/归档/日记清单与单文件
     '# Facts',
     '',
     '## 置顶（pinned）',
-    '- [!pinned] 用户叫owner',
+    '- [!pinned] 用户叫OWNER',
     '',
     '## 稳定事实',
     '- 2026-09-30：他在改 Irmia 的代码',
@@ -1236,11 +1385,11 @@ test('GET /api/memory：facts 分区、流水账/归档/日记清单与单文件
   const view = await call(fx, '/api/memory');
   assert.equal(view.status, 200);
   const body = view.body as {
-    facts: { sections: Array<{ title: string; lines: number }> };
-    files: Array<{ name: string }>;
-    episodes: Array<{ name: string }>;
-    archive: Array<{ name: string }>;
-    diary: Array<{ name: string }>;
+    facts: { path: string; sections: Array<{ title: string; lines: number }> };
+    files: Array<{ name: string; path: string }>;
+    episodes: Array<{ name: string; path: string }>;
+    archive: Array<{ name: string; path: string }>;
+    diary: Array<{ name: string; path: string }>;
     maintain: { cron: string };
     empty: boolean;
   };
@@ -1259,7 +1408,20 @@ test('GET /api/memory：facts 分区、流水账/归档/日记清单与单文件
 
   const facts = await call(fx, '/api/memory?file=MEMORIES/facts.md');
   assert.equal(facts.status, 200);
-  assert.match((facts.body as { content: string }).content, /用户叫owner/u);
+  assert.match((facts.body as { content: string }).content, /用户叫OWNER/u);
+
+  // 回归（2026-10-04 修的「清单里列得出来、点开却说不存在」）：
+  // ① 每组的位置由**服务端**说出来（path），不再让界面去拼——流水账与归档过去就是被拼错的；
+  // ② 清单里给出的每一条 path 都必须**真的读得回来**：以后谁再改分组、忘了改另一头，这条会红。
+  assert.equal(body.facts.path, 'MEMORIES/facts.md');
+  assert.equal(body.episodes[0]?.path, 'MEMORIES/episodes/2026-09-30.md');
+  assert.equal(body.archive[0]?.path, 'MEMORIES/episodes/archive/2026-09-20.md');
+  assert.equal(body.diary[0]?.path, 'diary/2026-09-30.md');
+  assert.ok(body.files.every((f) => f.path.startsWith('MEMORIES/')), '“其他”那组都在 MEMORIES/ 下');
+  for (const entry of [body.facts, ...body.files, ...body.episodes, ...body.archive, ...body.diary]) {
+    const read = await call(fx, `/api/memory?file=${encodeURIComponent(entry.path)}`);
+    assert.equal(read.status, 200, `清单里的 path 必须读得回来：${entry.path}`);
+  }
 
   const diary = await call(fx, '/api/memory?file=diary/2026-09-30.md');
   assert.equal(diary.status, 200);
@@ -1337,6 +1499,19 @@ test('dream 命令：不带凭证同样 401（与其余命令一个门槛）', a
 // **刻意写成字面量而不 import 那几个常量**：一 import，旧实现下整个文件在导入期就炸
 // （SyntaxError: does not provide an export named …），那种"全红"什么都验不到；
 // 而这里有意义的红是下面那句 `404 !== 200`——端点根本不存在。
+
+/**
+ * 一条 `budget/consumed` 的最小完整形状（字段一个不少：投影靠它累计，缺字段就是伪造事实）。
+ * 上下文审计的两类事实（`context` / `cacheBreak`）以可选字段挂在它上面——所以这里只给主字段。
+ */
+function consumedData(): Record<string, unknown> {
+  return {
+    turn: 1, step: 1, lane: 'heavy', model: 'deepseek-flash',
+    inputTokens: 100, outputTokens: 10,
+    cacheHitTokens: 90, cacheMissTokens: 10,
+    durationMs: 5, retryCount: 0, finishReason: 'completed', tokensTodayAccum: 110,
+  };
+}
 
 test('GET /api/framework-notes：一条提示都没有时给空数组（不是 404、不是 null）', async (t) => {
   const fx = await setup(t);
@@ -1434,6 +1609,123 @@ test('GET /api/framework-notes：?limit= 取最近几条，非法值退回默认
 
   const huge = (await call(fx, '/api/framework-notes?limit=9999')).body as { limit: number };
   assert.equal(huge.limit, 100, '上限是上限：这条端点只服务摘要卡');
+});
+
+test('GET /api/framework-notes：上下文审计两类也在这张卡里（缓存破坏 + 每步归因，各占各的额度）', async (t) => {
+  const fx = await setup(t);
+
+  // 一条真失守的哨兵（挂在 budget/consumed 上，见 model/context-audit.ts）
+  fx.append('budget/consumed', {
+    ...consumedData(),
+    cacheBreak: {
+      class: 'persona',
+      classes: ['persona'],
+      reason: '缓存前缀失守（persona）：人格文件被改写（IDENTITY / CONSTITUTION / STYLE）'
+        + '——常驻前缀从第一个字节起失守。距上次调用 2 分钟，本次 input 170000 token，缓存命中 3.0%。',
+      gapMs: 120_000,
+    },
+  });
+  // 六条归因事实，**分属六轮**（每轮一条是常态）：卡片只留最近 5 条，且**不许挤掉告警**
+  for (let i = 0; i < 6; i += 1) {
+    fx.append('budget/consumed', {
+      ...consumedData(),
+      turn: i + 1,
+      step: 1,
+      context: {
+        renderVersion: '28',
+        instructions: { tokens: 7000, hash: 'h-inst' },
+        tools: { tokens: 4000, hash: 'h-tools', count: 22 },
+        memory: { tokens: 2000, hash: 'h-mem', items: 1 },
+        history: { tokens: 152000, hash: `h-hist-${i}`, items: 255, headHash: 'h-head' },
+        now: { tokens: 3000, hash: `h-now-${i}` },
+        wake: { tokens: 200, hash: 'h-wake' },
+        hint: { tokens: 0, hash: 'h-hint' },
+        input: { items: 260 + i, tokens: 168000 },
+      },
+    });
+  }
+  // 同一轮里的三步：**只留最后一步**那一条（用户 2026-10-04 报的"还在刷屏"就是每步一条）
+  for (const step of [1, 2, 3]) {
+    fx.append('budget/consumed', {
+      ...consumedData(),
+      turn: 99,
+      step,
+      context: {
+        renderVersion: '28',
+        instructions: { tokens: 1, hash: 'i' },
+        tools: { tokens: 1, hash: 'j', count: 1 },
+        memory: { tokens: 0, hash: 'k', items: 0 },
+        history: { tokens: 1, hash: `h-step-${step}`, items: 1, headHash: 'l' },
+        now: { tokens: 1, hash: `n-step-${step}` },
+        wake: { tokens: 0, hash: 'm' },
+        hint: { tokens: 0, hash: 'n' },
+        input: { items: 2, tokens: 2 },
+      },
+    });
+  }
+  const alarm = fx.append('alarm/sent', { fingerprint: 'fp-1', level: 'critical', title: '告警出口连续失败' });
+
+  const body = (await call(fx, '/api/framework-notes')).body as { notes: Array<Record<string, unknown>> };
+  const kinds = body.notes.map((note) => note['kind']);
+  assert.equal(kinds.filter((kind) => kind === 'context').length, 5, '归因只占它自己那一小格（最近 5 条）');
+  assert.equal(kinds.filter((kind) => kind === 'cache-break').length, 1);
+  assert.equal(kinds.filter((kind) => kind === 'alarm').length, 1, '归因再多也挤不掉真告警');
+  assert.equal(body.notes.length, 7);
+  assert.equal(
+    body.notes.filter((note) => note['kind'] === 'context' && String(note['title']).startsWith('第 99 轮')).length,
+    1,
+    '一轮只出一条：同一轮的第 1/2/3 步不许各占一格',
+  );
+  assert.match(
+    String(body.notes.find((note) => note['kind'] === 'context')!['title']),
+    /^第 99 轮第 3 步/u,
+    '留下的必须是**最后一步**（倒着扫第一次遇到的那条）',
+  );
+
+  const breaker = body.notes.find((note) => note['kind'] === 'cache-break')!;
+  assert.equal(breaker['label'], '缓存破坏');
+  assert.equal(breaker['level'], 'warn');
+  assert.equal(breaker['title'], '缓存前缀失守：人格文件变更', '类别徽章要能一眼读懂是哪一类');
+  assert.match(String(breaker['reason']), /缓存命中 3\.0%/u, '判据与数字照实摆出来');
+  assert.equal(breaker['sid'], null, '框架自身的事：来源照实说"框架"');
+
+  const context = body.notes.find((note) => note['kind'] === 'context')!;
+  assert.equal(context['label'], '上下文');
+  assert.equal(context['level'], 'info', '归因是事实不是警告：安静地待着');
+  // 措辞里写明是 **input 段**（instructions 与 tools 不在这个数里），并且与 reason 的等式对得上
+  assert.match(String(context['title']), /^第 99 轮第 3 步的上下文：input 段 2 token \/ 2 条$/u);
+  assert.match(String(context['reason']), /整条 4 = 指令 1 \+ 工具 1（1 件） \+ input 段 2/u, '分部与合计必须自洽');
+  assert.match(String(context['reason']), /渲染版本 28/u);
+  assert.equal('data' in context, false, '照旧不许把整条事件丢出去');
+
+  // 告警照旧拿到完整的 limit：它的额度与归因无关
+  assert.equal(body.notes.find((note) => note['kind'] === 'alarm')!['seq'], alarm.seq);
+});
+
+test('GET /api/framework-notes：只有归因、没有真事时也不产生哨兵条目', async (t) => {
+  const fx = await setup(t);
+  // 十轮"前缀没变"的正常调用（没有 cacheBreak 字段）——每轮的步数不同，但一轮只留一条
+  for (let i = 0; i < 10; i += 1) {
+    fx.append('budget/consumed', {
+      ...consumedData(),
+      turn: i + 1,
+      step: 1,
+      context: {
+        renderVersion: '28',
+        instructions: { tokens: 1, hash: 'a' },
+        tools: { tokens: 1, hash: 'b', count: 1 },
+        memory: { tokens: 0, hash: 'c', items: 0 },
+        history: { tokens: 1, hash: 'd', items: 1, headHash: 'e' },
+        now: { tokens: 1, hash: 'f' },
+        wake: { tokens: 0, hash: 'g' },
+        hint: { tokens: 0, hash: 'h' },
+        input: { items: 2, tokens: 2 },
+      },
+    });
+  }
+  const body = (await call(fx, '/api/framework-notes')).body as { notes: Array<Record<string, unknown>> };
+  assert.equal(body.notes.filter((note) => note['kind'] === 'cache-break').length, 0, '没失守就没有哨兵条目');
+  assert.equal(body.notes.length, 5, '只剩归因那 5 条');
 });
 
 test('GET /api/sessions：`contacts` 是**对象**，且键是归一后的 sid（聊天页按它查名字）', async (t) => {

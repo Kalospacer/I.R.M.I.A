@@ -1018,7 +1018,7 @@ describe('pwsh：命令黑名单与输出处理（纯函数）', () => {
   test('危险命令命中规则，安全命令放行', () => {
     const blocked: Array<[string, string]> = [
       ['rm -rf /', 'rm-recursive-force'],
-      ['Remove-Item -Recurse -Force C:\\', 'remove-item-recursive-force'],
+      ['Remove-Item -Recurse -Force D:\\', 'remove-item-recursive-force'],
       ['Remove-Item C:\\ ', 'remove-item-drive-root'],
       ['format C: /q', 'format-volume'],
       ['mkfs.ext4 /dev/sda1', 'mkfs'],

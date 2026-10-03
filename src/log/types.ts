@@ -1,7 +1,13 @@
 /**
  * Irmia Agent — 事件类型全集
  * 与 docs/schema.md §1-§7 逐字对齐。修改事件形状必须先改 schema 文档。
+ *
+ * 值导入写 `.ts`、纯类型导入写 `.js`（Node 的 --experimental-strip-types 只擦类型、
+ * 不改写路径解析）。这里导入上下文审计的两个**类型**：它们是 `budget/consumed` 上
+ * 两个可选字段的形状，TypeScript 会整条擦除，运行期不留依赖。
  */
+
+import type { CacheBreak, ContextBreakdown } from '../model/context-audit.js';
 
 // ──────────────────────────────── 信封 ────────────────────────────────
 
@@ -404,6 +410,29 @@ export interface BudgetConsumed extends EventEnvelope<'budget/consumed', {
   durationMs: number; retryCount: number;
   finishReason: 'completed' | 'max_output_tokens' | 'failed' | 'aborted';
   tokensTodayAccum: number;
+  /**
+   * 这次请求的**上下文归因**（`model/context-audit.ts` 的 `ContextBreakdown`）：
+   * instructions / tools / 长期记忆层 / 历史 items / 此刻层 / 本轮输入 / 尾部插播各占多少 token。
+   *
+   * 为什么挂在预算事件上，而不是新开一种事件（2026-10-03，硬约束第 4 条）：
+   * `budget/consumed` 本来就是**一次模型调用一条**，而且它已经在记 `cacheHitTokens` /
+   * `cacheMissTokens`——缓存与"这次请求由什么组成"是同一件事的两面。新增类型要动 `AppEvent`
+   * 联合、可见性表、fold 与重放四处，收益是零。
+   *
+   * 归因是**渲染层的纯函数副产物**（段边界只有 `render()` 知道），运行期与重放走同一个
+   * `deriveRequest`，所以这个字段可重建、不是"只有运行期才有"的观测。
+   *
+   * **可选**：本字段是后加的，老日志里没有；`lastAuditedCall` 遇到没有它的调用直接跳过
+   * （拿一个没有归因的调用当比对基准只会得到"到处都变了"的假结论）。
+   */
+  context?: ContextBreakdown;
+  /**
+   * 缓存破坏哨兵的结论：与上一次被审计的调用做前缀比对，**除此刻层尾巴以外**的部分变了才有。
+   *
+   * 没有这个字段 = 这次与上次的冻结前缀一致（不是"没查"）。只在真破坏时出现，
+   * 所以它能直接当"框架提示"卡上的一条告警看。
+   */
+  cacheBreak?: CacheBreak;
 }> {}
 
 export interface BudgetRollover extends EventEnvelope<'budget/rollover', { date: string }> {}
@@ -458,12 +487,67 @@ export interface InputRequeued extends EventEnvelope<'input/requeued', {
   reason: 'turn-interrupted' | 'startup-recovery' | 'human-answered' | 'turn-error';
 }> {}
 
+/**
+ * 人在本机对话流里打的一条**指令**（B1 第二步：`/compact` 与 `/handoff`）。
+ *
+ * 为什么它必须是一种自己的事件，而不是借用别的信封（2026-10-04 定）：
+ *   · `input/claimed` 只说"这条输入被消费了"，说不出是**哪条指令**、带了什么理由；
+ *   · `alarm/sent` 是**告警**——它的 title/body/fingerprint 还要被限流、指纹配对与
+ *     "已恢复"那一套消费。把指令塞进去，读日志的人分不出"这是一条指令记录"还是
+ *     "框架报警了"，而这两种事实的处置完全不同。
+ * 一句话：事件日志是唯一真相源，**多出一种事实就该有它自己的类型**。
+ * （与 `speak/sent` 补 `text` 那次的分寸相反：那里是同一个事实补字段，这里是多出了一个事实。）
+ *
+ * visibility 一律 internal：它是**簿记**（谁在什么时候按了哪条），不是给她的输入。
+ * 指令的效果落在别的 model 事件上（`compaction/summary`）——她该看见的是那份摘要，
+ * 不是"用户按了个按钮"。GUI 侧同样不上屏（chat_page 的映射表里没有它）。
+ */
+export interface SlashHandled extends EventEnvelope<'slash/handled', {
+  /** 认出来的指令种类；`unknown` = 打了斜杠但不在名单里（只回一句话，什么都不做） */
+  kind: 'compact' | 'handoff' | 'unknown';
+  /** 打出来的那个词（`unknown` 时是被打错的词——回话要点名） */
+  name: string;
+  /** 指令后面跟的那句话（理由）；没有就是空串 */
+  argument: string;
+  /**
+   * 落地结果：
+   *   · `compacted` —— 真的压了一次（同一批里紧随一条 `compaction/summary`）；
+   *   · `empty`     —— 事件流里渲染不出条目，一个字都没改（不写空摘要）；
+   *   · `rejected`  —— 不认识的词，只回了一句话，什么都没做。
+   */
+  outcome: 'compacted' | 'empty' | 'rejected';
+  /** 被消费掉的那条输入（`wake/manual` 的 seq）：把"他打了什么"与"我们怎么处理"对上 */
+  inputSeq: number;
+  /** 遮蔽点；只有 `compacted` 有，且与紧随其后的 `compaction/summary` 是同一个数 */
+  coveredUpToSeq?: number;
+  /**
+   * **回给用户的那句话——逐字**（与 `injection/noted.note` 同一条理由：问"框架当时说了什么"
+   * 必须能从日志里查到原话，而不是靠渲染层再拼一遍）。
+   *
+   * 为什么不能只靠告警那条路：告警事件（`alarm/sent`）只装 `title`，回执正文只在告警文件与
+   * webhook 里——日志是唯一真相源，回执本身也得留在日志里。回执同时仍走告警出口送给人
+   * （见 `real-loop` 的 `runSlashCommand`）。
+   */
+  receipt: string;
+}> {}
+
 export interface ToolZombie extends EventEnvelope<'tool/zombie', {
   callId: string; name: string; note: string;
 }> {}
 
 export interface AlarmSent extends EventEnvelope<'alarm/sent', {
   fingerprint: string; level: 'info' | 'warn' | 'critical'; title: string;
+  /**
+   * 故障键（`category:stall`、`alert:水位停滞` 这类）：同一次故障的"报警"与"已恢复"靠它配对。
+   *
+   * 为什么落进事件（2026-10-03）：故障登记原来只在告警出口的内存里，进程一重启就丢，
+   * 于是一条已经报出去的故障永远等不到它的"已恢复"（限流窗口却还在，也不会重报）。
+   * **可选**字段：普通告警（notify、预算提示）不写它，老日志里也整个没有——
+   * `foldStalls` 遇到没有 key 的事件直接跳过，行为与之前逐条一致。
+   */
+  key?: string;
+  /** 这条是恢复通知而不是故障本身（`foldStalls` 据此销账）；同样可选，老日志没有 */
+  recovered?: true;
 }> {}
 
 export interface ReviewResolved extends EventEnvelope<'review/resolved', {
@@ -483,7 +567,21 @@ export interface PersonaUpdated extends EventEnvelope<'persona/updated', {
 }> {}
 
 export interface ConfigChanged extends EventEnvelope<'config/changed', {
-  fields: string[]; configHash: string;
+  fields: string[];
+  /**
+   * **生效配置**的指纹（不是盘上那份的）：这个事件说的是"运行中的进程现在按什么跑"。
+   * 盘上那份的新指纹另见命令响应里的 `savedConfigHash`。
+   */
+  configHash: string;
+  /**
+   * true = 这次改动**还没生效**，要重启进程才接管（2026-10-04 加）。
+   *
+   * 为什么必须有这一位：热更白名单现在是空的（见 `config/watcher.ts` 的文件头），
+   * 所有字段都走"重启才生效"那条路。不写这一位的话，日志里只有 `config/changed`
+   * 一条"配置变了"的事实，而进程其实还在按旧值跑——看日志的人（包括 replay）
+   * 会把两者当成同一件事。
+   */
+  requiresRestart?: boolean;
 }> {}
 
 /**
@@ -504,6 +602,47 @@ export interface MemoryMaintained extends EventEnvelope<'memory/maintained', {
   diaryFile: string | null;
   /** 本任务 light lane 消耗（input+output） */
   lightTokens: number;
+}> {}
+
+/**
+ * 本轮的记忆选材（B2，docs/memory-injection.md §4）。
+ *
+ * **为什么它必须是事件**：本仓库的地基是**可重放**——`deriveRequest` 必须能只凭事件日志重建
+ * 逐字节相同的请求。"这一轮选了索引里的哪几条"如果是运行期临时算出来的，事后重建就得重算，
+ * 而重算依赖当时的索引文件（她随时可能改自己的记忆），重建结果就与当时对不上了。
+ * 写成事件之后，`deriveRequest` 只读最后一个 `memory/selected{turn}`，两条路径同一份结论。
+ *
+ * 它同时回答**为什么没选其余**：事后读日志的人要能分清"心跳轮本就不注入"与"索引上限截断了"
+ * ——只记选中的那几条，这个问题就永远没人答得上来。
+ *
+ * 可见性 internal：它是**装配账**（哪几条进了请求是日志的事实），不是给她的输入。
+ * 真正给她看的是本轮固定块里那几条正文本身（见 model/render.ts 的 `TurnBlockFacts`）。
+ */
+export interface MemorySelected extends EventEnvelope<'memory/selected', {
+  /** 归属的 turn（轮首写，所以它的 seq 落在该 turn 的第一个 step/start 之前） */
+  turn: number;
+  /** 本轮的注入理由：心跳轮不注入；有人跟她说话时注入 */
+  injection: 'human' | 'heartbeat';
+  /** 本轮选中的条目（**指针**：路径 + 行号 + 一行摘要 + 置顶标记；正文不落事件） */
+  selected: Array<{
+    /** 相对工作根的 posix 路径（`safe_read` 的 path 用它） */
+    path: string;
+    /** 条目在文件里的行号（1 起，与 safe_read 回显同一口径） */
+    line: number;
+    /** 一行摘要（索引里印出来的那一行） */
+    summary: string;
+    /** `!pinned`：永不衰减、永不归档，心跳轮与超预算时也照样注入 */
+    pinned: boolean;
+  }>;
+  /** 没被选中的条数与原因（只记数：逐条记会让事件膨胀成索引的副本） */
+  notSelected: {
+    /** 心跳轮整轮不选（没人在跟她说话） */
+    heartbeat: number;
+    /** 非置顶条目，且本轮条数上限已满 */
+    notNeeded: number;
+  };
+  /** 写这条账时的索引规模（条数）——事后能判断"当时索引有多大" */
+  indexSize: number;
 }> {}
 
 // ──────────────────────────────── 扩展面 ────────────────────────────────
@@ -701,6 +840,52 @@ export interface ModelRestored extends EventEnvelope<'model/restored', {
   lane: ModelLane;
 }> {}
 
+/**
+ * 界面的密码被设上/被改掉（2026-10，本地认证从共享 token 换成密码）。
+ *
+ * 为什么它该进事件日志（而不是像 `skills-ignored.json` 那样只落盘）：
+ * 换密码是**一次能力边界的变更**——它当场废掉所有已经发出去的会话凭据，
+ * 也（在老实例上）废掉了那份 `data/.ui-token`。这类"谁在什么时候把门锁换了"的事实，
+ * 事后唯一能回答的地方就是日志；写在别处就是第二份真相源。
+ *
+ * 它**不带任何凭据**：没有密码、没有会话串，只有一个非密钥的会话 id。
+ * 可见性 internal——这是本机的运维事实，与她的行事无关，不该占她的上下文。
+ */
+export interface AuthPasswordSet extends EventEnvelope<'auth/password-set', {
+  /** 谁设的（界面/脚本自报的 label，缺省 'local'）：只作展示，不参与判定 */
+  by: string;
+  /** setup = 首次设密码；change = 改密码（会让全部旧会话失效） */
+  action: 'setup' | 'change';
+  /** 这次是否把遗留的 `data/.ui-token` 作废了（只有老实例迁移时才是 true） */
+  legacyTokenDisabled: boolean;
+  /** 这次同时失效了几条旧会话（setup 时恒为 0） */
+  sessionsRevoked: number;
+}> {}
+
+/**
+ * webhook 专用凭据被生成 / 被轮换（2026-10，B9：`/webhook/*` 从"共用界面会话凭据"
+ * 收窄成"只认一份专用凭据"）。
+ *
+ * 为什么它该进事件日志：换钥匙是一次**能力边界的变更**——它当场废掉上一份凭据，
+ * 也就当场打断了所有还没换过来的外部投递方（监控、别台机器上的脚本……），
+ * 而那些故障现场在别的机器上。事后唯一能回答"谁在什么时候换的、换到第几份"的地方就是日志；
+ * 界面上的状态会随下一次生成而变，留不下历史。
+ *
+ * 它**不带任何凭据**：没有明文（明文只在生成那一次的响应体里），也没有哈希，
+ * 只有一个非密钥的 8 字节 `secretId`（标识，可以进日志与界面）。
+ * 可见性 internal——本机的运维事实，与她的行事无关，不该占她的上下文。
+ */
+export interface AuthWebhookTokenRotated extends EventEnvelope<'auth/webhook-token-rotated', {
+  /** 谁生成的（界面/脚本自报的 label，缺省 'local' 且截断到 40 字符）：只作展示，不参与判定 */
+  by: string;
+  /** generate = 这台实例第一次生成；rotate = 覆盖掉上一份（上一份当场失效） */
+  action: 'generate' | 'rotate';
+  /** 新那份的标识（不是密钥） */
+  secretId: string;
+  /** 被顶掉的那份的标识（首次生成时 null）——这条事实正是"什么时候换过钥匙" */
+  previousSecretId: string | null;
+}> {}
+
 // ──────────────────────────────── 联合类型 ────────────────────────────────
 
 export type AppEvent =
@@ -715,13 +900,16 @@ export type AppEvent =
   | BudgetConsumed | BudgetRollover | BudgetExhausted | BudgetToppedUp
   | PolicyDenied | AuthzDenied | LogRepaired | InstanceTakeover
   | InputClaimed | InputDeadLetter | InputRequeued | ToolZombie
+  | SlashHandled
   | AlarmSent | ReviewResolved | SnapshotCheckpoint | CompactionSummary
-  | PersonaUpdated | ConfigChanged | MemoryMaintained
+  | PersonaUpdated | ConfigChanged | MemoryMaintained | MemorySelected
   | McpServerStarted | McpServerStopped | SkillInstalled | HookFired | SpeakSent
   | IntentionRaised | IntentionActed | TodoUpdated
   | JobStarted | JobFinished
   | HumanAsked | HumanAnswered | HumanExpired
   | PlanPending | PlanResolved
+  | AuthPasswordSet
+  | AuthWebhookTokenRotated
   | ModelDegraded | ModelRestored;
 
 export type AppEventType = AppEvent['type'];
@@ -761,6 +949,19 @@ export const EVENT_VISIBILITY: Record<string, Visibility> = {
   'policy/denied': 'model',
   // 整理留痕只在日志与前端，不进上下文（记忆的秩序由机制保证，不必每轮提醒她一遍）
   'memory/maintained': 'internal',
+  // 选材是**装配账**（这一轮往固定块里放了哪几条记忆），不是给她的输入：正文才进上下文，
+  // 账本身只服务于"同一份日志重建同一份请求"与事后复盘（B2，docs/memory-injection.md §4）
+  'memory/selected': 'internal',
+  // 换锁是本机的运维事实：她要办事时会撞上"进不去"，但"谁什么时候设了密码"本身
+  // 不该占她一拍上下文（与 session/* 同一条口径）
+  'auth/password-set': 'internal',
+  // webhook 专用凭据的轮换同上：它是本机的运维事实（谁什么时候换了那条通道的钥匙），
+  // 但它不改变她能做什么——外部投递进来照旧是一条 wake/webhook
+  'auth/webhook-token-rotated': 'internal',
+  // 人打的一条指令（`/compact` / `/handoff`）：簿记——谁按了哪条、带了什么理由、落地成什么。
+  // 不进上下文：她该看见的是指令的**效果**（紧随其后的 compaction/summary），不是"用户按了按钮"
+  // （B1 第二步；写在这里而不是靠 defaultVisibility 兜底，是为了让"这条线是有意画的"看得见）
+  'slash/handled': 'internal',
   // 其余全部 internal
 };
 

@@ -10,6 +10,7 @@ import 'package:irmia_gui/app.dart';
 import 'package:irmia_gui/pages/settings_page.dart';
 import 'package:irmia_gui/theme.dart';
 import 'package:irmia_gui/ui_kit.dart';
+import 'package:irmia_gui/ui_state.dart';
 
 /// 设置页的锚点 + 分区卡片交互（docs/astrbot-ux-interaction.md「改造后适用」第一条）：
 /// 用真实 loopback 服务喂数据，锁住这些事——锚点列表渲染（含 v30 的「外部依赖」与 v34 的「协议端」）、
@@ -28,7 +29,7 @@ void main() {
         'configured': true,
         'enabled': true,
         'kind': 'snowluma',
-        'dir': 'C:/SnowLuma',
+        'dir': 'D:/SnowLuma',
         'autoStart': true,
         'configSource': 'disk',
         'attached': true,
@@ -39,14 +40,14 @@ void main() {
         'endpoint': {'wsUrl': 'ws://127.0.0.1:3001/', 'hasToken': true, 'source': 'live'},
         'webuiUrl': 'http://localhost:5099',
         'installed': true,
-        'entryPath': 'C:/SnowLuma/dist/index.mjs',
+        'entryPath': 'D:/SnowLuma/dist/index.mjs',
       };
 
   /// GET /api/deps 的样例：rg 就绪、es 可一键装、pwsh 只能人工装（三态各一）
   Map<String, dynamic> depsReport() => <String, dynamic>{
         'available': true,
-        'dataDir': 'C:/path/to/data',
-        'toolsDir': 'C:/path/to/data/tools',
+        'dataDir': 'D:/irmia/data',
+        'toolsDir': 'D:/irmia/data/tools',
         'needsAttention': true,
         'entries': [
           {
@@ -65,14 +66,14 @@ void main() {
             'manualHint': 'winget install Microsoft.PowerShell',
             'downloadPage': 'https://github.com/PowerShell/PowerShell/releases/latest',
             'minVersion': '7.0',
-            'managedDir': 'C:/path/to/data/tools/pwsh',
+            'managedDir': 'D:/irmia/data/tools/pwsh',
           },
           {
             'name': 'rg',
             'label': 'ripgrep（rg）',
             'status': 'ready',
             'ok': true,
-            'path': 'C:/path/to/data/tools/rg/rg.exe',
+            'path': 'D:/irmia/data/tools/rg/rg.exe',
             'version': '15.1.0',
             'source': 'managed',
             'reason': '',
@@ -83,7 +84,7 @@ void main() {
             'manualHint': null,
             'downloadPage': 'https://github.com/BurntSushi/ripgrep/releases',
             'minVersion': '13.0',
-            'managedDir': 'C:/path/to/data/tools/rg',
+            'managedDir': 'D:/irmia/data/tools/rg',
           },
           {
             'name': 'es',
@@ -101,14 +102,14 @@ void main() {
             'manualHint': null,
             'downloadPage': 'https://www.voidtools.com/downloads/',
             'minVersion': '1.1',
-            'managedDir': 'C:/path/to/data/tools/es',
+            'managedDir': 'D:/irmia/data/tools/es',
           },
         ],
         'generatedAt': '2026-10-01T00:00:00.000Z',
       };
 
   const config = <String, dynamic>{
-    'dataDir': 'C:/path/to/data',
+    'dataDir': 'D:/irmia/data',
     'web': {'host': '127.0.0.1', 'port': 7788},
     'timezone': 'Asia/Shanghai',
     'models': {
@@ -137,6 +138,8 @@ void main() {
 
   late HttpServer server;
   late AppState state;
+  /// 界面状态的临时文件目录（「关窗时收进托盘」会写它，见 setUp）
+  late Directory stateTmpDir;
   Map<String, dynamic>? lastPost;
   String? lastConfirm;
   /// 写命令的**次数**（⑭：逐行保存要断言"只发一条"，只看 lastPost 分不出"发了一条"还是
@@ -162,7 +165,7 @@ void main() {
   String? sidePath;
   Map<String, dynamic>? sideBody;
   /// PUT 配置与启停各自的回执（默认按服务端形状给一份）
-  Map<String, dynamic> sideWriteReply = <String, dynamic>{'ok': true, 'restartRequired': true, 'dir': 'C:/SnowLuma'};
+  Map<String, dynamic> sideWriteReply = <String, dynamic>{'ok': true, 'restartRequired': true, 'dir': 'D:/SnowLuma'};
   Map<String, dynamic> sideActionReply = <String, dynamic>{
     'ok': true,
     'action': 'start',
@@ -175,6 +178,11 @@ void main() {
     // TestWidgetsFlutterBinding 默认把所有 HttpClient 请求挡成 400（请求不会真的发出），
     // 本组要打真实 loopback 服务，先把那层 mock 摘掉。
     HttpOverrides.global = null;
+    // 「关窗时收进托盘」这个界面偏好会落 %APPDATA%/Irmia/ui-state.json（v36）：
+    // 测试指向临时文件，别踩真实那份——设置页那条用例会真的写盘。
+    stateTmpDir = Directory.systemTemp.createTempSync('irmia-settings-state-');
+    stateFileOverride = '${stateTmpDir.path}${Platform.pathSeparator}ui-state.json';
+    closeToTray.value = false;
     lastPost = null;
     lastConfirm = null;
     postCount = 0;
@@ -187,7 +195,7 @@ void main() {
     // 一键安装的回执：**照真服务端的形状**给（含逐行 log——那是给人看的进度）
     installSideReply = <String, dynamic>{
       'ok': true,
-      'dir': r'C:\path\to\data\services\snowluma',
+      'dir': r'C:\path\to\snowluma',
       'version': 'v1.14.20',
       'detail': '已装好 v1.14.20',
       'log': <String>[
@@ -199,13 +207,13 @@ void main() {
         // 文件数是**实测值**（真包解出来 43 个文件、13 个顶层条目）：假数据与事实对齐，
         // 免得以后有人拿测试里的数字去写文档
         '解压完成（43 个文件）',
-        r'就绪：C:\path\to\data\services\snowluma',
+        r'就绪：C:\path\to\snowluma',
       ],
     };
     sideMethod = null;
     sidePath = null;
     sideBody = null;
-    sideWriteReply = <String, dynamic>{'ok': true, 'restartRequired': true, 'dir': 'C:/SnowLuma'};
+    sideWriteReply = <String, dynamic>{'ok': true, 'restartRequired': true, 'dir': 'D:/SnowLuma'};
     sideActionReply = <String, dynamic>{
       'ok': true,
       'action': 'start',
@@ -272,6 +280,13 @@ void main() {
   tearDown(() async {
     state.dispose();
     await server.close(force: true);
+    stateFileOverride = null;
+    closeToTray.value = false;
+    try {
+      stateTmpDir.deleteSync(recursive: true);
+    } catch (_) {
+      // 清不掉临时目录不影响断言
+    }
   });
 
   /// 交替推进真异步与假时钟：HttpClient 的每一步 await 都要先让真实 I/O 跑完，
@@ -286,6 +301,16 @@ void main() {
       }
     }
     fail('等待目标未出现：$target');
+  }
+
+  /// 真实文件 IO 在 fake async 环境里要靠 runAsync 推进，pump 负责回灌微任务：
+  /// 两者交替几轮，ui-state.json 的**串行写入队列**才真的跑完（与 shell_layout_test 同一招）。
+  /// 不推它就直接读盘，会撞上"文件还没写出来"——那正是这条用例第一版踩的坑。
+  Future<void> settleIo(WidgetTester tester, {int rounds = 12}) async {
+    for (var i = 0; i < rounds; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 10)));
+      await tester.pump();
+    }
   }
 
   /// 收尾：把所有还在飞的请求与 toast 计时器跑完，避免测试结束时报 pending timer
@@ -576,6 +601,45 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  // ── 「界面」卡：关窗行为（v36） ──
+
+  testWidgets('界面卡：关窗开关默认关（点 × 退出界面），打开后写进本机状态文件', (tester) async {
+    // 用户踩过两次的那个坑：默认"关窗=收进托盘"，而托盘图标被 Windows 收进
+    // "隐藏的图标"面板时，关窗就是"窗口再也找不回来"。所以默认必须是**关**。
+    await pumpSettings(tester, size: const Size(1350, 1600));
+
+    /// 读那份状态文件（真实 I/O 要走 runAsync 才推得动）
+    Future<Map<String, dynamic>> readState() async {
+      final raw = await tester.runAsync(() => File(stateFileOverride!).readAsString());
+      return jsonDecode(raw!) as Map<String, dynamic>;
+    }
+    final toggle = find.byKey(const ValueKey('close-to-tray'));
+    expect(toggle, findsOneWidget, reason: '开关要在「界面」卡里露面');
+    expect(tester.widget<Switch>(toggle).value, isFalse, reason: '默认关：点 × 就是退出界面');
+    // 后果要写在卡上（托盘图标被系统藏起来时，关窗=界面不见了）
+    expect(find.textContaining('托盘图标若被系统收进"隐藏的图标"面板'), findsOneWidget);
+    expect(find.textContaining('关掉此项则点 × 直接退出（她照常运行）'), findsOneWidget);
+
+    // 打开：偏好落本机状态文件（键 close-to-tray），不碰服务端配置。
+    // 写配置的请求数按"翻开关前后的差值"算——加载这一页本身要读好几条 GET，
+    // 但一条 POST config-update 都不该有。
+    final postsBefore = postCount;
+    await tapInCard(tester, toggle);
+    expect(tester.widget<Switch>(toggle).value, isTrue);
+    expect(closeToTray.value, isTrue, reason: '本次运行里就该生效（关窗回调读的是内存镜像）');
+    await settleIo(tester);
+    expect((await readState())[kCloseToTrayFlag], isTrue);
+
+    // 关回去：同一个键写成 false，界面回到默认行为
+    await tapInCard(tester, toggle);
+    expect(tester.widget<Switch>(toggle).value, isFalse);
+    expect(closeToTray.value, isFalse);
+    await settleIo(tester);
+    expect((await readState())[kCloseToTrayFlag], isFalse);
+    expect(postCount, postsBefore, reason: '这是界面自己的偏好，不该写服务端配置');
+    await drain(tester);
+  });
+
   // ── 外部依赖卡片（v30） ──
 
   testWidgets('外部依赖卡片：三态徽章、探测到的路径与版本、建议安装的计数', (tester) async {
@@ -590,7 +654,7 @@ void main() {
     expect(find.text('建议安装 2 项'), findsOneWidget);
 
     // 就绪的行要给"探测到的路径与版本"（这是事实，不是承诺）
-    expect(find.textContaining('15.1.0 · C:/path/to/data/tools/rg/rg.exe'), findsOneWidget);
+    expect(find.textContaining('15.1.0 · D:/irmia/data/tools/rg/rg.exe'), findsOneWidget);
 
     // **显式告知建议安装**：未安装的行必须写清"没有它会怎样"
     expect(find.textContaining('如实回退到 Windows PowerShell 5.1'), findsOneWidget);
@@ -622,7 +686,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 200));
     // 确认框要说清装什么、装到哪（这一步会把一段外部代码放到盘上）
     expect(find.text('安装 Everything 命令行（es.exe）'), findsOneWidget);
-    expect(find.textContaining('C:/path/to/data/tools/es'), findsOneWidget);
+    expect(find.textContaining('D:/irmia/data/tools/es'), findsOneWidget);
 
     // 先取消：不发请求
     await tester.tap(find.text('取消'));
@@ -706,7 +770,7 @@ void main() {
     expect(find.text('已就绪，OneBot 在 ws://127.0.0.1:3001/'), findsOneWidget,
         reason: 'detail 是给人看的那句话，要全文显示');
     expect(find.text('对接点：ws://127.0.0.1:3001/'), findsOneWidget);
-    expect(find.text('C:/SnowLuma'), findsNWidgets(2),
+    expect(find.text('D:/SnowLuma'), findsNWidgets(2),
         reason: '装在哪要摆两处：状态行（事实）与目录输入框（可改的那个）');
     expect(find.text('已找到可执行入口'), findsOneWidget, reason: '装没装是实测的（entryPath 找得到）');
 
@@ -742,27 +806,27 @@ void main() {
     await pumpSettings(tester, size: const Size(1350, 4000));
 
     final field = find.byKey(const ValueKey('protocol-side-dir'));
-    expect(tester.widget<TextField>(field).controller?.text, 'C:/SnowLuma');
+    expect(tester.widget<TextField>(field).controller?.text, 'D:/SnowLuma');
 
     // 未改动即禁用（与模型卡的保存同一条口径）
     FilledButton save() => tester.widget<FilledButton>(find.widgetWithText(FilledButton, '保存目录'));
     expect(save().onPressed, isNull);
 
-    await tester.enterText(field, r'C:\path\to\SnowLuma');
+    await tester.enterText(field, r'C:\path\to\snowluma');
     await tester.pump();
     expect(save().onPressed, isNotNull);
     // 服务端写盘那一步的回执：**归一化之后**的路径就是它给的（真实服务端会解成绝对路径）
-    sideWriteReply = <String, dynamic>{'ok': true, 'restartRequired': true, 'dir': r'C:\path\to\SnowLuma'};
+    sideWriteReply = <String, dynamic>{'ok': true, 'restartRequired': true, 'dir': r'C:\path\to\snowluma'};
     // 写完之后 GET 看到的也是新值（这是"保存成功"的判据）
-    protocolSide = <String, dynamic>{...protocolSide, 'dir': r'C:\path\to\SnowLuma'};
+    protocolSide = <String, dynamic>{...protocolSide, 'dir': r'C:\path\to\snowluma'};
     await tester.tap(find.widgetWithText(FilledButton, '保存目录'));
     await drain(tester);
 
     expect(sideMethod, 'PUT');
-    expect(sideBody, {'dir': r'C:\path\to\SnowLuma'});
+    expect(sideBody, {'dir': r'C:\path\to\snowluma'});
     await pumpUntil(tester, find.textContaining('已保存安装目录'));
     // 回填的是**服务端存下来的那个**（它才是以后真正会用的路径）
-    expect(tester.widget<TextField>(field).controller?.text, r'C:\path\to\SnowLuma');
+    expect(tester.widget<TextField>(field).controller?.text, r'C:\path\to\snowluma');
     expect(save().onPressed, isNull, reason: '保存成功后又回到干净态');
   });
 
@@ -925,11 +989,11 @@ void main() {
     sideWriteReply = <String, dynamic>{
       'ok': true,
       'restartRequired': true,
-      'dir': r'C:\path\to\data\services\snowluma',
+      'dir': r'C:\path\to\snowluma',
     };
     protocolSide = <String, dynamic>{
       ...protocolView(),
-      'dir': r'C:\path\to\data\services\snowluma',
+      'dir': r'C:\path\to\snowluma',
       'restartRequired': true,
       'attached': false,
       'state': 'stopped',
@@ -950,7 +1014,7 @@ void main() {
     expect(sideMethod, 'PUT');
     expect(sidePath, '/api/protocol-side/config');
     expect(sideBody, <String, dynamic>{
-      'dir': r'C:\path\to\data\services\snowluma',
+      'dir': r'C:\path\to\snowluma',
       'enabled': true,
       'autoStart': true,
     });
@@ -968,7 +1032,7 @@ void main() {
 
     // 目录与开关都替人写好了：目录框回填的是**服务端存下来的那个**，开关是开的，且没有未保存改动
     expect(tester.widget<TextField>(find.byKey(const ValueKey('protocol-side-dir'))).controller?.text,
-        r'C:\path\to\data\services\snowluma');
+        r'C:\path\to\snowluma');
     expect(tester.widget<Switch>(find.byKey(const ValueKey('protocol-side-enabled'))).value, isTrue);
     expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, '保存目录')).onPressed, isNull);
     // 「需重启」要摆出来，且入口三态不许把"不知道"说成"没有"
@@ -1065,7 +1129,7 @@ void main() {
     expect(sysValue(tester, 'web'), '127.0.0.1:7788');
     expect(sysValue(tester, 'timezone'), 'Asia/Shanghai');
     expect(sysValue(tester, 'budget.dailyTokens'), '2000000');
-    expect(inSystemCard(find.text('C:/path/to/data')), findsOneWidget, reason: '第 4 行是数据目录');
+    expect(inSystemCard(find.text('D:/irmia/data')), findsOneWidget, reason: '第 4 行是数据目录');
 
     // 其余 6 行连渲染都还没发生（不是"藏起来"，是根本没挂上去）
     expect(find.byKey(const ValueKey('sys-value-budget.stepTools')), findsNothing);
@@ -1198,23 +1262,56 @@ void main() {
     await drain(tester);
   });
 
-  testWidgets('系统卡：改不了的行不挂「编辑」胶囊、也不喊「需重启」', (tester) async {
+  testWidgets('系统卡：数据目录只读，destructive 策略这一行是唯一能改它的地方', (tester) async {
     await pumpSettings(tester, size: const Size(1350, 3400));
     await tapInCard(tester, inSystemCard(find.text('查看全部（10 行）')));
 
-    // 两条不走「编辑」胶囊的行：它们没有输入框（键就是点路径/行 id，找不到即证明它不可编辑）
+    // 两条只读行没有胶囊，也没有输入框（键就是点路径/行 id，找不到即证明它不可编辑）
     expect(find.byKey(const ValueKey('sys-edit-dataDir')), findsNothing);
     expect(find.byKey(const ValueKey('sys-edit-tools.destructiveEnabled')), findsNothing);
     expect(find.byKey(const ValueKey('sys-field-dataDir')), findsNothing);
     expect(find.byKey(const ValueKey('sys-field-tools.destructiveEnabled')), findsNothing);
 
     // 原因写在各自那一行里（不是一句"只读"）
-    expect(inSystemCard(find.text('C:/path/to/data')), findsOneWidget);
+    expect(inSystemCard(find.text('D:/irmia/data')), findsOneWidget);
     expect(inSystemCard(find.textContaining('换它等于让下一个进程从空目录开始')), findsOneWidget);
-    // destructive 那一条**刻意不复用「编辑」胶囊**：它的写通道要带确认短语
-    // （`update-config; enable-destructive`），所以走自己那枚「修改」。
-    expect(inSystemCard(find.text('destructive 工具策略')), findsOneWidget);
-    expect(inSystemCard(find.text('修改')), findsOneWidget);
+
+    // destructive 那一行**不是只读的**，只是它的改法与别的行不同（⑪ 起可改，2026-10-04 用户定调）。
+    // 它没有 `sys-edit-*` 胶囊，走的是一条三档选择通道：行上摆当前档 + 一枚「修改」，
+    // 点开弹层选档 → 再过一道确认框 → 才写盘（写的时候带字段级危险短语）。
+    // 为什么锁这一条：它曾经与数据目录并排当"只读行"，看起来像"这里改不了"——
+    // 那会把人推去手改 config.json，而这个开关正是最不该让人手改的一个。
+    final policyRow = find.ancestor(
+      of: find.text('destructive 工具策略'),
+      matching: find.byType(Row),
+    ).first;
+    // 行上的读数就是**盘上那份配置**的档位（示例是 false = 全关），不是一句静态说明
+    expect(
+      find.descendant(of: policyRow, matching: find.text('全关')),
+      findsOneWidget,
+      reason: '行上要摆当前档，人才知道现在是哪一档',
+    );
+    final policyEdit = find.descendant(of: policyRow, matching: find.text('修改'));
+    expect(policyEdit, findsOneWidget, reason: '这一行可改：给一枚明确的入口，而不是只写一句说明');
+    await tapInCard(tester, policyEdit);
+
+    // 三档弹层：全关 / 全开 / 按名单（后两档要挑工具，所以「按名单」那一步是另一个弹层）
+    expect(find.text('全关（一件都不给她看）'), findsOneWidget);
+    expect(find.text('全开（清单里全给）'), findsOneWidget);
+    expect(find.text('按名单（只给勾中的那几件）'), findsOneWidget);
+
+    // 选「全开」→ ui_kit 确认框（放宽权限这件事要人再点一次头）
+    await tester.tap(find.text('全开（清单里全给）'));
+    await tester.pumpAndSettle();
+    expect(find.text('修改 destructive 工具策略'), findsOneWidget, reason: '放宽之前还要一道确认');
+    expect(postCount, 0, reason: '确认之前一个字节都不该写盘');
+
+    // 确认之后才是那一次写：值是 true，且必须带字段级危险短语（服务端按它拦）
+    await tester.tap(find.text('确认'));
+    await pumpUntil(tester, find.text('已保存（重启后接管）'));
+    expect(postCount, 1);
+    expect(lastPost?['fields'], {'tools.destructiveEnabled': true});
+    expect(lastConfirm, 'update-config; enable-destructive');
 
     // 「需重启」只挂在能改的那 8 行上：改不了的行喊重启没意义（⑭ 的原话）
     expect(inSystemCard(find.text('需重启')), findsNWidgets(8));

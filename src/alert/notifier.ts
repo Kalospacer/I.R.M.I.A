@@ -95,6 +95,16 @@ export interface AlertRecord {
   fingerprint: string;
   level: AlertLevel;
   title: string;
+  /**
+   * 故障键（如 `category:stall`、`alert:水位停滞`）；普通告警为 null。
+   *
+   * 为什么它必须落进日志（2026-10-03）：`stalling` 原来只在内存里，于是**进程一重启，
+   * 一个已经报出去的故障就再也配不上它的"已恢复"**——故障键连同它的连续窗口一起丢了。
+   * 记进事件后，`foldStalls` 能把未恢复的故障重建回来，恢复通知照样只发一次。
+   */
+  key?: string | null;
+  /** 这条是恢复通知而不是故障本身（`foldStalls` 据此销账） */
+  recovered?: boolean;
 }
 
 export interface NotifierOptions {
@@ -177,6 +187,61 @@ export function foldAlarms(events: Iterable<AppEvent>): Map<string, number> {
 }
 
 /**
+ * 一次故障的连续窗口（stall 机制：恢复通知的依据）
+ */
+export interface StallRecord {
+  /** 首次**真正送达**告警的时刻（毫秒） */
+  since: number;
+  /** 这个故障键上报过几次（含被限流压制的那些） */
+  count: number;
+  /** 首次上报用的指纹：恢复通知的正文里如实引用它 */
+  fingerprint: string;
+  /**
+   * 这个故障**至少有一条告警真的送出去过**。
+   *
+   * 为什么要它（2026-10-03）：故障在整个窗口里都被限流压制时，人从来没被告知出过事；
+   * 这时再补一句"已恢复"就是不存在的假事实——恢复通知只配它跟过的那些故障。
+   * 它同时挡掉抖动：`stall → 正常 → stall → 正常` 里第二次故障若没送达，
+   * 就不会再冒出一条"已恢复"。
+   */
+  announced: boolean;
+}
+
+/**
+ * 从日志折叠**仍未恢复的故障**（键 → 连续窗口的近似值）。
+ *
+ * 为什么要它：限流窗口有 `foldAlarms` 跨重启，故障登记却只有内存一份——重启之后一条
+ * 已经报出去的故障既不会重复报（限流还在），也永远不会收到"已恢复"（登记没了）。
+ * 事件里现在带了 `key` / `recovered`（可选字段，老日志没有就跳过），于是两边都能重建。
+ *
+ * 两条刻意的近似（都在事件能表达的范围之内）：
+ *   · `since` 取**首次真正送达**那条告警的时刻，而不是首次失败的时刻——日志里只记了前者；
+ *   · `count` 数的是**送达过的次数**，不是连续失败次数。恢复通知里那句"连续 N 次"因此是下界，
+ *     比编一个数诚实。
+ */
+export function foldStalls(events: Iterable<AppEvent>): Map<string, StallRecord> {
+  const out = new Map<string, StallRecord>();
+  for (const event of events) {
+    if (event.type !== 'alarm/sent') continue;
+    const key = event.data.key;
+    if (key === undefined || key === null || key === '') continue;
+    const at = Date.parse(event.ts);
+    if (!Number.isFinite(at)) continue;
+    if (event.data.recovered === true) {
+      out.delete(key);
+      continue;
+    }
+    const previous = out.get(key);
+    if (previous === undefined) {
+      out.set(key, { since: at, count: 1, fingerprint: event.data.fingerprint, announced: true });
+    } else {
+      previous.count += 1;
+    }
+  }
+  return out;
+}
+
+/**
  * 告警限流索引：指纹 → 最近一次发出时刻（毫秒）。
  * 跨重启由日志重建：宿主把 `alarm/sent` 事件喂给 apply()，把实例作为 `history` 交给 Notifier。
  */
@@ -218,7 +283,15 @@ export function createNotifier(options: CreateNotifierOptions): AlertNotifier {
     record: (record) => {
       options.emit(
         'alarm/sent',
-        { fingerprint: record.fingerprint, level: record.level, title: record.title },
+        {
+          fingerprint: record.fingerprint,
+          level: record.level,
+          title: record.title,
+          // 故障键与"这条是恢复通知"是**可选**字段：普通告警（notify / 预算提示这类）不写 key，
+          // 老日志里也整个没有。有了它们，`foldStalls` 才能在重启后把未恢复的故障重建回来。
+          ...(record.key === undefined || record.key === null ? {} : { key: record.key }),
+          ...(record.recovered === true ? { recovered: true } : {}),
+        },
         defaultVisibility('alarm/sent'),
       );
     },
@@ -247,15 +320,13 @@ export function createNotifier(options: CreateNotifierOptions): AlertNotifier {
 
 // ──────────────────────────────── 实现 ────────────────────────────────
 
-/** 一次故障的连续窗口（stall 机制：恢复通知的依据） */
-interface StallRecord {
-  /** 首次失败时刻（毫秒） */
-  since: number;
-  /** 连续失败次数（含首次） */
-  count: number;
-  /** 首次失败用的指纹：恢复通知的正文里如实引用它 */
-  fingerprint: string;
+/** 告警与故障键的绑定：`recovered` 为 true 表示这条是恢复通知（不登记故障、只销账） */
+interface FaultRef {
+  key: string;
+  recovered?: boolean | undefined;
 }
+
+/** 一次故障的连续窗口（stall 机制：恢复通知的依据）——定义见文件上方的 `foldStalls` 段 */
 
 export class Notifier {
   private readonly alertDir: string;
@@ -310,19 +381,21 @@ export class Notifier {
     return this.deliver(
       { category: 'alert', level, title, body, params: { title } },
       fingerprintOf('alert', { title }),
-      `alert:${title}`,
+      { key: `alert:${title}` },
     );
   }
 
   /**
-   * 故障恢复通知：该故障键处于 stall 时发一条 info 并清除登记；没有登记返回 null
-   * （调用方据此决定要不要打"已恢复"日志——不制造假事实）。
+   * 故障恢复通知：该故障键处于 stall **且它的告警真的报出去过**时发一条 info 并清除登记；
+   * 否则返回 null（调用方据此决定要不要打"已恢复"日志——不制造假事实）。
    */
   async recover(spec: { level: AlertLevel; title: string }, note: string): Promise<AlertDelivery | null> {
     const key = `alert:${spec.title}`;
     const stall = this.stalling.get(key);
     if (stall === undefined) return null;
+    // 先销账再投递：恢复通知自己失败（或异常重复调用）时不该变成每拍重试的刷屏源
     this.stalling.delete(key);
+    if (!stall.announced) return null;
     const seconds = Math.max(0, Math.round((this.now().getTime() - stall.since) / 1000));
     return this.deliver(
       {
@@ -334,7 +407,8 @@ export class Notifier {
       },
       // 恢复通知单独成指纹，不被故障那 30 分钟窗口连坐
       fingerprintOf('alert:recovered', { title: spec.title }),
-      null,
+      // 恢复通知自己**不是**故障：不登记、也不重复销账
+      { key, recovered: true },
     );
   }
 
@@ -358,16 +432,22 @@ export class Notifier {
 
   /** 故障上报：登记 stall + 投递；重复调用只累计次数（告警被限流） */
   async fail(input: AlertInput): Promise<NotifyOutcome> {
-    this.markStall(`category:${input.category}`, fingerprintOf(input.category, input.params));
-    return toOutcome(await this.deliver(input, fingerprintOf(input.category, input.params), null));
+    return toOutcome(await this.deliver(
+      input,
+      fingerprintOf(input.category, input.params),
+      { key: `category:${input.category}` },
+    ));
   }
 
-  /** 恢复上报：处于 stall 时发一条"已恢复"并清除登记；不在 stall 时什么都不做 */
+  /**
+   * 恢复上报：处于 stall 时发一条"已恢复"并清除登记；不在 stall（或那次故障没送达）时什么都不做。
+   */
   async ok(category: string, body?: string | undefined): Promise<NotifyOutcome> {
     const key = `category:${category}`;
     const stall = this.stalling.get(key);
     if (stall === undefined) return { ok: true };
     this.stalling.delete(key);
+    if (!stall.announced) return { ok: true };
     const seconds = Math.max(0, Math.round((this.now().getTime() - stall.since) / 1000));
     const input: AlertInput = {
       category: `${category}:recovered`,
@@ -376,14 +456,26 @@ export class Notifier {
       body: body ?? `同类故障连续 ${stall.count} 次后首次成功，已恢复（故障持续 ${seconds} 秒）。`,
       params: { category },
     };
-    return toOutcome(await this.deliver(input, fingerprintOf(input.category, input.params), null));
+    return toOutcome(await this.deliver(
+      input,
+      fingerprintOf(input.category, input.params),
+      { key, recovered: true },
+    ));
   }
 
-  /** 恢复入口：把历史 alarm/sent 折进限流窗口（M3-10 跨重启限流） */
+  /**
+   * 恢复入口：把历史 `alarm/sent` 折进两份状态——限流窗口（M3-10 跨重启限流）与
+   * **尚未恢复的故障登记**（`foldStalls`）。后者让"已恢复"在重启之后仍然配得上它的报警。
+   */
   restore(events: Iterable<AppEvent>): void {
-    for (const [fingerprint, at] of foldAlarms(events)) {
+    const list = [...events];
+    for (const [fingerprint, at] of foldAlarms(list)) {
       const previous = this.windowsMap.get(fingerprint);
       if (previous === undefined || at > previous) this.windowsMap.set(fingerprint, at);
+    }
+    for (const [key, record] of foldStalls(list)) {
+      // 只补空缺：本进程已经登记的故障（更新、更准）不被历史覆盖
+      if (!this.stalling.has(key)) this.stalling.set(key, record);
     }
   }
 
@@ -400,7 +492,7 @@ export class Notifier {
   private async deliver(
     input: AlertInput,
     fingerprint: string,
-    stallKey: string | null,
+    fault: FaultRef | null,
   ): Promise<AlertDelivery> {
     const at = this.now();
     const nowMs = at.getTime();
@@ -409,9 +501,9 @@ export class Notifier {
 
     const last = this.windowsMap.get(fingerprint);
     if (last !== undefined && nowMs - last < this.rateLimitMs) {
-      // 有意丢弃：不是失败，是限流。故障仍在持续，stall 登记照旧推进
+      // 有意丢弃：不是失败，是限流。故障仍在持续，stall 登记照旧推进（只是没送达）
       this.counters.suppressed += 1;
-      if (stallKey !== null) this.markStall(stallKey, fingerprint);
+      this.noteFault(fault, fingerprint, false);
       return { sent: false, fingerprint, file, reason: RATE_LIMITED };
     }
 
@@ -429,11 +521,18 @@ export class Notifier {
     if (archived) {
       this.counters.sent += 1;
       this.windowsMap.set(fingerprint, nowMs);
-      if (stallKey !== null) this.markStall(stallKey, fingerprint);
-      this.record?.({ fingerprint, level: input.level, title: input.title });
+      this.noteFault(fault, fingerprint, true);
+      this.record?.({
+        fingerprint,
+        level: input.level,
+        title: input.title,
+        // 故障键只在故障类告警上出现：普通告警的 key 是 null，老日志则整个字段都没有
+        key: fault?.key ?? null,
+        ...(fault?.recovered === true ? { recovered: true } : {}),
+      });
     } else {
       this.counters.failed += 1;
-      if (stallKey !== null) this.markStall(stallKey, fingerprint);
+      this.noteFault(fault, fingerprint, false);
     }
 
     const reasons: string[] = [];
@@ -492,13 +591,23 @@ export class Notifier {
     }
   }
 
-  private markStall(key: string, fingerprint: string): void {
+  private markStall(key: string, fingerprint: string, announced: boolean): void {
     const existing = this.stalling.get(key);
     if (existing === undefined) {
-      this.stalling.set(key, { since: this.now().getTime(), count: 1, fingerprint });
+      this.stalling.set(key, { since: this.now().getTime(), count: 1, fingerprint, announced });
       return;
     }
     existing.count += 1;
+    if (announced) existing.announced = true;
+  }
+
+  /**
+   * 故障登记的推进：普通故障（`fault.recovered !== true`）落账；恢复通知自己只是销账完成，
+   * 不再重新登记——否则一次恢复就会把刚清掉的故障键又立起来。
+   */
+  private noteFault(fault: FaultRef | null, fingerprint: string, archived: boolean): void {
+    if (fault === null || fault.recovered === true) return;
+    this.markStall(fault.key, fingerprint, archived);
   }
 
   /** 告警日志按 UTC 日期分片（与 budget/rollover 的"今日"口径一致） */

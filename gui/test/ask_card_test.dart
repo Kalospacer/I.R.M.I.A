@@ -208,7 +208,7 @@ void main() {
   testWidgets('答复：发出 answer + askSeq，服务端凭它知道人答的是哪一条', (tester) async {
     final api = await _pumpHost(tester, dashboardWithCards());
 
-    await tester.enterText(find.byType(TextField), '放到 C:\\backup\\irmia 下面');
+    await tester.enterText(find.byType(TextField), '放到 C:\\backup\\app 下面');
     await tester.pump();
     await tester.tap(find.text(kAskCardAnswerLabel));
     await tester.pumpAndSettle();
@@ -217,7 +217,7 @@ void main() {
     expect(api.posts.length, 1, reason: '只发一条命令');
     expect(api.posts.single['path'], '/api/commands/answer');
     final body = api.posts.single['body'] as Map<String, dynamic>;
-    expect(body['answer'], '放到 C:\\backup\\irmia 下面');
+    expect(body['answer'], '放到 C:\\backup\\app 下面');
     expect(body['askSeq'], 12, reason: '台面上可能同时挂着系统提问，必须指名道姓');
     expect(find.byType(AlertDialog), findsNothing, reason: '答完卡就收了');
   });

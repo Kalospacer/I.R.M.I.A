@@ -101,7 +101,7 @@ function buildMixedLog(): AppEvent[] {
 
   push(
     evt<SessionStart>('session/start', {
-      pid: 4242, cwd: 'C:\\agent', version: '0.1.0', schemaVersion: '1', configHash: 'h0',
+      pid: 4242, cwd: 'D:\\agent', version: '0.1.0', schemaVersion: '1', configHash: 'h0',
     }),
     evt<TurnStart>('turn/start', { turn: 1 }),
     evt<StepStart>('step/start', {
@@ -841,7 +841,7 @@ test('压力参照时刻优先级：referenceTs > lastWake > lastModelSuccessAt 
 
   // 全部缺失时退到 firstEventAt：只要 triggerAt 早于首事件就算到期
   const onlyDefault = evt<SessionStart>('session/start', {
-    pid: 1, cwd: 'C:\\a', version: '0.1.0', schemaVersion: '1', configHash: 'h',
+    pid: 1, cwd: 'D:\\a', version: '0.1.0', schemaVersion: '1', configHash: 'h',
   }, { ts: tsAfter(500) });
   const stale = evt<IntentionRaised>('intention/raised', { intentionId: 'C', content: 'x', triggerAt: tsAfter(400) });
   assert.equal(pressureOf([onlyDefault, stale]), BASE_PRESSURE + 0.25, 'firstEventAt 是最后兜底');
@@ -1017,7 +1017,7 @@ test('不进投影的事件类型：只有 lastSeq 与 firstEventAt 前进，其
   resetFactory();
   const events: AppEvent[] = [
     evt<SessionStart>('session/start', {
-      pid: 1, cwd: 'C:\\a', version: '0.1.0', schemaVersion: '1', configHash: 'h',
+      pid: 1, cwd: 'D:\\a', version: '0.1.0', schemaVersion: '1', configHash: 'h',
     }),
     evt<DeveloperMessage>('developer/message', { added: ['read_file'], removed: [] }),
     evt<PolicyDenied>('policy/denied', { tool: 'shell', rule: 'hook', reason: '被 hook 拦下', callId: 'c1' }),
