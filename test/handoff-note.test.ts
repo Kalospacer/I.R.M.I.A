@@ -154,7 +154,7 @@ test('M5-2 收录范围：对话本身（他说了什么/我答了什么）+ wak
     evt('wake/channel', CHANNEL_INBOUND),
     evt('tool/call', { turn: 1, step: 1, callId: 'c1', name: 'read_file', arguments: '{"file_path":"a.txt"}', sideEffect: 'none' }),
     evt('tool/result', { turn: 1, step: 1, callId: 'c1', callSeq: 3, status: 'ok', content: '文件内容若干' }),
-    evt('tool/call', { turn: 1, step: 1, callId: 'c2', name: 'set_timer', arguments: '{"at":"tomorrow"}', sideEffect: 'idempotent' }),
+    evt('tool/call', { turn: 1, step: 1, callId: 'c2', name: 'timer', arguments: '{"action":"set","at":"tomorrow"}', sideEffect: 'idempotent' }),
     evt('message/assistant', { text: ASSISTANT_MARK, toolCalls: [] }),
     evt('message/reasoning', { turn: 1, step: 1, text: REASONING_MARK }),
     evt('compaction/summary', { coveredUpToSeq: 1, summary: SUMMARY_MARK }),
@@ -172,7 +172,7 @@ test('M5-2 收录范围：对话本身（他说了什么/我答了什么）+ wak
   assert.equal(note.text.includes(ASSISTANT_MARK), true, '她自己说过的话也要进笔记（否则遮蔽后她不知道自己答过）');
   assert.equal(note.text.includes(REASONING_MARK), false, '思维链不进笔记');
   assert.equal(note.text.includes(SUMMARY_MARK), false, '上一份笔记不进笔记（避免自我引用）');
-  assert.equal(note.text.includes('set_timer'), false, '纯流程调用不进笔记');
+  assert.equal(note.text.includes('"action":"set"'), false, '纯流程调用不进笔记');
   assert.equal(note.included, 6);
 });
 
@@ -214,6 +214,36 @@ test('M5-2 状态类去重：快照类工具与心跳按 key 只留最新一次'
   assert.match(note.text, /新表：每日整理 08:00/u);
   assert.equal(countOf(note.text, '心跳自省'), 1, '心跳按状态键只留最新一次');
   assert.match(note.text, /已安静 30 分钟/u, '留下的是最新那条心跳');
+});
+
+test('v35 合并后的 timer：按 action 分档——list 是快照（只留最新），set/cancel 是动作（不收录）', () => {
+  // 合并把三个名字压成一个 `timer`，但**交接价值没有合并**：
+  //   · `action=list` 是"读回来的快照"（原来 list_timers 的职责）——旧值没有交接价值，只留最新；
+  //   · `action=set` / `action=cancel` 是"发出去的动作"（原来 set_timer / cancel_timer 的职责）
+  //     ——它们的作用已经落在投影与人格文件里，进笔记只是噪音。
+  // 只按名字分类的实现会在这一条上现形：要么 list 的回执被丢（压缩后她不知道自己排过什么），
+  // 要么每次布防都在笔记里留一行。
+  resetFactory();
+  const events: AppEvent[] = [
+    evt('tool/call', { turn: 1, step: 1, callId: 'a1', name: 'timer', arguments: '{"action":"set","cron":"0 3 * * *"}', sideEffect: 'idempotent' }),
+    evt('tool/result', { turn: 1, step: 1, callId: 'a1', callSeq: 1, status: 'ok', content: '定时器已布防：id=T-1' }),
+    evt('tool/call', { turn: 2, step: 1, callId: 'a2', name: 'timer', arguments: '{"action":"list"}', sideEffect: 'idempotent' }),
+    evt('tool/result', { turn: 2, step: 1, callId: 'a2', callSeq: 2, status: 'ok', content: '定时器 1 个：旧表' }),
+    evt('tool/call', { turn: 3, step: 1, callId: 'a3', name: 'timer', arguments: '{"action":"list"}', sideEffect: 'idempotent' }),
+    evt('tool/result', { turn: 3, step: 1, callId: 'a3', callSeq: 4, status: 'ok', content: '定时器 1 个：新表' }),
+    evt('tool/call', { turn: 4, step: 1, callId: 'a4', name: 'timer', arguments: '{"action":"cancel","timer_id":"T-1"}', sideEffect: 'idempotent' }),
+    evt('tool/result', { turn: 4, step: 1, callId: 'a4', callSeq: 6, status: 'ok', content: '定时器 T-1 已取消并从表里移除。' }),
+  ];
+
+  const note = renderHandoffNote(events);
+
+  assert.equal(countOf(note.text, '[调用] timer'), 1, '同一个 timer 的 list 入参只留最新一次');
+  assert.match(note.text, /"action":"list"/u, '留下的是 list 那一次');
+  assert.equal(note.text.includes('"action":"set"'), false, '布防是流程动作，不进笔记');
+  assert.equal(note.text.includes('"action":"cancel"'), false, '撤销是流程动作，不进笔记');
+  assert.equal(note.text.includes('已取消并从表里移除'), false, '撤销的回执也不进笔记');
+  assert.equal(note.text.includes('旧表'), false, '旧的快照回执被丢弃');
+  assert.match(note.text, /新表/u);
 });
 
 // ──────────────────────────────── ⑤ 分段 ────────────────────────────────

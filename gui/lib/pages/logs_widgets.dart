@@ -8,9 +8,27 @@ const _eventGroups = <String, List<String>>{
   '消息': ['message/user', 'message/assistant', 'message/reasoning', 'developer/message'],
   '工具': ['tool/call', 'tool/result', 'tool/zombie'],
   '唤醒与队列': ['wake/timer', 'wake/file', 'wake/webhook', 'wake/manual', 'wake/heartbeat', 'wake/intention', 'wake/job', 'wake/channel', 'timer/set', 'timer/fired', 'timer/cancelled', 'input/claimed', 'input/dead-letter', 'input/requeued'],
-  '预算': ['budget/consumed', 'budget/rollover', 'budget/exhausted', 'budget/topped-up'],
+  '预算': ['budget/consumed', 'budget/rollover', 'budget/exhausted', 'budget/topped-up', 'budget/resumed'],
   '策略与审计': ['policy/denied', 'log/repaired', 'instance/takeover', 'alarm/sent', 'review/resolved', 'snapshot/checkpoint', 'compaction/summary', 'persona/updated', 'config/changed'],
   '扩展面': ['mcp/server-started', 'mcp/server-stopped', 'skill/installed', 'hook/fired', 'speak/sent', 'intention/raised', 'intention/acted', 'todo/updated', 'job/started', 'job/finished', 'human/asked', 'human/answered', 'human/expired', 'model/degraded', 'model/restored'],
+};
+
+/// 过滤器里的「人话名字」：条目的**值仍然是事件类型**（过滤是服务端按 `types=` 做的，
+/// 见 logs_page 的 `loadEvents`），这里只换显示名。
+///
+/// 「上下文归因」为什么是 `budget/consumed` 的一个名字、而不是另开一条（2026-10-04）：
+///   · 归因（`budget/consumed.context`）**不是一个事件类型**，它是那条预算事件上的一个字段
+///     ——框架自己定过"归因挂在已有事件上，不新增类型"（见 src/model/context-audit.ts 的文件头）；
+///   · 服务端只按类型过滤（精确匹配，或以 `/` 结尾时前缀匹配），编一个
+///     `budget/consumed.context` 的假类型过去**一条都匹配不到**；
+///   · 所以它按既有分法归到「预算」组（与其余四条同域），落点就是它所在的那个类型。
+///   代价说清：选「上下文归因」等于选 `budget/consumed`（那一屏里既有带归因的、也有不带的），
+///   而"这条到底有没有归因"在**行摘要**上就看得出来（带归因的那行会缀「归因 X」，
+///   点开还有整条等式）——比多一条匹配不到任何东西的假类型诚实。
+///   （显示名也**不能太长**：菜单项的宽度是有限的，'上下文归因（budget/consumed）' 实测会把
+///   那一行撑出 22px 溢出——多出来的那截类型名放注释里，别放在菜单上。）
+const _typeLabels = <String, String>{
+  'budget/consumed': '上下文归因',
 };
 
 // ─── 取值与格式化 ───
@@ -77,6 +95,79 @@ TextStyle _mono(double size, Color color) => TextStyle(
       color: color,
       fontFeatures: const [FontFeature.tabularFigures()],
     );
+
+// ─── 两条"事实类"事件的人话（唯一实现：行摘要与详情面板共用，界面不写第二份措辞） ───
+
+/// 精确整数（千分位）。与 TS 侧 `context-audit.ts` 的 `exact()` 同一口径：
+/// 归因那一行是给人**核对**的，两千和三千不能都印成"0.2万"。
+String _exact(int value) {
+  final text = (value < 0 ? 0 : value).toString();
+  final out = StringBuffer();
+  for (var i = 0; i < text.length; i += 1) {
+    if (i > 0 && (text.length - i) % 3 == 0) out.write(',');
+    out.write(text[i]);
+  }
+  return out.toString();
+}
+
+int _segTokens(Map<String, dynamic> segment) => _int(segment['tokens']);
+
+/// 归因里的"整条"（指令 + 工具 + input 段）。三者是**顶层三段**，`input.tokens` 不含前两段——
+/// 这正是当初"合计比前面几项之和还小"那个读起来像瞎写的 bug（见 context-audit.ts `describeContext`）。
+int? _contextWhole(Map<String, dynamic> data) {
+  final context = data['context'];
+  if (context is! Map) return null;
+  final ctx = context.cast<String, dynamic>();
+  return _segTokens(_map(ctx['instructions'])) + _segTokens(_map(ctx['tools'])) + _segTokens(_map(ctx['input']));
+}
+
+/// 上下文归因 → 一行人话（`src/model/context-audit.ts` 的 `describeContext` 的界面版）。
+///
+/// 口径与那边逐条对齐：**整条 = 指令 + 工具 + input 段**，每项精确整数、等式两边按定义相等；
+/// 固定块（B2）在旧记录里没有那一段，没有就**不印**（印 0 会被读成"当时这一段是空的"）；
+/// 措辞里**不出现任何价格/货币字样**（用户明确不要计价）。
+/// 没有 `context` 字段（旧日志，或这条不是模型记账）返回 null——调用方据此退回原来的摘要。
+String? _contextLine(Map<String, dynamic> data) {
+  final context = data['context'];
+  if (context is! Map) return null;
+  final ctx = context.cast<String, dynamic>();
+  final instructions = _map(ctx['instructions']);
+  final tools = _map(ctx['tools']);
+  final input = _map(ctx['input']);
+  final history = _map(ctx['history']);
+  final segments = <String>['记忆 ${_exact(_segTokens(_map(ctx['memory'])))}'];
+  final state = ctx['state'];
+  if (state is Map) {
+    segments.add('固定块 ${_exact(_segTokens(state.cast<String, dynamic>()))}');
+  }
+  segments
+    ..add('历史 ${_exact(_segTokens(history))}（${_int(history['items'])} 条）')
+    ..add('此刻层 ${_exact(_segTokens(_map(ctx['now'])))}');
+  // 这两段为 0 时不印：它们不是"当时是空的"，而是"那一步没有这一格"
+  if (_segTokens(_map(ctx['wake'])) > 0) segments.add('本轮输入 ${_exact(_segTokens(_map(ctx['wake'])))}');
+  if (_segTokens(_map(ctx['hint'])) > 0) segments.add('尾部插播 ${_exact(_segTokens(_map(ctx['hint'])))}');
+  return '整条 ${_exact(_contextWhole(data) ?? 0)} = 指令 ${_exact(_segTokens(instructions))}'
+      ' + 工具 ${_exact(_segTokens(tools))}（${_int(tools['count'])} 件）'
+      ' + input 段 ${_exact(_segTokens(input))}（${segments.join(' · ')}）';
+}
+
+/// `budget/resumed` → 一行人话：哪一层、谁解的、凭什么解的、解除那一刻两个数是多少。
+///
+/// 两个数都是**解除那一刻**的（`actual` 是已用量、`limit` 是**有效上限**＝基础上限＋累计加注）——
+/// 当时撞线的那个数不在这里，它在解除之前那条 `budget/exhausted` 里（见 src/log/types.ts）。
+String _resumedLine(Map<String, dynamic> data) {
+  final why = _str(data['reason']) == 'limit-raised' ? '配置里的上限被调大' : '累计加注把上限抬高了';
+  return '${_str(data['layer'])} 层暂停已解除：已用 ${_exact(_int(data['actual']))}'
+      ' / 有效上限 ${_exact(_int(data['limit']))}（$why）';
+}
+
+/// 详情面板顶上那段"读法"：有归因给归因等式，`budget/resumed` 给解除那句话，其余返回 null
+/// （返回 null 就不显示这一段——行摘要已经说得清，原始 JSON 照旧在下面）。
+String? _detailLine(Map<String, dynamic> ev) {
+  final data = _map(ev['data']);
+  if (_str(ev['type']) == 'budget/resumed') return _resumedLine(data);
+  return _contextLine(data);
+}
 
 Widget _card(BuildContext context, Widget child) {
   final scheme = Theme.of(context).colorScheme;

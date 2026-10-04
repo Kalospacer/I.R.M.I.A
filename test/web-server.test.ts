@@ -1667,20 +1667,13 @@ test('GET /api/framework-notes：上下文审计两类也在这张卡里（缓�
 
   const body = (await call(fx, '/api/framework-notes')).body as { notes: Array<Record<string, unknown>> };
   const kinds = body.notes.map((note) => note['kind']);
-  assert.equal(kinds.filter((kind) => kind === 'context').length, 5, '归因只占它自己那一小格（最近 5 条）');
+  // 2026-10-04 第二次改口径：**归因整个不进这张卡**（用户两次报"还在刷屏"之后定的）。
+  // 它先是"每步一条"，改成"一轮只留最后一步"之后仍然嫌吵——每条占两行，而它说的不是"提示"：
+  // 归因是事实，事实去日志页看（事件 `budget/consumed.context` 一直在）。
+  assert.equal(kinds.filter((kind) => kind === 'context').length, 0, '归因不进这张卡');
   assert.equal(kinds.filter((kind) => kind === 'cache-break').length, 1);
-  assert.equal(kinds.filter((kind) => kind === 'alarm').length, 1, '归因再多也挤不掉真告警');
-  assert.equal(body.notes.length, 7);
-  assert.equal(
-    body.notes.filter((note) => note['kind'] === 'context' && String(note['title']).startsWith('第 99 轮')).length,
-    1,
-    '一轮只出一条：同一轮的第 1/2/3 步不许各占一格',
-  );
-  assert.match(
-    String(body.notes.find((note) => note['kind'] === 'context')!['title']),
-    /^第 99 轮第 3 步/u,
-    '留下的必须是**最后一步**（倒着扫第一次遇到的那条）',
-  );
+  assert.equal(kinds.filter((kind) => kind === 'alarm').length, 1);
+  assert.equal(body.notes.length, 2, '卡上只剩真事：缓存破坏 + 告警');
 
   const breaker = body.notes.find((note) => note['kind'] === 'cache-break')!;
   assert.equal(breaker['label'], '缓存破坏');
@@ -1689,20 +1682,11 @@ test('GET /api/framework-notes：上下文审计两类也在这张卡里（缓�
   assert.match(String(breaker['reason']), /缓存命中 3\.0%/u, '判据与数字照实摆出来');
   assert.equal(breaker['sid'], null, '框架自身的事：来源照实说"框架"');
 
-  const context = body.notes.find((note) => note['kind'] === 'context')!;
-  assert.equal(context['label'], '上下文');
-  assert.equal(context['level'], 'info', '归因是事实不是警告：安静地待着');
-  // 措辞里写明是 **input 段**（instructions 与 tools 不在这个数里），并且与 reason 的等式对得上
-  assert.match(String(context['title']), /^第 99 轮第 3 步的上下文：input 段 2 token \/ 2 条$/u);
-  assert.match(String(context['reason']), /整条 4 = 指令 1 \+ 工具 1（1 件） \+ input 段 2/u, '分部与合计必须自洽');
-  assert.match(String(context['reason']), /渲染版本 28/u);
-  assert.equal('data' in context, false, '照旧不许把整条事件丢出去');
-
   // 告警照旧拿到完整的 limit：它的额度与归因无关
   assert.equal(body.notes.find((note) => note['kind'] === 'alarm')!['seq'], alarm.seq);
 });
 
-test('GET /api/framework-notes：只有归因、没有真事时也不产生哨兵条目', async (t) => {
+test('GET /api/framework-notes：只有归因、没有真事时这张卡是空的', async (t) => {
   const fx = await setup(t);
   // 十轮"前缀没变"的正常调用（没有 cacheBreak 字段）——每轮的步数不同，但一轮只留一条
   for (let i = 0; i < 10; i += 1) {
@@ -1725,7 +1709,9 @@ test('GET /api/framework-notes：只有归因、没有真事时也不产生哨�
   }
   const body = (await call(fx, '/api/framework-notes')).body as { notes: Array<Record<string, unknown>> };
   assert.equal(body.notes.filter((note) => note['kind'] === 'cache-break').length, 0, '没失守就没有哨兵条目');
-  assert.equal(body.notes.length, 5, '只剩归因那 5 条');
+  // 十轮正常调用**只留归因**时，这张卡是**空的**（2026-10-04 口径）：归因不进卡，
+  // 事实在日志页看。这条同时钉住"归因不再把别的东西挤出去"这件事。
+  assert.equal(body.notes.length, 0, '只有归因时这张卡是空的');
 });
 
 test('GET /api/sessions：`contacts` 是**对象**，且键是归一后的 sid（聊天页按它查名字）', async (t) => {

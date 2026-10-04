@@ -520,10 +520,23 @@ describe('M5-1 人格连续性：压缩 / 崩溃恢复后的首个 turn', () => 
       !bytesOf(request.input).includes(SHADOW_BODY),
       '被遮蔽的历史不得出现——压缩后连续性靠摘要而不是完整历史',
     );
-    // ④ 本轮新输入在尾部收尾（只追加，不改历史）
-    const tail = request.input.at(-1) as { role: string; content: string };
-    assert.equal(tail.role, 'user');
-    assert.ok(tail.content.includes('压缩完接着干'));
+    // ④ 本轮新输入在**历史之后、固定块之前**（v31 的顺序；旧布局里它压在整份 input 的末尾）
+    //
+    //    判据没有放松，只是换了认法：旧的是"末项是 user 且带这句话"（按位置认，v31 起末项是此刻层），
+    //    新的是"这条输入在请求里恰好出现一次、是全卷最后一条 user、且它就排在固定块前面那一格"。
+    //    最后那一条是 v31 挪动它的全部意义：下一轮它作为历史出现时是同一个位置、同一串字节。
+    const wakeItems = request.input.filter(
+      (item): item is { type: string; role: string; content: string } =>
+        (item as { role?: string }).role === 'user'
+        && typeof (item as { content?: unknown }).content === 'string'
+        && ((item as { content: string }).content.includes('压缩完接着干')),
+    );
+    assert.equal(wakeItems.length, 1, '本轮新输入在请求里恰好出现一次（不重复渲染）');
+    const lastUser = request.input.filter(item => (item as { role?: string }).role === 'user').at(-1);
+    assert.equal(lastUser, wakeItems[0], '它是全卷最后一条 user（历史都在它前面）');
+    const wakeIndex = request.input.indexOf(wakeItems[0]!);
+    assert.equal(wakeIndex, blockIndex - 1, '它就排在固定块前面那一格（v31 的顺序）');
+    assert.ok(!isNowLayer(request.input[wakeIndex]!), '新输入不是此刻层');
   });
 
   test('M5-1b 崩溃恢复后的首个 turn：退回的输入被重新处理，请求仍以 IDENTITY + STATE 开头', async (t) => {
@@ -925,15 +938,36 @@ describe('M5-10 前缀命中：连续 step 的历史段逐字节冻结', () => {
 
     // ③ 增量只是本步新产生的东西（assistant 文本 + 工具调用 + 工具结果）
     const appendedInStep2 = historyItemsOf(h.requests[1]!).slice(historyItemsOf(h.requests[0]!).length);
-    // 增量 = 本轮新输入 + assistant + 工具调用 + 工具结果。第一条是「本轮任务」本身：
-    // v4 布局里此刻层恒在末尾，所以首轮那条新输入在第二次请求里才成为历史段的一部分。
+    // v31 改了这一段的位置，也改了这条断言该数几个：
+    //   旧布局（v30）本轮新输入压在**整个 input 的最尾**（此刻层之后），所以第 1 步的历史段里
+    //   **没有**它——第 2 步才有，于是"增量"是 4 条（本轮输入打头）。
+    //   新布局（v31）本轮新输入排在**历史之后、固定块之前**，于是第 1 步的历史段里就已经有它了
+    //   （它在历史末尾那一条），第 2 步只把**她这一步新产生的**三样接在后面。
+    //   判据没有放松：原来查"本轮输入 + assistant + 工具调用 + 工具回执都在增量里"，
+    //   现在查"增量恰好是 assistant + 工具调用 + 工具回执这三样"，并把"本轮输入在两个 step 的
+    //   历史段里**同一位置、同一串字节**"单独钉一条（那正是 v31 挪它要买到的东西）。
     assert.deepEqual(
       appendedInStep2.map(item => (item as { type: string }).type),
-      ['message', 'message', 'function_call', 'function_call_output'],
-      '增量 = 本轮输入 + assistant + function_call + function_call_output',
+      ['message', 'function_call', 'function_call_output'],
+      '增量 = assistant + function_call + function_call_output（本轮输入已经在第 1 步的历史段里了）',
     );
-    assert.equal((appendedInStep2[0] as { role: string }).role, 'user', '本轮新输入进历史段');
-    assert.equal((appendedInStep2[1] as { role: string }).role, 'assistant');
+    assert.equal((appendedInStep2[0] as { role: string }).role, 'assistant');
+    // 本轮新输入（「本轮任务」那一条）在两个 step 的历史段里必须**同一位置、逐字节相同**：
+    // 它就是下一轮"历史往后接一段"的那一格，位置一变前缀就断在它这儿。
+    const step1History = historyItemsOf(h.requests[0]!);
+    const step2History = historyItemsOf(h.requests[1]!);
+    const wakeAt = step1History.length - 1;
+    const wakeItem = step1History[wakeAt] as { role?: string; content?: unknown };
+    assert.equal(wakeItem.role, 'user', '本轮新输入在第 1 步历史段的末尾');
+    assert.ok(
+      typeof wakeItem.content === 'string' && wakeItem.content.includes('本轮任务'),
+      '末条就是本轮新输入本身（否则下面那条是空断言）',
+    );
+    assert.equal(
+      bytesOf(step2History[wakeAt]),
+      bytesOf(step1History[wakeAt]),
+      '本轮新输入在两个 step 里同一位置、同一串字节（v31 挪到历史之后买到的就是它）',
+    );
 
     // ④ 命中估算：第 2-5 次请求的命中占本次字符流 ≥ 80%（M5-10 的门槛）
     const ratios: number[] = [];
@@ -1000,7 +1034,7 @@ describe('M5-10 前缀命中：连续 step 的历史段逐字节冻结', () => {
    *（实测 `context.now` 约 3955 token/步，其中 STATE 3845）。这条断言就是"不再重发"的可执行形式：
    * 两步之间**第一处不同必须落在此刻层**，而不是像改造前那样落在历史之后的第一个字节上。
    */
-  test('同一轮相邻两步：除此刻层外逐字节相同，固定块位置与内容一致（B2）', async (t) => {
+  test('同一轮相邻两步：第 2 步起摘掉固定块，此前逐字节冻结（v31 契约）', async (t) => {
     resetFactory();
     const STEPS = 3;
     const script: ScriptedResult[] = [
@@ -1017,49 +1051,78 @@ describe('M5-10 前缀命中：连续 step 的历史段逐字节冻结', () => {
     assert.deepEqual(await h.turn([wake]), { kind: 'completed' });
     assert.equal(h.requests.length, STEPS);
 
-    const blocks = h.requests.map(r => turnBlockOf(r));
     /**
-     * "此刻层之外那一串"：记忆层 + 事件流 + 固定块（按请求里的顺序）。
+     * v31 改了这一版买到的东西，所以这条用例的判据跟着换（**只紧不松**）：
      *
-     * 为什么比较它而不是整个 input：每一步都会往历史里追加自己产生的 assistant / 工具调用 /
-     * 工具回执（**正常追加**，不是抖动）。所以"除此刻层外逐字节相同"的正确形式是
-     * **前缀关系**：上一步那一串必须逐字节是这一步那一串的前缀，新条目只出现在尾巴上。
+     *   旧（B2/v29）：固定块在两步里位置与内容都一致，"除此刻层外逐字节相同"。
+     *   新（v31）：固定块**只在第 1 步发**，第 2 步起连发都不发（用户的口径是"开始 tool call 的
+     *   第一次请求就直接摘掉"）。于是那条旧断言守的东西在新布局下不再是目标——但"冻结"这条
+     *   性质要守得更死，所以改成把它拆成两条正面断言：
+     *     ① 第 1 步到固定块之前那一段（记忆层 + 历史 + 本轮新输入）逐步逐字节冻结；
+     *     ② 第 2 步 = 第 1 步**去掉固定块那一条**，一条不多、一条不少（此刻层各自照旧）。
+     *
+     *   注意这里不能再用 `turnBlockOf`——它在第 2 步本来就该找不到块，找不到不是渲染层出事。
      */
+    /** 首步的固定块（第 1 步必须有；缺了才是渲染层出事） */
+    const firstBlock = inputItemsOf(h.requests[0]!).find(isTurnBlock);
+    assert.ok(firstBlock !== undefined, '第 1 步必须有固定块');
+    assert.ok(
+      (firstBlock as { content: string }).content.includes(`[当前状态]\n${PERSONA.state}`),
+      '状态在第 1 步的固定块里',
+    );
+
+    /** 此刻层之外的一切（记忆层 + 事件流 + 本轮新输入） */
     const outside = (r: (typeof h.requests)[number]): unknown[] =>
       inputItemsOf(r).filter(item => !isNowLayer(item));
+    /** 按 step 取出那一步的固定块（没有就是 undefined，不是错误） */
+    const blockOf = (r: (typeof h.requests)[number]): unknown => inputItemsOf(r).find(isTurnBlock);
+
     for (let i = 1; i < STEPS; i++) {
-      assert.equal(blocks[i], blocks[0], `第 ${i + 1} 步的固定块必须与首步逐字节相同`);
-      assert.ok(blocks[i]!.includes(`[当前状态]\n${PERSONA.state}`), '状态在固定块里');
-      assert.ok(!nowLayerOf(h.requests[i]!).includes('[当前状态]'), '此刻层里没有状态');
+      const prev = h.requests[i - 1]!;
+      const next = h.requests[i]!;
 
-      const prev = outside(h.requests[i - 1]!);
-      const next = outside(h.requests[i]!);
-      assert.ok(next.length > prev.length, `第 ${i + 1} 步：此刻层之外只许追加`);
-      // 位置契约：固定块恒在**历史之后**——它是最后一条，或后面只跟本轮新输入
-      // （首步的本轮新输入排在固定块之后，第 2 步起它已经在历史里了）。
-      const at = next.findIndex(isTurnBlock);
-      assert.ok(
-        at >= next.length - 2,
-        `第 ${i + 1} 步：固定块必须落在历史之后（它在第 ${at} 条 / 共 ${next.length} 条）`,
-      );
+      // ① 第 2 步起固定块不再出现，此刻层也不许把状态背回来
+      assert.equal(blockOf(next), undefined, `第 ${i + 1} 步不再发固定块（v31）`);
+      assert.ok(!nowLayerOf(next).includes('[当前状态]'), '此刻层里没有状态（它不跟着块一起发）');
 
-      // 把这些会挪位的固定块摘掉，剩下的（记忆层 + 事件流）才是真正逐字节冻结的那一串
-      const history = (r: (typeof h.requests)[number]): unknown[] =>
-        outside(r).filter(item => !isTurnBlock(item));
-      const prevHistory = history(h.requests[i - 1]!);
-      const nextHistory = history(h.requests[i]!);
+      // ② 到固定块之前那一段逐步逐字节冻结：上一步去掉块之后，必须是这一步去掉块之后的前缀
+      const prevHistory = outside(prev).filter(item => !isTurnBlock(item));
+      const nextHistory = outside(next).filter(item => !isTurnBlock(item));
+      assert.ok(nextHistory.length > prevHistory.length, `第 ${i + 1} 步：此刻层之外只许追加`);
       const frozen = commonItemPrefix(prevHistory, nextHistory);
       assert.equal(
         frozen,
         prevHistory.length,
-        `第 ${i + 1} 步：上一步的历史必须逐字节冻结（抖动只许出现在此刻层）\n`
+        `第 ${i + 1} 步：上一步"去块之后"的那一串必须逐字节冻结（抖动只许出现在此刻层）\n`
         + `@${frozen} 上一步：${bytesOf(prevHistory[frozen])}\n@${frozen} 这一步：${bytesOf(nextHistory[frozen])}`,
       );
-      // 固定块在两步里的落点相同：都在"历史末尾、此刻层之前"（前面已经断言内容逐字节相同）
-      const blockAt = inputItemsOf(h.requests[i]!).findIndex(isTurnBlock);
-      assert.ok(blockAt >= 0, '固定块在请求里');
-      assert.ok(isNowLayer(inputItemsOf(h.requests[i]!)[blockAt + 1]), '固定块之后紧挨着此刻层');
+
+      // ③ 第 2 步 = 第 1 步去掉**固定块那一条**，其余一条不多、一条不少（此刻层各自随 step 变）
+      assert.equal(
+        bytesOf(nextHistory),
+        bytesOf([...prevHistory, ...nextHistory.slice(prevHistory.length)]),
+        `第 ${i + 1} 步：去块之后就是"上一步那串 + 本步新产生的"，没有别的位移`,
+      );
+      // 最要紧的那一格：不同分支只在"块发不发"上，块**从不进历史**（它不在去块后的那一串里）
+      assert.ok(
+        !nextHistory.some(isTurnBlock),
+        `第 ${i + 1} 步：去块之后不许还剩块（块不进历史）`,
+      );
     }
+
+    // ④ 首步那条块，在后续步骤里既不出现、也没有被搬进历史
+    //
+    //    判据用**整段段头**（`isTurnBlock` 的同一个），不做子串扫：此刻层的任务卡里也会出现
+    //    "本轮固定块"这几个字（她得知道自己那一轮看见了什么），拿片段扫会扫出一堆假阳性。
+    for (let i = 1; i < STEPS; i++) {
+      assert.equal(
+        inputItemsOf(h.requests[i]!).some(item =>
+          bytesOf(item).includes(TURN_BLOCK_BANNER)),
+        false,
+        `第 ${i + 1} 步的请求里一个字的固定块都没有（连段头都不许出现）`,
+      );
+    }
+
     // 抖动确实只在"每个 step 本就该变"的那一条上（时刻 + 任务卡的步数）
     const nowVariants = new Set(h.requests.map(r => nowLayerOf(r)));
     assert.equal(nowVariants.size, STEPS, '此刻层逐 step 变化');

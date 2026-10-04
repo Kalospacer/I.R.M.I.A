@@ -1,15 +1,16 @@
 /**
  * B2 记忆注入（memory-injection）——设计见 docs/memory-injection.md
  *
- * 这一份专测**索引 + 选材 + 按需读 + 心跳轮不注入**，四件事各成一组：
+ * 这一份专测**索引 + 注入 + 心跳轮不注入 + 正文不经注入进上下文**，四件事各成一组：
  *   ① 索引：确定性（同一份记忆建两次逐字节相同）、幂等（内容没变不写盘）、
  *      归档区不进索引、行号与 safe_read 同口径；
- *   ② 选材：pinned 必选、条数上限、超预算按优先级丢非 pinned；
- *   ③ 正文：按 `path:line` 现取（与 safe_read 同一份素材），读不到就跳过；
+ *   ② 注入账（2026-10-04 简化）：只记"注入了没有 + 当时那份索引的指纹与条数"，**索引全文不落事件**；
+ *   ③ 正文：**不注入**——固定块里只有索引（指针表），正文要她按需 `safe_read` 现取
+ *      （用户的口径：「只看索引，如果需要，heavy 自己去读，随后跟随 tool call 留在上下文」）；
  *   ④ 端到端（真 RealLoop + 真日志）：
- *      · 有人在跟她说话 → `memory/selected` 记下选了哪几条，正文进**固定块**；
- *      · **心跳轮 → 一条都不注入**（判据是本轮唤醒只有 `wake/heartbeat`）；
- *      · 固定块在两步里逐字节相同（"一轮一次"的可执行形式）。
+ *      · 有人在跟她说话 → 固定块里**只有索引、没有正文**，`memory/selected` 记一笔账；
+ *      · **心跳轮 → 索引也不注入**（判据是本轮唤醒只有 `wake/heartbeat`）；
+ *      · 固定块只发在第一步（v31），且轮内不许重建索引。
  *
  * 三条纪律与其余测试一致：时钟全注入、事实一律从日志断言、认层按段头不按下标。
  */
@@ -27,15 +28,19 @@ import { TURN_BLOCK_BANNER } from '../src/model/render.ts';
 import type { RenderedRequest } from '../src/model/render.ts';
 import { ensureMemorySeeds, memoriesDir } from '../src/persona/memory-maintain.ts';
 import {
-  ENTRY_SUMMARY_MAX_CHARS, INDEX_TOKEN_BUDGET, MAX_SELECTED_ENTRIES, MEMORY_INDEX_FILE,
-  buildMemoryIndex, ensureMemoryIndex, memoryIndexPath, readExcerpt, readMemoryIndexTextReadOnly,
-  renderMemoryIndex, renderSelectedMemory, selectMemory,
+  ENTRY_SUMMARY_MAX_CHARS, INDEX_TOKEN_BUDGET, MEMORY_INDEX_FILE,
+  buildMemoryIndex, ensureMemoryIndex, memoryIndexPath, readMemoryIndexTextReadOnly,
+  renderMemoryIndex,
 } from '../src/persona/memory-injection.ts';
 import { deriveRequest } from '../src/runtime/agent-loop.ts';
 import { RealLoop } from '../src/runtime/real-loop.ts';
+import { sha256Hex } from '../src/persona/versions.ts';
 import { applyOne, fold } from '../src/state/fold.ts';
+import { buildCatalogRegistry } from '../src/tools/catalog.ts';
+import type { ToolDefinition } from '../src/tools/types.ts';
 import { ToolRegistry } from '../src/tools/registry.ts';
 import { estimateTokens } from '../src/tools/registry.ts';
+import { TimerStore } from '../src/wake/timer-store.ts';
 
 // ──────────────────────────────── 夹具 ────────────────────────────────
 
@@ -155,29 +160,9 @@ describe('B2 记忆索引：确定性、幂等、归档区不进', () => {
   });
 });
 
-// ──────────────────────────────── ② 选材 ────────────────────────────────
+// ──────────────────────────────── ② 注入账（只记指纹与规模） ────────────────────────────────
 
-describe('B2 选材：pinned 必选、条数上限、心跳轮零条', () => {
-  test('有人在跟她说话：pinned 一定在，其余按索引顺序补足', (t) => {
-    const dir = makeDataDir(t);
-    const index = buildMemoryIndex(dir);
-    const picked = selectMemory(index, { heartbeatTurn: false });
-    assert.equal(picked.selected.some((e) => e.pinned), true, '置顶条目必选');
-    assert.equal(picked.selected.length, Math.min(index.entries.length, MAX_SELECTED_ENTRIES));
-    assert.equal(picked.skipped.heartbeat, 0);
-    assert.equal(picked.skipped.notNeeded, index.entries.length - picked.selected.length);
-  });
-
-  test('**心跳轮：一条都不选**，理由记在 heartbeat 那一格', (t) => {
-    const dir = makeDataDir(t);
-    const index = buildMemoryIndex(dir);
-    assert.ok(index.entries.length > 0, '前提：索引里本来是有东西的');
-    const picked = selectMemory(index, { heartbeatTurn: true });
-    assert.deepEqual(picked.selected, [], '没人在跟她说话，记忆正文不注入');
-    assert.equal(picked.skipped.heartbeat, index.entries.length, '未选中的原因归到"心跳"这一格');
-    assert.equal(picked.skipped.notNeeded, 0);
-  });
-
+describe('B2 注入账：索引的指纹与条数落事件，全文不落事件', () => {
   test('超预算：按优先级从后往前丢**非置顶**条目，置顶永不因为超预算被丢', (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'irmia-b2-budget-'));
     ensureMemorySeeds(dir);
@@ -190,42 +175,101 @@ describe('B2 选材：pinned 必选、条数上限、心跳轮零条', () => {
     assert.ok(estimateTokens(renderMemoryIndex(index)) <= INDEX_TOKEN_BUDGET + 200, '整体在预算量级上');
     assert.ok(renderMemoryIndex(index).includes('另有'), '尾部要如实写明还有几条没展开');
   });
+
+  test('注入账的形状：注入了没有 / 当时那份索引的指纹 / 条数——**索引全文不在事件里**', async (t) => {
+    // 这条钉的是 2026-10-04 的口径（只给索引）：账要能回答"注进去的是哪一版"，
+    // 但**不许把索引全文抄进事件**——那是重复存储（索引就渲染在固定块里），而日志是 append-only 的。
+    const h = await makeHarness(t, ['看了一眼。']);
+    h.append('wake/manual', { note: '看一眼备份目录' });
+    await h.loop.tickOnce();
+
+    const events = await h.events();
+    const selected = selectedEventsOf(events);
+    assert.equal(selected.length, 1, '一轮一条注入账');
+    const data: MemorySelected['data'] = selected[0]!.data;
+    assert.equal(data.turn, 1);
+    assert.equal(data.injection, 'human', '有人跟她说话');
+    assert.equal(selected[0]!.visibility, 'internal', '它是装配账，不进她的上下文');
+
+    // 指纹 = **当时注入的那段索引文本**的哈希：这条判据把"账"与"请求里那一段"锁在一起
+    const indexText = renderMemoryIndex(buildMemoryIndex(h.dir));
+    assert.equal(data.indexHash, sha256Hex(indexText), '指纹必须等于当时那段索引文本的哈希');
+    assert.equal(data.entries, buildMemoryIndex(h.dir).entries.length, '条数是索引规模');
+
+    // 事件里**不许有索引全文**：段头与正文形态一个都不许出现
+    const raw = JSON.stringify(selected[0]);
+    assert.equal(raw.includes('记忆索引（机制生成'), false, '索引全文不落事件（重复存储）');
+    assert.equal(raw.includes('safe_read'), false, '索引里的指引文字也不落事件');
+    assert.ok(raw.length < 400, `这一条账本身要小（实际 ${raw.length} 字符）——它是账不是内容`);
+  });
+
+  test('心跳轮：账上如实写 heartbeat（那一轮不注入索引）', async (t) => {
+    const h = await makeHarness(t, ['看了一眼。']);
+    // 心跳轮要**真的走到请求**，得先过必要性门（§4.11）：规则短路只放行"有硬牵挂"的心跳。
+    h.append('tool/result', {
+      turn: 0, step: 0, callId: 'orphan', callSeq: 0, status: 'unknown', content: '结局不明，待人确认',
+    });
+    h.append('wake/heartbeat', { idleTicks: 3, pressure: 0.05, nextDelayMs: 600_000 });
+    await h.loop.tickOnce();
+
+    const ranSteps = (await h.events()).some((e) => e.type === 'step/start');
+    assert.equal(ranSteps, true, '心跳轮必须真的起了一步，否则这条用例什么也没测到');
+    const selected = selectedEventsOf(await h.events());
+    assert.equal(selected.length, 1, '心跳轮照写一条账（"为什么没注入"要有答案）');
+    assert.equal(selected[0]!.data.injection, 'heartbeat');
+    assert.equal(selected[0]!.data.indexHash, '', '不注入 → 没有"注进去的那一版"，指纹是空串');
+  });
 });
 
-// ──────────────────────────────── ③ 正文 ────────────────────────────────
+// ──────────────────────────────── ③ 正文不注入（只给索引） ────────────────────────────────
 
-describe('B2 按需读：正文从文件现取，读不到就跳过', () => {
-  test('取回的是"那一条"：起始行 + 折行都属于同一条，到下一个条目为止', (t) => {
-    const dir = makeDataDir(t, {
-      'style-notes.md': '# 表达风格观察\n\n- 他讨厌八股过渡，\n  尤其是"首先/其次/最后"。\n- 另一条：短句更好。\n',
-    });
-    const index = buildMemoryIndex(dir);
-    const target = index.entries.find((e) => e.path.endsWith('style-notes.md'));
-    assert.ok(target, 'style-notes 要在索引里');
-    const excerpt = readExcerpt(dir, target);
-    assert.ok(excerpt, '要能取回正文');
-    assert.ok(excerpt.text.startsWith('- 他讨厌八股过渡'), `取回的应当是那一条：${excerpt.text}`);
-    assert.ok(excerpt.text.includes('尤其是'), '折行属于同一条');
-    assert.ok(!excerpt.text.includes('另一条'), '不许越过下一条的边界');
+describe('B2 只给索引：正文不进上下文，要她自己按需读', () => {
+  test('固定块里只有索引（指针表）：路径 + 行号 + 摘要都在，正文一个字都不在', async (t) => {
+    // 用户的口径：「只看索引，如果需要，heavy 自己去读，随后跟随 tool call 留在上下文」。
+    // 这条把它钉成可执行的：索引那一段在固定块里；**正文的形态**（`## 路径:行号` 段头、
+    // "行号| 文本" 那些带行号的行）一个都不许在。
+    const h = await makeHarness(t, ['看了一眼。']);
+    h.append('wake/manual', { note: '看一眼备份目录' });
+    await h.loop.tickOnce();
+
+    assert.equal(h.requests.length, 1);
+    const block = turnBlockOf(h.requests[0]);
+    assert.ok(block.includes('记忆索引（机制生成'), '索引（指针表）在固定块里');
+    assert.ok(block.includes('MEMORIES/facts.md:'), '索引给出路径与行号（她要照它 safe_read）');
+    assert.ok(block.includes('用户不喜欢八股过渡'), '那一条的**摘要**在索引里（钩子还在）');
+
+    // 正文的形态一个都不许在（与心跳轮那条同一个判据：正文有段头与行号，索引两样都没有）
+    assert.equal(block.includes('## 本轮选中的记忆'), false, '「选中的记忆正文」那一段整个不出现');
+    assert.equal(block.includes('## MEMORIES/'), false, '正文条目的段头（## 路径:行号）不在');
+    assert.equal(/^\d+\| /mu.test(block), false, '带行号的正文行一条都不在');
+    assert.equal(block.includes('(source: turn 3)'), false, '正文原行的归属标记不在（索引里那一行摘要照旧在）');
+
+    // 整份请求里也不许有（不只固定块）
+    const whole = JSON.stringify((h.requests[0] as { input: unknown }).input);
+    assert.equal(/^\d+\| /mu.test(whole), false, '整个请求里都没有带行号的正文行');
   });
 
-  test('指针漂了（文件被删、行号越界）→ 返回 null，不臆造内容', (t) => {
-    const dir = makeDataDir(t);
-    assert.equal(readExcerpt(dir, { path: 'MEMORIES/jargon.md', line: 9999, summary: 'x', pinned: false }), null);
-    assert.equal(readExcerpt(dir, { path: 'MEMORIES/nope.md', line: 1, summary: 'x', pinned: false }), null);
-  });
+  test('正文**由她自己读**：safe_read 走工具结果进历史，不占固定块', async (t) => {
+    // 这是"只给索引"的另一半：正文不是不进上下文，而是**经工具结果进**——
+    // 它落在历史里，从此每轮都在前缀里（KV 天然命中），而不是每轮由机制重新编码。
+    const h = await makeHarness(t, [
+      {
+        text: '照索引读那一条。',
+        toolCalls: [{
+          callId: 'c1', name: 'read_file',
+          arguments: JSON.stringify({ file_path: 'MEMORIES/facts.md' }),
+        }],
+      },
+      '读完了。',
+    ], { register: (registry) => { registry.register(stepTool()); } });
+    h.append('wake/manual', { note: '看一眼备份目录' });
+    await h.loop.tickOnce();
+    assert.equal(h.requests.length, 2, '这一轮跑了两步（第一步读了文件）');
 
-  test('选中的正文渲染：带行号（与 safe_read 同一口径）、空选中不产生空段', (t) => {
-    const dir = makeDataDir(t);
-    const index = buildMemoryIndex(dir);
-    const entry = index.entries[0]!;
-    const excerpt = readExcerpt(dir, entry);
-    assert.ok(excerpt);
-    const text = renderSelectedMemory([excerpt]);
-    assert.ok(text.includes('本轮选中的记忆'), '要有归属表头（这是框架给的，不是谁在说话）');
-    assert.ok(text.includes(`${entry.path}:${entry.line}`), '要给出它在哪儿');
-    assert.ok(new RegExp(`^${entry.line}\\| `, 'mu').test(text), '正文带行号');
-    assert.equal(renderSelectedMemory([]), '', '没有选中任何一条时返回空串（不写空段）');
+    // 她读回来的东西在**第二步的历史**里（工具结果），不是被机制塞进固定块
+    const second = JSON.stringify((h.requests[1] as { input: unknown }).input);
+    assert.ok(second.includes('已读取 MEMORIES/facts.md'), '工具结果进历史（那是"跟随 tool call 留在上下文"）');
+    assert.equal(second.includes('## 本轮选中的记忆'), false, '即便如此，机制也没有替她挑正文塞进来');
   });
 });
 
@@ -241,7 +285,40 @@ interface Harness {
   events: () => Promise<AppEvent[]>;
 }
 
-async function makeHarness(t: TestContext, script: string[]): Promise<Harness> {
+/**
+ * 一步的剧本：一个字符串 = 只说话（一步结束）；带 `toolCalls` = 先说一句、再调工具（于是有下一步）。
+ * v30 加这一半是为了测"**轮内不许重建索引**"：那需要一轮里真的跑两步。
+ */
+type ScriptedTurn = string | {
+  text: string;
+  toolCalls: Array<{ callId: string; name: string; arguments: string }>;
+};
+
+interface HarnessHooks {
+  /** 第 n 次请求**发出之前**调：用来模拟"她在这一步里写了一笔记忆"（改盘 + 重建索引） */
+  onRequest?: (n: number) => void;
+  /** 往工具清单里补一件工具（默认空清单：这一份测试大多不需要工具） */
+  register?: (registry: ToolRegistry) => void;
+}
+
+/** 一件最小工具：够让一轮跑出第二步（正文与本次改动无关） */
+function stepTool(): ToolDefinition {
+  return {
+    name: 'read_file',
+    description: '读取工作区内的文本文件并返回内容。',
+    parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
+    executionMode: 'parallel',
+    sideEffect: 'none',
+    timeoutMs: 5_000,
+    handler: async (args) => ({ content: `已读取 ${(args as { file_path?: string }).file_path ?? ''}` }),
+  };
+}
+
+async function makeHarness(
+  t: TestContext,
+  script: ScriptedTurn[],
+  hooks: HarnessHooks = {},
+): Promise<Harness> {
   const dir = makeDataDir(t);
   const log = await EventLog.open(join(dir, 'events'));
   const projection = fold([]);
@@ -267,9 +344,12 @@ async function makeHarness(t: TestContext, script: string[]): Promise<Harness> {
     modelFor: (): string => 'fake-heavy',
     stream: async (request: unknown) => {
       requests.push(request);
-      const text = queue.shift() ?? '好。';
+      hooks.onRequest?.(requests.length);
+      const entry = queue.shift() ?? '好。';
+      const text = typeof entry === 'string' ? entry : entry.text;
+      const toolCalls = typeof entry === 'string' ? [] : entry.toolCalls;
       return {
-        status: 'completed', text, reasoning: '', toolCalls: [], outputItems: [],
+        status: 'completed', text, reasoning: '', toolCalls, outputItems: [],
         usage: { inputTokens: 10, outputTokens: 2, cachedTokens: 0, reasoningTokens: 0 },
         incompleteReason: null, model: 'fake-heavy', responseId: 'r', durationMs: 1,
         failure: null, interrupted: false,
@@ -277,6 +357,8 @@ async function makeHarness(t: TestContext, script: string[]): Promise<Harness> {
     },
   } as never;
 
+  const registry = new ToolRegistry();
+  hooks.register?.(registry);
   const loop = new RealLoop({
     log,
     dataDir: dir,
@@ -284,7 +366,7 @@ async function makeHarness(t: TestContext, script: string[]): Promise<Harness> {
     now: () => new Date(NOW),
     timezone: TZ,
     ds,
-    registry: new ToolRegistry(),
+    registry,
     persona: PERSONA,
     config: defaultConfig(dir),
     out: () => {},
@@ -313,46 +395,63 @@ function selectedEventsOf(events: readonly AppEvent[]): Array<AppEvent & { type:
   return events.filter((e): e is AppEvent & { type: 'memory/selected' } => e.type === 'memory/selected');
 }
 
-describe('B2 端到端：选材事件 + 固定块 + 心跳轮不注入', () => {
-  test('有人跟她说话：memory/selected 记下选了哪几条，正文进固定块', async (t) => {
+describe('B2 端到端：注入账 + 固定块只放索引 + 心跳轮不注入', () => {
+  test('有人跟她说话：固定块里**只有索引**（指针表），正文一个字都不注入', async (t) => {
     const h = await makeHarness(t, ['看了一眼。']);
     h.append('wake/manual', { note: '看一眼备份目录' });
     await h.loop.tickOnce();
 
     const events = await h.events();
     const selected = selectedEventsOf(events);
-    assert.equal(selected.length, 1, '一轮一条选材账');
+    assert.equal(selected.length, 1, '一轮一条注入账');
     const data: MemorySelected['data'] = selected[0]!.data;
     assert.equal(data.turn, 1);
     assert.equal(data.injection, 'human', '有人跟她说话');
-    assert.ok(data.selected.length > 0, '索引里有东西，就该选中几条');
-    assert.equal(data.selected.some((e) => e.pinned), true, '置顶条目必选');
-    assert.equal(data.indexSize, selected[0]!.data.selected.length + data.notSelected.notNeeded);
+    assert.equal(
+      data.indexHash,
+      sha256Hex(renderMemoryIndex(buildMemoryIndex(h.dir))),
+      '账上的指纹等于这一段索引文本的哈希（账与请求里那一段是同一版）',
+    );
+    assert.ok(data.entries > 0, '索引里有东西，条数就该是正数');
     assert.equal(selected[0]!.visibility, 'internal', '它是装配账，不进她的上下文');
 
-    // 选材账在第一个 step/start **之前**写下 —— 这是"能按 seq 重建"的前提
+    // 注入账在第一个 step/start **之前**写下 —— 这是"能按 seq 重建"的前提
     const stepStart = events.find((e) => e.type === 'step/start');
     assert.ok(stepStart, '这一轮起了 step');
-    assert.ok(selected[0]!.seq < stepStart.seq, '选材账必须落在 step/start 之前');
+    assert.ok(selected[0]!.seq < stepStart.seq, '注入账必须落在 step/start 之前');
 
-    // 正文进了**固定块**（不是此刻层、不是记忆层）
     assert.equal(h.requests.length, 1);
     const block = turnBlockOf(h.requests[0]);
     assert.ok(block.includes('STATE：正在补 B2 的记忆注入'), '状态在固定块里');
-    assert.ok(block.includes('本轮选中的记忆'), `选中的正文要在固定块里：\n${block}`);
-    assert.ok(block.includes('用户不喜欢八股过渡'), '置顶条目那条正文要真的在');
-    assert.ok(block.includes('MEMORIES/facts.md:'), '正文要带它在哪儿（与 safe_read 同一口径）');
+    // 索引在固定块里：路径 + 行号 + 摘要（**指针**，不是正文）
+    assert.ok(block.includes('记忆索引（机制生成'), `索引要在固定块里：\n${block}`);
+    assert.ok(block.includes('MEMORIES/facts.md:'), '索引给出路径与行号（她照它 safe_read）');
+    assert.ok(block.includes('用户不喜欢八股过渡'), '那一条的摘要（钩子）在索引里');
+    // **正文不进固定块**（2026-10-04 用户口径）：正文的形态一个都不许出现
+    assert.equal(block.includes('## 本轮选中的记忆'), false, '「选中的记忆正文」那一段整个不出现');
+    assert.equal(block.includes('## MEMORIES/'), false, '正文条目的段头（## 路径:行号）不在');
+    assert.equal(/^\d+\| /mu.test(block), false, '带行号的正文行一条都不在');
 
-    // 索引本身在**长期记忆层**（input[0]）：跨轮稳定、每轮只出现一次
+    // 索引本身在**本轮固定块**（v30；v29 时在长期记忆层）：一轮一份，固定块之外一处都不许有。
+    // 位置断言从"在不在头部"改成"在不在固定块里"——这正是那次挪层要钉住的东西。
     const input = (h.requests[0] as { input: Array<{ content?: unknown }> }).input;
+    const indexItems = input.filter(
+      (i) => typeof i.content === 'string' && i.content.includes('记忆索引（机制生成'),
+    );
+    assert.equal(indexItems.length, 1, '索引只出现一次（每轮一份，不重复）');
+    assert.ok(
+      turnBlockOf(h.requests[0]).includes('记忆索引（机制生成'),
+      '索引在**本轮固定块**里（v30 起；历史之后的这一段）',
+    );
     assert.equal(
-      input.filter((i) => typeof i.content === 'string' && i.content.includes('记忆索引（机制生成')).length,
-      1,
-      '索引只出现一次（在长期记忆层里）',
+      input.filter((i) => !(typeof i.content === 'string' && i.content.startsWith(TURN_BLOCK_BANNER))
+        && typeof i.content === 'string' && i.content.includes('记忆索引（机制生成')).length,
+      0,
+      '固定块之外的任何一条都不许有索引（头部 / 历史 / 此刻层都没有）',
     );
   });
 
-  test('**心跳轮：记忆一条都不注入**，账上如实写 heartbeat', async (t) => {
+  test('**心跳轮：索引也不注入**，账上如实写 heartbeat', async (t) => {
     const h = await makeHarness(t, ['看了一眼。']);
     // 心跳轮要**真的走到请求**，得先过必要性门（§4.11）：规则短路只放行"有硬牵挂"的心跳。
     // 这里放一条待确认调用（`tool/result{unknown}` 落进 needsReview）——那是真实存在的牵挂，
@@ -376,18 +475,18 @@ describe('B2 端到端：选材事件 + 固定块 + 心跳轮不注入', () => {
     assert.equal(selected.length, 1, '心跳轮照写一条账（"为什么没注入"要有答案）');
     const data = selected[0]!.data;
     assert.equal(data.injection, 'heartbeat');
-    assert.deepEqual(data.selected, [], '一条都不选');
-    assert.ok(data.notSelected.heartbeat > 0, '未选中的原因记在 heartbeat 那一格');
-    assert.equal(data.notSelected.notNeeded, 0);
+    assert.equal(data.indexHash, '', '不注入 → 没有"注进去的那一版"，指纹是空串');
 
     assert.equal(h.requests.length, 1, '心跳轮照样起 step（不注入不等于不思考）');
     const block = turnBlockOf(h.requests[0]);
     assert.ok(block.includes('STATE：正在补 B2 的记忆注入'), '状态仍然在（那是"她此刻是什么状态"）');
-    assert.ok(!block.includes('本轮选中的记忆'), '没人在跟她说话 → 记忆正文那一段整段不出现');
-    assert.ok(!block.includes('用户不喜欢八股过渡'), '置顶条目也不注入（心跳轮的判据优先）');
-    assert.ok(!block.includes('MEMORIES/'), '心跳轮不注入记忆正文（索引里那几条一条都不在）');
+    // 用户的口径：只有用户输入时才注入。所以心跳轮的块里**连索引都不该有**——
+    // 不只是"正文不在"（正文本来就已经全局不注入了），而是整段记忆相关的内容都不在。
+    assert.ok(!block.includes('记忆索引（机制生成'), '心跳轮不注入索引（只有用户输入时才注入）');
+    assert.ok(!block.includes('MEMORIES/facts.md:'), '索引的指针行一条都不在');
+    assert.ok(!block.includes('本轮选中的记忆'), '记忆正文那一段当然也不在');
   });
-  test('混着一条真人消息时按"有人说话"算：记忆照注入', async (t) => {
+  test('混着一条真人消息时按"有人说话"算：索引照注入', async (t) => {
     const h = await makeHarness(t, ['看了一眼。']);
     h.append('wake/heartbeat', { idleTicks: 1, pressure: 0.05, nextDelayMs: 600_000 });
     h.append('wake/manual', { note: '顺手问一句' });
@@ -396,8 +495,69 @@ describe('B2 端到端：选材事件 + 固定块 + 心跳轮不注入', () => {
     const selected = selectedEventsOf(await h.events());
     assert.equal(selected.length, 1);
     assert.equal(selected[0]!.data.injection, 'human', '一批里有一条真人输入，就不是心跳轮');
-    assert.ok(selected[0]!.data.selected.length > 0);
-    assert.ok(turnBlockOf(h.requests[0]).includes('本轮选中的记忆'));
+    assert.ok(selected[0]!.data.entries > 0, '有人说话 → 索引注入，条数为正');
+    assert.notEqual(selected[0]!.data.indexHash, '', '注入了就有"注进去的那一版"的指纹');
+    assert.ok(turnBlockOf(h.requests[0]).includes('记忆索引（机制生成'), '索引在固定块里');
+  });
+
+  test('v30 端到端：**轮内不许重建索引**——索引同源同拍，且只发在第一步（v31）', async (t) => {
+    // 这一条钉的是 v30 的硬约束：索引与状态**同源同拍**——宿主在**轮首**建/读一次
+    // （real-loop 的 agentDeps），整轮共用。所以"她在这两步之间写了一笔记忆"不该让第二步的
+    // 固定块变样；她写的东西要到**下一轮**才进她的上下文。
+    const holder = { dir: '' };
+    let rebuilt: string | null = null;
+    const h = await makeHarness(t, [
+      {
+        text: '第一步：先看一眼那份记忆。',
+        toolCalls: [{ callId: 'c1', name: 'read_file', arguments: JSON.stringify({ file_path: 'MEMORIES/facts.md' }) }],
+      },
+      '第二步：收尾。',
+      '下一轮。',
+    ], {
+      register: (registry) => {
+        registry.register(stepTool());
+      },
+      onRequest: (n) => {
+        // 第 1 步里"她写了一笔记忆"：改 facts.md（有效分区）→ 索引真的被重建（真机制，幂等写盘）
+        if (n !== 1) return;
+        writeFileSync(
+          join(memoriesDir(holder.dir), 'facts.md'),
+          FACTS.replace('## 观察\n', '## 观察\n\n- [valid 2026-10-04] 她在这一轮里刚记下的一条。\n'),
+          'utf8',
+        );
+        rebuilt = ensureMemoryIndex(holder.dir);
+      },
+    });
+    holder.dir = h.dir;
+
+    h.append('wake/manual', { note: '看一眼备份目录' });
+    await h.loop.tickOnce();
+
+    assert.equal(rebuilt, 'updated', '盘上的 INDEX.md 真的被重建了（否则这条用例什么也没测到）');
+    assert.equal(h.requests.length, 2, '这一轮真的跑了两步');
+    const block1 = turnBlockOf(h.requests[0]);
+    assert.ok(block1.includes('用户不喜欢八股过渡'), '索引确实在固定块里（第一步）');
+    // v31：第 2 步**连块都不发**——"轮内不许重建索引"因此更硬（它连发出去的机会都没有）。
+    // 判据只变紧：原来查"两步的块逐字节相同"，现在查"第 2 步一个字的块都没有"。
+    const second = (h.requests[1] as { input: Array<{ content?: unknown }> }).input;
+    assert.ok(
+      !second.some((item) => typeof item.content === 'string' && item.content.startsWith(TURN_BLOCK_BANNER)),
+      '第 2 步起固定块不再出现（v31：用户的口径是"开始 tool call 的第一次请求就直接摘掉"）',
+    );
+    assert.equal(
+      JSON.stringify(second).includes('她在这一轮里刚记下的一条'),
+      false,
+      '轮内新写的那一条当然也不在第 2 步的请求里',
+    );
+
+    // 下一轮才看得见——这正是"轮首发一次"这条纪律的可观测后果
+    h.append('wake/manual', { note: '再看一眼' });
+    await h.loop.tickOnce();
+    assert.equal(h.requests.length, 3);
+    assert.ok(
+      turnBlockOf(h.requests[2]).includes('她在这一轮里刚记下的一条'),
+      '她写的那一笔在**下一轮**的固定块里（索引轮首重建）',
+    );
   });
 
   test('每轮一条账，且只写在该轮的第一个 step 之前（能按 seq 重建的前提）', async (t) => {
@@ -417,24 +577,23 @@ describe('B2 端到端：选材事件 + 固定块 + 心跳轮不注入', () => {
       assert.equal(prior.length, i + 1, `第 ${i + 1} 个 step/start 之前应当恰有 ${i + 1} 条选材账`);
       assert.equal(prior[prior.length - 1]!.data.turn, step.data.turn, '最近那条账属于本 turn');
     }
-    // 两轮的固定块内容可以不同（各自选材），但**同一轮之内**不变——后者由 m5 的相邻两步用例钉住
+    // 两轮的固定块内容可以不同（索引各自轮首重建），但**同一轮之内**不变——
+    // 后者由 m5 的相邻两步用例与 render.test.ts 的 v31 用例钉住。
     assert.equal(h.requests.length, 2);
-    assert.ok(turnBlockOf(h.requests[0]).includes('本轮选中的记忆'));
-    assert.ok(turnBlockOf(h.requests[1]).includes('本轮选中的记忆'));
+    assert.ok(turnBlockOf(h.requests[0]).includes('记忆索引（机制生成'));
+    assert.ok(turnBlockOf(h.requests[1]).includes('记忆索引（机制生成'));
   });
 });
 
-describe('B2 重放：deriveRequest 只认事件里的选材，不重算', () => {
-  test('同一份事件 + 同一份素材 → 逐字节相同；换了选材事件 → 固定块跟着换', async (t) => {
+describe('B2 重放：固定块只放索引，正文不经注入进上下文', () => {
+  test('同一份入参两次渲染逐字节相同；固定块里只有索引，正文一个字都不在', async (t) => {
     const h = await makeHarness(t, ['好。']);
     h.append('wake/manual', { note: '看一眼' });
     await h.loop.tickOnce();
     const events = await h.events();
 
     const index = buildMemoryIndex(h.dir);
-    const entry = index.entries.find((e) => e.pinned) ?? index.entries[0]!;
-    const excerpt = readExcerpt(h.dir, entry);
-    assert.ok(excerpt);
+    const indexText = renderMemoryIndex(index);
 
     const base = {
       persona: { ...PERSONA, relationship: null },
@@ -443,28 +602,129 @@ describe('B2 重放：deriveRequest 只认事件里的选材，不重算', () =>
       lane: 'heavy' as const,
       events,
       wakeEvent: null,
-      taskCard: { title: 't', turn: 1, step: 2, todoOpen: [] },
+      // v31 起固定块只在**第 1 步**发（第 ≥2 步摘掉）：这条用例查的是块的内容与"同一份入参两次
+      // 渲染逐字节相同"，所以取第 1 步。第 2 步没有块这件事由 render.test.ts 的 v31 用例钉。
+      taskCard: { title: 't', turn: 1, step: 1, todoOpen: [] },
       now: NOW,
       model: 'fake-heavy',
-      memoryIndex: renderMemoryIndex(index),
-      turnBlock: { state: PERSONA.state, relationship: null, memory: renderSelectedMemory([excerpt]) },
+      memoryIndex: indexText,
+      // 2026-10-04 起固定块里**没有**记忆正文那一段（只给索引）：memory 恒为 null，
+      // 与运行期的 `turnBlockFacts` 同形（见 real-loop）。正文要她自己 safe_read。
+      turnBlock: { state: PERSONA.state, relationship: null, memory: null },
     };
     const a: RenderedRequest = deriveRequest(base);
     const b: RenderedRequest = deriveRequest(base);
     assert.equal(JSON.stringify(a.input), JSON.stringify(b.input), '同一份输入渲染两次逐字节相同');
 
-    // 选材换了（换成另一条）→ 固定块里那一段跟着换，其余一切不动
-    const other = index.entries.find((e) => e !== entry)!;
-    const otherExcerpt = readExcerpt(h.dir, other);
-    assert.ok(otherExcerpt);
-    const c = deriveRequest({
-      ...base,
-      turnBlock: { state: PERSONA.state, relationship: null, memory: renderSelectedMemory([otherExcerpt]) },
-    });
-    assert.notEqual(turnBlockOf(c), turnBlockOf(a), '选材不同 → 固定块不同');
+    // ① 索引在固定块里（**唯一**进上下文的记忆素材）
+    const block = turnBlockOf(a);
+    assert.ok(block.includes('记忆索引（机制生成'), '索引在固定块里');
+    assert.ok(block.includes(indexText.split('\n')[0] ?? ''), '注进去的就是这一版索引文本');
+    // ② 正文一个字节都不在——按正文自己的形态判（段头 / 带行号的行）
+    assert.equal(block.includes('## MEMORIES/'), false, '正文条目的段头（## 路径:行号）不在');
+    assert.equal(/^\d+\| /mu.test(block), false, '带行号的正文行不在');
+    assert.equal(
+      JSON.stringify(a.input).includes('## 本轮选中的记忆'),
+      false,
+      '整份请求里都没有「选中的记忆正文」那一段',
+    );
+
+    // ③ 换了索引文本 → 固定块跟着换（块里那段确实由入参决定，不是写死的）
+    const c = deriveRequest({ ...base, memoryIndex: `${indexText}\n\n（这一行是后来加的）` });
+    assert.notEqual(turnBlockOf(c), block, '索引不同 → 固定块不同');
     const stripBlock = (r: RenderedRequest): string =>
       JSON.stringify(r.input.filter((i) => !(i.type === 'message'
         && typeof i.content === 'string' && i.content.startsWith(TURN_BLOCK_BANNER))));
     assert.equal(stripBlock(a), stripBlock(c), '除固定块外逐字节相同');
+  });
+});
+
+// ──────────────────────────────── ⑤ 端到端：按索引指针读那一条 ────────────────────────────────
+
+describe('memory_read 端到端（真循环 + 真日志）：访问账真的落进 data/events/', () => {
+  /**
+   * 这一条补的是**整链**：不是"工具层把 payload 交给了一个收集器"，而是
+   * **真 RealLoop 派发 → 工具执行 → 事件写进真 EventLog → 从盘上读回来**。
+   *
+   * 为什么必须走真循环：`memory_read` 与运行期之间只隔着**一行接线**
+   * （`main.ts` 的 `memoryReadRecorder: (data) => emit('memory/read', data)`）。
+   * 只测"注入收集器收到了"的话，那一行接了没有、参数对不对，测试全看不见——
+   * 而这正是本次要确认的东西（此前它一直是"没实测"）。
+   *
+   * 装配方式与 `main.ts` 同构：registry 里放的是 `buildCatalogRegistry` 造出来的
+   * **真 `memory_read`**，它的 `memoryReadRecorder` 直接写进这一份真日志。
+   */
+  test('她按索引指针读一条 → memory/read 落到日志，且日志里没有正文', async (t) => {
+    const dir = makeDataDir(t);
+    // 索引那一行：facts.md 第 11 行是「备份目录在 D 盘根下。」
+    const line = FACTS.split('\n').findIndex((l) => l.includes('备份目录在 D 盘根下')) + 1;
+    assert.ok(line > 0, '夹具里得先有那一条');
+
+    // 日志句柄在 harness 里，而 registry 要在注册钩子里装配 —— 用一个可变引用把它接上
+    // （与其它用例里 `ws.root = h.root` 同一手法）。**必须先声明**：闭包引用的是它。
+    let appendMemoryRead: (data: unknown) => void = () => {
+      throw new Error('日志还没接上：appendMemoryRead 在 harness 就位之前被调用了');
+    };
+
+    const realMemoryRead = await buildCatalogRegistry({
+      dataDir: dir,
+      timers: new TimerStore(join(dir, 'timers.json')),
+      emit: () => {},
+      destructiveEnabled: false,
+      // 与 main.ts 同构：工具交出来的 payload 直接落进这一份日志
+      memoryReadRecorder: (data) => appendMemoryRead(data),
+    }).then((r) => {
+      const tool = r.registry.get('memory_read');
+      assert.ok(tool !== null, 'memory_read 没进清单');
+      return tool;
+    });
+
+    const h = await makeHarness(t, [
+      {
+        text: '翻一下那条。',
+        toolCalls: [{
+          callId: 'call-mem-1',
+          name: 'memory_read',
+          arguments: JSON.stringify({ path: 'MEMORIES/facts.md', line }),
+        }],
+      },
+      '看到了。',
+    ], {
+      register: (registry) => {
+        // 真工具进真 registry：handler 原样透传，只补 loop 不提供的 displayName
+        registry.register({
+          ...realMemoryRead,
+          handler: (args, ctx) => realMemoryRead.handler(args, ctx),
+        } as ToolDefinition);
+        appendMemoryRead = (data) => h.append('memory/read', data);
+      },
+    });
+
+    h.append('wake/manual', { note: '看一下备份目录那条' });
+    await h.loop.tickOnce();
+
+    const events = await h.events();
+    // ① 她确实读到了那一条（工具结果里有正文）
+    const result = events.find((e) => e.type === 'tool/result');
+    assert.ok(result, '这一轮该有一次工具结果');
+    assert.ok(
+      (result.data as { content?: string }).content?.includes('备份目录在 D 盘根下'),
+      `工具结果里要有那一条正文：${JSON.stringify(result.data).slice(0, 300)}`,
+    );
+
+    // ② 访问账**真的在日志里**（不是只有测试注入的形状）
+    const reads = events.filter((e) => e.type === 'memory/read');
+    assert.equal(reads.length, 1, `该落一条 memory/read，实际 ${reads.length} 条`);
+    const data = reads[0]!.data as { turn: number; path: string; line: number; lines: number; pinned: boolean };
+    assert.equal(data.path, 'MEMORIES/facts.md');
+    assert.equal(data.line, line, '指针要原样落库');
+    assert.equal(data.lines, 1, '默认只读一行');
+    assert.equal(data.pinned, false);
+    assert.equal(typeof data.turn, 'number', 'turn 由工具层从 ctx.turn 交出来');
+    assert.equal(reads[0]!.visibility, 'internal', '访问账不进她的上下文');
+
+    // ③ **日志里没有正文**（"只放指针不放正文"的盘上证据）
+    const onDisk = JSON.stringify(events.filter((e) => e.type === 'memory/read'));
+    assert.equal(onDisk.includes('备份目录在 D 盘根下'), false, `访问账里不许有正文：${onDisk}`);
   });
 });

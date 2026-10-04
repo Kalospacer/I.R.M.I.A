@@ -18,7 +18,15 @@
  *
  * 这份用例走**真 HTTP 路由 + 真 EventLog + 真投影**，把那条缝钉住。两条方向都测：
  *   • 接上通报口 → 插话之后剩下的气泡一条都不发（已发的不受影响）；
- *   • 摘掉通报口 → 9 条全发（复现事故。这条是回归哨兵：缝再被撕开就会红）。
+ *   • 摘掉通报口 → 应发的段**一条不少全发**（复现事故。这条是回归哨兵：缝再被撕开就会红）。
+ *
+ * ──────────────────── 2026-10-05：夹具压回 `SPEAK_SEGMENT_MAX` 以内 ────────────────────
+ *
+ * `speak` 现在**超过 45 字就不自动分段**（整条一次发出）。这条用例原来的夹具 107 字，
+ * 于是整段只发一条：界面插话永远落在**唯一那条**之后、"说到一半被打断"这件事根本没发生，
+ * 断言跟着变成空转（实测：`bubbles.length` = 1，而它在等 9）。夹具改成 4 段共 35 字，
+ * 段数由 `expectedSegments` **按实现算出来**（不再写死 9）——这条用例要守的是
+ * "**界面插话这条投递链是通的**（消息真的落库、每条都出去了）"，不是"必须切成九条"。
  */
 
 import assert from 'node:assert/strict';
@@ -40,16 +48,35 @@ import { startWebServer, type WebServer } from '../src/web/server.ts';
 const TEST_TOKEN = 'test-token-0123456789abcdef';
 
 /**
- * 她这一口气要说的话：九个逗号段，切成九条气泡。
+ * 她这一口气要说的话：四个逗号段，切成四条气泡（35 字，压在 `SPEAK_SEGMENT_MAX` = 45 以内）。
  *
- * 为什么用九条：事故那轮正好是 9 条（seq 15491…15509），而"人插话时说到一半"这件事
- * 只有在**还剩好几条没发**时才看得出来。
+ * 事故那轮是 9 条（seq 15491…15509）；这里减到 4 条是 2026-10-05 的连带修改——超过 45 字
+ * `speak` 就不分段了，107 字的老夹具只会整条发一条，"人插话时说到一半"这件事随之消失
+ * （见文件头那段）。四条足够：插话落在第二条之后，还剩两条没发。
  */
 const HER_SPEECH = [
-  '第一句话摆在这里给你看', '第二句话摆在这里给你看', '第三句话摆在这里给你看',
-  '第四句话摆在这里给你看', '第五句话摆在这里给你看', '第六句话摆在这里给你看',
-  '第七句话摆在这里给你看', '第八句话摆在这里给你看', '第九句话摆在这里给你看',
+  '第一句摆在这里', '第二句放在那边', '第三句换个地方说', '第四句再说一句吧',
 ].join('，');
+
+/**
+ * 这一次发言**应该**发出去几条气泡——按实现算出来的，不写死。
+ *
+ * 口径就是 `speak` 的分段判据（`src/tools/admin.ts`）：整段超过 `SPEAK_SEGMENT_MAX` 字时
+ * 不分段（一条整发），否则按中文逗号断开、摘掉标点。这里刻意不 import `splitForChat`：
+ * 要钉的是"**应发的段一条不少**"，把被测实现搬进算式里，规则一旦被改坏，这个数会跟着变坏
+ * 而断言照样绿——那就成了自己给自己作证。所以只按上面那条口径数逗号段。
+ * 夹具长度也在这里钉一次：它必须落在 45 以内，否则"说到一半"这件事又会消失。
+ */
+const expectedSegments = [...HER_SPEECH].length > 45
+  ? 1
+  : HER_SPEECH.split('，').length;
+// 夹具长度用**关系**钉，不写死数字：写死 33 那种数只会在改夹具时徒增一次无关的红色，
+// 而这里真正要守的是"整段落在 45 以内"（超了就不分段，"说到一半"随之消失）。
+assert.ok(
+  [...HER_SPEECH].length <= 45,
+  `夹具 ${[...HER_SPEECH].length} 字超过分段上限 45：整段会一次发出，"说到一半"测不出来`,
+);
+assert.ok(expectedSegments > 2, `夹具要能切出多段才测得出打断，实际 ${expectedSegments} 段`);
 
 interface Rig {
   dir: string;
@@ -65,7 +92,7 @@ interface Rig {
    *
    * 为什么不让用例自己加一：那样测的是"计数变了 speak 会不会停"（`admin-pwsh.test.ts`
    * 已经管了），而不是"界面那条消息会不会把计数推动起来"。后者才是这次坏掉的东西。
-   * 复现事故（摘掉通报口）时这个计数一直是 0——所以九条会全发出去，与 17:38 那轮一模一样。
+   * 复现事故（摘掉通报口）时这个计数一直是 0——所以应发的段会全发出去，与 17:38 那轮一模一样。
    */
   epoch(): number;
   readAll(): Promise<AppEvent[]>;
@@ -160,7 +187,7 @@ async function uiWake(base: string, note: string): Promise<{ seq: number; status
  * 打字等待换成"等那条界面消息真的落库"而不是立即返回：真实装配里那条 HTTP 要走一个来回，
  * 而 speak 正好在那段时间里"打着字"。换成立即返回的话，判据会在通报到达之前就被读一遍，
  * 用例测到的就不是这条缝，而是机器有多快。等它有上限（2s），超时照旧往下走——
- * 摘掉通报口的那条回归用例正是靠这个上限跑完九条。
+ * 摘掉通报口的那条回归用例正是靠这个上限跑完所有段。
  */
 async function speakWhileOwnerInterrupts(
   rig: Rig,
@@ -211,7 +238,7 @@ async function speakWhileOwnerInterrupts(
     signal: new AbortController().signal,
     workspaceRoot: rig.dataDir,
     // 计数**只**来自通报口（rig 的 noteUserSpoke）：这条缝断了它就不动，
-    // speak 会照旧把九条说完——正是事故当时的样子。
+    // speak 会照旧把应发的段说完——正是事故当时的样子。
     interruptEpoch: rig.epoch,
     claimInterruption: () => {},
   };
@@ -256,7 +283,14 @@ test('界面插话打断她正在说的那半截话：已发的不受影响，�
   assert.equal(r.notified[0]!.type, 'wake/manual');
 
   assert.equal(out.bubblesWhenOwnerSpoke, 2, '用户开口时她刚说出第二条（事故那轮的形状）');
-  // 第三条是并发那一刻正在发的那一条（收不回来）；第四条起一条都不许出去。
+  // 已经出去的是**开头那几段**（顺序与分段都照旧；`bubblesWhenOwnerSpoke === 2` 本身也钉住了
+  // "它至少冒过两条"，所以这一条不是空断言）。
+  assert.deepEqual(
+    out.bubbles,
+    HER_SPEECH.split('，').slice(0, out.bubbles.length),
+    '分段与顺序照旧：出去的就是那句原话的开头几段',
+  );
+  // 第三条是并发那一刻正在发的那一条（收不回来）；再往后一条都不许出去。
   // 允许"第三条之后又冒了一条"是如实留给时序的：判据在**每段开头**才被读一次，
   // 插话若正好落在那一读之后，正在打的那一条仍会出去——这与"不撤回已发"是同一条口径。
   assert.ok(
@@ -264,27 +298,36 @@ test('界面插话打断她正在说的那半截话：已发的不受影响，�
     `插话之后最多再出去一条，实际出去了 ${out.bubbles.length - out.bubblesWhenOwnerSpoke} 条：`
     + out.bubbles.join('／'),
   );
+  // **这条是夹具的活性锁**：夹具一旦长过 `SPEAK_SEGMENT_MAX`（或分段规则再变），整段会一次
+  // 发出、插话落在唯一那条之后——打断分支根本不进，这条会红在"应发的还有没发完"上，
+  // 而不是让用例静悄悄地变成空转（实测踩过一次：`bubbles.length` = 1 却还在等 9）。
   assert.ok(
-    out.bubbles.length < 9,
-    `没发的一条都不许再发（剩 ${9 - out.bubbles.length} 条）：${out.bubbles.join('／')}`,
+    out.bubbles.length < expectedSegments,
+    `插话必须落在发言中途：应发 ${expectedSegments} 段，实际已经全发完了 ${out.bubbles.length} 条`,
   );
   assert.match(out.content, /发言被打断：他刚说「和我的私聊是私有的，没关系」。/);
   assert.match(out.content, new RegExp(`已经发出去的（收不回来了）：${out.bubbles.length} 条`));
-  assert.match(out.content, new RegExp(`没来得及发的（${9 - out.bubbles.length} 条）：1\\. `));
-  assert.ok(
-    !out.content.split('\n')[2]!.includes('第一句话'),
-    `未发那行不许夹带已发的内容：${out.content}`,
+  assert.match(
+    out.content,
+    new RegExp(`没来得及发的（${expectedSegments - out.bubbles.length} 条）：1\\. `),
   );
 });
 
-test('回归哨兵：摘掉通报口就是事故当时的样子——人插话之后她照旧说完九条', async (t) => {
+test('回归哨兵：摘掉通报口就是事故当时的样子——人插话之后她照旧把应发的段说完', async (t) => {
   // 这条不是"测旧代码"，是把**缝**钉在用例里：`WebServerDeps.noteUserSpoke` 一旦被摘掉
   // （或者 main.ts 忘了接），这里立刻红——而那正是 17:38 那轮的表现。
   const r = await rig(t, false);
   const out = await speakWhileOwnerInterrupts(r, { notify: false, wakeSeq: 15497 });
 
   assert.deepEqual(r.notified, [], '没接通报口：没人被通知');
-  assert.equal(out.bubbles.length, 9, '九条全发出去——这正是用户截图里看到的"她没停下来"');
+  // 判据是"**应发的段一条不少**"，不是"必须切成九条"：段数由 expectedSegments 按实现算出来，
+  // 这样分段规则以后怎么变，这条哨兵测的都还是"插话拦不住她"这件事本身。
+  assert.equal(
+    out.bubbles.length,
+    expectedSegments,
+    `应发的 ${expectedSegments} 段一条不少全出去——这正是用户截图里看到的"她没停下来"`,
+  );
+  assert.deepEqual(out.bubbles, HER_SPEECH.split('，'), '而且逐段就是那句原话（标点摘掉）');
   assert.ok(!out.content.includes('被打断'), `回执也不该说被打断：${out.content}`);
   assert.match(out.content, /发言已处理/, '照旧是"处理完了"的正常回执');
 });

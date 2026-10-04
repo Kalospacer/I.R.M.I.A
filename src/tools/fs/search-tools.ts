@@ -36,8 +36,9 @@
 
 import { relative } from 'node:path';
 
+import { PATH_BOUNDARY_HINT } from '../boundary.ts';
 import type { FsEnv } from './env.ts';
-import { resolveInsideRoot } from './path-guard.ts';
+import { resolveGuarded } from './env.ts';
 import { buildMatcher } from './search-core.ts';
 import {
   ABORTED_RESULT,
@@ -207,18 +208,22 @@ function parseRgNullOutput(stdout: string, root: string, fallbackPath: string): 
 export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefinition {
   return {
     name: 'rg_search',
+    // path 那句是 P3 的正面修法：描述说清"文件也吃得下"，她就不必先猜对工具。
+    // 实测依据：11 次把文件路径喂进来、被"不是目录"挡回去（docs/tools-audit.md §2.2），
+    // 而 `rg` 本来就吃文件操作数——挡它的是我们自己多要的那一道 requireDirectory。
     description:
       '按内容搜索（不是文件名）：由 ripgrep 引擎执行，首行标注 engine。' +
-      '支持正则、glob 过滤、上下文行、忽略大小写。定位后用 safe_read 读区间。',
+      '支持正则、glob 过滤、上下文行、忽略大小写；path 给目录就递归搜、给单个文件就只搜它。' +
+      '定位后用 safe_read 读区间。',
     parameters: {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: '正则表达式（默认）或字面量（fixed_strings=true）' },
-        path: { type: 'string', description: '搜索范围，目录，默认工作目录根' },
+        path: { type: 'string', description: `搜索范围：目录（递归搜）或单个文件（只搜它），默认工作根。${PATH_BOUNDARY_HINT}` },
         glob: { type: 'string', description: '文件名过滤，如 "*.ts" 或 "src/**/*.{ts,js}"；多个用逗号分隔' },
-        context: { type: 'integer', description: '每条命中前后各带多少行上下文，默认 2，上限 20' },
-        max_results: { type: 'integer', description: '最多返回多少条命中，默认 100' },
-        ignore_case: { type: 'boolean', description: '忽略大小写，默认 false' },
+        context: { type: 'integer', description: '每条命中前后各带多少行上下文，默认 0（只看命中行），上限 20' },
+        max_results: { type: 'integer', description: '最多返回多少条命中，默认 40' },
+        case_sensitive: { type: 'boolean', description: '区分大小写，默认 false（默认不区分，与 ripgrep 默认相反）' },
         fixed_strings: { type: 'boolean', description: '把 pattern 当字面量而不是正则，默认 false' },
         max_file_bytes: { type: 'integer', description: '跳过大于该字节数的文件，默认 8388608' },
       },
@@ -240,17 +245,27 @@ export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
       if ('error' in maxRes) return invalidArgs('rg_search', maxRes.error);
       const sizeRes = readOptionalInt(args, 'max_file_bytes', 1024, 512 * 1024 * 1024);
       if ('error' in sizeRes) return invalidArgs('rg_search', sizeRes.error);
-      const contextLines = ctxRes.value ?? 2;
-      const maxResults = maxRes.value ?? 100;
+      const contextLines = ctxRes.value ?? 0;
+      const maxResults = maxRes.value ?? 40;
       const maxFileBytes = sizeRes.value ?? MAX_FILE_BYTES;
-      const ignoreCase = readOptionalBool(args, 'ignore_case') ?? false;
+      // 参数名与默认值都照 devkit：那边是 `case_sensitive`，默认 false = **不区分大小写**
+      // （`_registry.py:583-605`、`tools/rg_search.py:244-252`）。旧实现是 `ignore_case`
+      // 默认 false = 区分大小写，方向正好相反——默认值翻转会**静默改变召回**，
+      // 所以这里连参数名一起换成源的名字：`case_sensitive` 的默认值写在名字里（false 即"不敏感"），
+      // 而 `ignore_case` 这个名字配 false 读起来像"不忽略=敏感"，两套读法都有理，正是要消除的歧义。
+      const caseSensitive = readOptionalBool(args, 'case_sensitive') ?? false;
+      const ignoreCase = !caseSensitive;
       const fixedStrings = readOptionalBool(args, 'fixed_strings') ?? false;
       const globArg = readOptionalString(args, 'glob');
 
       const pathInput = readOptionalString(args, 'path') ?? '.';
-      const target = await resolveInsideRoot(ctx.workspaceRoot, pathInput, {
+      // **目录与单个文件都收**（P3）：传目录照旧递归搜，传文件就只搜那一个文件——
+      // 这正是 rg 的基本用法，`--with-filename` 已经在，单文件的命中照样带文件名。
+      // 旧口径要的是 `requireDirectory: true`（只收目录），把"文件操作数"整个挡在门外：
+      // 实测 11 次传文件被拒，占它 16 次失败里的 11 次（docs/tools-audit.md §2.2）。
+      const target = await resolveGuarded(env, ctx, pathInput, {
         purpose: 'rg_search',
-        requireDirectory: true,
+        allowDirectory: true,
       });
       if (!target.ok) return fail(target.code, target.reason);
       const searchRoot = target.path;
@@ -308,7 +323,7 @@ export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
       const engine = `engine: ripgrep (${gate.label})`;
       const header =
         `模式 ${'`'}${pattern}${'`'} · 命中 ${hits.length} 处 / 文件 ${new Set(hits.map((h) => h.relPath)).size} 个 · ` +
-        `context=${contextLines}${ignoreCase ? ' · 忽略大小写' : ''}${fixedStrings ? ' · 字面量' : ''}`;
+        `context=${contextLines}${ignoreCase ? ' · 忽略大小写' : ' · 区分大小写'}${fixedStrings ? ' · 字面量' : ''}`;
       return ok(renderHits(limited, engine, header) + truncationNote(limited.length, maxResults));
     },
   };
@@ -335,8 +350,8 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
       type: 'object',
       properties: {
         pattern: { type: 'string', description: '文件名模式，支持 * 与 ?，如 "*.test.ts"；也给字面量子串如 "config"' },
-        path: { type: 'string', description: '限定搜索目录，默认工作目录根' },
-        max_results: { type: 'integer', description: '最多返回多少个文件，默认 100' },
+        path: { type: 'string', description: `限定搜索目录（相对工作根），默认工作根。${PATH_BOUNDARY_HINT}` },
+        max_results: { type: 'integer', description: '最多返回多少个文件，默认 100；传 0 表示只报数量、不列文件' },
         match_path: { type: 'boolean', description: 'true 时对整个路径匹配而不是只匹配文件名，默认 false' },
         ignore_case: { type: 'boolean', description: '忽略大小写，默认 true' },
       },
@@ -351,24 +366,42 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
       if (args === null) return invalidArgs('es_search', '期望一个对象，例如 {"pattern": "*.test.ts"}');
       const pattern = readString(args, 'pattern');
       if (pattern === null || pattern === '') return invalidArgs('es_search', '缺少 pattern');
-      const maxRes = readOptionalInt(args, 'max_results', 1, 2000);
+      // max_results 的最小值是 **0**（旧实现是 1，`max_results:0` 直接报参数错）：devkit 把
+      // 0 定义为"只统计不返回列表"（`tools/es_search.py:220`、`:275-276`），它的 schema 里
+      // 这个 0 是写明的默认边界之一。模型在"先探一下有多少个"的场景会真的用 0。
+      const maxRes = readOptionalInt(args, 'max_results', 0, 2000);
       if ('error' in maxRes) return invalidArgs('es_search', maxRes.error);
       const maxResults = maxRes.value ?? 100;
+      // 0 = 只要数量：es.exe 那边就不加 `-n`（与源 `if max_results > 0` 同判据），
+      // 但**结果一条都不列**——这正是她传 0 时要的东西，也是它省上下文的地方。
+      const countOnly = maxResults === 0;
       const matchPath = readOptionalBool(args, 'match_path') ?? false;
       const ignoreCase = readOptionalBool(args, 'ignore_case') ?? true;
 
       const pathInput = readOptionalString(args, 'path') ?? '.';
-      const guarded = await resolveInsideRoot(ctx.workspaceRoot, pathInput, {
+      const guarded = await resolveGuarded(env, ctx, pathInput, {
         purpose: 'es_search',
         requireDirectory: true,
       });
-      if (!guarded.ok) return fail(guarded.code, guarded.reason);
+      // 错误消息给一句出路（0 token：结果不进 tools 段，行为一个字不动）：
+      // es 的实参是 `-path <dir>`，给它文件只会返回空——所以"只吃目录"这条要**拦在前面**，
+      // 而 path-guard 只说"不是目录"、没有下一步。传文件进来时她要做的正是 rg_search（P3 之后它吃文件）。
+      if (!guarded.ok) {
+        return fail(
+          guarded.code,
+          guarded.reason
+          + (guarded.code === FS_ERROR_CODES.NOT_A_DIRECTORY
+            ? '；es_search 只按文件名搜目录，要按内容搜这个文件请用 rg_search（它吃文件操作数）'
+            : ''),
+        );
+      }
       const searchRoot = guarded.path;
       const patternText = pattern;
       if (ctx.signal.aborted) return ABORTED_RESULT;
 
       // es 的 -i 表示「区分大小写」，与 rg 相反；忽略大小写时不能加
-      const esArgs = ['-n', String(maxResults), '-path', searchRoot];
+      // `-n` 只在 max_results > 0 时给（源 `tools/es_search.py:275-276` 同判据）
+      const esArgs = countOnly ? ['-path', searchRoot] : ['-n', String(maxResults), '-path', searchRoot];
       if (!ignoreCase) esArgs.push('-i');
       if (matchPath) esArgs.push('-p');
       esArgs.push('--', patternText);
@@ -400,9 +433,14 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
         .split(/\r?\n/u)
         .map((line) => line.trim())
         .filter((line) => line !== '');
-      const limited = found.slice(0, maxResults);
       const engine = `engine: everything (${gate.label})`;
       const header = `模式 ${'`'}${patternText}${'`'} · 命中 ${found.length} 个文件`;
+      // max_results=0：只报数量。**一条路径都不列**——这是"先探一下有多少个"的调用，
+      // 列出来就等于没省（而省上下文正是她传 0 的目的）。
+      if (countOnly) {
+        return ok(`${engine}\n${header}\n（max_results=0：只统计不列文件；要看清单请传 max_results≥1）`);
+      }
+      const limited = found.slice(0, maxResults);
       const body = limited.map((p) => relative(ctx.workspaceRoot, p).replaceAll('\\', '/')).join('\n');
       return ok(`${engine}\n${header}\n\n${body}${found.length === 0 ? '(无命中)' : ''}${truncationNote(limited.length, maxResults)}`);
     },

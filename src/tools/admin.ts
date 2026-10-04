@@ -1,8 +1,9 @@
 /**
  * Irmia Agent — 管理工具包（docs/design.md §4.10 / §4.11 / §4.20 / §4.21 / §6）
  *
- * 九件工具：write_persona / set_timer / cancel_timer / list_timers / speak / report / todo /
- * read_channel / ask_human。它们的共同点是"改变 Agent 自身、对外发声、问人、或看外面发来的东西"，
+ * 八件工具（v35 起 `set_timer` / `cancel_timer` / `list_timers` 三件并成一件 `timer`）：
+ * write_persona / timer / speak / report / todo / read_channel / send_media / ask_human。
+ * 它们的共同点是"改变 Agent 自身、对外发声、问人、或看外面发来的东西"，
  * 而不是读写文件——所以全部走注入的出口（事件写入口、定时器、告警、回投、日志读取），
  * 本模块不直接碰 EventLog，也不自己分配 seq。
  *
@@ -32,7 +33,7 @@
 
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { mkdir, open, rename, rm } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve, sep } from 'node:path';
 
 import type { StoredTimerEntry, TimerSetInput, TimerStore } from '../wake/timer-store.js';
@@ -50,7 +51,13 @@ import {
 import { CHAT_TYPE_LABELS, channelForNamespace, normalizeSid, parseSid, sessionLabelOf, type SessionEntry } from '../channel/sessions.ts';
 import { renderExternalEvent } from '../model/render.ts';
 import { normalizePersonaAsset } from '../persona/loader.ts';
+// 待办的载体只有一处：`STATE.md` 的两节。解析 / 渲染 / 最小替换都在那个模块里（不在这里另写一份）
+import { TODO_SECTIONS, planTodoWrite } from '../persona/todo-state.ts';
 import { charCount, splitForChat } from './chat-split.ts';
+// 局部替换复用 safe_edit 的编辑内核（匹配 / 消歧 / 行号前缀防呆）：两处各写一套，
+// "找不到怎么办、多匹配怎么办"迟早给出两种答案——那种不一致只有她撞上时才会被发现。
+import { planEdit } from './fs/edit-core.ts';
+import { toErrorMessage } from './fs/types.ts';
 import type { ToolContext, ToolDefinition, ToolHandlerResult } from './types.js';
 import {
   TOOL_ERROR_CODES,
@@ -122,9 +129,74 @@ function waitBudgetText(ms: number): string {
 export const TODO_STATUSES: readonly TodoItem['status'][] = ['pending', 'in_progress', 'completed'];
 
 const TODO_SINGLE_CONTENT_MAX = 500;
-/** speak 的建议长度：desc 里说的「一次最多 40 字」 */
-const SPEAK_TEXT_MAX = 25;
-/** 硬上限：只是防它把整篇报告塞进来；稍微超过不拒，只在结果里提醒 */
+/**
+ * 待办清单的载体（`STATE.md`，相对 `personaRoot`）。
+ *
+ * 为什么把它写成常量而不是散在 handler 里：`todo` 与任务卡读取侧**必须指同一个文件**——
+ * 一边写 `STATE.md`、另一边读别的名字，症状是"她记了、但看板永远空着"，而且不报错。
+ */
+const TODO_CARRIER_FILE = 'STATE.md';
+/**
+ * speak 的说话风格目标：**描述里那句「N 字内」的唯一来源**（描述由它拼出来，不许在描述里手写一个数）。
+ *
+ * **25 是用户定的说话风格目标，不是从日志里测出来的分位数。** 他要的是短句、
+ * 像打字聊天：一次说一件事、最多两个逗号（描述里那三句就是他的口径）。
+ *
+ * 所以别拿 `data/events/*.jsonl` 的实测分布来"纠正"这个数。这一处被纠过两次，
+ * 两次都是同一个错——把"她多数时候写得更长"当成"这个数不合理"，于是擅自放宽。
+ * 实测分布对**提醒该多密**有用（提醒太密会变成每轮重发的噪声），对**目标该定多少**
+ * 没有发言权：目标的价值就在于它比现状短，超了说明她该往回收，而不是说明目标该改。
+ *
+ * 那 469 次调用的 p50=31 / p90=66（口径见 `_research/tools-audit-usage.mjs`）
+ * 只解释了一件事：提醒**不能**按"越过目标就发"来判，否则 69% 的调用都在被追一句。
+ * 实测走的是 `SPEAK_TEXT_REMIND_MAX`，它与这个数**脱钩**（2026-10-05 用户定：两条线都是 25），
+ * 所以要调提醒的密度就单独调那一个常量，别动这个数。
+ */
+export const SPEAK_TEXT_SUGGESTED_MAX = 25;
+/**
+ * 提醒线：越过它就追一句，把话头引回上面的说话风格目标。
+ *
+ * **这条线的作用是纠偏，不是"打脸"**：它是一句提醒，不是一次判错登记。
+ * 回执里那句话的用处是让她知道"这么长已经不像我平时说话了"，好把话收短；
+ * 说成"你超出了上限"是在数落她，说成"你做不到"更是错的——目标定了就是让她往那儿走。
+ *
+ * 与建议线**脱钩**（两条线现在都取 25，但不是一个概念，见 SPEAK_TEXT_SUGGESTED_MAX）：
+ * 建议线是"往哪儿说"，提醒线是"多长才值得追一句"。分开的唯一理由是**提醒的密度**：
+ * 实测 469 次调用里越过 150 字的只有 8 次（1.7%），而按"越过目标就提醒"是 324 次（69%）
+ * ——那段话跟着工具结果留在历史里（之后每轮重发），还是每次都在打断她。
+ * 用户 2026-10-05 把两条线一起定回 25：他宁愿每次超 25 都被提醒一句，也不要她在长话上失去纠偏。
+ *
+ * ① **节奏预算**（提醒之外另一条真实边界）：默认 90 字/分 × 一趟总预算 90s ⇒ 约 135 字之后
+ *    剩下的段不再等（见 SPEAK_TOTAL_BUDGET_MS）——过了那条线，"像人打字"这个节奏已经做不到了；
+ * ② **语域边界**：`report` 实测最短一次 135 字（docs/tools-audit.md §2.6）——再长本来就该走 report。
+ */
+export const SPEAK_TEXT_REMIND_MAX = 25;
+/**
+ * **超过它就不再按标点自动分段**：整段一次发出去。
+ *
+ * 分段本身是"像人打字"的节奏（按 `charCount` 在每个逗号与句号处断开，逐条发），
+ * 但那个节奏只对短话成立：45 字以上再按标点切，读起来是**刷屏**，而且切点会越来越随意
+ * （话越长，标点越不像意群边界——同一口气被切碎）。长话整条发出，形状反而接近
+ * "他发来一条很长的消息"，而不是"她连发七八条"。
+ *
+ * **45 的来历**：用户 2026-10-05 定"超过 45 就不自动分段了"。阈值取在**分段的最大收益点**上——
+ * 45 字以内的短话切出来是自然的意群（一句话本来就该一口气说完）；46 字起才切，切出来的段
+ * 已经长于"一次说一件事"的量，剩下的只是机械地按标点数数。所以这条线是**分段形态**的分界，
+ * 不是说话风格的分界。
+ *
+ * **它与 25 / 提醒线不是一个概念，别混成一个**：
+ *   • 25（`SPEAK_TEXT_SUGGESTED_MAX`）= **目标**——她该往哪儿说（越短越好，像打字聊天）；
+ *   • 45（本常量）= **分段的上限**——切与不切的那一刀，与"该说多长"无关；
+ *   • 提醒线（`SPEAK_TEXT_REMIND_MAX`）= **纠偏的密度**——多久追她一句。
+ * 两者会同时出现在一段 30~45 字的文本上：**切照切、提醒照发**（分段是形态，提醒是引导），
+ * 所以"提醒了还分段"不是矛盾，也不需要谁让谁。
+ *
+ * 判据用 `charCount`（中文计字口径：emoji 算一个字）而不是 `text.length`：后者会把 emoji
+ * 数成两个，于是同一段话在带表情时提前越过 45。**边界是精确的**：正好 45 字仍分段，
+ * 46 字起不分段——测试 `test/admin-pwsh.test.ts` 钉住了这两侧。
+ */
+export const SPEAK_SEGMENT_MAX = 45;
+/** 硬上限：只是防它把整篇报告塞进来；稍微超过不拒，只在结果里提醒（那条提醒见 SPEAK_TEXT_REMIND_MAX） */
 const SPEAK_TEXT_HARD_MAX = 400;
 /** report 的上限：正式内容允许长，与 speak 差三个量级 */
 const REPORT_TEXT_MAX = 64000;
@@ -526,17 +598,26 @@ export interface AdminToolsOptions {
 
 export const ADMIN_TOOL_NAMES = [
   'write_persona',
-  'set_timer',
-  'cancel_timer',
-  'list_timers',
+  'timer',
   'speak',
   'report',
   'todo',
   'read_channel',
+  // send_media 从 2026-10-03 起就在这个包里注册，但一直没进这份名单——
+  // 于是 `byName('send_media')` 在类型上不可达（只有运行期的 Map 认得它）。顺手补齐。
+  'send_media',
   'ask_human',
 ] as const;
 
 export type AdminToolName = (typeof ADMIN_TOOL_NAMES)[number];
+
+/**
+ * 合并后的定时器工具名（v35：`set_timer` / `cancel_timer` / `list_timers` 三件并成这一件）。
+ *
+ * 它是个**对外可见的字面量**：authz 的名单、交接笔记的归类、GUI 的图标表都要跟着它。
+ * 别处引用时优先导入这个常量，而不是再抄一遍 `'timer'`。
+ */
+export const TIMER_TOOL_NAME = 'timer';
 
 // ──────────────────────────────── read_channel 的注入点 ────────────────────────────────
 
@@ -928,7 +1009,8 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
     description:
       '改你自己的人格资产（persona/*.md）——persona/ 唯一写通道。'
       + 'IDENTITY.md、CONSTITUTION.md 只读；STYLE.md 只能写 proposals/STYLE.md 提提案；'
-      + 'STATE.md、RELATIONSHIPS/*.md 可直接写。整体替换；按需层超 4KB 警告。',
+      + 'STATE.md、RELATIONSHIPS/*.md 可直接写。给 content 整体替换，或给 old/new 只换那一段'
+      + '（改动同样记 persona/updated）；按需层超 4KB 警告。',
     parameters: {
       type: 'object',
       properties: {
@@ -936,9 +1018,11 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
           type: 'string',
           description: 'persona/ 内的相对路径，必须 .md，例如 "STATE.md"、"STYLE.md"、"RELATIONSHIPS/alex.md"',
         },
-        content: { type: 'string', description: '文件完整的新内容（整体替换）' },
+        content: { type: 'string', description: '整体替换：文件完整的新内容（与 old/new 二选一）' },
+        old: { type: 'string', description: '局部替换：要被替换的原文（与 new 配对；唯一命中才动手）' },
+        new: { type: 'string', description: '局部替换：替换后的新文本（空串 = 删掉这一段）' },
       },
-      required: ['file', 'content'],
+      required: ['file'],
       additionalProperties: false,
     },
     executionMode: 'exclusive',
@@ -948,11 +1032,32 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
       try {
         const args = argsRecord(rawArgs, 'write_persona');
         const file = requiredString(args, 'file', { maxLength: 512 });
-        const rawContent = requiredString(args, 'content', { allowEmpty: true });
-        // 落盘前统一字节形状（行尾 / BOM / 多余尾部空行）：人格文件不该因为"谁写的"
-        // 而产生两种字节——那会让同一份内容在换人编辑后让整个请求重新落盘
-        const content = normalizePersonaAsset(rawContent);
 
+        // 两种形态二选一（P2，2026-10-04）：`content` 整体替换 / `old`+`new` 只换一段。
+        //
+        // 为什么必须补上第二种：实测 STATE.md 被改 87 次，其中 **62 次（71%）走的是 safe_edit**，
+        // 而那条路不写 `persona/updated`、也不进人格版本库——"persona/ 唯一写通道"这句话
+        // 从来没在代码里落过。她走 safe_edit 不是不守规矩，是**理性**：改一行要重吐整篇
+        // 65~72 行的 STATE.md，输出贵、抄错几率大。只堵洞（见 catalog 的只读区）不加形态，
+        // 等于把"审计问题"换成"质量与成本问题"，所以两件必须同批。
+        const hasContent = typeof args['content'] === 'string';
+        const hasOld = typeof args['old'] === 'string';
+        const hasNew = typeof args['new'] === 'string';
+        if (hasContent && (hasOld || hasNew)) {
+          return errorResult(
+            'content 与 old/new 二选一：整体替换给 content，只改一段给 old+new（两个都给我不知道你想怎样）。',
+            TOOL_ERROR_CODES.invalidArgs,
+          );
+        }
+        if (!hasContent && !hasOld) {
+          return errorResult(
+            '要写什么没给：整体替换给 content（完整的新内容），只改一段给 old（要被替换的原文）+ new。',
+            TOOL_ERROR_CODES.invalidArgs,
+          );
+        }
+
+        // 四种门（.md / 保护 / 提案）先跑完再碰盘：局部替换要读原文，但读之前就该知道
+        // 这个文件到底许不许写——顺序反了，错误消息会变成"读不到"而不是"你不许改"。
         const target = resolvePersonaPath(personaRootOf(ctx), file);
         if (!target.display.toLowerCase().endsWith(PERSONA_FILE_SUFFIX)) {
           return errorResult(
@@ -981,6 +1086,51 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
           );
         }
 
+        // 到这里才取内容：整体替换来自参数，局部替换要读盘再规划。
+        // 落盘前统一字节形状（行尾 / BOM / 多余尾部空行）：人格文件不该因为"谁写的"
+        // 而产生两种字节——那会让同一份内容在换人编辑后让整个请求重新落盘
+        let rawContent: string;
+        let editNote = '';
+        if (hasContent) {
+          rawContent = args['content'] as string;
+        } else {
+          let original: string;
+          try {
+            original = await readFile(target.absolute, 'utf8');
+          } catch (err) {
+            return errorResult(
+              `${target.display} 还读不到（${toErrorMessage(err)}）。`
+              + '局部替换只改已存在的文件；第一次写这个文件请用 content 给完整内容。',
+              TOOL_ERROR_CODES.writeFailed,
+            );
+          }
+          // 匹配 / 消歧 / 行号前缀防呆全部复用 safe_edit 的同一份内核（`planEdit`）：
+          // 两处各写一套"找不到怎么办、多匹配怎么办"，迟早给出两种答案。
+          const planned = planEdit(original, {
+            mode: 'replace',
+            old: args['old'] as string,
+            new: hasNew ? (args['new'] as string) : '',
+          });
+          if (!planned.ok) {
+            const where = planned.matches === undefined || planned.matches.length === 0
+              ? ''
+              : `\n命中 ${planned.matches.length} 处：${planned.matches.slice(0, 5).map((m) => `第 ${m.line} 行`).join('、')}`
+                + (planned.matches.length > 5 ? ' …' : '')
+                + '\n要改的如果不止一处，把 old 写长一点带上前后文让它唯一，或改用 content 整体替换。';
+            return errorResult(
+              `局部替换没动手：${planned.message}${where}`
+              + '\n先 safe_read 确认原文——行首空白与换行符也算内容。',
+              planned.code,
+            );
+          }
+          rawContent = planned.text;
+          editNote = `\n[局部替换] ${planned.summary}`
+            + (planned.fuzzy
+              ? '（走的是**缩进容错**：命中的不是逐字相同的那一段，而是缩进差 1~2 格的同一段）'
+              : '');
+        }
+        const content = normalizePersonaAsset(rawContent);
+
         const bytes = Buffer.byteLength(content, 'utf8');
         if (bytes > PERSONA_HARD_LIMIT_BYTES) {
           return errorResult(
@@ -1005,6 +1155,7 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
           );
         }
         const head = `已写入 ${target.display}：${bytes} 字节，sha256 ${diffHash.slice(0, 16)}，已记录 persona/updated。`
+          + editNote
           + (content === rawContent
             ? ''
             : '\n[已规范化] 行尾统一为 LF、去掉了 BOM 与多余尾部空行。'
@@ -1016,22 +1167,132 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
     },
   };
 
-  // ── 定时器三件 ──
+  // ── 定时器：一件工具、三个动作（v35 合并）──
+  //
+  // 合并前是三件（`set_timer` / `cancel_timer` / `list_timers`），四天实测合起来只有 8 次调用
+  // （set 2 / list 6 / cancel 0），却常驻 269 token（三份 name + description + schema，
+  // 每一步请求都在付）。合并的根据与取舍见 docs/tools-audit.md §3.4 与 docs/design.md §4.18。
+  //
+  // **三个能力一个都不能丢**，尤其是：
+  //   · `list`——她真的在用（三件里调用最多的一件）；
+  //   · `cancel`——误排之后唯一的撤销出口（零调用不等于没用：删了它只剩徒手改
+  //     `data/timers.json` 一条路，而那是她的核心资产）。
+  //   合并的是**入口**，不是能力。
+  //
+  // **名字取中性的 `timer`，不保留 `set_timer`**：三个动作里"设"只占一个，一件叫 `set_timer`
+  // 的工具去 `list` 是名字与动作打架——她得多记一条"列定时器藏在 set_timer 底下"，而
+  // `list` 恰恰是三者里最常用的。中性的名词对三个动作一视同仁，也让 `action` 读起来自然。
+  //
+  // **判据只做一处**：`action` 是同一个枚举（下面的 TIMER_ACTIONS）、同一个必填校验
+  // （readTimerAction），三个动作共用同一组参数读取（optionalString / requiredString）、
+  // 同一个结果出口（okResult / errorResult）与同一个异常兜底（errorResultFromThrown）。
+  // 不允许出现"三个分支各说各话"——那种不一致只有她撞上时才会被发现。
+  //
+  // **action 必填、没有默认动作**：这是合并带来的唯一新失败模式（少写一个字段），
+  // 而"默认成 set"会让 `timer {at: …}` 这种漏写静默生效成布防。必填 + 一条说清三个取值的
+  // 报错，比一个猜出来的默认动作安全。（她原来的习惯写法 `set_timer {at: …}` 现在会得到
+  // 一句"缺少必填参数 action"，改一次就好。）
 
-  const setTimer: ToolDefinition = {
-    name: 'set_timer',
+  /** 一条调用的三个动作。取值即 `action` 的枚举，报错文案也从它拼出来（不手写第二份） */
+  const TIMER_ACTIONS = ['set', 'cancel', 'list'] as const;
+  type TimerAction = (typeof TIMER_ACTIONS)[number];
+
+  /**
+   * 读 `action`：**唯一的动作判据**。缺字段与非法取值分别给一句能照着改的话。
+   *
+   * 缺字段走 `requiredString`（"缺少必填参数 action"，与全仓其它工具同一条措辞）；
+   * 非法取值单独判——`requiredString` 只保证"有个非空字符串"，而 `action=frobnicate`
+   * 必须报"只能是 set / cancel / list"，否则她只会看到一句语焉不详的失败。
+   */
+  const readTimerAction = (args: Record<string, unknown>): TimerAction => {
+    const action = requiredString(args, 'action', { maxLength: 16 });
+    if (!(TIMER_ACTIONS as readonly string[]).includes(action)) {
+      throw new ToolArgumentError(
+        'action',
+        `timer 的 action 只能是 ${TIMER_ACTIONS.join(' / ')}，收到 ${JSON.stringify(action)}：`
+        + 'set 布防、cancel 撤销、list 列出当前未触发的。',
+      );
+    }
+    return action as TimerAction;
+  };
+
+  /** action=set：布防（at 一次性 / cron 周期，两者给定时以 at 为准——TimerStore 的既有语义） */
+  const setTimerAction = async (args: Record<string, unknown>): Promise<ToolHandlerResult> => {
+    const at = optionalString(args, 'at', { maxLength: 64 });
+    const cron = optionalString(args, 'cron', { maxLength: 128 });
+    if (at === undefined && cron === undefined) {
+      return errorResult(
+        'timer 的 action=set 需要 at 或 cron 至少一个：at 做一次性定时（带时区的 ISO 8601），'
+        + 'cron 做周期定时（五段）。只想看现在有哪些定时器就用 action=list。',
+        TOOL_ERROR_CODES.invalidArgs,
+      );
+    }
+    const input: TimerSetInput = {
+      ...(at === undefined ? {} : { at }),
+      ...(cron === undefined ? {} : { cron }),
+      ...(args['payload'] === undefined ? {} : { payload: args['payload'] }),
+    };
+    const result = await timers.set(input);
+    if (!result.ok) {
+      return errorResult(`定时器未布防：${result.error}`, TOOL_ERROR_CODES.invalidArgs);
+    }
+    const entry = timers.get(result.id);
+    const due = entry === null ? '（表项缺失）' : entry.at;
+    const kind = cron === undefined || at !== undefined ? '一次性' : `周期（${cron}）`;
+    return okResult(
+      `定时器已布防：id=${result.id}，${kind}，下次到期 ${due}。`
+      + '撤销用同一条工具的 action=cancel 加这个 id。',
+    );
+  };
+
+  /** action=cancel：按 id 撤销。id 不在表里不算错（可能已触发/已取消），但要给出下一步 */
+  const cancelTimerAction = async (args: Record<string, unknown>): Promise<ToolHandlerResult> => {
+    const timerId = requiredString(args, 'timer_id', { maxLength: 200 });
+    const removed = await timers.cancel(timerId);
+    if (!removed) {
+      return okResult(
+        `定时器 ${timerId} 不在表里（可能已触发、已被取消或 id 不对）。`
+        + '用同一条工具的 action=list 看当前有哪些。',
+      );
+    }
+    return okResult(`定时器 ${timerId} 已取消并从表里移除。`);
+  };
+
+  /** action=list：列出未触发的（含周期条的下一拍），按到期先后——每行都带 id，撤销要用它 */
+  const listTimersAction = (args: Record<string, unknown>): ToolHandlerResult => {
+    // 这个动作没有自己的参数；多给的字段照旧不认（additionalProperties:false 是 schema 那一侧的事，
+    // 这里只确认入参是个对象——判据与另外两个动作同一条入口）
+    void args;
+    const entries = timers.list();
+    if (entries.length === 0) {
+      return okResult('当前没有任何未触发的定时器。布防用同一条工具的 action=set（at 一次性 / cron 周期）。');
+    }
+    return okResult(`定时器 ${entries.length} 个（按到期先后）：\n${entries.map(describeTimer).join('\n')}`);
+  };
+
+  const timer: ToolDefinition = {
+    name: TIMER_TOOL_NAME,
+    // 58 token（<60 的那条收紧线钉着这一件，见 test/tool-catalog.test.ts）：三个动作一句一个，
+    // list 列出什么、cancel 拿什么去撤都写在这份说明书里——她看到的就是这一份。
     description:
       '定时器：到点以 wake/timer 唤醒你自己（不是提醒用户）。'
-      + 'at 一次性（带时区 ISO 8601，如 2026-09-30T14:00:00+08:00）；'
-      + 'cron 周期（五段：分 时 日 月 周），自动结算下一次。payload 回注给未来的你。',
+      + 'action 三选一：set 布防（at 一次性 / cron 周期）；'
+      + 'list 列出未触发的（含周期下一拍、按到期先后、带 id）；'
+      + 'cancel 按 id 撤销，id 见回执。',
     parameters: {
       type: 'object',
       properties: {
-        at: { type: 'string', description: '带时区的 ISO 8601 绝对时刻，例 2026-09-30T14:00:00+08:00' },
-        cron: { type: 'string', description: '五段 cron（分 时 日 月 周），例 "0 9 * * 1-5"' },
-        payload: { description: '到期时回注的任意 JSON 值，用于让未来的你知道这次要做什么' },
+        action: {
+          type: 'string',
+          enum: [...TIMER_ACTIONS],
+          description: 'set 布防 / cancel 撤销 / list 列出未触发的',
+        },
+        at: { type: 'string', description: 'set：带时区的 ISO 8601 绝对时刻，例 2026-09-30T14:00:00+08:00' },
+        cron: { type: 'string', description: 'set：五段 cron（分 时 日 月 周），例 "0 9 * * 1-5"' },
+        payload: { description: 'set：到期时回注给未来的你的任意 JSON 值' },
+        timer_id: { type: 'string', description: 'cancel：要撤的那个 id（set 与 list 的回执里都有）' },
       },
-      required: [],
+      required: ['action'],
       additionalProperties: false,
     },
     executionMode: 'parallel',
@@ -1039,78 +1300,12 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
     timeoutMs: 5_000,
     handler: async (rawArgs): Promise<ToolHandlerResult> => {
       try {
-        const args = argsRecord(rawArgs, 'set_timer');
-        const at = optionalString(args, 'at', { maxLength: 64 });
-        const cron = optionalString(args, 'cron', { maxLength: 128 });
-        if (at === undefined && cron === undefined) {
-          return errorResult(
-            'set_timer 需要 at 或 cron 至少一个：at 做一次性定时（带时区的 ISO 8601），cron 做周期定时（五段）。',
-            TOOL_ERROR_CODES.invalidArgs,
-          );
-        }
-        const input: TimerSetInput = {
-          ...(at === undefined ? {} : { at }),
-          ...(cron === undefined ? {} : { cron }),
-          ...(args['payload'] === undefined ? {} : { payload: args['payload'] }),
-        };
-        const result = await timers.set(input);
-        if (!result.ok) {
-          return errorResult(`定时器未布防：${result.error}`, TOOL_ERROR_CODES.invalidArgs);
-        }
-        const entry = timers.get(result.id);
-        const due = entry === null ? '（表项缺失）' : entry.at;
-        const kind = cron === undefined || at !== undefined ? '一次性' : `周期（${cron}）`;
-        return okResult(`定时器已布防：id=${result.id}，${kind}，下次到期 ${due}。取消用 cancel_timer。`);
-      } catch (err) {
-        return errorResultFromThrown(err, TOOL_ERROR_CODES.invalidArgs);
-      }
-    },
-  };
-
-  const cancelTimer: ToolDefinition = {
-    name: 'cancel_timer',
-    description: '取消一个已布防的定时器（用 set_timer 返回的 id）。返回它是否真的存在过。',
-    parameters: {
-      type: 'object',
-      properties: { timer_id: { type: 'string', description: 'set_timer 返回的定时器 id' } },
-      required: ['timer_id'],
-      additionalProperties: false,
-    },
-    executionMode: 'parallel',
-    sideEffect: 'idempotent',
-    timeoutMs: 5_000,
-    handler: async (rawArgs): Promise<ToolHandlerResult> => {
-      try {
-        const args = argsRecord(rawArgs, 'cancel_timer');
-        const timerId = requiredString(args, 'timer_id', { maxLength: 200 });
-        const removed = await timers.cancel(timerId);
-        if (!removed) {
-          return okResult(
-            `定时器 ${timerId} 不在表里（可能已触发、已被取消或 id 不对）。用 list_timers 看当前有哪些。`,
-          );
-        }
-        return okResult(`定时器 ${timerId} 已取消并从表里移除。`);
-      } catch (err) {
-        return errorResultFromThrown(err, TOOL_ERROR_CODES.invalidArgs);
-      }
-    },
-  };
-
-  const listTimers: ToolDefinition = {
-    name: 'list_timers',
-    description: '列出当前所有未触发的定时器（含周期条的下一拍）与它们的内容，按到期先后排序。',
-    parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
-    executionMode: 'parallel',
-    sideEffect: 'idempotent',
-    timeoutMs: 5_000,
-    handler: async (rawArgs): Promise<ToolHandlerResult> => {
-      try {
-        argsRecord(rawArgs, 'list_timers');
-        const entries = timers.list();
-        if (entries.length === 0) {
-          return okResult('当前没有任何未触发的定时器。用 set_timer 布防（at 一次性 / cron 周期）。');
-        }
-        return okResult(`定时器 ${entries.length} 个（按到期先后）：\n${entries.map(describeTimer).join('\n')}`);
+        // 一处入口：参数是对象 → 读出动作 → 分派。三个动作的结果形状因此完全一致
+        const args = argsRecord(rawArgs, TIMER_TOOL_NAME);
+        const action = readTimerAction(args);
+        if (action === 'set') return await setTimerAction(args);
+        if (action === 'cancel') return await cancelTimerAction(args);
+        return listTimersAction(args);
       } catch (err) {
         return errorResultFromThrown(err, TOOL_ERROR_CODES.invalidArgs);
       }
@@ -1122,13 +1317,17 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
   const speak: ToolDefinition = {
     name: 'speak',
     description:
-      '跟人说话用这个（日常闲聊）——一次 25 字内、最多两个逗号，一轮一次就够：'
-      + '整段交给它，它按打字速度在每个逗号与句号处断开发出去。'
+      `跟人说话用这个（日常闲聊）——一次说一件事、${SPEAK_TEXT_SUGGESTED_MAX} 字内、最多两个逗号，一轮一次就够：`
+      + '整段交给它，按打字节奏自动断句发出去。'
       + '别反复调它堆话，长内容用 report；不调它，人听不到你。',
     // 描述不许写长：它进 tools 那一段（请求的缓存前缀），且 `tool-catalog` 有一条
     // **<60 token** 的硬线（本轮口径，与另外六件一起算）。所以分段的细则
     // （顿号不断、成对符号里不断、不足 12 字整段一条）**只写在 `chat-split.ts` 里**，
     // 不往这里塞——那些是她写标点时自然就会写对的规则，不需要她背。
+    //
+    // 那个字数上限**由 SPEAK_TEXT_SUGGESTED_MAX 拼进来**，不许在描述里手写：描述与判据
+    // 必须同源。它同时是**说话风格目标**（用户定的 25 字、短句、像打字聊天），不是从实测
+    // 分布里挑的分位数——别照着日志里的 p90 把它放宽（那一版被纠过，见该常量的注释）。
     parameters: {
       type: 'object',
       properties: {
@@ -1157,7 +1356,11 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
       try {
         const args = argsRecord(rawArgs, 'speak');
         const text = requiredString(args, 'text', { maxLength: SPEAK_TEXT_HARD_MAX });
-        const overSuggested = text.length > SPEAK_TEXT_MAX;
+        // 提醒：越过提醒线就追那一句。**它是纠偏，不是判错**——那句话只该把话头引回
+        // "一次说一件事、像打字聊天"的目标，不该说成"你超了上限"（更不该说成"你做不到"）。
+        // 提醒线与建议线**脱钩**（2026-10-05 用户定：两条都是 25），所以改提醒的密度
+        // 只动 SPEAK_TEXT_REMIND_MAX，不要连建议线一起动——后者是用户定的说话风格。
+        const overRemindLine = text.length > SPEAK_TEXT_REMIND_MAX;
         const level = readNotifyLevel(args);
         const chars = text.length;
         const lines: string[] = [];
@@ -1189,7 +1392,11 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         //
         // 说话期间人又开口了（`ctx.interrupt`）就立刻停：已经发出去的收不回来，没发的
         // 一段都不发，并在回执里如实告诉她——那条回执是给她重新组织语言的依据。
-        const segments = splitForChat(text);
+        // 分段与不分段的分界（`SPEAK_SEGMENT_MAX`，用户 2026-10-05 定的口径）：
+        // **45 字以内才按标点切**（切出来是自然的意群，逐条发就是"她在打字"）；
+        // **46 字起整条一次发出**——长话再切是刷屏，而且切点越来越随意。
+        // 只有这一处判定，别在下面再写一套：分段规则全在 `chat-split.ts` 里。
+        const segments = charCount(text) > SPEAK_SEGMENT_MAX ? [text] : splitForChat(text);
         const typing = options.speakTyping ?? DEFAULT_SPEAK_TYPING;
         const perCharMs = typing.typingEffect ? 60_000 / typing.charsPerMinute : 0;
         /** 这一条投递回执的归并键：`read_channel` 按它把一次 speak 归成一行（见 SpeakSentPayload） */
@@ -1324,9 +1531,12 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
             : `已发往 ${targetLabel}（sid ${target.url}）：${sent} 条`);
         }
         return okResult(`发言已处理：\n${lines.map((line) => `- ${line}`).join('\n')}`
-          + (overSuggested
-            ? `\n\n提醒：这段 ${text.length} 字，超过 speak 的建议上限 ${SPEAK_TEXT_MAX} 字。`
-              + '下次话多就分成几次调 speak——一次只说一小段，更像人在聊天，也不会被切得七零八落。'
+          + (overRemindLine
+            // 措辞是**纠偏**，不是判错：说"这段偏长、往回收"，不说"你超了上限"（更不说"做不到"）。
+            // 顺带给出去路（拆成几次 / 正式内容走 report），否则她只收到一句"太长了"。
+            ? `\n\n提醒：这段 ${text.length} 字，比平时说话长了些（speak 的风格是一次说一件事、`
+              + `${SPEAK_TEXT_SUGGESTED_MAX} 字内）。能拆成几次说就拆；`
+              + '正式内容直接走 report——speak 的断句与打字节奏是按短话设计的。'
             : ''));
       } catch (err) {
         return errorResultFromThrown(err, TOOL_ERROR_CODES.notConfigured);
@@ -1412,19 +1622,43 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
   };
 
   // ── todo ──
-
+  //
+  // 2026-10-04 用户的口径（「state……甚至就应该取代 todo」→「或者说合并」）：**别再有第二本账**。
+  // 所以这个工具的名字与调用方式一个字节没变（`items` 仍是全量替换），但它现在把清单**写进
+  // `STATE.md` 的两节**（`## 当前任务` / `## 接着干`），而不是另起一份投影里的 todoList。
+  // 任务卡（此刻层那条 `当前任务：…` + `未完成计划：`）只从这两节渲染——显示单源。
+  //
+  // 写通道与 `write_persona` **同一条**（`persona/updated` + `onPersonaUpdated`），但落盘前多一道
+  // **计划**：`planTodoWrite` 只替换那两节的正文区间，其余字节一个不动；定位不到就如实报错，
+  // 绝不退回"整份重写"（那会静默毁掉她写在 STATE 里的别的东西）。
+  //
+  // ## 描述为什么这么短（这一段是给下一个想把它写详细的人看的）
+  //
+  // 描述是**常驻开销**（每轮请求都带），而 `registry.register` 有一条 **100 token** 的硬门，
+  // 超了直接抛错 → `buildCatalogRegistry` 把这条记进 `problems` 并**跳过这一件工具**。
+  // 症状不是"描述长"，而是**她少了一件工具**，只能从"她怎么突然不会记待办了"反推回来
+  // （`test/tool-catalog.test.ts` 开篇记着这个坑已经栽过两次：pwsh 119、speak 改措辞后又超）。
+  // 而这一件的口径比硬门更紧：它在"七件压到 60 以内"的名单里（`todo` 名列其中）。
+  //
+  // 所以这里只留三件事：**做什么 / 写到哪两节 / 失败会怎样**。
+  //   • 不复述 STATE 的段落结构——那是 `STATE.md` 自己的事（她写它、`write_persona` 改它）；
+  //   • 不复述状态字段的枚举——`parameters.items.status` 的 enum 已经写了 pending/in_progress/
+  //     completed，回执里也会把清单原样列给她看；
+  //   • 不写"每轮注入进度看板"这类背景——任务卡每步都在她眼前，描述里再说一遍纯属重复付费。
+  // 改这段之前先量一下：`_research/tool-desc-len.mts`（或直接跑 tool-catalog 那两条用例）。
   const todo: ToolDefinition = {
     name: 'todo',
     description:
-      '写这一轮的计划清单，全量替换（items 就是完整清单，[] 清空）；状态层每轮注入，'
-      + '是给未来的自己看的进度看板。与 intention 分工：todo 是任务内步骤，'
-      + 'intention 是跨时间愿望（"明天提醒他"）。',
+      `清单写进 STATE.md 的「## ${TODO_SECTIONS[0]}」「## ${TODO_SECTIONS[1]}」两节`
+      + '（全量替换，[] 清空）：第一项进前者，记 `- [ ]`/`- [~]`/`- [x]`。'
+      + '只动这两节，其余字节不变；两节不在就报错。',
     parameters: {
       type: 'object',
       properties: {
         items: {
           type: 'array',
-          description: '完整清单，按执行顺序排列；全量替换语义',
+          description:
+            '完整清单，按执行顺序排列（全量替换语义）；第一项=当前任务，其余=接着干',
           items: {
             type: 'object',
             properties: {
@@ -1442,14 +1676,59 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
     executionMode: 'parallel',
     sideEffect: 'idempotent',
     timeoutMs: 5_000,
-    handler: async (rawArgs): Promise<ToolHandlerResult> => {
+    handler: async (rawArgs, ctx): Promise<ToolHandlerResult> => {
       try {
         const args = argsRecord(rawArgs, 'todo');
         const items = readTodoItems(args['items']);
+
+        // ① 读出她当前那份 STATE（todo 的载体就在里面）
+        const target = resolvePersonaPath(personaRootOf(ctx), TODO_CARRIER_FILE);
+        let current: string;
+        try {
+          current = await readFile(target.absolute, 'utf8');
+        } catch (err) {
+          return errorResultFromThrown(err, TOOL_ERROR_CODES.writeFailed);
+        }
+
+        // ② 规划：只换那两节的正文区间（失败即如实报错，一个字节都不写）
+        const plan = planTodoWrite(current, items);
+        if (!plan.ok) {
+          return errorResult(plan.message, TOOL_ERROR_CODES.invalidArgs);
+        }
+        if (!plan.changed) {
+          // 幂等：同一份清单重复写不该产生一次 persona/updated（那会让下一轮的固定块白失守一次）
+          return okResult(
+            items.length === 0
+              ? '清单已经是空的（STATE 的那两节本来就没有待办，未产生写入）。'
+              : `清单没有变化（${items.length} 项，STATE 里已经是这一份，未产生写入）：\n`
+                + items.map(describeTodo).join('\n'),
+          );
+        }
+
+        // ③ 落盘 + 账（与 write_persona 同一条通道：先规范化字节形状，再原子写，再落事件）
+        const content = normalizePersonaAsset(plan.text);
+        const bytes = Buffer.byteLength(content, 'utf8');
+        if (bytes > PERSONA_HARD_LIMIT_BYTES) {
+          return errorResult(
+            `STATE.md 写入后会有 ${bytes} 字节，超过单文件硬上限 ${PERSONA_HARD_LIMIT_BYTES}。`
+            + '请精简清单（或先把 STATE 里已办结的旧账挪进记忆文件）后重试；本次没有写入。',
+            TOOL_ERROR_CODES.tooLarge,
+          );
+        }
+        await writeFileAtomic(target.absolute, content);
+
+        const diffHash = sha256Hex(content);
         emit('todo/updated', { items });
+        emit('persona/updated', { file: target.display, diffHash, by: 'agent' });
         options.onTodoUpdated?.(items);
-        if (items.length === 0) return okResult('清单已清空（todo/updated 记录为空表）。');
-        return okResult(`清单已更新（${items.length} 项）：\n${items.map(describeTodo).join('\n')}`);
+        options.onPersonaUpdated?.({ file: target.display, diffHash, by: 'agent' });
+
+        const where = `STATE.md 的「${TODO_SECTIONS[0]}」/「${TODO_SECTIONS[1]}」`;
+        const head = items.length === 0
+          ? `清单已清空（${where} 两节已置空；其余内容一个字节没动）。`
+          : `清单已写进 ${where}（${items.length} 项；${plan.summary}）：\n`
+            + items.map(describeTodo).join('\n');
+        return okResult(`${head}\n以后要看进度就看这两节——它每轮都在你的上下文里。`);
       } catch (err) {
         return errorResultFromThrown(err, TOOL_ERROR_CODES.invalidArgs);
       }
@@ -1797,9 +2076,7 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
 
   const tools: readonly ToolDefinition[] = [
     writePersona,
-    setTimer,
-    cancelTimer,
-    listTimers,
+    timer,
     speak,
     report,
     todo,

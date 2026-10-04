@@ -17,12 +17,14 @@ import {
   CONFIG_VERSION,
   ConfigError,
   DEFAULT_MEMORY_MAINTAIN_CRON,
+  DEFAULT_STATE_BUDGET_BYTES,
   applyUpgradeChain,
   canonicalConfigJson,
   configHash,
   defaultConfig,
   loadConfig,
   readApiKey,
+  trustBoundaryRoot,
   upgradeHooks,
   type AppConfig,
   type ConfigUpgradeHook,
@@ -114,7 +116,6 @@ test('默认配置生成：空目录写出带注释的 config.json，字段齐�
   const c = loaded.config;
   assert.equal(c.schemaVersion, CONFIG_VERSION);
   assert.equal(c.dataDir, join(dir, 'data'));
-  assert.deepEqual(c.paths.workspaceAllowlist, [join(dir, 'workspace')]);
   assert.deepEqual(c.budget, {
     stepTools: 20, turnSteps: 30, taskTokens: 500_000,
     dailyTokens: 2_000_000, softRatio: 0.8, failStreakMax: 5,
@@ -135,6 +136,46 @@ test('默认配置生成：空目录写出带注释的 config.json，字段齐�
   const again = await loadConfig(dir);
   assert.equal(again.createdDefault, false);
   assert.equal(again.configHash, loaded.configHash);
+});
+
+/**
+ * `trust.workspaceRoot` 的默认值（2026-10-05 定）：**智能体自己的工作根 = 配置目录**。
+ *
+ * 为什么值得一条单独的用例：这个默认值决定 `mode: 'workspace'` 那一档到底是"只限工作目录"
+ * 还是"把她锁在门外"。原来的默认是 `<配置目录>/workspace`，而她的记忆
+ * （`<dataDir>/workspace/MEMORIES/`）与人格资产（`<dataDir>/persona/`）都在它**之外**——
+ * 那一档下她连自己的记忆都读不到（实测见 `test/trust-boundary.test.ts` 的那组用例）。
+ * 现在的口径干净了：**`workspace` = 今天的行为**（fs 工具族今天用的就是这个根）、
+ * **`full` = 新放开的那一档**。这条断言把"默认是哪一边"钉死，免得它悄悄漂回窄的那一侧。
+ */
+test('trust 默认：full + 边界根 = 配置目录（= 智能体自己的工作根，不是 <dir>/workspace）', async (t) => {
+  const dir = await freshDir(t);
+  const c = (await loadConfig(dir)).config;
+
+  assert.equal(c.trust.mode, 'full', '默认完全信任（用户 2026-10-04 的决定）');
+  assert.equal(
+    c.trust.workspaceRoot,
+    resolve(dir),
+    'workspace 档的边界默认 = 配置目录（她的 MEMORIES/ 与 persona/ 都在它之下）',
+  );
+  assert.notEqual(
+    c.trust.workspaceRoot,
+    join(dir, 'workspace'),
+    '别再漂回那个窄口径：它落在 MEMORIES/ 与 persona/ 之外，等于把她锁在门外',
+  );
+
+  // 盘上显式写了就以盘上为准（默认只是默认）
+  await writeFile(
+    join(dir, CONFIG_FILE_NAME),
+    JSON.stringify({ trust: { mode: 'workspace', workspaceRoot: join(dir, 'narrow') } }),
+    'utf8',
+  );
+  const explicit = (await loadConfig(dir)).config;
+  assert.equal(explicit.trust.mode, 'workspace');
+  assert.equal(explicit.trust.workspaceRoot, join(dir, 'narrow'));
+  // 执行器的边界读的就是这个字段（同源，不是各算一遍）
+  assert.equal(trustBoundaryRoot(explicit.trust), join(dir, 'narrow'));
+  assert.equal(trustBoundaryRoot(c.trust), null, "'full' 档 = 不设边界");
 });
 
 test('默认配置文件被改坏后重新加载：不覆盖用户文件，只报错', async (t) => {
@@ -158,7 +199,6 @@ test('缺失字段合并默认：段内缺字段补默认，用户写过的值�
     budget: { turnSteps: 5 },
     timezone: 'Asia/Shanghai',
     models: { heavy: { model: 'custom-heavy' } },
-    paths: { workspaceAllowlist: ['ws', join(dir, 'extra')] },
   });
 
   const { config, createdDefault } = await loadConfig(dir);
@@ -173,12 +213,11 @@ test('缺失字段合并默认：段内缺字段补默认，用户写过的值�
   assert.equal(config.models.heavy.baseUrl, 'https://api.deepseek.com', '只写 model 时其余字段补默认');
 
   // 相对路径按配置文件所在目录解析为绝对路径
-  assert.deepEqual(config.paths.workspaceAllowlist, [join(dir, 'ws'), join(dir, 'extra')]);
   assert.equal(config.dataDir, join(dir, 'data'), '未写 dataDir 时用默认');
 
   // 合并只发生在内存里：用户文件不被改写（保住他手写的注释与排版）
   const onDisk = JSON.parse(await readFile(join(dir, CONFIG_FILE_NAME), 'utf8')) as JsonObject;
-  assert.deepEqual(Object.keys(onDisk).sort(), ['budget', 'models', 'paths', 'timezone']);
+  assert.deepEqual(Object.keys(onDisk).sort(), ['budget', 'models', 'timezone']);
 });
 
 test('心跳区间：上下限可配，空拍上限低于下限时兜到下限（不静默变成“更久不露面”）', async (t) => {
@@ -205,7 +244,7 @@ test('deps.paths：三个键各自独立、相对路径以配置目录为基准�
   });
 
   const { config } = await loadConfig(dir);
-  // 相对路径解析成绝对路径（与 dataDir / paths.workspaceAllowlist 同一口径）
+  // 相对路径解析成绝对路径（与 dataDir 同一口径）
   assert.equal(config.deps.paths.rg, join(dir, 'tools', 'rg.exe'));
   assert.equal(config.deps.paths.pwsh, 'C:\\path\\to\\pwsh.exe', '绝对路径原样保留');
   assert.equal(config.deps.paths.es, undefined, '只有空白等于没写（不干预），而不是把它当路径去 spawn');
@@ -405,8 +444,6 @@ test('非法字段值一律报 ConfigError，不静默回退默认（含易错�
     { doc: { models: { heavy: { model: '' } } }, where: 'models.heavy.model' },
     { doc: { models: 'heavy' }, where: 'models' },
     { doc: { tools: { destructiveEnabled: 'yes' } }, where: 'tools.destructiveEnabled' },
-    { doc: { paths: { workspaceAllowlist: 'ws' } }, where: 'paths.workspaceAllowlist' },
-    { doc: { paths: { workspaceAllowlist: ['ws', ''] } }, where: 'paths.workspaceAllowlist[1]' },
     { doc: { alerts: { webhookUrl: 'ftp://x' } }, where: 'alerts.webhookUrl' },
     { doc: { alerts: { rateLimitMin: -1 } }, where: 'alerts.rateLimitMin' },
   ];
@@ -514,4 +551,84 @@ test('注入迁移钩子后旧配置可升到当前版本并生效', async (t) =
   assert.equal(loaded.config.budget.turnSteps, 3, '迁移保留用户值');
   assert.equal(loaded.config.dataDir, join(dir, 'migrated-data'));
   assert.ok((await readdir(dir)).some((name) => name === `${CONFIG_FILE_NAME}.bak.v0`));
+});
+
+// ──────────────────────────────── 自带记忆系统总开关 ────────────────────────────────
+
+test('persona.memoryEnabled：默认 true（现在这套自带记忆），且写进默认配置文档', async (t) => {
+  const dir = await freshDir(t);
+  const loaded = await loadConfig(dir);
+  assert.equal(loaded.config.persona.memoryEnabled, true, '默认必须是"现在这样"：关掉是一次显式选择');
+  assert.equal(defaultConfig(dir).persona.memoryEnabled, true);
+
+  // 默认配置是给人看的：开关与它关掉什么必须落在文件里，而不是只活在类型注释里
+  const doc = JSON.parse(await readFile(loaded.path, 'utf8')) as JsonObject;
+  assert.equal((doc['persona'] as JsonObject)['memoryEnabled'], true, '默认文档要写出这个字段');
+  assert.match(
+    JSON.stringify(doc['persona']),
+    /不注入任何记忆/u,
+    '默认文档的注释要说清"关掉 = 框架不生成索引、不注入、不整理"',
+  );
+});
+
+test('persona.memoryEnabled：false 读得回来；写别的类型当场报错（不静默当成开）', async (t) => {
+  const dir = await freshDir(t);
+  await writeRawConfig(dir, { persona: { memoryEnabled: false } });
+  assert.equal((await loadConfig(dir)).config.persona.memoryEnabled, false);
+
+  // "false" / 0 / null 都是笔误。静默当成 true 比报错坏得多：人会以为关掉了，其实框架照旧
+  // 生成索引、照旧每轮注入、照旧跑整理——那是"我配了却不生效"里最难查的一类
+  for (const bogus of ['false', 0, 1]) {
+    await writeRawConfig(dir, { persona: { memoryEnabled: bogus } });
+    await assert.rejects(
+      () => loadConfig(dir),
+      (err: unknown) => err instanceof ConfigError && /memoryEnabled/u.test((err as Error).message),
+      `${JSON.stringify(bogus)} 不是合法布尔值，应当场报错`,
+    );
+  }
+
+  // 没写这个字段 = 默认 true（缺字段补默认，不是"缺失即关闭"）
+  await writeRawConfig(dir, { persona: { owner: 'someone' } });
+  assert.equal((await loadConfig(dir)).config.persona.memoryEnabled, true);
+});
+
+// ──────────────────────────────── STATE.md 字节预算（v32） ────────────────────────────────
+
+test('persona.stateBudgetBytes：默认 8 KB，且写进默认配置文档并说清它做什么', async (t) => {
+  const dir = await freshDir(t);
+  const loaded = await loadConfig(dir);
+  assert.equal(DEFAULT_STATE_BUDGET_BYTES, 8 * 1024, '出厂预算就是 8 KB（用户定的口径）');
+  assert.equal(loaded.config.persona.stateBudgetBytes, DEFAULT_STATE_BUDGET_BYTES);
+  assert.equal(defaultConfig(dir).persona.stateBudgetBytes, DEFAULT_STATE_BUDGET_BYTES);
+
+  // 默认配置是给人看的：这个字段干什么、为什么是 8 KB、只提醒不截断，都要落在文件里
+  const doc = JSON.parse(await readFile(loaded.path, 'utf8')) as JsonObject;
+  const persona = doc['persona'] as JsonObject;
+  assert.equal(persona['stateBudgetBytes'], DEFAULT_STATE_BUDGET_BYTES, '默认文档要写出这个字段');
+  const text = JSON.stringify(persona);
+  assert.match(text, /预算超限，记得维护，将过时内容移入记忆文件或删除/u, '用户的原话要逐字写进去');
+  assert.match(text, /只提醒、不截断/u, '要说清框架不动她的文件');
+  assert.match(text, /8 KB/u, '要写清为什么是 8 KB');
+});
+
+test('persona.stateBudgetBytes：写多少读回多少；坏值当场报错（不静默按 8 KB 算）', async (t) => {
+  const dir = await freshDir(t);
+  await writeRawConfig(dir, { persona: { stateBudgetBytes: 4096 } });
+  assert.equal((await loadConfig(dir)).config.persona.stateBudgetBytes, 4096, '人写的值要照收');
+
+  // 单位是**字节**，"填 8 想表示 8 KB"是真实会发生的笔误：下限 1 KB 会把它当场拦下。
+  // 静默接受等于让这条提醒永远不出现（8 字节的 STATE 不存在），而人会以为设过了。
+  // `null` 不在这里：它按本仓库的既有语义 = "没写这个字段"（用默认值），不是坏值。
+  for (const bogus of [8, '8192', 0, -1, 1.5, 64 * 1024 + 1]) {
+    await writeRawConfig(dir, { persona: { stateBudgetBytes: bogus } });
+    await assert.rejects(
+      () => loadConfig(dir),
+      (err: unknown) => err instanceof ConfigError && /stateBudgetBytes/u.test((err as Error).message),
+      `${JSON.stringify(bogus)} 不是合法预算，应当场报错`,
+    );
+  }
+
+  // 没写这个字段 = 默认值（缺字段补默认，不是"缺失即关掉提醒"）
+  await writeRawConfig(dir, { persona: { owner: 'someone' } });
+  assert.equal((await loadConfig(dir)).config.persona.stateBudgetBytes, DEFAULT_STATE_BUDGET_BYTES);
 });

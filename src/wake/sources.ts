@@ -106,7 +106,7 @@ export class TimerWakeSource implements WakeSourceAdapter {
    * **payload 跟着事件走**（`entry.payload` 原样带进 `wake/timer`）。这不是顺手加的字段：
    * `at` 型定时器**一触发就从表里删掉**，而认领方（real-loop 的 memoryMaintainWake）原先
    * 只查表拿 payload——于是 at 型定时器的 payload 静默丢失，`/dream` 排的那条唤醒跑成了
-   * 普通 turn，她自己用 `set_timer` 布的"到点提醒我做什么"同样一句话都留不下，
+   * 普通 turn，她自己用 `timer`（action=set）布的"到点提醒我做什么"同样一句话都留不下，
    * 而工具描述里明写着"payload 是到期时你希望看到的任意 JSON"。cron 型条目触发后保留，
    * 所以这个问题只在 `at` 型上现形——踩中的正是最常用的那种。
    *

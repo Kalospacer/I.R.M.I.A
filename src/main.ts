@@ -24,7 +24,7 @@ import { ManagedProtocolService, resolveServiceDir } from './services/snowluma.t
 import { normalizeSid, parseAliases } from './channel/sessions.ts';
 import { createNotifier } from './alert/notifier.ts';
 import { notifyStartupRecovery } from './alert/startup.ts';
-import { loadConfig, readApiKey, type AppConfig } from './config/config.ts';
+import { loadConfig, readApiKey, trustBoundaryRoot, type AppConfig } from './config/config.ts';
 import { ensurePersonaSeeds, loadPersona, type PersonaAssets } from './persona/loader.ts';
 import { ensureMemorySeeds } from './persona/memory-maintain.ts';
 import { ensureMemoryIndex } from './persona/memory-injection.ts';
@@ -37,8 +37,11 @@ import { SkillManager } from './skill/skills.ts';
 import {
   HookRunner, digestProjection, hookConfigPath, loadHookConfig, protectedHookPaths,
 } from './hook/hooks.ts';
-import { RealLoop } from './runtime/real-loop.ts';
+import { RealLoop, memoryHostingEnabled } from './runtime/real-loop.ts';
 import { startWebServer, type WebServer } from './web/server.ts';
+import { AUTH_FILE_NAME, UI_TOKEN_FILE } from './web/auth.ts';
+import { WEBHOOK_SECRET_FILE_NAME } from './web/webhook-secret.ts';
+import { keysPath } from './config/keys.ts';
 import { applyOne, finalizePressure } from './state/fold.ts';
 import { JobManager } from './runtime/job-manager.ts';
 import { toInstanceTakeoverData, type TakeoverRecord } from './runtime/instance-lock.ts';
@@ -64,9 +67,9 @@ import {
  * 改这一个要同步四处：`package.json` 的 version、`gui/pubspec.yaml` 的 version、
  * `gui/lib/pages/settings_page.dart` 的 `guiVersion`（界面显示），以及下面两个自持字面量：
  * `web/server.ts` 的 `McpProbeHost.clientInfo`、`mcp/client.ts` 的 `DEFAULT_CLIENT_INFO`。
- * 第二个内测版：功能面到"能装能用"，但仍会有破坏性改动，所以带 `-beta.2`。
+ * 第三个内测版：功能面到"能装能用"，但仍会有破坏性改动，所以带 `-beta.3`。
  */
-export const AGENT_VERSION = '0.1.0-beta.2';
+export const AGENT_VERSION = '0.1.0-beta.3';
 /** 事件形状版本（docs/schema.md） */
 export const SCHEMA_VERSION = '1';
 export const DEFAULT_DATA_DIR_NAME = 'data';
@@ -186,8 +189,19 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
   if (seededMemory.length > 0) write(`[记忆] 首次启动，已建好记忆结构：${seededMemory.join('、')}`);
   // 记忆索引（B2）：与种子同一风格——机制保证"结构存在"，但它的内容由记忆文件生成。
   // 幂等（内容没变不写盘）：否则每次重启都会把常驻前缀打掉一次，而重启并不改变任何一条记忆。
-  const indexAction = ensureMemoryIndex(dataDir);
-  if (indexAction !== 'unchanged') write(`[记忆] 已${indexAction === 'created' ? '生成' : '重建'}记忆索引 INDEX.md`);
+  //
+  // **关掉框架代管记忆时整段跳过**（v32，docs/persona.md §3.1）：不再生成、也不再重建
+  // `INDEX.md`——盘上已有的那份留在原地（框架此后一个字节都不动它），读、写、整理全归她自己。
+  // 判据与运行期（real-loop 的索引注入、每日整理布防）**同一处**（`memoryHostingEnabled`）。
+  // 上面那一步仍然建目录结构：「记忆托管」关的是框架替她做的那半，不是她自己的文件系统——
+  // 她随时可能想记一笔，那时发现"记忆目录不存在"才是真的坏。
+  if (memoryHostingEnabled(config)) {
+    const indexAction = ensureMemoryIndex(dataDir);
+    if (indexAction !== 'unchanged') write(`[记忆] 已${indexAction === 'created' ? '生成' : '重建'}记忆索引 INDEX.md`);
+  } else {
+    write('[记忆] 记忆托管已关（persona.memoryEnabled = false）：不生成、不重建索引 INDEX.md，'
+      + '每日整理也不布防——读、写、整理全归她自己');
+  }
 
   // 定时器表由宿主创建并交给恢复流程：唤醒源必须在同一份表上挂 onDue 回调。
   // 若让 recover 自建一份，它的回调只写日志，到期事实不会变成 wake/timer 事件。
@@ -375,22 +389,58 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
         },
       };
   /**
-   * 媒体投递口（`send_media`）：本机文件只允许 `dataDir` 白名单内的路径（与 fs 工具同一条
-   * 边界），读成字节交给通道层；网络图直接透传，让平台自己去回源。
+   * 媒体投递口（`send_media`）：本机文件只允许**两个允许根**里的路径——`dataDir` 与
+   * **工作根**（与 fs 工具族、`http_download` 同源），读成字节交给通道层；
+   * 网络图直接透传，让平台自己去回源。
+   *
+   * 两个根各有各的来路：她既有的写法（`workspace/tmp/…`）相对 `dataDir`，
+   * 而 `http_download` 落在工作根下。少了第二个根，**下载下来的图就发不出去**
+   * （实测 t285 连撞两次）。顺序与判定见 `channel/media-poster.ts` 的文件头。
    *
    * 只装配了 QQ 官方通道时才建：OneBot 那边还没实现媒体投递，与其给一个发不出去的壳，
    * 不如让工具如实报"没有接线"（与 read_channel 没接线时同一条纪律）。
    */
   // 胶水抽到 `channel/media-poster.ts` 了（原来写在这里，一次都没被测过）：
   // 白名单、大小、字节读取那三条规则现在有主，见 `test/media-poster.test.ts`。
+  //
+  // `workspaceRoot` 传 `process.cwd()`：这是 fs 工具族真正的根（`agent-loop.ts` 里
+  // `deps.workspaceRoot ?? process.cwd()`，而 real-loop 不传它）。**不要**用下面
+  // `launch()` 里那个 `join(dataDir, 'workspace')`——那是磁盘事实快照的根，不是工具的根。
+  //
+  // 受保护路径（**一份名单、两处消费**）：定义了「谁能改我」的钩子配置 + 本机凭据。
+  //   · fs 写入口（catalog 的 `protectedPaths`）拒绝改写它们；
+  //   · `send_media` 的外发门（媒体投递口的 `protectedPaths`）拒绝把它们发给通道。
+  // 为什么必须共用一份：这两件事挡的是同一批文件——凭据既不该被她改掉，也不该被她交出去
+  // （用户 2026-10-05 点名：她能读 `.keys.json` 不是问题，"发到第三方通道"才是）。名单里
+  // 每一项都指得出它的定义处，不再手写同义字面量。
+  const protectedPaths: readonly string[] = [
+    ...protectedHookPaths(dataDir),
+    keysPath(dataDir),                                    // data/.keys.json：模型与通道密钥
+    join(dataDir, AUTH_FILE_NAME),                        // data/.auth.json：界面密码与会话凭据
+    join(dataDir, WEBHOOK_SECRET_FILE_NAME),              // data/.webhook-secret.json：webhook 专用凭据
+    join(dataDir, UI_TOKEN_FILE),                         // data/.ui-token：遗留共享 token（只读兼容）
+  ];
   const mediaPoster: MediaPoster | null = qqChannel === null
     ? null
-    : createWorkspaceMediaPoster({ dataDir, channels });
+    : createWorkspaceMediaPoster({
+      dataDir,
+      workspaceRoot: process.cwd(),
+      channels,
+      protectedPaths,
+    });
   let toolRegistry: ToolRegistry | undefined;
   // destructive 工具的开关（三态）归一到布尔：true 或非空名单都表示「开着」——
   // 名单模式的逐件过滤由注册表的 includeDestructive 负责，装配层只需知道要不要把它们造出来。
   const destructiveTools = config.tools.destructiveEnabled === true
     || (Array.isArray(config.tools.destructiveEnabled) && config.tools.destructiveEnabled.length > 0);
+
+  // 活动边界（trust.mode）如实报一句：这是一条**边界**，"它现在管到哪儿"必须是启动日志里
+  // 看得见的事实（设置页显示的是同一份 config，判据也只有一处——config.ts 的 trustBoundaryRoot，
+  // 执行器读的正是它）。真假循环两条路都该看见这句，所以放在分岔之前。
+  const boundaryRoot = trustBoundaryRoot(config.trust);
+  write(`[信任] 活动边界：${boundaryRoot === null
+    ? '完全信任（整台电脑：文件读写与命令都不设边界）'
+    : `只限 ${boundaryRoot}（越界的文件读写与命令一律拒绝）`}`);
 
   /**
    * 外部依赖管理器（v30）：pwsh 7 / ripgrep / es.exe 的探测、安装与复检都归它。
@@ -511,8 +561,13 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       destructiveEnabled: destructiveTools,
       // 后台任务管理器惰性取值：装配顺序上 catalog 先于 jobManager 的其它消费方就位
       jobs: () => jobManager,
-      // 钩子配置对 agent 只读（§4.19 第 5 条）：写入口拒绝，读不受限
-      protectedPaths: protectedHookPaths(dataDir),
+      // 记忆访问账（design §4.17 第 2 条"访问强化"）：`memory_read` 每读成功一条就记一笔，
+      // **只放指针不放正文**（正文已经作为工具结果留在历史里）。有了它，"整理任务把常读的
+      // 条目往前提"才有数据可依——在那之前这条机制一直是"设计里有、实现里没有"。
+      memoryReadRecorder: (data) => emit('memory/read', data),
+      // 受保护路径（钩子配置 + 本机凭据）对 agent 只读（§4.19 第 5 条）：写入口拒绝，读不受限。
+      // 名单与 `send_media` 的外发门是**同一份**（见上面 protectedPaths 的定义处）
+      protectedPaths,
       // 回投接线（M9）：通道存在时 speak 的第三路才有地址；回投实现走通道自己的发送器
       ...(replyPoster === null ? {} : {
         currentWakeChannel: () => realLoopRef.current?.wakeChannel() ?? null,
@@ -582,10 +637,14 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       dataDir,
       timers,
       emit: () => {},
-      protectedPaths: protectedHookPaths(dataDir),
+      // 与真循环那份**同一个数组**（不是各算一遍）：两处各写一次名单，迟早漂成两份
+      protectedPaths,
       destructiveEnabled: destructiveTools,
       deps,
       onNote: write,
+      // **刻意不接 `memoryReadRecorder`**：这条分支没有真循环（不跑模型、不派发工具），
+      // 所以永远不会有一次真的记忆读取，也就没有访问账可记。`memory_read` 照旧注册
+      // ——界面要看得见清单与开关（上面那条注释的理由）。
     });
     toolRegistry = observed.registry;
     toolRegistry.setDisabled(config.tools.disabled);

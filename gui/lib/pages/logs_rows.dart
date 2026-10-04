@@ -9,7 +9,12 @@ String _summary(Map<String, dynamic> ev) {
     case 'tool/result':
       return '${d['status'] ?? '结果'} · ${_brief(d['content'])}';
     case 'budget/consumed':
-      return '+${_num(_int(d['inputTokens']))}↑ +${_num(_int(d['outputTokens']))}↓ (hit ${_num(_int(d['cacheHitTokens']))}) ${d['lane'] ?? ''}';
+      // 归因（`context`）是这条事件上的一个字段：有它就缀一句"整条多大"（点开有整条等式），
+      // 没有（旧日志、或这条不是模型记账）就照旧只报这笔用量
+      return '+${_num(_int(d['inputTokens']))}↑ +${_num(_int(d['outputTokens']))}↓ (hit ${_num(_int(d['cacheHitTokens']))}) ${d['lane'] ?? ''}'
+          '${_contextWhole(d) == null ? '' : ' · 归因 ${_num(_contextWhole(d)!)}'}';
+    case 'budget/resumed':
+      return _resumedLine(d);
     case 'turn/end':
       return d['reason'] is Map ? _str(_map(d['reason'])['kind']) : '结束原因未知';
     case 'turn/start':
@@ -156,7 +161,10 @@ class _TypeMenu extends StatelessWidget {
                     color: picked.contains(type) ? scheme.primary : scheme.onSurfaceVariant,
                   ),
                   const SizedBox(width: 8),
-                  Text(type, style: _mono(11.5, picked.contains(type) ? scheme.primary : scheme.onSurface)),
+                  // 显示名走 `_typeLabels`（logs_widgets.dart：人话名字表），
+                  // 勾选与过滤用的仍然是**事件类型**本身——服务端只按 type 过滤，见那张表的注释
+                  Text(_typeLabels[type] ?? type,
+                      style: _mono(11.5, picked.contains(type) ? scheme.primary : scheme.onSurface)),
                 ],
               ),
             ),
@@ -235,6 +243,14 @@ class _EventRow extends StatelessWidget {
                 DetailRow(label: '序列号', value: '#${ev['seq'] ?? '—'}'),
                 DetailRow(label: '可见性', value: _str(ev['visibility']).isEmpty ? 'internal' : _str(ev['visibility'])),
                 DetailRow(label: '来源', value: _str(ev['origin']).isEmpty ? '—' : _str(ev['origin'])),
+                // 有"人话"可读的事件（上下文归因 / 预算暂停解除）在原始 JSON **之前**先给人读的那一行：
+                // 这两类事件的原始 JSON 是一张字段表，人得自己在脑子里加一遍（归因的"整条"尤其）
+                if (_detailLine(ev) != null) ...[
+                  const SizedBox(height: 8),
+                  Text('读法', style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant)),
+                  const SizedBox(height: 6),
+                  SelectableText(_detailLine(ev)!, style: _mono(11.5, scheme.onSurface)),
+                ],
                 const SizedBox(height: 8),
                 Text('原始 JSON', style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant)),
                 const SizedBox(height: 6),

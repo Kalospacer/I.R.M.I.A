@@ -27,6 +27,7 @@ import type {
 import { defaultVisibility } from '../src/log/types.ts';
 import { DsClientError, type DsClient, type DsRequest, type DsStreamResult } from '../src/model/ds-client.ts';
 import { RENDER_VERSION } from '../src/model/render.ts';
+import { planTodoWrite } from '../src/persona/todo-state.ts';
 import { deriveRequest, runTurn, type AgentLoopDeps, type AgentLoopPersona } from '../src/runtime/agent-loop.ts';
 import { applyOne, fold } from '../src/state/fold.ts';
 import { ToolRegistry, type ToolDefinition } from '../src/tools/registry.ts';
@@ -403,6 +404,144 @@ test('软阈值提示：作为尾部 developer 消息插播，历史不被改写
 });
 
 // ──────────────────────────────── ⑤ 请求可重建 ────────────────────────────────
+
+/**
+ * v31 回归（2026-10-05）：**todo 是"每步都要看见"的东西，不能跟着固定块一起被摘掉**。
+ *
+ * 用户的问法：「改了上下文的构成，有没有别的机制被连带搞坏——特别是那个 todo 工具」。
+ * 拆开是两件事，这条用例把两件都钉住（在**真循环**里，不靠手写 render 入参）：
+ *   ① 任务卡（含「未完成计划」）在**此刻层**，此刻层 v31 照旧每步都发 → 第 2 / 第 3 步的请求里
+ *      照样有她那三条待办，"她动手期间看不见待办"这件事**没有发生**；
+ *   ② 清单跟着**上一步结束时**的投影走：她第 3 步把一项划掉，第 4 步的请求里那一项就没了。
+ *
+ * 为什么必须在这里测（而不是只在 render.test 里）：任务卡的内容由 `TurnRunner.taskCard()` 从
+ * `projection.todoList` 现算，工具写的事件必须真的折进那个投影——这条链路只有跑真循环才经过。
+ */
+test('v31 回归：todo 工具写进 STATE 的清单，在同轮后续 step 的请求里照样看得见（不被固定块连累）', async (t) => {
+  const harness = await makeHarness(t);
+  /**
+   * 真工具（`src/tools/admin.ts` 的 `todo`）现在把清单写进 **STATE.md 的两节**，并落
+   * `todo/updated` + `persona/updated` 两条账；运行期 `onPersonaUpdated` 会从盘上重载 STATE，
+   * 于是同一轮后续 step 的任务卡立刻是新清单。这里用**真模块**做同样两件事：
+   *   ① `planTodoWrite` 算出新 STATE（只动那两节）→ 写回 `PERSONA.state`；
+   *   ② 落 `todo/updated` 事件（账）。
+   * 不用替身模拟"清单进了哪里"——那正是这次合并要锁住的那条链路。
+   */
+  const personaState = { text: '# 当前状态\n\n## 当前任务\n\n## 接着干\n\n## 别的节\n- 不动\n' };
+  const patchList = (items: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>): void => {
+    const plan = planTodoWrite(personaState.text, items);
+    assert.equal(plan.ok, true, plan.ok ? '' : plan.message);
+    if (!plan.ok) return;
+    personaState.text = plan.text;
+    harness.append('todo/updated', { items });
+  };
+  const todoTool: ToolDefinition = {
+    name: 'todo',
+    description: '写这一轮的计划清单，全量替换。',
+    parameters: { type: 'object', properties: { items: { type: 'array' } }, required: ['items'] },
+    executionMode: 'parallel',
+    sideEffect: 'idempotent',
+    timeoutMs: 5000,
+    handler: async (rawArgs) => {
+      const items = (rawArgs as { items: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }> }).items;
+      patchList(items);
+      return { content: `清单已写进 STATE（${items.length} 项）` };
+    },
+  };
+  const registry = makeRegistry();
+  registry.register(todoTool);
+
+  const wake = wakeManual(harness, '核对备份');
+  const model = fakeModel([
+    // 第 1 步：写清单（此刻这一步的请求里还没有清单——它是"上一步结束时"的投影）
+    {
+      text: '先把清单写下来。',
+      toolCalls: [{
+        callId: 'call_todo',
+        name: 'todo',
+        arguments: JSON.stringify({
+          items: [
+            { content: '看目录', status: 'in_progress' },
+            { content: '看日志尾部', status: 'pending' },
+            { content: '写结论', status: 'pending' },
+          ],
+        }),
+      }],
+    },
+    // 第 2 步：读一处
+    {
+      text: '先看目录。',
+      toolCalls: [{ callId: 'call_read', name: 'read_file', arguments: '{"file_path":"a.txt"}' }],
+    },
+    // 第 3 步：把第一项划掉
+    {
+      text: '目录看完了，划掉第一项。',
+      toolCalls: [{
+        callId: 'call_todo2',
+        name: 'todo',
+        arguments: JSON.stringify({
+          items: [
+            { content: '看目录', status: 'completed' },
+            { content: '看日志尾部', status: 'in_progress' },
+            { content: '写结论', status: 'pending' },
+          ],
+        }),
+      }],
+    },
+    { text: '都看完了。' },
+  ]);
+
+  assert.deepEqual(
+    await runTurn(harness.depsOf(model.ds, {
+      registry,
+      // 人格（含 STATE）是**运行期的活对象**：真宿主里 `onPersonaUpdated` 会从盘上重载它
+      // （main.ts），所以 `todo` 刚写进 STATE 的那份清单，同一轮的后续 step 立刻读得到。
+      // 这里给的是同一个活引用，deps 每步现取 `persona.state`——与 real-loop 的 getter 同形。
+      persona: { ...PERSONA, get state() { return personaState.text; } },
+      // 固定块素材：与宿主同一分工（real-loop 轮首读一次状态，整轮转手）。给了它，第 1 步才有块可摘
+      turnBlock: { state: PERSONA.state, relationship: null, memory: null },
+    }), [wake]),
+    { kind: 'completed' },
+  );
+  assert.equal(model.requests.length, 4, '这一轮真的跑了四步（否则下面的"逐步"断言不成立）');
+
+  /** 某一步请求里此刻层那条的全文（任务卡就在里面） */
+  const nowLayerOf = (n: number): string => {
+    const items = (model.requests[n]!.input ?? []) as Array<Record<string, unknown>>;
+    const hit = items.find(item =>
+      typeof item['content'] === 'string' && String(item['content']).includes('以下为框架提供的此刻层'));
+    assert.ok(hit !== undefined, `第 ${n + 1} 步的请求里必须有此刻层`);
+    return String(hit!['content']);
+  };
+  /** 这一步的请求里有几条固定块（v31：第 2 步起 0 条） */
+  const blockCountOf = (n: number): number => {
+    const items = (model.requests[n]!.input ?? []) as Array<Record<string, unknown>>;
+    return items.filter(item =>
+      typeof item['content'] === 'string' && String(item['content']).includes('以下为框架提供的本轮固定块')).length;
+  };
+
+  // ① 第 1 步：清单还没写（它写在这一步里），此刻层里当然没有未完成项
+  assert.equal(blockCountOf(0), 1, '第 1 步有固定块');
+  assert.ok(!nowLayerOf(0).includes('未完成计划：'), '第 1 步：清单是这一步才写的');
+
+  // ② 第 2 步起：固定块没了，但**待办照样在**——这正是这条用例要守的那条性质
+  for (const n of [1, 2]) {
+    assert.equal(blockCountOf(n), 0, `第 ${n + 1} 步不再发固定块（v31）`);
+    const now = nowLayerOf(n);
+    assert.ok(now.includes('当前任务：核对备份'), `第 ${n + 1} 步：任务卡还在`);
+    assert.ok(now.includes('未完成计划：'), `第 ${n + 1} 步：未完成计划还在（她动手期间看得见待办）`);
+    assert.ok(now.includes('- 看目录'), `第 ${n + 1} 步：第一项在`);
+    assert.ok(now.includes('- 看日志尾部'), `第 ${n + 1} 步：第二项在`);
+    assert.ok(now.includes('- 写结论'), `第 ${n + 1} 步：第三项在`);
+    assert.ok(now.includes(`已 ${n + 1} 步`), `第 ${n + 1} 步：步数跟着这一 step 走`);
+  }
+
+  // ③ 她第 3 步把第一项划掉 → 第 4 步的请求里那一项就没了（清单跟着 STATE 走，不是一份死快照）
+  const last = nowLayerOf(3);
+  assert.ok(last.includes('未完成计划：'), '第 4 步：清单还在');
+  assert.ok(!last.includes('- 看目录'), '第 4 步：划掉的那一项不进"未完成计划"');
+  assert.ok(last.includes('- 看日志尾部') && last.includes('- 写结论'), '第 4 步：没划掉的两项照旧在');
+});
 
 test('M2-2 请求可重建：同一批日志事件重新派生，请求字节一致', async (t) => {
   const harness = await makeHarness(t);

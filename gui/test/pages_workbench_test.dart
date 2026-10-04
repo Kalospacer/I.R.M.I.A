@@ -57,7 +57,6 @@ void main() {
     },
     'alerts': {'webhookUrl': 'http://127.0.0.1:9000/hook', 'rateLimitMin': 5},
     'web': {'host': '127.0.0.1', 'port': 7788},
-    'paths': {'workspaceAllowlist': ['D:/work']},
   };
   final events = <String, dynamic>{
     'events': [

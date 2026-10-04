@@ -11,6 +11,11 @@
  *   1. 与群成员档案一样**不写 config.json**：这是界面在改的东西，配置留给用户手写；
  *   2. 改完**立刻生效**（下一轮就按新名单判），所以每轮 refresh 一次 mtime；
  *   3. 豁免是"**不扫描也不提示**"（省掉那次 light 判定）——不是"照扫只是不说"。
+ *
+ * 第 3 条 2026-10-04 修过一次**真的漏**：判定层（要不要花一次 light）问了名单，可规则层
+ * （字面命中 → 贴那句话）没问，于是"豁免"只做到了"不用模型扫"，规则扫照样扫、照样贴。
+ * 现在"规则命中 → 警告"的**两个出口**（唤醒路径落 `injection/noted`、渲染层旧日志现算）
+ * 都先问 {@link WarnExemptBook.isExempt}——判据仍然只有这一处实现，调用方不要自己拼。
  */
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -18,6 +23,34 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 export const WARN_EXEMPT_FILE = 'warn-exempt.json';
+
+/**
+ * 一条通道消息里"判豁免用得上的那四样"——就是 `isExempt` 的入参形状。
+ *
+ * 单独给它一个名字，是因为它有两个调用方：名单自己（唤醒路径），和**规则层的豁免闸门**
+ * （`channel/injection.ts` 的 `setWarnExemptJudge`：渲染层旧日志现算那条路也要问同一处判据）。
+ * 两边共用这一个形状，改动时不会只改一头。
+ */
+export interface WarnExemptSubject {
+  channel: string;
+  chatType: string;
+  /**
+   * 会话 id。**缺了就当"不在名单里"**（预警开着是安全的那一侧）——渲染/读取路径上的消息
+   * 理论上都带它，但类型上它是可选的，这里把"缺了怎么办"写死在形状里，而不是留给调用方猜。
+   */
+  chatId?: string | undefined;
+  person: string;
+}
+
+/**
+ * 「这条通道消息豁免吗」——宿主递进来的判据，**唯一的实现是本类的 `isExempt`**。
+ *
+ * 为什么是个可传的函数、而不是让用到它的地方自己去读盘：`render` 是纯函数（缓存铁律 1，
+ * 见 docs/schema.md §13）——它不读文件、不判据，只用入参里那个函数；判定与读盘都留在宿主
+ * （`real-loop` 装配 deps 时、`replay` 装配重建选项时各传一次）。这样"渲染出的字节"只取决于
+ * 入参，不取决于"这个进程有没有注册过谁"。
+ */
+export type WarnExemptJudge = (subject: WarnExemptSubject) => boolean;
 
 interface WarnExemptDoc {
   version: 1;
@@ -114,12 +147,14 @@ export class WarnExemptBook {
    * 群聊**永远不认整群豁免**（哪怕配置文件里被人手写了一条 `qq:group:...` 的会话级豁免）：
    * 用户定的口径是"群里只能按人豁免"。所以这里按 chatType 分流，而不是看 sid 在不在名单里。
    */
-  isExempt(event: { channel: string; chatType: string; chatId: string; person: string }): boolean {
+  isExempt(event: WarnExemptSubject): boolean {
     const namespace = event.channel === 'onebot' ? 'onebot' : 'qq';
     if (event.chatType === 'c2c') {
+      if (event.chatId === undefined) return false;
       return this.sessions.has(`${namespace}:c2c:${event.chatId}`);
     }
     if (event.chatType === 'group' || event.chatType === 'group-at') {
+      if (event.chatId === undefined) return false;
       const groupSid = `${namespace}:group:${event.chatId}`;
       return (this.members.get(groupSid) ?? new Set<string>()).has(event.person);
     }

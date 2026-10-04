@@ -36,8 +36,57 @@ import {
   type ToolContext,
 } from './types.ts';
 
-/** 单文件编辑的硬上限：再大就不该走替换式编辑，而该用生成式写入 */
-const HARD_TARGET_LIMIT = 16 * 1024 * 1024;
+/**
+ * 单文件编辑的字节上限：**20 MiB**。取这个数的依据是 devkit 的同一个常量
+ * （`tools/_file_utils.py:13` `SAFE_EDIT_MAX_SIZE = 20 * 1024 * 1024`），
+ * 它对 `safe_edit` 的读取、`safe_write` 的 content 各设一道，两边同值。
+ *
+ * 这个常量在本仓库的含义与源仓库**不同，而且必须不同**：
+ *
+ * - 源仓库：超限拒绝（`safe_edit.py:135-136`、`safe_write.py:118-123`）；
+ * - 本仓库 v30 之前：读取硬顶 16 MiB、**静默丢弃超出的部分**，然后把截断后的内容
+ *   整篇写回。实测 17,825,826 B 的文件做一次 safe_edit → 落盘 16,777,216 B，
+ *   丢 1,048,610 B，全程 `isError=false`（docs/devkit-migration-audit.md §1 #1）。
+ *
+ * 所以这里不是一个"调大调小"的阈值，而是**数据完整性的边界**：超过它的目标文件
+ * 一律拒绝进入编辑链路（见 readTargetFile），超过它的新内容一律拒绝落盘
+ * （见 guardedWrite）。取整文件的 stat().st_size 与内存里的原始字节长度来判，
+ * 不再有"读一部分、写整篇"的组合。
+ *
+ * 为什么是 20 MiB 而不是继续用 16 MiB：① 与源同值，迁移忠实度审计把这条判成"漂移"的
+ * 直接依据就是两边同用 `SAFE_EDIT_MAX_SIZE`；② 20 MiB 在源仓库里同时管"读"与"写"
+ * 两道门，本仓库照抄同一个数，将来对照两边行为时不必先换算阈值；
+ * ③ 可经 `FsEnv.maxEditBytes` 显式调大（无人值守下若真有更大的文件要改，那是配置的事），
+ * 但默认值不随环境漂移——默认值只由这段注释里的依据决定。
+ */
+export const DEFAULT_MAX_EDIT_BYTES = 20 * 1024 * 1024;
+
+/** 字节数转人话（与 text-codec 的 formatBytes 同形，这里独立一份避免内核反向依赖展示层） */
+function humanBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * 超限拒绝的统一话术：**多大、上限多少、可以怎么做**——三件事缺一不可。
+ *
+ * 为什么把这三件写死在这里而不是各调用点自己拼：这条拒绝是**数据丢失的防线**，
+ * 它出现的每一次都必须让模型立刻明白"不是路径错了、不是参数错了，是太大了，
+ * 而我没动它"。少任何一件，模型下一步的动作就会变成"再试一次/换个参数试"
+ * ——而它真正该做的是换一条路（分段处理或让人上手）。
+ *
+ * @param subject 被拒的东西（`a.ts`、或 `a.ts 这次要写入的内容`）
+ */
+export function oversizeMessage(subject: string, size: number, limit: number): string {
+  return (
+    `${subject} 有 ${humanBytes(size)}，超过本工具能安全处理的上限 ${humanBytes(limit)}，已拒绝（**一个字节都没动**）。`
+    + '为什么是"拒绝"而不是"读一部分"：写工具会把整篇内容写回去，读到一部分就等于把没读到的那部分删掉。'
+    + '可以怎么做：① 把要改的地方挪到一个小文件里再改；'
+    + '② 用 rg_search 定位后只 safe_read 需要的区间，不要整篇改写；'
+    + '③ 确实要动这么大的文件，请由人在外部编辑器里改（或把 FsEnv.maxEditBytes 调大后重启）。'
+  );
+}
 
 // ──────────────────────────────── 内容规划 ────────────────────────────────
 
@@ -263,7 +312,11 @@ function planExactReplace(
   const exact = findAll(normalized, oldText);
   if (exact.length === 0) return null;
   const replaceAll = request.replaceAll === true;
-  const occurrence = request.occurrence;
+  // occurrence === 0 = "没指定"（devkit 的 schema 默认值就是 0，见 parseEditRequest）。
+  // 归一在这里做一次，下面的三分支才不用各写一遍 `|| request.occurrence === 0`。
+  const occurrence = request.occurrence === undefined || request.occurrence === 0
+    ? undefined
+    : request.occurrence;
 
   if (!replaceAll && exact.length > 1 && occurrence === undefined) {
     return {
@@ -394,32 +447,53 @@ export function planEdit(original: string, request: EditRequest): PlanResult {
     if (request.new === undefined) {
       return { ok: false, code: FS_ERROR_CODES.INVALID_ARGS, message: 'insert_at_line 模式必须提供 new' };
     }
+    if (lineNo < 0 || lineNo > total) {
+      return {
+        ok: false,
+        code: FS_ERROR_CODES.INVALID_ARGS,
+        message:
+          `line=${lineNo} 越界：文件共 ${total} 行，insert_at_line 要求 0 ≤ line ≤ ${total}` +
+          '（0 表示插到文件开头，N 表示插到第 N 行**之后**）。',
+      };
+    }
     const insertText = normalizeEol(request.new);
     const insertLines = insertText === '' ? [] : insertText.split('\n');
-    // line 是「插入到第 line 行之前」；0 与 1 等价于文件开头，超过末尾即追加
-    const at = Math.max(0, Math.min(lineNo === 0 ? 0 : lineNo - 1, total));
+    // 与 devkit 逐字对齐（`tools/safe_edit.py:289-295`）：line=0 → 插到最前；
+    // 否则 **插在第 line 行之后**。源仓库那句 `parts[:line] + "\n" + insert_text + "\n" + parts[line:]`
+    // 展开成 0-based 下标就是下面这两支，一字不差。
+    //
+    // ⚠️ 方向与下面的 delete_lines **不同**（那个按闭区间删、含两端），因此
+    // "删第 N 行 + 插 line=N" 拼不出"替换第 N 行"——新内容会落到原第 N+1 行之后。
+    // 两句各自都与源一致，**不要**为了"看起来对齐"改其中一支：那等于把核对过的差异反着改回去。
+    // 处置（描述里的两句 + 锁测试）见 `edit-tools.ts` 里 `line` 参数上方那段注释。
+    const at = lineNo === 0 ? 0 : lineNo;
     const lines = [...split.lines];
     lines.splice(at, 0, ...insertLines);
+    const afterLine = lineNo === 0 ? '文件开头' : `第 ${lineNo} 行之后`;
     return {
       ok: true,
       text: rebuild(lines.join('\n'), split.eol, split.trailingNewline),
-      summary: `在第 ${at + 1} 行前插入 ${insertLines.length} 行（原文件共 ${total} 行）`,
+      summary: `在${afterLine}插入 ${insertLines.length} 行（原文件共 ${total} 行）`,
       matchCount: 1,
       fuzzy: false,
     };
   }
 
+  // delete_lines：三个越界条件一律报错，**不夹取**（devkit 同判据，`tools/safe_edit.py:252-263`）。
+  // 夹取在"删多了"与"删少了"两个方向上都错，而模型看不出哪个方向发生了——报错才能让它改区间重试。
   const startLine = request.startLine ?? 1;
   const endLine = request.endLine ?? startLine;
-  if (startLine > total) {
+  if (startLine < 1 || endLine < startLine || endLine > total) {
     return {
       ok: false,
       code: FS_ERROR_CODES.INVALID_ARGS,
-      message: `start_line ${startLine} 超出文件总行数 ${total}`,
+      message:
+        `行号越界：start_line=${startLine}, end_line=${endLine}，文件共 ${total} 行` +
+        `（delete_lines 要求 1 ≤ start_line ≤ end_line ≤ ${total}）。`,
     };
   }
   const from = startLine - 1;
-  const to = Math.min(endLine, total);
+  const to = endLine;
   const lines = [...split.lines];
   const removed = lines.splice(from, to - from);
   return {
@@ -510,8 +584,8 @@ export async function guardedWrite(
     return { ok: false, code: FS_ERROR_CODES.INVALID_ARGS, message: '没有要写入的目标', rolledBack: false };
   }
 
-  // 第零步：只读区（design §4.19 技能目录）。放在最前面——命中就不该产生备份、更不该碰盘。
-  // 这是「拦截在决定操作的那一层」：不靠提示词祈求模型别改技能目录。
+  // 第零步：只读区（design §4.19 技能目录 / P2 的人格资产）。放在最前面——命中就不该产生备份、更不该碰盘。
+  // 这是「拦截在决定操作的那一层」：不靠提示词祈求模型别改这些地方。
   for (const target of targets) {
     const prefix = readOnlyPrefixOf(env.readOnlyPrefixes, target.relPath);
     if (prefix === null) continue;
@@ -519,8 +593,8 @@ export async function guardedWrite(
       ok: false,
       code: FS_ERROR_CODES.PATH_DENIED,
       message:
-        `${target.relPath} 在只读区 ${prefix}/ 内（design §4.19：技能目录是只读资产，模型只读不写）。`
-        + `要读正文用 safe_read（${prefix}/<name>/SKILL.md）；要改内容请由人修改后重新确认技能。`,
+        `${target.relPath} 在只读区 ${prefix}/ 内（模型可读、不可改）。`
+        + (env.readOnlyHints[prefix] ?? '要改它请走它自己的写通道，不要用通用文件工具。'),
       rolledBack: false,
     };
   }
@@ -545,6 +619,18 @@ export async function guardedWrite(
   const verdicts: Array<{ relPath: string; verdict: SyntaxVerdict }> = [];
   for (const target of targets) {
     const bytes = encodeText(target.text, target.encoding);
+    // 落盘内容的体积闸门。**与读取端那道门同值、同判据**：读取端挡的是"目标文件太大"，
+    // 这一道挡的是"这次要写进去的内容太大"——两道都必要，因为 multi_edit 能把若干个
+    // 小文件改成一个巨大的结果，safe_write 也能凭空写一个超过上限的新文件。
+    // 放在编码之后：判的是**真实落盘的字节数**，不是 JS 字符串的字符数（中文一字三字节）。
+    if (bytes.buffer.length > env.maxEditBytes) {
+      return {
+        ok: false,
+        code: FS_ERROR_CODES.TOO_LARGE,
+        message: oversizeMessage(`${target.relPath} 这次要写入的内容`, bytes.buffer.length, env.maxEditBytes),
+        rolledBack: false,
+      };
+    }
     encoded.push({ target, buffer: bytes.buffer });
     const verdict = await checkSyntax(target.path, bytes.buffer, env.deps);
     verdicts.push({ relPath: target.relPath, verdict });
@@ -696,10 +782,14 @@ export function parseEditRequest(args: Record<string, unknown>): EditRequest | {
   }
   const occurrence = args['occurrence'];
   if (occurrence !== undefined) {
-    if (typeof occurrence !== 'number' || !Number.isInteger(occurrence) || occurrence < 1) {
-      return { error: 'occurrence 必须是 >= 1 的整数' };
+    if (typeof occurrence !== 'number' || !Number.isInteger(occurrence) || occurrence < 0) {
+      return { error: 'occurrence 必须是 >= 0 的整数（0 = 未指定）' };
     }
-    request.occurrence = occurrence;
+    // occurrence === 0 合法：devkit 的 schema 把 `default: 0` 写明了（`_registry.py:211-215`），
+    // 模型照默认值回填 `occurrence: 0` 时不该当场失败（旧实现报"必须是 >= 1 的整数"，
+    // 见 docs/devkit-migration-audit.md §3.5 #14）。0 的语义就是"没指定"，不落进 request，
+    // 下游因此只有一种"未指定"的表示，不必在每条分支里都记得判 0。
+    if (occurrence > 0) request.occurrence = occurrence;
   }
   const line = args['line'];
   if (line !== undefined) {
@@ -726,6 +816,19 @@ export function parseEditRequest(args: Record<string, unknown>): EditRequest | {
   if (mode === 'replace' && (request.old === undefined || request.old === '')) {
     return { error: 'replace 模式必须提供非空 old' };
   }
+  // 互斥（devkit 同判据，`tools/safe_edit.py:183-189`）：两个都"指定第几处"的口径同时出现时，
+  // 源仓库报错，旧实现**静默按 replace_all 执行、occurrence 被丢掉**——而 schema 描述里
+  // 写着"与 replace_all 互斥"（docs/devkit-migration-audit.md §1 #13：实测
+  // `{old:'const',new:'let',replace_all:true,occurrence:9}` 成功替换全部 3 处）。
+  // 描述与实现必须说同一句话：模型以为自己只改了第 9 处，实际全改了，这是最容易漏看的一类静默扩大。
+  // 注意判据是 `occurrence > 0`：`occurrence: 0` 是"未指定"，与 replace_all 并存不算冲突。
+  if (request.replaceAll === true && request.occurrence !== undefined) {
+    return {
+      error:
+        `occurrence=${request.occurrence} 与 replace_all 不能同时使用，请只选其一` +
+        '（要全替换就去掉 occurrence，要只改一处就把 replace_all 去掉）',
+    };
+  }
   if (mode === 'insert_at_line' && (request.new === undefined || request.line === undefined)) {
     return { error: 'insert_at_line 模式必须提供 line 与 new' };
   }
@@ -750,22 +853,55 @@ export function parseEditRequestFromUnknown(args: unknown): EditRequest | { erro
 export interface ReadTargetResult {
   buffer: Buffer | null;
   error?: string;
+  /** 错误码；只在 error 非空时有意义。缺省按 IO_ERROR 处理 */
+  code?: FsErrorCode;
+  /** 目标文件的字节数。超限被拒时调用方要把它写进错误消息 */
+  size?: number;
 }
 
-/** 读目标文件；不存在时返回 buffer=null（新建语义），其他错误如实上报 */
-export async function readTargetFile(absPath: string): Promise<ReadTargetResult> {
+/**
+ * 读目标文件的**全部**内容；不存在时返回 buffer=null（新建语义），其他错误如实上报。
+ *
+ * **这里绝不能截断**：读到的内容会被规划后整篇写回，所以"读到一部分"等于"把没读到的
+ * 那部分删掉"。旧实现正是这么干的——`open` 后读一个 16 MiB 的缓冲、`subarray(0, bytesRead)`
+ * 直接返回，一个字节的提示都没有，于是任何超过 16 MiB 的文件做一次 `safe_edit` 都会被
+ * 截掉尾巴（实测 17,825,826 B → 16,777,216 B，丢 1,048,610 B，`isError=false`）。
+ *
+ * 现在的做法：先 `stat` 拿**整文件**大小，超过 `env.maxEditBytes`（默认 20 MiB，见
+ * `DEFAULT_MAX_EDIT_BYTES`）就直接拒绝，一个字节都不读、更不写；错误里给全三件事
+ * ——**文件多大、上限多少、可以怎么做**。只读不写是本函数唯一的两种结果。
+ */
+export async function readTargetFile(absPath: string, maxBytes: number = DEFAULT_MAX_EDIT_BYTES): Promise<ReadTargetResult> {
+  let size: number;
+  let handle: Awaited<ReturnType<typeof open>>;
   try {
-    const handle = await open(absPath, 'r');
-    try {
-      const buf = Buffer.allocUnsafe(HARD_TARGET_LIMIT);
-      const read = await handle.read(buf, 0, HARD_TARGET_LIMIT, 0);
-      return { buffer: buf.subarray(0, read.bytesRead) };
-    } finally {
-      await handle.close();
-    }
+    handle = await open(absPath, 'r');
   } catch (err) {
     if (isRecord(err) && err['code'] === 'ENOENT') return { buffer: null };
     return { buffer: null, error: toErrorMessage(err) };
+  }
+  try {
+    size = (await handle.stat()).size;
+    if (size > maxBytes) {
+      return { buffer: null, size, code: FS_ERROR_CODES.TOO_LARGE, error: oversizeMessage(absPath, size, maxBytes) };
+    }
+    // 精确按 stat 到的长度分配：读到的字节数必须与这个长度相等，否则宁可报错也不返回短内容
+    const buf = Buffer.allocUnsafe(size);
+    const read = await handle.read(buf, 0, size, 0);
+    if (read.bytesRead !== size) {
+      return {
+        buffer: null,
+        size,
+        error:
+          `只读到 ${read.bytesRead} 字节（stat 说是 ${size} 字节）——文件正在被别处改动，`
+          + '为避免写回时丢掉没读到的部分，本次操作已放弃；请稍后重试。',
+      };
+    }
+    return { buffer: buf };
+  } catch (err) {
+    return { buffer: null, error: toErrorMessage(err) };
+  } finally {
+    await handle.close();
   }
 }
 

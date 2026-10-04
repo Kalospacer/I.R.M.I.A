@@ -46,6 +46,11 @@ export const HANDOFF_MIN_FOLD_TOKENS = 48;
  *
  * v27 之后 `notify` 不在这里了——那件工具已删（它与 speak 重复）。
  * 发言出口现在是 `speak`（日常）与 `report`（正式内容），两者仍都算流程类。
+ *
+ * **v35 起 `set_timer` / `cancel_timer` 这两个名字仍然留在名单里**，虽然工具已经并进
+ * `timer` 一件了：笔记是从**盘上的事件**渲染出来的，历史事件里那三个名字会长期存在，
+ * 删掉旧名等于让老日志里的定时器布防突然挤进笔记（重放出来的笔记也就跟着变）。
+ * 新名字 `timer` 不能只按名字分类——见 `noteClassOf`。
  */
 export const FLOW_TOOLS: readonly string[] = ['set_timer', 'cancel_timer', 'speak', 'report'];
 
@@ -53,8 +58,22 @@ export const FLOW_TOOLS: readonly string[] = ['set_timer', 'cancel_timer', 'spea
  * 状态类工具：回执只描述"此刻是什么样"，历史值没有交接价值——按 `tool:<name>:<角色>` 只留最新一次
  * （入参与回执各自只留最新：它们是同一次调用的两面，挤在同一个 key 上会互相抵消）。
  * 注意与 FLOW_TOOLS 的分工：流程类是"发出去的动作"，状态类是"读回来的快照"。
+ *
+ * 同样保留旧名 `list_timers`（历史事件），新名字按动作判（`noteClassOf`）。
  */
 export const STATE_TOOLS: readonly string[] = ['list_timers', 'todo'];
+
+/**
+ * 合并后的定时器工具名（与 `tools/admin.ts` 的 `TIMER_TOOL_NAME` 同字面量）。
+ *
+ * 为什么不直接导入那个常量：persona 这一层是被渲染层依赖的纯函数层，
+ * 反向引 `tools/admin.ts` 会把一整个工具包（fs、通道、告警）拖进它的依赖图里。
+ * 同字面量的写法在本仓有先例（`PERSONA_PROPOSAL_DIR` 与 web/server.ts 那份）。
+ */
+export const TIMER_TOOL = 'timer';
+
+/** 定时器的读动作（= 原来那件 `list_timers` 的职责）：它才是"快照"，另外两个是"动作" */
+export const TIMER_READ_ACTION = 'list';
 
 /** 笔记首行标题（进不了任何分段，但仍计入总预算） */
 const HEADER = '# 交接笔记';
@@ -260,10 +279,11 @@ export function collectHandoffEntries(
   const stateTools = new Set(opts.stateTools ?? STATE_TOOLS);
   const payloads = timerPayloadsOf(events);
 
-  // callId → 工具名：工具回执本身不带名字，得从对应的 tool/call 取
-  const nameById = new Map<string, string>();
+  // callId → 那次调用的名字与入参：工具回执本身两样都不带，得从对应的 tool/call 取
+  // （入参也要取：v35 起"收不收"不只取决于名字，见 noteClassOf）
+  const callById = new Map<string, { name: string; args: string }>();
   for (const e of events) {
-    if (e.type === 'tool/call') nameById.set(e.data.callId, e.data.name);
+    if (e.type === 'tool/call') callById.set(e.data.callId, { name: e.data.name, args: e.data.arguments });
   }
 
   const out: HandoffEntry[] = [];
@@ -301,23 +321,26 @@ export function collectHandoffEntries(
       continue;
     }
     if (e.type === 'tool/call') {
-      if (flowTools.has(e.data.name)) continue; // 纯流程调用：不收录
+      const cls = noteClassOf(e.data.name, e.data.arguments, flowTools, stateTools);
+      if (cls === 'flow') continue; // 纯流程调用：不收录
       const entry: HandoffEntry = {
         seq: e.seq, ts: e.ts, kind: 'tool-call', tool: e.data.name,
         text: `[调用] ${e.data.name}(${oneLine(e.data.arguments)})`,
       };
-      if (stateTools.has(e.data.name)) entry.stateKey = `tool:${e.data.name}:call`;
+      if (cls === 'state') entry.stateKey = `tool:${e.data.name}:call`;
       out.push(entry);
       continue;
     }
     if (e.type === 'tool/result') {
-      const name = nameById.get(e.data.callId) ?? '?';
-      if (flowTools.has(name)) continue;
+      const call = callById.get(e.data.callId);
+      const name = call?.name ?? '?';
+      const cls = noteClassOf(name, call?.args, flowTools, stateTools);
+      if (cls === 'flow') continue;
       const entry: HandoffEntry = {
         seq: e.seq, ts: e.ts, kind: 'tool-result', tool: name,
         text: resultText(name, e),
       };
-      if (stateTools.has(name)) entry.stateKey = `tool:${name}:result`;
+      if (cls === 'state') entry.stateKey = `tool:${name}:result`;
       out.push(entry);
       continue;
     }
@@ -326,7 +349,45 @@ export function collectHandoffEntries(
   return out;
 }
 
-/** 工具回执文本：状态模板化（同一状态渲染出同一字节串，与 render 的固定模板同精神） */
+/**
+ * 一条工具调用在笔记里的归类：`'flow'`（不收录）/ `'state'`（收录，但按 key 只留最新）/ `'plain'`。
+ *
+ * **为什么要看入参，而不是只看名字**（v35）：定时器合并成一件 `timer` 之后，同一个名字底下
+ * 既有"布防 / 撤销"（发出去的动作，与从前的 `set_timer` / `cancel_timer` 一样该丢），
+ * 又有"列出此刻有哪些"（读回来的快照，与从前的 `list_timers` 一样只该留最新一次）。
+ * 只按名字分，要么把 `list` 的回执丢掉（她压缩之后不知道自己排过什么），要么让每次布防
+ * 都在笔记里留一行噪音——两种都是合并前那份判据的退化。
+ *
+ * 读不出 `action`（没有入参、不是 JSON、不是字符串）时按 `'flow'` 算：那种调用本来就
+ * 因为参数不合法而失败了，它的回执没有交接价值。
+ */
+function noteClassOf(
+  name: string,
+  args: string | undefined,
+  flowTools: ReadonlySet<string>,
+  stateTools: ReadonlySet<string>,
+): 'flow' | 'state' | 'plain' {
+  if (name === TIMER_TOOL) return timerActionOf(args) === TIMER_READ_ACTION ? 'state' : 'flow';
+  if (flowTools.has(name)) return 'flow';
+  if (stateTools.has(name)) return 'state';
+  return 'plain';
+}
+
+/** 从入参 JSON 里取 `action`；取不到返回 null（调用方按 `'flow'` 处理） */
+function timerActionOf(args: string | undefined): string | null {
+  if (args === undefined) return null;
+  try {
+    const parsed: unknown = JSON.parse(args);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    const action = (parsed as Record<string, unknown>)['action'];
+    return typeof action === 'string' ? action : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 工具回执文本：状态模板化（同一状态渲染出同一字节串，与 render 的固定模板同精神） */
 function resultText(name: string, e: AppEvent & { type: 'tool/result' }): string {
   const d = e.data;
   const head = `[结果] ${name} ${d.status}`;

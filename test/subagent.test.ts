@@ -645,3 +645,58 @@ test('M8-2 子代理执行中 SIGKILL：父 task 结算 unknown、子 turn 链�
   assert.equal(refolded.openTools.length, 0);
   assert.equal(refolded.budget.tokensTask, recovered.projection.budget.tokensTask);
 });
+
+// ──────────────────────────────── 活动边界（trust.mode） ────────────────────────────────
+
+/**
+ * 子代理是**第二个装配点**：它的工具与父是同一批，边界必须与父逐字相同。
+ *
+ * 为什么值得一条用例：主循环与子代理链各自组一份 `AgentLoopDeps`，而"完全信任"档下
+ * 子代理被悄悄关回工作根，表现是"父能写的地方子代理写不了"——那时她只会看到一个
+ * 莫名其妙的 E_UNSAFE_PATH，没有任何线索指向"这是另一条装配路径"。
+ */
+test('活动边界：子代理逐字继承父的 boundaryRoot（null / 具体根 / 缺省三态）', async (t) => {
+  for (const value of [null, 'B:\\trust-root', undefined] as const) {
+    const fx = await makeHarness(t);
+    /** 'absent' = 工具上下文中**没有这个键**（缺省三态要与"显式 undefined"同义） */
+    const seen: Array<string | null | 'absent'> = [];
+    fx.registry.register({
+      name: 'probe_ctx',
+      description: '记录子代理工具上下文里的 boundaryRoot（本用例只关心这一个字段）',
+      parameters: { type: 'object', properties: {} },
+      executionMode: 'parallel',
+      sideEffect: 'none',
+      timeoutMs: 5_000,
+      handler: async (_args, ctx) => {
+        seen.push('boundaryRoot' in ctx ? ctx.boundaryRoot ?? null : 'absent');
+        return { content: 'ok' };
+      },
+    });
+
+    const model = fakeModel([
+      // ① 父：派子代理
+      { calls: [{ callId: 'c-task', name: TASK_TOOL_NAME, arguments: { description: '摸一下边界' } }], usage: { inputTokens: 10, outputTokens: 0 } },
+      // ② 子代理：跑探针工具（边界就在这里被观测）
+      { calls: [{ callId: 'c-probe', name: 'probe_ctx', arguments: {} }], usage: { inputTokens: 10, outputTokens: 0 } },
+      // ③ 子代理收尾
+      { text: '子代理看过了。', usage: { inputTokens: 10, outputTokens: 5 } },
+      // ④ 父收尾
+      { text: '父收到。', usage: { inputTokens: 10, outputTokens: 5 } },
+    ]);
+    // task 工具自己装（要带 allowTools：工具集是父注册表的子集，探针得在白名单里）
+    fx.registry.register(
+      createTaskTool(fx.taskDeps(model.ds, { allowTools: ['probe_ctx'] })),
+      { replace: true },
+    );
+
+    const wake = fx.append('wake/manual', { note: `父的输入：boundaryRoot=${String(value)}` });
+    const parent = value === undefined
+      ? fx.parentDeps(model.ds)
+      : fx.parentDeps(model.ds, { boundaryRoot: value });
+    assert.equal((await runTurn(parent, [wake])).kind, 'completed');
+
+    const expected = value === undefined ? 'absent' : value;
+    assert.deepEqual(seen, [expected], `子代理拿到的边界应当是 ${String(expected)}`);
+  }
+});
+

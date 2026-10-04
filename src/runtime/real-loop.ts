@@ -35,16 +35,23 @@ import { readFileSync, readdirSync, statfsSync, unlinkSync } from 'node:fs';
 import { arch, platform as osPlatform, release as osRelease } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
-import type { AppEvent, BudgetLayer, MemorySelected, PendingInput, Projection, TurnEndReason, WakeChannel } from '../log/types.js';
+import type { AppEvent, BudgetLayer, PendingInput, Projection, TurnEndReason, WakeChannel } from '../log/types.js';
 import { isTopLevelEvent } from '../log/types.ts';
 import { InjectionJudge, type InjectionVerdict } from '../channel/injection-judge.ts';
-import { injectionNoteOf, noteForFlagged, quotesOfHints, reasonOfHints, scanForInjection } from '../channel/injection.ts';
+import {
+  injectionNoteOf, noteForFlagged, quotesOfHints, reasonOfHints, scanForInjection,
+} from '../channel/injection.ts';
 import { TopicSummarizer } from '../channel/topic.ts';
 import type { WakeEmission } from '../wake/sources.js';
 import type { EventLog } from '../log/event-log.js';
 import type { DsClient } from '../model/ds-client.js';
 import type { ToolRegistry } from '../tools/registry.js';
-import { DEFAULT_ASK_HUMAN_TIMEOUT_MIN, DEFAULT_WORKSPACE_DIR_NAME, type AppConfig } from '../config/config.ts';
+import {
+  DEFAULT_ASK_HUMAN_TIMEOUT_MIN,
+  DEFAULT_WORKSPACE_DIR_NAME,
+  trustBoundaryRoot,
+  type AppConfig,
+} from '../config/config.ts';
 import type { PersonaAssets } from '../persona/loader.js';
 import { applyOne, finalizePressure, wakeSourceOf } from '../state/fold.ts';
 import { saveProjectionCache } from '../state/projection-cache.ts';
@@ -82,11 +89,11 @@ import type { TimerStore } from '../wake/timer-store.js';
 import { modelVisibilityFor, trustOfBatch, isOwnerLabel } from './trust.ts';
 import { createAuthzGate, type Scenario } from './authz.ts';
 import { GroupMemberBook } from '../channel/group-members.ts';
-import { WarnExemptBook } from '../channel/warn-exempt.ts';
+import { WarnExemptBook, type WarnExemptSubject } from '../channel/warn-exempt.ts';
 import { MEMORY_MAINTAIN_PAYLOAD_KIND, maintainMemory, memoriesDir } from '../persona/memory-maintain.ts';
 import {
-  buildMemoryIndex, ensureMemoryIndex, readExcerpt, renderMemoryIndex, renderSelectedMemory, selectMemory,
-  type MemoryExcerpt, type MemoryIndex,
+  buildMemoryIndex, emptyMemoryIndex, ensureMemoryIndex, renderMemoryIndex,
+  type MemoryIndex,
 } from '../persona/memory-injection.ts';
 import {
   applyTopUpEvent, emptyTopUps, foldTopUps, parseTopUpRequest, raiseLimits,
@@ -97,6 +104,7 @@ import {
   isSlashCommandEvent, parseSlashCommand, unknownCommandReply, type SlashCommand,
 } from './slash-commands.ts';
 import { renderHandoffNote } from '../persona/handoff-note.ts';
+import { sha256Hex } from '../persona/versions.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
@@ -215,6 +223,44 @@ function readPayloadFlag(payload: unknown, key: string, value: string): boolean 
 export function isMemoryMaintainPayload(payload: unknown): boolean {
   if (typeof payload !== 'object' || payload === null) return false;
   return (payload as Record<string, unknown>)['kind'] === MEMORY_MAINTAIN_PAYLOAD_KIND;
+}
+
+/**
+ * 框架代管记忆开着吗？（`config.persona.memoryEnabled`，见 docs/persona.md §3.1）
+ *
+ * 三处判据**共用这一个函数**（索引注入、每日整理布防、整理 turn 的认领）：它们都在本模块里，
+ * 各写一个 `!== false` 迟早会漂成"索引不注入了、但整理照跑"那种半开状态。
+ * 重放与界面预览那两条**重建**路径读的是同一个配置字段（`buildReplayReport` / `buildRequestPreview`），
+ * 不引这个函数是因为它们手里没有 RealLoop——口径同源，判据同字段，不是第二份实现。
+ *
+ * 只收 `false` 才算关：缺字段、坏值（配置解析层已拦）一律当**开**——与那个字段的出厂默认一致，
+ * 也让所有老调用点（不带这个 deps、老测试）行为不变。
+ */
+export function memoryHostingEnabled(config: AppConfig): boolean {
+  return config.persona.memoryEnabled !== false;
+}
+
+/**
+ * 本轮的记忆索引素材（v32）：**建/读一次**，注入文本与注入账共用这一份。
+ *
+ * 为什么把它抽成函数（而不是留在 `agentDeps` 里内联）：这是"关掉框架代管记忆"那条路上
+ * **唯一会碰盘**的一步。抽出来之后，它可以在真实数据目录上被直接断言——"关掉时不建索引、
+ * 不读记忆、注入文本为空"这三件事是**可实测**的，而不是"读代码看起来对"。
+ *
+ * 关掉时给一份**空索引**（`emptyMemoryIndex`）而不是 null：
+ *   • `ensureMemoryIndexSafely()` 会**就地重建** `INDEX.md`——关掉之后框架一个字节都不该再动它；
+ *   • `buildMemoryIndex()` 会扫 `facts.md` / `episodes/`——连"扫一眼"都不该发生；
+ *   • 注入与账目（`memory/selected` 的指纹与条数）必须以**同一份索引**为准：给一份空索引，
+ *     两处自然都是空的，不需要在两侧各加一个 if（那样才有"账上说注入了、请求里却没有"的空间）。
+ */
+export function memoryIndexPlan(
+  config: AppConfig,
+  dataDir: string,
+  build: (dir: string) => MemoryIndex,
+): { index: MemoryIndex; text: string } {
+  if (!memoryHostingEnabled(config)) return { index: emptyMemoryIndex(), text: '' };
+  const index = build(dataDir);
+  return { index, text: renderMemoryIndex(index) };
 }
 
 /** 打断 speak 的唤醒类型：**人**开口的那三种。定时器、意图、后台任务、心跳都不算 */
@@ -584,6 +630,18 @@ export class RealLoop {
     });
   }
 
+  /**
+   * 豁免名单（惰性建：没有豁免的实例一次盘都不碰）+ **每轮 refresh 一次**（口径：改完下一轮生效）。
+   *
+   * 为什么 refresh 由调用点显式做、而不是判据每次自己 stat：判据在渲染里会被**每条**通道消息问
+   * 一次，那里每问一次都 statSync 一遍盘是不可接受的；而"名单改了要立刻生效"的粒度本来就是
+   * **轮**（见 channel/warn-exempt.ts 的约束 2）。
+   */
+  private warnExemptBook(): WarnExemptBook {
+    this.warnExempt ??= new WarnExemptBook(this.deps.dataDir);
+    return this.warnExempt;
+  }
+
   start(): void {
     if (this.running) return;
     this.running = true;
@@ -694,6 +752,10 @@ export class RealLoop {
     await this.ensureReady();
     this.rolloverIfNeeded();
     this.settleTopUpRequests();
+    // 抬上限解除暂停：每一拍再判一次（幂等——写完之后记录就没了，不会再写第二条）。
+    // 启动那一次已经覆盖"改配置 + 重启"，这里覆盖运行期上限变化的其余路径（加注看门文件
+    // 刚被拾取、判定器被重建……），并保证唤醒门读到的记录与活的上限永远对得上。
+    this.releaseLiftedPauses();
     await this.healthCheck();
     // 图片附件：每拍补下最近到达的（**包括 turn 进行中到达的那张**——它会立刻出现在她
     // 后续 step 的历史里）。放在 busy 检查之前：她正忙的时候恰恰是图片最容易到场的时候。
@@ -1080,10 +1142,57 @@ export class RealLoop {
       title: `预算耗尽（${facts.name}）：已用 ${used} / 上限 ${limit}`,
       body: `${facts.name}这一档到上限了：已用 ${used} / 上限 ${limit}。${state}`
         + `两条出路：① 去「设置 → 系统」把「${facts.field}」调大——${facts.scope}；`
-        + '它是启动参数，改完要重启进程才生效。'
+        + '它是启动参数，改完要重启进程才生效。已经暂停的层，重启后新上限只要高于已用量，'
+        + '暂停就自动解除（会落一条 budget/resumed，说清是谁解的、凭什么解的）；'
+        + '新上限仍不高于已用量则照旧停着，那就只剩加注这条路。'
         + `② 加注：irmia topup --layer ${layer} --tokens <N> —— 不用重启，循环下一拍拾取后接着跑。`,
       params: { layer },
     });
+  }
+
+  /**
+   * 抬上限解除暂停（2026-10-04 修的真 bug）：**判据看活的数，不看那条粘在投影里的记录**。
+   *
+   * 现场：任务层撞线 → 暂停；用户去「设置 → 系统」把上限调大并重启进程，什么都没变——因为
+   * `lastExhausted` 是**日志的折叠结果**，重启只是把同一条 `budget/exhausted` 重放一遍，
+   * 唤醒门照旧拿它拦住所有输入（那条 `wake/manual` 一直躺着没有 turn 起来），用户只好再加一次注
+   * （`budget/topped-up` 一到，紧接着就 `turn/start`）。**配置变了、进程也重读了配置，
+   * 却解不开一个"上限不够"造成的暂停——这是判据看错了东西**。
+   *
+   * 判据在 `BudgetGuard.liftedPauses`（四条：不是不可恢复的暂停、记录确实来自撞线、
+   * 有效上限真的被抬高了、当刻不再越线），这里只做两件属于循环层的事：
+   *   ① **人审挂起在台上时 task 层让路**——那条暂停的解除条件是"人答了"（答复到达会写
+   *      `budget/topped-up{by:'human-answer'}`），不是"上限比已用大了"。挂起线索是进程态
+   *      （`this.suspension`，由 warmUp 的 scanSuspension 从日志重建），只有循环层知道；
+   *   ② **落事件**：解除是一件事，就得写进日志。只改投影会在下一次重启时被日志推翻
+   *      （这正是本 bug 的成因）。
+   *
+   * 幂等：写完之后 fold 立刻把该层记录删掉，下一拍判据为空，不会再写第二条。
+   * 调用点两处：warmUp（"改配置 + 重启"那条路）与每一拍（运行期上限变化的其余路径）。
+   */
+  private releaseLiftedPauses(): number {
+    const p = this.deps.projection;
+    let released = 0;
+    for (const lifted of this.guard.liftedPauses(p)) {
+      if (lifted.layer === 'task' && this.suspension !== null) continue;
+      this.appendSync('budget/resumed', {
+        layer: lifted.layer,
+        limit: lifted.limit,
+        actual: lifted.actual,
+        reason: lifted.reason,
+      }, 'internal');
+      released += 1;
+      const how = lifted.reason === 'limit-raised'
+        ? '上限已调到' : '加注累计已把上限抬到';
+      this.write(`[预算] ${lifted.layer} 层暂停已解除（${how} ${lifted.limit} > 已用 ${lifted.actual}）`);
+      // 恢复通知走告警出口（与加注同一条口径）：上一个进程报出去的那条故障要有人来销账，
+      // 否则人只会在告警面板上一直看见"预算耗尽"，不知道重启之后它已经解开了
+      void this.notifier.ok(
+        CATEGORY.budget,
+        `${lifted.layer} 层预算暂停已解除：${how} ${lifted.limit}，高于当刻已用 ${lifted.actual}。`,
+      );
+    }
+    return released;
   }
 
   // ──────────────────────────────── 加注 ────────────────────────────────
@@ -1421,6 +1530,11 @@ export class RealLoop {
       this.write(`[人审] 停机期间收到答复（「${hanging.answered.answer}」）：turn ${hanging.answered.suspension.turn} 的输入将重新入队`);
     }
     this.setTopUps(foldTopUps(events));
+    // 抬上限解除暂停：**启动时就判一次**。「设置 → 系统」那四项是启动参数，改完重启才生效，
+    // 所以"改配置解暂停"这条路只可能在这里落地（判据看活的有效上限，见 releaseLiftedPauses）。
+    // 必须排在 setTopUps 之后：有效上限 = 配置 + 加注累计，两个来源都齐了才能比；
+    // 也必须排在 scanSuspension 之后：人审挂起在台上时 task 层要让路。
+    this.releaseLiftedPauses();
     // 信任门的真相源是日志：重启后谁被确认过必须原样重建，否则已生效的 skill 会集体掉出 catalog
     this.skills?.setTrustEvents(events);
     for (const event of events) {
@@ -1438,6 +1552,16 @@ export class RealLoop {
    * cron 只在启动时读一次：它决定"什么时候做后台维护"，不是运行期要热更的开关。
    */
   private async ensureMemoryMaintainTimer(): Promise<void> {
+    // 关掉框架代管记忆＝**不布防**（v32，见 docs/persona.md §3.1）：这一步是"框架替她做整理"的
+    // 全部入口，布防了就一定会跑。落一行说明，别让人对着空表猜"是没到点还是没布上"。
+    //
+    // 已布防过的旧条目**不主动撤**：撤表是另一件事（表里可能还有她自己排的别的东西），
+    // 而这条路上的双保险在 `memoryMaintainWake`——触发时它同样直接返回 null，整理 turn 不会跑。
+    if (!memoryHostingEnabled(this.deps.config)) {
+      this.write('[记忆整理] 记忆托管已关（persona.memoryEnabled = false）：每日整理未布防，'
+        + '读、写、整理全归她自己');
+      return;
+    }
     const timers = this.deps.timers;
     if (timers === undefined) return;
     const cron = this.memoryMaintainCron.trim();
@@ -1463,10 +1587,15 @@ export class RealLoop {
    *
    * **先认事件里带的 payload，再回退查表**。只查表是不够的：`at` 型定时器触发后条目就被
    * 删了，`timers.get(timerId)` 拿到 null，于是它的 payload 判不出来——`/dream` 排的唤醒
-   * 会跑成普通 turn，她自己 `set_timer` 布的"到点提醒我做什么"也一并失效。
+   * 会跑成普通 turn，她自己 `timer`（action=set）布的"到点提醒我做什么"也一并失效。
    * cron 型条目触发后保留，所以回退那半仍然有用（也兼容旧日志）。
    */
   private memoryMaintainWake(batch: readonly PendingInput[]): AppEvent | null {
+    // **双保险**（v32）：关掉框架代管记忆时一条都不认领——即便定时器表里、或者旧日志里还留着
+    // 整理条目（这一版之前布防的 cron、或者她自己 `/dream` 排的那条）。判据与布防、与索引注入
+    // 是同一个函数，不另写一个；返回 null 之后这条唤醒落回普通 turn 的路（她若真要整理，
+    // 那是她自己读、自己写的事，框架不替她做）。
+    if (!memoryHostingEnabled(this.deps.config)) return null;
     for (const item of batch) {
       const event = this.deps.log.get(item.wakeSeq);
       if (event === null || event.type !== 'wake/timer') continue;
@@ -1557,6 +1686,10 @@ export class RealLoop {
 
   private agentDeps(wakeEvents: readonly AppEvent[]): AgentLoopDeps {
     const d = this.deps;
+    // 豁免名单**轮首 refresh 一次**：渲染层那条"旧日志现算"的路（render 的兜底扫描）在这一轮里
+    // 会被逐条消息问到，读的正是这份名单——"这一轮按哪份名单渲染"要在这里定死，而不是等某条
+    // 消息渲染到一半时才发现盘上刚改过（口径：名单改完**下一轮**生效）。
+    this.warnExemptBook().refresh();
     // 场合：最高档 = GUI/本机唤醒、官 bot 上用户 id 的会话（单聊与群聊都算）、她自己。
     // 其余（群里别人、陌生单聊、webhook）都是"软件里遇到的人"→ guest。
     const scenario: Scenario = this.scenarioOf(wakeEvents);
@@ -1564,9 +1697,17 @@ export class RealLoop {
     // 读一次是这段代码的全部要点：`deriveRequest` 每步都会重新读 deps，而 deps 里的这份
     // 是**轮首快照**——一轮之内它逐字节不变，"不必每步重新编码"才成立。
     const turnBlock = this.turnBlockFacts();
-    // 记忆索引（B2）：也在这里建/读一次。选材与注入用的是**同一份**索引——两处各读一次盘，
-    // 就可能在"记忆刚好被改动"的那一拍选出与正文对不上的指针。
-    const index = this.ensureMemoryIndexSafely();
+    // 记忆索引（B2）：也在这里建/读一次。账目与注入用的是**同一份**索引——两处各读一次盘，
+    // 就可能在"记忆刚好被改动"的那一拍记下与注进去的版本对不上的指纹。
+    //
+    // 关掉框架代管记忆时**不建也不读**（v32，docs/persona.md §3.1）：`memoryIndexPlan` 给一份空索引，
+    // 于是注入的那段自然为空、账目如实记成"0 条、空指纹"——两处仍然同源，不需要在两侧各加一个
+    // if（那样才有"账上说注入了、请求里却没有"的空间）。判据与理由都收在那个函数里。
+    const { index, text: indexText } = memoryIndexPlan(d.config, d.dataDir, this.ensureMemoryIndexSafely);
+    // 心跳轮**不注入**（2026-10-04 用户的口径：只有用户输入时才注入）：索引那一段整段不出现。
+    // 判据与注入账用的是同一个 `isHeartbeatTurn`——两处各写一个判据迟早会漂成
+    // "账上说没注入、请求里却有"。
+    const heartbeatTurn = isHeartbeatTurn(wakeEvents);
     const authzGate = createAuthzGate({
       scenario,
       hardRefusal: d.config.tools.groupSceneHardRefusal === true,
@@ -1589,11 +1730,15 @@ export class RealLoop {
       // persona 用 **getter** 而不是拷快照：deriveRequest 每步都会重新读这些字段，
       // 而本方法每 turn 只装配一次。
       //
-      // **B2 起 state 是例外**：它改由 `turnBlock` 携带（轮首读一次的快照）。
-      // 原先这里也是 getter，于是她在 turn 内用 write_persona 改了自己的 STATE，本 turn 的
-      // 后续 step 立刻能读到——代价是"状态"跟着此刻层每步重发（实测整份 STATE.md
-      // 约 3845 token/步，占那几天账单的 28.6%）。缓存前缀的纪律优先于"同轮立刻可见"：
-      // 改动现在**下一轮**才进她的上下文（取舍记在 docs/memory-injection.md §2）。
+      // **state 这一格有两件事要说清**（2026-10-05 核实过，两条注释以前是混着写的）：
+      //   ① **她上下文里那份状态**不再走这里——它由 `turnBlock` 携带（宿主轮首读一次的快照，
+      //      见本文件 `turnBlockFacts()`）。所以她在 turn 内改 STATE.md，改动**下一轮**才进
+      //      她自己的固定块（取舍记在 docs/memory-injection.md §2）；
+      //   ② 但**任务卡**（此刻层那条 `当前任务：…` + `未完成计划：`）仍然每步现读这里的
+      //      `state`——因为待办清单的载体就是 STATE 的两节（`persona/todo-state.ts`）。
+      //      于是这个 getter 不是遗留物：`todo` 工具写完 STATE 会触发 `onPersonaUpdated`
+      //      （main.ts 从盘上重载 `d.persona`），同一轮的**下一步**就看得见新清单。
+      //      把这一格换成轮首快照，会让"她刚记下的待办下一步就不见了"。
       // 哈希仍取实时值：它是缓存破坏哨兵与 step/start 的指纹，本来就该反映"此刻盘上是什么"。
       persona: {
         get identity() { return d.persona.identity; },
@@ -1615,6 +1760,11 @@ export class RealLoop {
       // （同签名命中 85.2%、换签名 41.2%，最差 2%）。所以能力的收窄挪到**执行期**，
       // 见下面的 authzGate——清单不再承担权限表达。
       modelVisibility: { includeDestructive: d.config.tools.destructiveEnabled },
+      // 活动边界（`config.trust.mode`）：**装配层唯一的消费点**——判据是 config.ts 的
+      // `trustBoundaryRoot`（'full' → null 完全信任 / 'workspace' → 只限 trust.workspaceRoot）。
+      // 与 workspaceRoot 一样是启动期定下的（它进的是 `AgentLoopDeps`，每 turn 重新装配一次，
+      // 但值来自同一份 config，改配置要重启才接管——GUI 的开关也是这么写的）。
+      boundaryRoot: trustBoundaryRoot(d.config.trust),
       now: () => d.now().toISOString(),
       timezone: d.timezone,
       budget: this.budgetHook(),
@@ -1642,13 +1792,21 @@ export class RealLoop {
       // 记忆索引（B2）：`MEMORIES/INDEX.md` 的渲染形态——只有指针（路径 + 一行摘要 + !pinned），
       // 正文要她按需 safe_read。每 turn 重建一次索引文件（幂等：内容没变就不写盘），
       // 因为上一轮里她可能刚写过新记忆。见 persona/memory-injection.ts。
-      memoryIndex: renderMemoryIndex(index),
-      // 本轮固定块（B2）：轮首读一次的状态 / 关系档案。记忆那一段由**循环层**在轮首补上
-      // （`memory/selected` 与它同一时刻定下，见 agent-loop 的 selectMemoryForTurn）——
-      // 那样"选了哪几条"与"注入了什么"是同一份结论，不会两处各算一遍。
+      // **心跳轮给空串**（整段不出现）：没人在跟她说话时，连指针表都不注入（用户 2026-10-04 的口径）。
+      memoryIndex: heartbeatTurn ? '' : indexText,
+      // 本轮固定块（B2）：轮首读一次的状态 / 关系档案。
+      // **记忆正文不在这里**（2026-10-04 用户的口径：「只看索引，如果需要，heavy 自己去读，
+      // 随后跟随 tool call 留在上下文」）：机制不再替她挑几条正文塞进来，固定块里关于记忆的
+      // 只有上面那份索引（指针表）。她需要哪一条就照索引 safe_read——读回来的内容作为工具结果
+      // 留在历史里，长期命中前缀缓存；代价是她得自己想起来去读（见 docs/memory-injection.md §5）。
       turnBlock,
-      // 记忆选材（B2）：宿主给判据与正文，循环层在轮首写 `memory/selected` 事件。
-      // 心跳轮（只有 wake/heartbeat）返回零条——没人在跟她说话，正文不注入（docs §5）。
+      // STATE 预算（v32）：宿主装配 deps 时读一次配置（启动期参数），循环层每步原样转手。
+      // 「她的 STATE 有多少字节」不在这里量——deriveRequest 从 `persona.state` 量，
+      // 重放与界面预览因此拿到同一个数（三处判据一致，见 agent-loop 的注释）。
+      stateBudgetBytes: d.config.persona.stateBudgetBytes,
+      // 记忆索引注入账（B2）：宿主给"注入了没有 + 当时那份索引的指纹与条数"，
+      // 循环层在轮首写 `memory/selected` 事件（索引全文不落事件，见那个事件的注释）。
+      // 心跳轮（只有 wake/heartbeat）记 injection:'heartbeat'——那一轮不注入（docs §5）。
       memorySelector: ({ wakeEvents: turnWakes }) => this.planMemorySelection(index, turnWakes),
       // 联络方式（装置自述的状态层那一半）：配置事实 + 本轮唤醒来源
       contact: this.contactFacts(),
@@ -1656,6 +1814,10 @@ export class RealLoop {
       // 在宿主手上，而渲染层是纯函数（不读环境值，缓存铁律 1）。一 turn 算一次。
       machine: this.machineFacts(),
       usage: this.usageFacts(),
+      // 豁免判据（显式入参那条路）：渲染层"旧日志现算"的兜底扫描要问它。判据仍是
+      // `WarnExemptBook.isExempt` 这一处实现，宿主在这里递一次、每步原样转手（渲染不读盘）。
+      // 名单只在本方法开头 refresh 一次——粒度就是"轮"（改完下一轮生效）。
+      warnExempt: (subject: WarnExemptSubject) => this.warnExemptBook().isExempt(subject),
       // 缓存破坏哨兵的阈值（config.contextAudit）：观测阈值，只决定"要不要记一条 cacheBreak"
       cacheBreakThresholds: {
         idleMs: this.deps.config.contextAudit.cacheBreakIdleMin * 60_000,
@@ -1811,56 +1973,47 @@ export class RealLoop {
   /**
    * 建/读一次索引（幂等）。读盘或写盘失败（磁盘满、权限）时照常按现有文件建一份内存索引，
    * 绝不让这一轮发不出去——记忆索引是**便利**，不是存续的前提；她自己的记忆文件才是真源。
+   *
+   * `dir` 形参只有一个用处：`memoryIndexPlan` 那条路（v32）把它作为 `build` 的入参递进来，
+   * 于是"关掉框架代管记忆＝连扫都不扫"这件事可以在真实数据目录上被直接断言。本类的调用点
+   * 传的都是 `this.deps.dataDir`，与原来逐字节等价。
    */
-  private ensureMemoryIndexSafely(): MemoryIndex {
+  private ensureMemoryIndexSafely(dir: string = this.deps.dataDir): MemoryIndex {
     try {
-      ensureMemoryIndex(this.deps.dataDir);
+      ensureMemoryIndex(dir);
     } catch {
       // 写不进去：下面仍按盘上现有内容建索引
     }
-    return buildMemoryIndex(this.deps.dataDir);
+    return buildMemoryIndex(dir);
   }
 
   /**
-   * 本轮的记忆选材（B2，docs/memory-injection.md §4）：判据是纯函数，正文在这里现取。
+   * 本轮的**记忆索引注入账**（B2，docs/memory-injection.md §4；2026-10-04 简化）。
    *
-   * 三件事：
-   *   ① **判心跳轮**：本轮唤醒只有 `wake/heartbeat` → 一条都不选（没人在跟她说话，
+   * 两件事：
+   *   ① **判心跳轮**：本轮唤醒只有 `wake/heartbeat` → 这一轮不注入索引（没人在跟她说话，
    *      没有谁的上下文需要对齐；她要看就按索引 `safe_read`）；
-   *   ② **选哪几条**：`selectMemory`（pinned 必选 + 按索引顺序补足到条数上限）；
-   *   ③ **取正文**：按 `path:line` 从盘上现读那一条（与 `safe_read` 同一份素材、同一口径）。
+   *   ② **留指纹**：把当时注入的那段索引文本的哈希与条数交出去，循环层落成 `memory/selected`。
+   *      索引全文**不落事件**——它就渲染在固定块里，全文再存一份是重复存储（事件是 append-only 的）。
    *
-   * 取正文失败的条目**跳过**（文件被删、行号漂了）：选材账里照记它被选中过（那是当时的判据结论），
-   * 但正文那一段里不出现——不臆造内容，也不让一条读不到的指针把整块搞没。
+   * 原来这里还要"选哪几条 + 取正文"（`selectMemory` / `readExcerpt` / `renderSelectedMemory`），
+   * 用户 2026-10-04 定了口径「只看索引，如果需要，heavy 自己去读，随后跟随 tool call 留在上下文」，
+   * 于是整条选材与正文装配都删了——固定块里只留索引。
    */
   private planMemorySelection(index: MemoryIndex, wakeEvents: readonly AppEvent[]): {
     injection: 'human' | 'heartbeat';
-    selected: MemorySelected['data']['selected'];
-    notSelected: MemorySelected['data']['notSelected'];
-    indexSize: number;
-    text: string;
+    indexHash: string;
+    entries: number;
   } {
     const heartbeatTurn = isHeartbeatTurn(wakeEvents);
-    const selection = selectMemory(index, { heartbeatTurn });
-    const excerpts: MemoryExcerpt[] = [];
-    for (const entry of selection.selected) {
-      const excerpt = readExcerpt(this.deps.dataDir, entry);
-      if (excerpt !== null) excerpts.push(excerpt);
-    }
+    // 心跳轮：什么都没注入，所以**没有"注进去的那一版"**——指纹留空串、条数留 0。
+    // 此处刻意不算那份没被注入的索引的哈希：算了就等于账上写着一个"当时并不在请求里"的指纹，
+    // 事后读日志的人会以为它注进去了（这个洞正是记账要防的那一类）。
+    if (heartbeatTurn) return { injection: 'heartbeat', indexHash: '', entries: 0 };
     return {
-      injection: heartbeatTurn ? 'heartbeat' : 'human',
-      selected: selection.selected.map((entry) => ({
-        path: entry.path,
-        line: entry.line,
-        summary: entry.summary,
-        pinned: entry.pinned,
-      })),
-      notSelected: {
-        heartbeat: selection.skipped.heartbeat,
-        notNeeded: selection.skipped.notNeeded,
-      },
-      indexSize: index.entries.length,
-      text: renderSelectedMemory(excerpts),
+      injection: 'human',
+      indexHash: sha256Hex(renderMemoryIndex(index)),
+      entries: index.entries.length,
     };
   }
 
@@ -1877,8 +2030,9 @@ export class RealLoop {
    * 关系档案与此刻层用的是**同一个判据**（`relationshipForCurrentWake`）：
    * 一次唤醒一个人，所以"本轮命中谁"在一轮内是常量。
    *
-   * 记忆那一段**不在这里**：它由循环层在轮首按 `memory/selected` 的**同一份**结论补上
-   * （见 agent-loop 的 `selectMemoryForTurn`）——两处各算一遍就是给漂移留门。
+   * 记忆那一段**不在这里、也不在任何地方**（2026-10-04 用户的口径：只看索引，需要就 heavy
+   * 自己去读）：固定块里关于记忆的只有 `memoryIndex` 那份索引（指针表），正文由她 `safe_read`
+   * 现取、作为工具结果留在历史里。理由与代价见 docs/memory-injection.md §5。
    */
   private turnBlockFacts(): TurnBlockFacts {
     return {
@@ -1922,9 +2076,8 @@ export class RealLoop {
     // 为什么选"不扫描"而不是"照扫只是不说"：这条判定存在的唯一意义就是提醒她；
     // 人已经判定"这个人可信"之后，再花一次 light 调用算一遍、算完又不告诉她，纯属白花钱，
     // 还会在日志里留下一堆没人看的标记。省掉的正是下面那次 judge。
-    this.warnExempt ??= new WarnExemptBook(this.deps.dataDir);
-    this.warnExempt.refresh();
-    const exempt = this.warnExempt;
+    const exempt = this.warnExemptBook();
+    exempt.refresh();
     const targets = wakeEvents
       .filter((e): e is AppEvent & { type: 'wake/channel' } => e.type === 'wake/channel')
       .filter((e) => !this.judgedMessageIds.has(e.data.messageId))
@@ -1988,11 +2141,28 @@ export class RealLoop {
    * 与"她看见"是同一刻，而不是判定那一刻——判了却没能送进去（turn 没跑起来）不算示警。
    *
    * 去重按 messageId：重投与攒批窗口会让同一条再走一遍这一拍（见 notedMessageIds）。
+   *
+   * **豁免闸门（2026-10-04 修的真 bug）**：被豁免的会话/人在这里就 `continue`，一个字都不落
+   * ——包括"已经落过 flag 的老消息"再走一遍这一拍的情形（口径：豁免之后不再产生新的警告）。
+   * 放在最前面的理由是它与"有没有判定结论"无关：豁免是**不扫描也不提示**，不是"照扫只是不说"。
+   * 已经落库的那些 `injection/noted` / `injection/flagged` 一个字都不动（日志只增不改）。
+   *
+   * **中途到达的消息不走这一拍**（2026-10-04 实测，口径见 docs/operations.md §4.3）：她在跑一个
+   * turn 时新来的消息由 agent-loop **中途认领**（`input/claimed`，见 claimDeliveredInputs），
+   * 本方法一次都不会为它跑——用户现场那条就是这样（seq 17263 在 turn 380 中途到达，全日志里
+   * `injection/noted` 一条都没有）。它的预警只剩渲染层现算那一个出口（`renderExternalEvent`）：
+   *   · 豁免的：不扫也不提示；未豁免的：渲染时现算（因此**不进**「最近 24 小时示警 X 次」计数，
+   *     且每次渲染重扫一遍字面——纯函数、无 IO，代价可接受）；
+   *   · 要给它"补一次判定"就得在折叠那一拍做（异步判定与逐步渲染抢时序），目前**有意不做**。
    */
   private noteInjectionWarnings(wakeEvents: readonly AppEvent[]): void {
+    // 判据的唯一实现在 WarnExemptBook；这里与判定层、渲染层问的是同一处
+    const exempt = this.warnExemptBook();
+    exempt.refresh();
     for (const event of wakeEvents) {
       if (event.type !== 'wake/channel') continue;
       const d = event.data;
+      if (exempt.isExempt(d)) continue;
       if (this.notedMessageIds.has(d.messageId)) continue;
       // 判过的用它那句（含语义级），没判过的现扫字面——与渲染层同一个判据、同一段文案
       const flagged = this.flaggedNotes.get(d.messageId);

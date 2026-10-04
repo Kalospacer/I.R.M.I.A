@@ -30,7 +30,7 @@ import type { DepsManager, DepName } from '../../deps/manager.ts';
 import type { FsToolDeps, FsToolOptions, ToolDefinition, ToolRegistryLike } from './types.ts';
 
 export * from './types.ts';
-export { createEnv, runProcessDefault, type FsEnv } from './env.ts';
+export { createEnv, resolveGuarded, runProcessDefault, DEFAULT_READ_ONLY_PREFIXES, type FsEnv } from './env.ts';
 export {
   BLOB_DIR_NAME,
   BLOB_ID_PATTERN,
@@ -66,7 +66,7 @@ export {
   type BackupEntry,
   type BackupRecord,
 } from './backup.ts';
-export { comparisonKey, isInside, resolveInsideRoot, type GuardResult } from './path-guard.ts';
+export { comparisonKey, expandAliases, firstSegmentOf, isInside, resolveInsideRoot, type GuardResult, type PathAlias } from './path-guard.ts';
 export {
   DEFAULT_SKIP_DIRS,
   buildGlobFilter,
@@ -153,6 +153,16 @@ export async function buildFsTools(
   const env: FsEnv = createEnv(options, deps);
   const manager = options.deps ?? await defaultDepsManager(options);
   const note = options.onNote ?? ((): void => undefined);
+
+  // 生效的路径别名也要能被人**一眼核对**（与"条件注册的工具不出现时必须如实告知"同一条纪律）：
+  // 别名靠"主根优先"判定，所以唯一会让它失效的情形是**主根下后来真的建了同名目录**——
+  // 把表打出来，人对着目录看一眼就知道有没有这种事。这里只说表本身（相对数据目录），
+  // 不猜 workspaceRoot：真实的解析永远用调用时的 ctx.workspaceRoot。
+  note(`[工具] 路径别名：${
+    env.pathAliases({ workspaceRoot: process.cwd() })
+      .map((alias) => `${alias.prefix}/ → ${alias.root}`)
+      .join(' · ')
+  }`);
 
   const [rgProbe, esProbe] = await Promise.all([manager.get('rg'), manager.get('es')]);
   const rgGate: SearchEngineGate = searchGateOf(

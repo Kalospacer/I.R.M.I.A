@@ -495,6 +495,12 @@ export function summarizeEvent(event: AppEvent): string {
     case 'budget/exhausted':
       return `${event.data.layer} 撞线 ${event.data.actual} / 上限 ${event.data.limit}${event.data.resumable ? '（可恢复）' : ''}`;
     case 'budget/topped-up': return `${event.data.layer} +${event.data.addedTokens}（by ${event.data.by}）`;
+    // 暂停解除（2026-10-04）：两个数都是**解除那一刻**的（有效上限 = 基础上限 + 累计加注；
+    // 当时撞线的那个数不在这里，它在解除之前那条 budget/exhausted 里）。这句话是排障时
+    // "谁把它解开的、凭什么"的唯一答案，所以不许落进 default 打成原始 JSON。
+    case 'budget/resumed':
+      return `${event.data.layer} 暂停已解除：已用 ${event.data.actual} / 有效上限 ${event.data.limit}`
+        + `（${event.data.reason === 'limit-raised' ? '上限被调大' : '加注抬高了上限'}）`;
     case 'policy/denied':
       return `${event.data.tool} · ${event.data.rule} · ${clip(event.data.reason, 60)}`;
     case 'log/repaired':

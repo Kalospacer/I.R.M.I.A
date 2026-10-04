@@ -15,7 +15,10 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { NOW_LAYER_BANNER, RENDER_VERSION, TURN_BLOCK_BANNER, render, renderWake } from '../src/model/render.ts';
+import {
+  NOW_LAYER_BANNER, RENDER_VERSION, TURN_BLOCK_BANNER, render, renderWake,
+  stateBudgetReminder, stateBytesOf,
+} from '../src/model/render.ts';
 import type {
   InputItem, MachineFacts, RenderImageRef, RenderInput, RenderPersona, RenderedRequest, UsageFacts,
 } from '../src/model/render.ts';
@@ -99,6 +102,17 @@ const DEFAULT_TOOLS: Array<{ name: string; description: string; parameters: Reco
   { name: 'read_file', description: '读文件', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
 ];
 
+/**
+ * v30 的两份素材：**技能目录**留在长期记忆层（头部），**记忆索引**搬进本轮固定块。
+ * 它们放一起才有意义——"头部还剩什么"与"索引去了哪儿"是同一件事的两面。
+ */
+const SKILL_CATALOG_FIXTURE = '[可用技能]\n- safe_read: 读记忆文件（带行号）';
+const MEMORY_INDEX_FIXTURE = '# 记忆索引（机制生成，不是你的笔记）\n\n'
+  + '- `MEMORIES/facts.md:3` **!pinned** 用户不喜欢八股过渡';
+/** 「她写了一笔记忆」之后的索引：她新写的那一条被重建进索引（只多一行，其余逐字节相同） */
+const MEMORY_INDEX_AFTER_WRITE = `${MEMORY_INDEX_FIXTURE}\n`
+  + '- `MEMORIES/facts.md:28` 刚记下的一条：备份脚本挪到了 D 盘 tools 目录';
+
 interface RenderOverrides {
   events?: AppEvent[];
   persona?: RenderPersona;
@@ -128,8 +142,18 @@ interface RenderOverrides {
    * "状态有没有进上下文"，而不是"谁把它递进去的"；要测"没给固定块"的场景就传 `null`。
    */
   turnBlock?: RenderInput['turnBlock'];
-  /** 记忆索引（长期记忆层那一段）：默认 null（没有索引时该段整体不出现） */
+  /** 记忆索引（v30 起进**本轮固定块**的尾部）：默认 null（没有索引时该段整体不出现） */
   memoryIndex?: string | null;
+  /** 技能目录（长期记忆层 / 头部剩下的那一样）：v30 起头部只留它与最近摘要 */
+  skillCatalog?: string | null;
+  /**
+   * `persona/STATE.md` 的字节数（v32 的预算提醒素材）：运行期由 `deriveRequest` 从
+   * `persona.state` 量（`stateBytesOf`），这里显式给是为了让单测**不依赖夹具长度**——
+   * 要测"超预算那一行在不在"，直接把数字摆出来比"造一份 9 KB 的 STATE 夹具"清楚得多。
+   */
+  stateBytes?: number | null;
+  /** STATE 的字节预算（v32）：缺省取 `DEFAULT_STATE_BUDGET_BYTES`（8 KB，与配置默认值同源） */
+  stateBudgetBytes?: number | null;
 }
 
 function renderOnce(
@@ -166,7 +190,12 @@ function renderOnce(
     ...(maxContextImages === undefined ? {} : { maxContextImages }),
     softHint: o.softHint ?? null,
     memoryIndex: o.memoryIndex ?? null,
+    skillCatalog: o.skillCatalog ?? null,
     turnBlock,
+    // v32：STATE 预算提醒的两份素材。缺省 = 与运行期/配置同一条默认路径（`?? null` + 渲染层的
+    // 出厂预算），所以绝大多数用例根本不用管它——它们关心的是别的层。
+    stateBytes: o.stateBytes ?? null,
+    stateBudgetBytes: o.stateBudgetBytes ?? null,
   });
 }
 
@@ -197,6 +226,16 @@ function asCall(it: InputItem | undefined, label: string): CallItem {
 function asOutput(it: InputItem | undefined, label: string): OutputItem {
   if (!it || it.type !== 'function_call_output') throw new Error(`${label}：期望 function_call_output item，实际 ${JSON.stringify(it)}`);
   return it;
+}
+
+/**
+ * 一条 message item 的**文本**：图片那种 content 数组给空串（认层、比字节用的是文字）。
+ * 为什么要这个帮手：`content` 的类型是 `string | InputContentPart[]`，直接 `.includes` / `.startsWith`
+ * 在类型上过不去——而这一份测试里到处都要按文本断言。
+ */
+function textOfItem(it: InputItem | undefined, label: string): string {
+  const m = asMessage(it, label);
+  return typeof m.content === 'string' ? m.content : '';
 }
 
 /**
@@ -898,6 +937,144 @@ describe('此刻层 · `用度：` 只在告警时出现（v24）', () => {
   });
 });
 
+// ──────────────────────────────── 此刻层 · STATE 预算提醒（v32） ────────────────────────────────
+
+/**
+ * 用户 2026-10-05 的口径（逐字）：
+ *
+ *   > 「STATE 如果超预算的话，就加个提醒 `[STATE.md]预算超限，记得维护，将过时内容移入记忆文件或删除`」
+ *
+ * 并且明确选了**只提醒、不截断**（框架不动她的文件，她看到提醒自己去维护）。所以这一组钉四件事：
+ *   ① 超预算时那一行**在**，含用户的原话与两个数字；
+ *   ② 没超时**整行不出现**（不是"0%"、不是"正常"）；
+ *   ③ 掉回预算内 → 下一轮就不出现（渲染是纯函数：同一份素材同一个结果，不记"已提醒过"）；
+ *   ④ 它是**此刻层**的字段，不进冻结前缀 / 记忆层 / 固定块——那三层的轮内冻结性质一个字没动。
+ */
+describe('此刻层 · STATE 预算提醒（v32）', () => {
+  /** 用户那句话本身（一个标点都不许改）：这一行必须在提醒的正文里逐字出现 */
+  const OWNER_WORDS = '预算超限，记得维护，将过时内容移入记忆文件或删除';
+  /** 出厂默认预算（KB）：与 config.ts 的 DEFAULT_STATE_BUDGET_BYTES 同源（8 KB） */
+  const BUDGET = 8 * 1024;
+  /** 实测那份 17007 字节的 STATE（16.6 KB） */
+  const OVER = 17_007;
+
+  test('超预算：那一行在此刻层，带用户的原话与两个数字（16.6 KB / 8 KB）', () => {
+    const r = renderOnce({ stateBytes: OVER, stateBudgetBytes: BUDGET });
+    const now = envLayer(r);
+
+    assert.ok(now.includes('[STATE.md]'), `提醒要在（此刻层）：\n${now}`);
+    assert.ok(now.includes(OWNER_WORDS), '用户的原话必须逐字出现');
+    assert.ok(now.includes('16.6 KB'), '要给实际大小');
+    assert.ok(now.includes('预算 8 KB'), '要给预算值');
+    // 用户给的形态就是这个：`[STATE.md] 16.6 KB / 预算 8 KB——预算超限，…`
+    assert.ok(
+      now.includes(`[STATE.md] 16.6 KB / 预算 8 KB——${OWNER_WORDS}`),
+      `整行照用户给的格式：\n${now}`,
+    );
+  });
+
+  test('没超预算（含正好等于）：整行不出现——不写"0%"、不写"正常"', () => {
+    for (const [label, bytes] of [
+      ['远小于预算', 1024],
+      ['正好等于预算', BUDGET],
+      ['没量到（缺省）', null],
+    ] as Array<[string, number | null]>) {
+      const now = envLayer(renderOnce(
+        bytes === null ? {} : { stateBytes: bytes, stateBudgetBytes: BUDGET },
+      ));
+      assert.ok(!now.includes('[STATE.md]'), `${label}：不该出现这一行：\n${now}`);
+      assert.ok(!now.includes('预算超限'), `${label}：连那几个字都不该有`);
+    }
+  });
+
+  test('掉回预算内：同一份素材渲染两次逐字节相同（没有"已提醒过"这种状态）', () => {
+    // 她压下来之后量到的是新尺寸——渲染层只看这一次的素材，所以提醒**自动消失**。
+    // 同一份素材两次渲染必须逐字节一致（缓存铁律 1：禁相对时间、禁随机、禁环境值）。
+    const heavy = () => renderOnce({ stateBytes: OVER, stateBudgetBytes: BUDGET });
+    assert.equal(bytes(heavy()), bytes(heavy()), '同一份素材两次渲染逐字节一致');
+    assert.equal(envLayer(heavy()), envLayer(heavy()));
+
+    // 压到预算内之后的下一轮：同一批事件、同一份其它素材，只有尺寸变了
+    const slim = renderOnce({ stateBytes: 4096, stateBudgetBytes: BUDGET });
+    assert.ok(!envLayer(slim).includes('[STATE.md]'), '下一轮就不出现了');
+    assert.equal(
+      withoutNow(heavy()),
+      withoutNow(slim),
+      '尺寸变只动此刻层：前缀、记忆层、事件流逐字节不变',
+    );
+    // 反过来也一样：尺寸变大时，那一行**只**出现在此刻层
+    assert.ok(!withoutNow(heavy()).includes(OWNER_WORDS), '提醒不进此刻层以外的任何一层');
+  });
+
+  test('只在此刻层、不进冻结前缀与固定块：固定块的轮内冻结一字未动', () => {
+    // 固定块这一组要**非空才出现**（`renderTurnBlock` 的空项不渲染）：给一份索引把块撑起来，
+    // 于是"固定块逐字节不变"这条断言真的落在块上（否则它在测 undefined）。
+    //
+    // ⚠️ 比的是**同一轮里尺寸不同**的两份渲染，不是第 1 步 vs 第 2 步：v31 起固定块只在第 1 步发
+    //（`firstStep` 判据），拿第 2 步来比会得到"块不见了"——那是另一条契约，不是这一条要问的。
+    const turnBlock = { state: 'STATE 段：正在搭 render 层。', relationship: null, memory: null };
+    const step1 = (stateBytes: number): RenderedRequest => renderOnce({
+      turnBlock, memoryIndex: MEMORY_INDEX_FIXTURE, stateBytes, stateBudgetBytes: BUDGET,
+      taskCard: { title: '盯备份', turn: 9, step: 1, todoOpen: ['看日志尾部'] },
+      now: NOW_A,
+    });
+    const over = step1(OVER);
+    const slim = step1(4096);
+
+    // ① 冻结前缀：instructions 一个字节都不许有它
+    assert.ok(!over.instructions.includes('[STATE.md]'), 'instructions 是冻结前缀：提醒不许进去');
+    assert.ok(!over.instructions.includes(OWNER_WORDS));
+    // ② 固定块：尺寸变了它逐字节相同（"一轮之内逐字节不变"这条契约没被这一行碰）
+    const blockOver = textOfItem(over.input.find(isTurnBlock), '固定块');
+    assert.equal(
+      blockOver,
+      textOfItem(slim.input.find(isTurnBlock), '固定块'),
+      '固定块不随 STATE 尺寸变——提醒不在其中',
+    );
+    assert.ok(!blockOver.includes('[STATE.md]'), '固定块里没有提醒那一行');
+    assert.ok(blockOver.includes('[当前状态]') && blockOver.includes('# 记忆索引（机制生成'), '（前置事实）块里本来有状态与索引');
+    // ③ 它在**此刻层**那一条里，且那一条仍然是 input 的最后一条（每步都发）
+    const now1 = over.input.filter(isNowLayer);
+    assert.equal(now1.length, 1, '此刻层仍然只有一条');
+    assert.equal(now1[0], over.input[over.input.length - 1], '此刻层收尾');
+    assert.ok(textOfItem(now1[0], '此刻层').includes('[STATE.md]'), '提醒在此刻层');
+    assert.ok(!textOfItem(over.input.filter(isNowLayer)[0], '此刻层').includes('[当前状态]'), '（前置事实）状态不在此刻层');
+    // ④ 归因口径：这一行算在「此刻层」那一段里，固定块那一段的字节与 token 一个都不动
+    assert.equal(over.context.state?.tokens, slim.context.state?.tokens, '固定块的 token 不变');
+    assert.ok(
+      (over.context.now?.tokens ?? 0) > (slim.context.now?.tokens ?? 0),
+      '多出来的 token 记在此刻层那一段',
+    );
+  });
+
+  test('量尺是"进上下文的那份文本"的 UTF-8 字节数（与 write_persona 同口径）', () => {
+    assert.equal(stateBytesOf(''), 0);
+    assert.equal(stateBytesOf(null), 0);
+    assert.equal(stateBytesOf(undefined), 0);
+    assert.equal(stateBytesOf('abc'), 3);
+    // 一个汉字 3 字节：这份 STATE 几乎全是中文，"多少字"与"多少字节"差三倍
+    assert.equal(stateBytesOf('当前状态'), 12);
+    // 纯函数：同一份文本量两次同一个数（渲染确定性的前提）
+    assert.equal(stateBytesOf('# 当前状态\n\n待命中。\n'), stateBytesOf('# 当前状态\n\n待命中。\n'));
+  });
+
+  test('缺省与坏值：没设预算 / 坏数字一律当"没量到"，返回 null 而不是抛异常', () => {
+    assert.equal(stateBudgetReminder(OVER, BUDGET)?.startsWith('[STATE.md]'), true);
+    // 缺省预算 = 出厂 8 KB（调用方漏传时按代码口径判，而不是"永不提醒"）
+    assert.ok(stateBudgetReminder(OVER)?.includes('预算 8 KB'), '缺省取 DEFAULT_STATE_BUDGET_BYTES');
+    for (const bad of [
+      [null, BUDGET], [undefined, BUDGET], [Number.NaN, BUDGET], [-1, BUDGET],
+      [OVER, 0], [OVER, -8], [OVER, Number.NaN], [OVER, null],
+    ] as Array<[number | null | undefined, number | null | undefined]>) {
+      assert.equal(
+        stateBudgetReminder(bad[0], bad[1]),
+        null,
+        `(${String(bad[0])}, ${String(bad[1])}) 应当整行省略`,
+      );
+    }
+  });
+});
+
 // ──────────────────────────────── 此刻层 · 注入预警（v25） ────────────────────────────────
 
 /**
@@ -1580,7 +1757,8 @@ test('wake/heartbeat 报"已安静"，分钟/秒分档', () => {
     const set = evt<TimerSet>('timer/set', { timerId: 'tm-3', at: tsAfter(15), payload: { note: '收尾检查' } });
     const wake = evt<WakeTimer>('wake/timer', { timerId: 'tm-3', scheduledAt: tsAfter(15), firedAt: tsAfter(16) });
     const r = renderOnce({ events: [set], wakeEvent: wake });
-    const tail = asMessage(r.input[r.input.length - 1], '末项');
+    // v31 起本轮新输入排在历史之后、固定块之前——按 role 找它，不按"末项"（末项是此刻层）
+    const tail = asMessage(r.input.filter((i): i is MessageItem => i.type === 'message' && i.role === 'user').pop(), '本轮新输入');
     assert.equal(tail.role, 'user');
     assert.equal(tail.content, `[定时器触发] 收尾检查（计划时刻 ${tsAfter(15)}）`);
   });
@@ -1614,7 +1792,7 @@ test('wake/heartbeat 报"已安静"，分钟/秒分档', () => {
     assert.equal(renderWake(notWake), '');
   });
 
-  test('内联 wake 与尾部 wake 渲染同一字节串', () => {
+  test('内联 wake 与"本轮新输入"渲染同一字节串（v31：它排在历史之后、固定块之前）', () => {
     const events = buildMixedLog();
     const wake = lastEvent(events);
     const inline = renderOnce({ events }).input
@@ -1623,7 +1801,10 @@ test('wake/heartbeat 报"已安静"，分钟/秒分档', () => {
     const inlineManual = inline[inline.length - 1];
     assert.ok(inlineManual !== undefined, '事件流里应有 wake/manual 渲染出的 user 消息');
     const withTail = renderOnce({ events, wakeEvent: wake });
-    const tail = asMessage(withTail.input[withTail.input.length - 1], '末项');
+    const tail = asMessage(
+      withTail.input.filter((i): i is MessageItem => i.type === 'message' && i.role === 'user').pop(),
+      '本轮新输入',
+    );
     assert.equal(renderWake(wake), inlineManual, '事件流渲染与 renderWake 出口一致');
     assert.equal(tail.content, inlineManual);
   });
@@ -1763,21 +1944,40 @@ describe('铁律 6 · 组装顺序', () => {
     );
   });
 
-  test('input 装配：稳定层打头 → 未遮蔽事件 → 本轮固定块 → 此刻层 → 本轮新输入收尾', () => {
+  test('v31 input 装配：稳定层 → 事件流 → **本轮新输入** → 固定块 → 此刻层收尾', () => {
     const events = buildMixedLog();
     const wake = lastEvent(events);
     const r = renderOnce({ events, wakeEvent: wake });
-    const last = asMessage(r.input[r.input.length - 1], '末项');
-    assert.equal(last.role, 'user');
-    assert.equal(last.content, renderWake(wake), '尾部是本轮新输入');
-    // 事件流从稳定层之后开始；固定块与此刻层都排在整段历史之后，且**固定块在固定块之前**
-    assert.equal(asMessage(eventItems(r)[0], '事件流第 1 条').content, '看下 D 盘备份状态');
+    // ① 本轮新输入紧接历史（v31 的顺序）：它下一轮作为历史出现时**位置与字节都不变**
+    //    （同一份日志里那条事件也在 events 里 → 会出现两次：历史里那次在前，轮首那次在后，
+    //     所以从后往前找"轮首那一条"）
+    let wakeIndex = -1;
+    for (let i = r.input.length - 1; i >= 0; i -= 1) {
+      const item = r.input[i]!;
+      if (item.type === 'message' && item.role === 'user' && item.content === renderWake(wake)) {
+        wakeIndex = i;
+        break;
+      }
+    }
     const blockIndex = r.input.findIndex(isTurnBlock);
     const nowIndex = r.input.findIndex(isNowLayer);
-    assert.equal(blockIndex, r.input.length - 3, '固定块在历史之后（B2）');
-    assert.equal(nowIndex, blockIndex + 1, '此刻层紧随固定块，在整段历史之后');
-    assert.equal(nowIndex, r.input.length - 2, '此刻层紧挨本轮输入');
+    assert.ok(wakeIndex > 0, '本轮新输入在装配里');
+    assert.equal(asMessage(r.input[wakeIndex]!, '本轮新输入').content, renderWake(wake));
+    assert.equal(blockIndex, wakeIndex + 1, '固定块紧随本轮新输入（v31：新输入在块之前）');
+    assert.equal(nowIndex, blockIndex + 1, '此刻层紧随固定块');
+    assert.equal(nowIndex, r.input.length - 1, '此刻层收尾（v31 起新输入不再压在最尾）');
+    // ② 事件流从稳定层之后开始
+    assert.equal(asMessage(eventItems(r)[0], '事件流第 1 条').content, '看下 D 盘备份状态');
     assertPaired(r);
+    // ③ 最要紧的那条性质：本轮新输入那一段，与"下一轮历史里同一条"逐字节相同
+    const asHistory = renderOnce({ events: [...events, wake], wakeEvent: null });
+    const historyText = asHistory.input
+      .filter((i): i is MessageItem => i.type === 'message' && i.role === 'user')
+      .map(i => i.content);
+    assert.ok(
+      historyText.includes(renderWake(wake)),
+      '它进了历史，且历史里那一条与轮首那条逐字节相同——"每轮往后接一段"靠的就是这一点',
+    );
   });
 
   test('无事件且无 wake 时 input 只有固定块与此刻层', () => {
@@ -1834,37 +2034,221 @@ describe('铁律 6 · 组装顺序', () => {
       relationship: { who: 'YG', content: '他只有一个名字。' },
       memory: '## 本轮选中的记忆（正文）\n（示例）',
     };
+    // v30 起固定块里还有记忆索引，所以这条契约测试**带上索引一起跑**：它同样必须轮内冻结
+    // （索引是宿主在轮首建/读的那一份，轮内不许重建）。
+    const idx: Pick<RenderOverrides, 'skillCatalog' | 'memoryIndex'> = {
+      skillCatalog: SKILL_CATALOG_FIXTURE, memoryIndex: MEMORY_INDEX_FIXTURE,
+    };
     const step1 = renderOnce({
-      events, turnBlock, now: NOW_A, taskCard: { title: '补 B2', turn: 5, step: 1, todoOpen: ['索引'] },
+      events, turnBlock, ...idx, now: NOW_A, taskCard: { title: '补 B2', turn: 5, step: 1, todoOpen: ['索引'] },
     });
     const step2 = renderOnce({
-      events, turnBlock, now: NOW_B, taskCard: { title: '补 B2', turn: 5, step: 2, todoOpen: ['索引'] },
+      events, turnBlock, ...idx, now: NOW_B, taskCard: { title: '补 B2', turn: 5, step: 2, todoOpen: ['索引'] },
     });
 
-    // ① 两步里固定块的位置与字节都一致
-    assert.equal(step1.input.findIndex(isTurnBlock), step2.input.findIndex(isTurnBlock), '位置一致');
-    const b1 = asMessage(step1.input.find(isTurnBlock), '固定块');
-    const b2 = asMessage(step2.input.find(isTurnBlock), '固定块');
-    assert.equal(b1.content, b2.content, '固定块在一轮之内逐字节不变（这是这一版买到的东西）');
-    assert.equal(step1.context.state.hash, step2.context.state.hash, '归因里的固定块哈希相等');
-    assert.equal(step1.context.state.tokens, step2.context.state.tokens);
+    // ① 第 1 步有固定块（含索引），第 2 步**没有**（v31：固定块只在轮首那一次请求的尾巴上）
+    const b1 = textOfItem(step1.input.find(isTurnBlock), '固定块');
+    assert.equal(step2.input.find(isTurnBlock), undefined, '第 2 步起固定块不再出现（v31 的口径）');
+    assert.equal(step2.context.state?.tokens, 0, '归因里那一段跟着归零（不是漏记，是这一步没发）');
+    assert.ok(b1.includes('# 记忆索引（机制生成'), '索引确实在固定块里（这条契约现在也罩着它）');
 
-    // ② 除此刻层那一条之外，两步的 input 逐字节相同（KV 前缀能一直命中到固定块末尾）
-    const strip = (r: RenderedRequest): string => JSON.stringify(r.input.filter(i => !isNowLayer(i)));
-    assert.equal(strip(step1), strip(step2), '除此刻层外逐字节相同');
-
-    // ③ 逐项公共前缀：正好停在**此刻层**那一条上（而不是像改造前那样停在历史之后）
+    // ② 两步的公共前缀：**一直命到固定块那一条之前**（历史 + 本轮新输入整段），
+    //    第一处不同是"第 1 步的固定块" vs "第 2 步的此刻层"
     const json = (item: InputItem): string => JSON.stringify(item);
     let common = 0;
     while (common < step1.input.length && common < step2.input.length
       && json(step1.input[common]!) === json(step2.input[common]!)) common += 1;
-    assert.ok(isNowLayer(step2.input[common]!), `第一处不同必须是此刻层，实际是 ${json(step2.input[common]!)}`);
-    assert.ok(common >= 2, '公共前缀至少穿过固定块那一条');
-    assert.ok(json(step2.input[common]!).includes('已 2 步'), '此刻层确实随 step 变（任务卡的步数）');
+    assert.ok(isTurnBlock(step1.input[common]!), `第 1 步在这里出现固定块，实际是 ${json(step1.input[common]!)}`);
+    assert.ok(isNowLayer(step2.input[common]!), `第 2 步在这里是此刻层，实际是 ${json(step2.input[common]!)}`);
+    assert.equal(common, step1.input.length - 2, '公共前缀到固定块之前为止（此刻层仍在尾部，每步都发）');
+
+    // ③ 第 2 步 = 第 1 步去掉固定块（此刻层照旧，各自随 step 变）
+    const stripNow = (r: RenderedRequest): string => JSON.stringify(r.input.filter(i => !isNowLayer(i)));
+    assert.equal(
+      stripNow(step2),
+      JSON.stringify(step1.input.filter(i => !isNowLayer(i) && !isTurnBlock(i))),
+      '摘掉固定块之后，其余一条不多、一条不少',
+    );
+    assert.ok(stateLayer(step2).includes('已 2 步'), '此刻层仍带步数（她动手时还知道走到第几步）');
 
     // ④ 此刻层本身没变的那部分（时刻以外的字段）不该被固定块的内容污染
     assert.equal(stateLayer(step1).includes('[当前状态]'), true);
     assert.equal(envLayer(step1).includes('[当前状态]'), false, '状态不在此刻层里了（B2）');
+  });
+
+  /**
+   * 回归补测（2026-10-05，v31 之后的第一件事）：**固定块被摘掉之后，谁还在替她看着待办**。
+   *
+   * 用户当时的问法是"改了上下文构成，有没有别的机制被连带搞坏——特别是那个 todo 工具"。
+   * 实测结论（探针 `_research/context-regression-probe.ts`，真跑一轮抓请求体）：
+   *   • 任务卡（含「已 M 步」与「未完成计划」列表）**在此刻层**，此刻层每步都发 → 她动手期间
+   *     照样看得见待办，且清单来自**上一步结束时**的投影（她把一项划掉，下一步就少一项）；
+   *   • 固定块里那几样（STATE / 关系档案 / 记忆索引）第 2 步起**一件都不在**——那是有意的取舍。
+   *
+   * 没有这条用例之前，"todo 还在不在"只有 `renderNowText`（M8-4）与"此刻层含未完成计划"
+   * （下面那条单步用例）两处间接覆盖：**没人烤过"第 ≥2 步的请求里还有没有待办"**。
+   */
+  test('v31 回归：第 ≥2 步摘掉固定块之后，任务卡与「未完成计划」仍在此刻层（todo 没被连带摘掉）', () => {
+    const events = buildMixedLog();
+    // 同一轮两步：素材同一份；第 2 步的清单就是"她把第一项划掉之后"的投影（运行期真形状）
+    const turnBlock = { state: 'STATE 段：正在搭 render 层。', relationship: null, memory: null };
+    const step = (n: number, todoOpen: string[]): RenderedRequest => renderOnce({
+      events, turnBlock, memoryIndex: MEMORY_INDEX_FIXTURE,
+      now: n === 1 ? NOW_A : NOW_B,
+      taskCard: { title: '盯备份', turn: 9, step: n, todoOpen },
+    });
+    const items = ['看目录', '看日志尾部', '写结论'];
+    const step1 = step(1, items);
+    const step2 = step(2, items);
+    const step3 = step(3, ['看日志尾部', '写结论']);
+
+    // ① 前置事实：第 2 步确实把固定块摘了（否则下面几条是空断言）
+    assert.equal(step2.input.find(isTurnBlock), undefined, '第 2 步不含固定块（v31）');
+    assert.ok(
+      dumpInput(step2).includes('记忆索引（机制生成') === false,
+      '固定块之外没有第二份索引——所以"第 2 步看不见索引"是必然，不是遗漏',
+    );
+
+    // ② 待办：第 2 / 第 3 步照样在，而且就在此刻层那一条里
+    for (const [label, r] of [['第 2 步', step2], ['第 3 步', step3]] as Array<[string, RenderedRequest]>) {
+      const now = r.input.filter(isNowLayer).map(i => (i as MessageItem).content).join('\n');
+      assert.ok(now.includes('未完成计划：'), `${label}：此刻层必须带出未完成项`);
+      assert.ok(now.includes('当前任务：盯备份'), `${label}：任务卡还在（标题）`);
+      assert.ok(now.includes(`已 ${label === '第 2 步' ? 2 : 3} 步`), `${label}：步数跟着这一 step 走`);
+    }
+    for (const item of items) {
+      assert.ok(stateLayer(step2).includes(`- ${item}`), `第 2 步仍看得见待办「${item}」`);
+    }
+    for (const item of ['看日志尾部', '写结论']) {
+      assert.ok(stateLayer(step3).includes(`- ${item}`), `第 3 步仍看得见待办「${item}」`);
+    }
+
+    // ③ 清单来自**上一步结束时**的投影：第 3 步里已经划掉的那一项不再出现
+    const now3 = stateLayer(step3);
+    assert.ok(!now3.includes('- 看目录'), '她划掉的项不进「未完成计划」（进度看板只列未完成）');
+    assert.ok(now3.includes('- 看日志尾部') && now3.includes('- 写结论'), '没划掉的两项照旧在');
+
+    // ④ 被摘掉的是固定块那几样，别把此刻层也当成"顺手摘了"
+    assert.ok(!stateLayer(step2).includes('[当前状态]'), '状态不在此刻层（它确实跟着固定块走了）');
+    assert.equal(
+      step2.input.filter(isNowLayer).length,
+      1,
+      '此刻层仍然只有一条（每步都发的那一条）',
+    );
+  });
+
+  test('v30：记忆索引在本轮固定块里（不在头部），且是块的**最后一段**', () => {
+    const turnBlock = {
+      state: 'STATE 段：正在搭 render 层。',
+      relationship: { who: 'YG', content: '他只有一个名字。' },
+      memory: '## 本轮选中的记忆（正文）\n（示例）',
+    };
+    const r = renderOnce({ skillCatalog: SKILL_CATALOG_FIXTURE, memoryIndex: MEMORY_INDEX_FIXTURE, turnBlock });
+
+    // ① 位置：认层的段头之后那一条里必须有索引，且排在状态 / 档案 / 正文**之后**。
+    //    为什么排最后：它是块内唯一"其余都不变、只有它变"的素材（她写一笔记忆就重建一次），
+    //    而 KV 是 token 前缀匹配——放尾部时前缀能一直命到索引之前。
+    const block = textOfItem(r.input.find(isTurnBlock), '固定块');
+    assert.ok(block.startsWith(TURN_BLOCK_BANNER), '固定块以段头开头');
+    const iState = block.indexOf('[当前状态]');
+    const iRel = block.indexOf('[关系档案 · YG]');
+    const iBody = block.indexOf('## 本轮选中的记忆（正文）');
+    const iIndex = block.indexOf('# 记忆索引（机制生成');
+    assert.ok(
+      iState > 0 && iRel > iState && iBody > iRel && iIndex > iBody,
+      `顺序：当前状态 → 关系档案 → 本轮选中的正文 → 记忆索引，实际下标 ${iState}/${iRel}/${iBody}/${iIndex}`,
+    );
+    assert.ok(block.trimEnd().endsWith(MEMORY_INDEX_FIXTURE.trim()), '索引就是固定块的结尾（逐字节）');
+
+    // ② 头部（长期记忆层）只剩技能目录：索引一个字节都不在
+    const memory = textOfItem(r.input.find(isMemoryLayer), '长期记忆层');
+    assert.equal(memory, SKILL_CATALOG_FIXTURE.trim(), '头部只剩技能目录（摘要本轮没有）');
+    assert.ok(!JSON.stringify(r.input.find(isMemoryLayer)).includes('记忆索引'), '头部那一条里没有索引');
+
+    // ③ 归因口径跟着挪：索引的 token 记在**固定块**那一段，记忆层那一段与有没有索引无关
+    const withoutIndex = renderOnce({
+      skillCatalog: SKILL_CATALOG_FIXTURE, memoryIndex: null, turnBlock,
+    });
+    assert.equal(r.context.memory.hash, withoutIndex.context.memory.hash, '记忆层哈希与有没有索引无关');
+    assert.equal(r.context.memory.tokens, withoutIndex.context.memory.tokens);
+    const blockTokens = r.context.state?.tokens ?? 0;
+    const blockTokensWithout = withoutIndex.context.state?.tokens ?? 0;
+    assert.ok(
+      blockTokens > blockTokensWithout,
+      `索引要算进固定块那一段（${blockTokensWithout} → ${blockTokens}）`,
+    );
+
+    // ④ 固定块之外一条都不许有（历史 / 此刻层都不背索引）
+    const inBlock = (i: InputItem): boolean =>
+      i.type === 'message' && typeof i.content === 'string' && i.content.startsWith(TURN_BLOCK_BANNER);
+    assert.equal(
+      r.input.filter(i => !inBlock(i) && JSON.stringify(i).includes('记忆索引')).length,
+      0,
+      '索引只在固定块那一条里',
+    );
+  });
+
+  test('v30/v31：索引在轮内不许重建——索引只在第 1 步的固定块里；她写一笔（改索引）头部字节不变', () => {
+    const turnBlock = { state: 'STATE 段：正在搭 render 层。', relationship: null, memory: null };
+    const card = (step: number): RenderInput['taskCard'] =>
+      ({ title: '补 B3', turn: 7, step, todoOpen: ['索引'] });
+    const blockOf = (r: RenderedRequest): string => textOfItem(r.input.find(isTurnBlock), '固定块');
+    const headOf = (r: RenderedRequest): string => JSON.stringify(r.input.find(isMemoryLayer) ?? null);
+
+    // 一轮之内的两步：**索引素材是轮首定下的同一份**（real-loop 在 agentDeps 里读一次），
+    // 所以"轮内不许重建索引"在这里就是"两步的固定块逐字节相同"。
+    const step1 = renderOnce({
+      skillCatalog: SKILL_CATALOG_FIXTURE, memoryIndex: MEMORY_INDEX_FIXTURE, turnBlock,
+      now: NOW_A, taskCard: card(1),
+    });
+    const step2 = renderOnce({
+      skillCatalog: SKILL_CATALOG_FIXTURE, memoryIndex: MEMORY_INDEX_FIXTURE, turnBlock,
+      now: NOW_B, taskCard: card(2),
+    });
+    // v31 起固定块只在第 1 步发，所以"轮内不许重建索引"在这里是"第 2 步根本没有索引那一段"
+    // ——比"两步逐字节相同"更硬：它连发出去的机会都没有。
+    assert.equal(step2.input.find(isTurnBlock), undefined, '第 2 步不含固定块（v31）');
+    assert.ok(blockOf(step1).includes('# 记忆索引（机制生成'), '索引在第 1 步的固定块里（否则下面几条是空断言）');
+    assert.equal(JSON.stringify(step2.input).includes('记忆索引'), false, '第 2 步的请求里一个字的索引都没有');
+    const strip = (r: RenderedRequest): string => JSON.stringify(r.input.filter(i => !isNowLayer(i)));
+    assert.equal(
+      strip(step2),
+      JSON.stringify(step1.input.filter(i => !isNowLayer(i) && !isTurnBlock(i))),
+      '第 2 步 = 第 1 步去掉固定块，其余逐字节相同（带索引时同样成立）',
+    );
+
+    // 她写了一笔记忆：facts.md 被改写 → INDEX.md 被重建。**改的只有索引这一份素材**。
+    const nextTurn = renderOnce({
+      skillCatalog: SKILL_CATALOG_FIXTURE, memoryIndex: MEMORY_INDEX_AFTER_WRITE, turnBlock,
+      now: '2020-06-01T22:00:00.000Z', taskCard: card(1),
+    });
+
+    // ① 头部（长期记忆层）**一个字节都不动**——这是这次挪层要买到的东西
+    assert.equal(nextTurn.context.memory.hash, step1.context.memory.hash, '头部哈希不变');
+    assert.equal(nextTurn.context.memory.tokens, step1.context.memory.tokens, '头部 token 不变');
+    assert.equal(headOf(nextTurn), headOf(step1), '头部逐字节不变');
+    // ② 变的只有固定块那一段（它本来就一轮一变，代价封顶在它自己）+ 此刻层
+    assert.notEqual(nextTurn.context.state?.hash, step1.context.state?.hash, '索引变了 → 固定块跟着变');
+    assert.ok(blockOf(nextTurn).includes('刚记下的一条'), '她新写的那一条在固定块里（索引里那一行）');
+    const nextTokens = nextTurn.context.state?.tokens ?? 0;
+    const prevTokens = step1.context.state?.tokens ?? 0;
+    assert.ok(
+      nextTokens > prevTokens,
+      `固定块因为多了一行索引而略大（${prevTokens} → ${nextTokens}，这是它该付的）`,
+    );
+    // ③ 历史（长前缀）不动：头部守住之后，索引的变化再也够不着它
+    assert.equal(nextTurn.context.history.headHash, step1.context.history.headHash, '历史前段哈希不变');
+    assert.equal(
+      JSON.stringify(eventItems(nextTurn)),
+      JSON.stringify(eventItems(step1)),
+      '历史逐字节不变（索引在尾部变化不该碰它）',
+    );
+    // ④ 索引只出现一次，且落在固定块里
+    assert.equal(
+      nextTurn.input.filter(i => i.type === 'message'
+        && typeof i.content === 'string' && i.content.includes('记忆索引（机制生成')).length,
+      1,
+    );
   });
 
   test('tools 映射为 function 形状且字段不丢；model 原样透传', () => {

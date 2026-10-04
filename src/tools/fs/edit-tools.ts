@@ -11,7 +11,9 @@
  */
 
 import { createBackup, listBackups, readBackup } from './backup.ts';
+import { PATH_BOUNDARY_HINT } from '../boundary.ts';
 import type { FsEnv } from './env.ts';
+import { resolveGuarded } from './env.ts';
 import {
   atomicWrite,
   describeVerdict,
@@ -22,8 +24,8 @@ import {
   readTargetFile,
   type WriteTarget,
 } from './edit-core.ts';
-import { readOnlyPrefixOf, resolveInsideRoot } from './path-guard.ts';
-import { decodeText, encodeText, type DetectedEncoding } from './text-codec.ts';
+import { insideAny, readOnlyPrefixOf } from './path-guard.ts';
+import { decodeText, encodeText, formatBytes, previewLine, type DetectedEncoding } from './text-codec.ts';
 import {
   ABORTED_RESULT,
   FS_ERROR_CODES,
@@ -72,20 +74,51 @@ export function createSafeEditTool(env: FsEnv): ToolDefinition {
     name: 'safe_edit',
     description:
       '已有文件精确替换（先备份，改坏自动回滚）。old 里抄自 safe_read 的行号前缀自动剥掉。'
-      + '多匹配用 occurrence:N 或 replace_all。整行增删用 mode=insert_at_line / delete_lines'
-      + '（配 line 或 start_line+end_line）。',
+      + '多匹配用 occurrence:N 或 replace_all。'
+      + 'insert_at_line 插第 line 行后、delete_lines 含两端；拼不出替换，用 old/new。',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: '文件路径，必须在工作目录内' },
-        mode: { type: 'string', enum: ['replace', 'insert_at_line', 'delete_lines'], description: '默认 replace' },
+        path: { type: 'string', description: `文件路径。${PATH_BOUNDARY_HINT}` },
+        // mode 这一格的描述是**两个行模式的语义本身**（见下面三段注释）。为什么不写进工具描述：
+        // `safe_edit` 是 `test/tool-catalog.test.ts` 里被压到 <60 token 的那六件之一，而
+        // "把两个方向各写一句 + 点明拼不出替换"至少要 20 个 token——工具描述只塞得下那句
+        // 结论（"insert_at_line 插第 line 行后、delete_lines 含两端；拼不出替换，用 old/new"），
+        // 例子与理由放这里（参数描述不进门禁，模型每次请求同样看得到）。
+        mode: {
+          type: 'string',
+          enum: ['replace', 'insert_at_line', 'delete_lines'],
+          description:
+            '默认 replace。insert_at_line：把 new 插在第 line 行**之后**（line:0=文件开头）；'
+            + 'delete_lines：删 start_line..end_line、**含两端**。两者拼不出「替换第 N 行」'
+            + '（删 2-2 再插 line:2，new 会落到原第 3 行之后），替换请走 replace + old/new。',
+        },
         old: { type: 'string', description: 'replace 模式：要被替换的原文（行号前缀会被自动剥掉）' },
         new: { type: 'string', description: 'replace 模式：替换后的新文本；insert_at_line 模式：要插入的文本' },
-        replace_all: { type: 'boolean', description: '替换全部匹配，默认 false（多匹配时必须显式消歧）' },
-        occurrence: { type: 'integer', description: '只替换第 N 处匹配（1-based），与 replace_all 互斥' },
-        line: { type: 'integer', description: 'insert_at_line 模式：插入到第几行之前（真实行号，1-based；0 = 开头）' },
-        start_line: { type: 'integer', description: 'delete_lines 模式：起始行（含，真实行号，1-based）' },
-        end_line: { type: 'integer', description: 'delete_lines 模式：结束行（含，真实行号，1-based）' },
+        replace_all: { type: 'boolean', description: '替换全部匹配，默认 false（多匹配时必须显式消歧）；与 occurrence 互斥' },
+        occurrence: { type: 'integer', description: '只替换第 N 处匹配（1-based）；0 = 未指定（默认）。与 replace_all 互斥' },
+        // ── 两个行模式的语义必须各写一句，而且**不能互相推导**（2026-10-05 实测）──
+        //
+        // 实测的不对称：`delete_lines 2-2` 删的是**第 2 行**（闭区间、含两端），
+        // 而 `insert_at_line line=2` 插在**第 2 行之后**。两句话各自都对（都与 devkit 的
+        // `tools/safe_edit.py` 逐字对齐，`edit-core.ts` 里那两支就是源的写法），
+        // 但**方向不同**：于是最自然的那种写法——
+        //   "把第 2 行换成新内容" = 先 `delete_lines 2..2` 再 `insert_at_line line=2`——
+        // 会**静默错位**：删掉第 2 行后原第 3 行变成第 2 行，"插在第 2 行之后"就落到了它后面，
+        // 新内容跑到下一行下面，而回执两句话都写着"成功"。
+        //
+        // 三条处置，缺一条这个坑就还在：
+        //   ① **不改方向**：那是刚按 devkit 对齐的行为（改动它等于把一个已核对的差异反着改回去）；
+        //   ② 描述里把两个方向的语义各写一句，并点明"这两者拼不出替换"、指过去 `old`/`new`
+        //      ——替换的正路是 replace 模式（把该行原文抄进 old），它按文本匹配、与行号无关；
+        //   ③ 锁测试钉住那对组合的结果（`test/fs-tools.test.ts`「先删后插 ≠ 替换第 N 行」），
+        //      免得将来有人"顺手"把某一支的方向改齐，把这条已经写在文档里的取舍又改回坑里。
+        line: {
+          type: 'integer',
+          description: 'insert_at_line 模式：插到第几行**之后**（真实行号，1-based；0 = 文件开头，越界报错）',
+        },
+        start_line: { type: 'integer', description: 'delete_lines 模式：起始行（**含**，真实行号，1-based）' },
+        end_line: { type: 'integer', description: 'delete_lines 模式：结束行（**含**，真实行号，1-based）' },
       },
       required: ['path'],
       additionalProperties: false,
@@ -102,7 +135,7 @@ export function createSafeEditTool(env: FsEnv): ToolDefinition {
       const parsed = parseEditRequest(args);
       if ('error' in parsed) return invalidArgs('safe_edit', parsed.error);
 
-      const guarded = await resolveInsideRoot(ctx.workspaceRoot, pathInput, { purpose: 'safe_edit' });
+      const guarded = await resolveGuarded(env, ctx, pathInput, { purpose: 'safe_edit' });
       if (!guarded.ok) {
         return fail(
           guarded.code,
@@ -113,9 +146,9 @@ export function createSafeEditTool(env: FsEnv): ToolDefinition {
       }
       if (ctx.signal.aborted) return ABORTED_RESULT;
 
-      const read = await readTargetFile(guarded.path);
+      const read = await readTargetFile(guarded.path, env.maxEditBytes);
       if (read.error !== undefined) {
-        return fail(FS_ERROR_CODES.IO_ERROR, `读取 ${guarded.relPath} 失败：${read.error}`);
+        return fail(read.code ?? FS_ERROR_CODES.IO_ERROR, `读取 ${guarded.relPath} 失败：${read.error}`);
       }
       if (read.buffer === null) {
         return fail(FS_ERROR_CODES.NOT_FOUND, `${guarded.relPath} 不存在；新建文件请用 safe_write。`);
@@ -167,12 +200,20 @@ export function createSafeWriteTool(env: FsEnv): ToolDefinition {
     name: 'safe_write',
     description:
       '新建或整体覆盖文本文件：自动建父目录，写前做语法检查（.ts/.js/.json），失败即中止并保留原文件。' +
-      '覆盖会先备份，可用 safe_rollback 恢复。已有文件做局部修改请用 safe_edit。',
+      '**已存在的文件默认拒绝覆盖**（返回现有内容预览）——改局部内容请用 safe_edit，' +
+      '确需整体覆盖请显式给 overwrite:true（会先备份，可用 safe_rollback 恢复）。',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: '文件路径，必须在工作目录内' },
+        path: { type: 'string', description: `文件路径。${PATH_BOUNDARY_HINT}` },
         content: { type: 'string', description: '完整文件内容' },
+        overwrite: {
+          type: 'boolean',
+          // 默认值是**刻意的**，判据取自源（`_registry.py:1755-1759` 的 `default: False`、
+          // 行为见 `tools/safe_write.py:137-161`）：缺省即"只许新建"，把"整篇覆盖"
+          // 变成一个必须**说出口**的动作。见下面 handler 里那道门的注释。
+          description: '文件已存在时是否覆盖；默认 false（不写，返回现有内容预览与下一步）',
+        },
         encoding: {
           type: 'string',
           enum: ['auto', 'utf8', 'utf8-bom', 'utf16le', 'latin1'],
@@ -193,18 +234,85 @@ export function createSafeWriteTool(env: FsEnv): ToolDefinition {
       const content = readString(args, 'content');
       if (content === null) return invalidArgs('safe_write', '缺少 content（要写空文件请传 content:""）');
       const encodingArg = readOptionalString(args, 'encoding') ?? 'auto';
+      // `readOptionalBool` 对非布尔值**静默当作没给**（返回 undefined）。对这一个参数不能这样：
+      // `overwrite` 决定"要不要抹掉整篇"，把 'yes'/1/"true" 当成"没给"会得到一次
+      // 看起来像参数错的拒绝，而真实原因是**她以为自己在说"覆盖"**——
+      // 语义上这是"说了但不合法"，必须报参数错，不能悄悄降级成默认值。
+      const overwriteRaw = args['overwrite'];
+      if (overwriteRaw !== undefined && typeof overwriteRaw !== 'boolean') {
+        return invalidArgs('safe_write', `overwrite 必须是布尔值（true/false），实际 ${JSON.stringify(overwriteRaw)}`);
+      }
+      const overwrite = overwriteRaw === true;
 
-      const guarded = await resolveInsideRoot(ctx.workspaceRoot, pathInput, {
+      const guarded = await resolveGuarded(env, ctx, pathInput, {
         purpose: 'safe_write',
         allowMissing: true,
       });
       if (!guarded.ok) return fail(guarded.code, guarded.reason);
       if (ctx.signal.aborted) return ABORTED_RESULT;
 
-      const read = await readTargetFile(guarded.path);
-      if (read.error !== undefined) {
-        return fail(FS_ERROR_CODES.IO_ERROR, `读取 ${guarded.relPath} 失败：${read.error}`);
+      // ── 只读区 / 受保护文件：**先于**体积门与覆盖门 ──
+      //
+      // 为什么单独在这里判一次（`guardedWrite` 第零步本来就有）：覆盖门会在"文件已存在
+      // 且没给 overwrite"时先返回 FILE_EXISTS，而那会把 `data/persona/STATE.md` 这类
+      // **只读资产**的真正理由（路径不许写）盖掉——模型收到"文件已存在，要不要 overwrite?"
+      // 会以为"给了开关就能写"，而它其实永远不能写。**更严的判据必须先生效**。
+      // 判据本身不另写一份：复用 `guardedWrite` 用的同两个来源（`readOnlyPrefixes`
+      // 与 `protectedPaths`），消息也取同一份提示，避免两处口径漂移。
+      const roPrefixOfWrite = readOnlyPrefixOf(env.readOnlyPrefixes, guarded.relPath);
+      if (roPrefixOfWrite !== null) {
+        return fail(
+          FS_ERROR_CODES.PATH_DENIED,
+          `${guarded.relPath} 在只读区 ${roPrefixOfWrite}/ 内（模型可读、不可改）。`
+          + (env.readOnlyHints[roPrefixOfWrite] ?? '要改它请走它自己的写通道，不要用通用文件工具。'),
+        );
       }
+      if (insideAny(env.protectedPaths, guarded.path)) {
+        return fail(
+          FS_ERROR_CODES.PATH_DENIED,
+          `${guarded.relPath} 是受保护配置（对 agent 只读）：它定义的正是「谁能改我」，`
+          + '由 agent 改写会让这道防护形同虚设，因此写入口直接拒绝。'
+          + '要变更请由人修改该文件本体，重启后生效（读它不受限制）。',
+        );
+      }
+
+      const read = await readTargetFile(guarded.path, env.maxEditBytes);
+      if (read.error !== undefined) {
+        return fail(read.code ?? FS_ERROR_CODES.IO_ERROR, `读取 ${guarded.relPath} 失败：${read.error}`);
+      }
+
+      // ── 覆盖门（照源 `tools/safe_write.py:137-161`）──
+      //
+      // 缺省**不覆盖已存在的文件**：返回现有内容预览 + 明确的下一步，一个字节都不写。
+      // 判据取自源（那边的 `overwrite` 默认 False），理由也是源的：
+      // `safe_write` 的定位是"新建"，而"整篇覆盖"是**最贵的一类失误**——模型想"改一部分"
+      // 却调了 `safe_write`，一次调用就把没读过的内容全抹掉（本仓库的审计把它记成
+      // docs/devkit-migration-audit.md §1 #3 的 S1 项）。旧实现无条件覆盖，等于把这道
+      // 刹车拆了。**门要挡的是"没说出口的覆盖"**，不是"覆盖"本身：真要整体覆盖
+      // （比如重写一份生成的配置文件），显式给 `overwrite:true` 就走下面那条正常链路
+      // （备份 → 写入 → 语法检查 → 失败回滚）。
+      //
+      // 顺序：① 只读区/受保护（上面，更严的判据先生效）→ ② 体积门（读得到才知道
+      // 文件存不存在）→ ③ 本门。反过来会让拒绝理由说谎。
+      if (read.buffer !== null && !overwrite) {
+        const existing = decodeTarget(read.buffer).text;
+        const preview = existing
+          .split('\n')
+          .slice(0, 8)
+          .map((line) => `    ${previewLine(line)}`);
+        return fail(
+          FS_ERROR_CODES.FILE_EXISTS,
+          `${guarded.relPath} 已存在（${formatBytes(read.buffer.length)}），`
+          + '默认不整体覆盖——本次调用没有写入任何内容。\n'
+          + '现有内容前几行：\n'
+          + `${preview.join('\n')}\n`
+          + '下一步二选一：\n'
+          + `  · 只想改其中一部分 → 用 safe_edit（给 old/new 局部替换）；\n`
+          + `  · 确实要整篇重写 → 重新调 safe_write 并显式给 overwrite:true`
+          + '（会先备份，之后可用 safe_rollback 退回）。',
+        );
+      }
+
       const originalEncoding: DetectedEncoding =
         read.buffer === null ? 'utf8' : decodeTarget(read.buffer).encoding;
       const requested: DetectedEncoding | null =
@@ -252,7 +360,7 @@ export function createSafeRollbackTool(env: FsEnv): ToolDefinition {
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: '文件路径，必须在工作目录内' },
+        path: { type: 'string', description: `文件路径。${PATH_BOUNDARY_HINT}` },
         backup: { type: 'string', description: '指定备份文件名（见 list:true 的输出）；省略则取最近一次' },
         list: { type: 'boolean', description: '只列出备份，不执行回滚' },
       },
@@ -270,7 +378,7 @@ export function createSafeRollbackTool(env: FsEnv): ToolDefinition {
       const listOnly = readOptionalBool(args, 'list') ?? false;
       const wanted = readOptionalString(args, 'backup');
 
-      const guarded = await resolveInsideRoot(ctx.workspaceRoot, pathInput, {
+      const guarded = await resolveGuarded(env, ctx, pathInput, {
         purpose: 'safe_rollback',
         allowMissing: true,
       });
@@ -291,14 +399,14 @@ export function createSafeRollbackTool(env: FsEnv): ToolDefinition {
         return ok(`${guarded.relPath} 的备份（${all.length} 份，最多保留 ${env.backupKeep} 份）：\n${rows.join('\n')}`);
       }
 
-      // 只读区（design §4.19 技能目录）：可读不可写，而回滚也是写操作。
+      // 只读区（design §4.19 技能目录 / P2 的人格资产）：可读不可写，而回滚也是写操作。
       // list:true 已在上面返回（那是纯读），所以这里拦不到误伤。
       const roPrefix = readOnlyPrefixOf(env.readOnlyPrefixes, guarded.relPath);
       if (roPrefix !== null) {
         return fail(
           FS_ERROR_CODES.PATH_DENIED,
-          `${guarded.relPath} 在只读区 ${roPrefix}/ 内（design §4.19：技能目录是只读资产）；`
-          + '回滚同样是写操作，被拒绝。需要恢复请由人处理该目录。',
+          `${guarded.relPath} 在只读区 ${roPrefix}/ 内（可读、不可写）；回滚同样是写操作，被拒绝。`
+          + (env.readOnlyHints[roPrefix] ?? '要改它请走它自己的写通道，不要用通用文件工具。'),
         );
       }
 
@@ -318,9 +426,9 @@ export function createSafeRollbackTool(env: FsEnv): ToolDefinition {
         );
       }
 
-      const read = await readTargetFile(guarded.path);
+      const read = await readTargetFile(guarded.path, env.maxEditBytes);
       if (read.error !== undefined) {
-        return fail(FS_ERROR_CODES.IO_ERROR, `读取 ${guarded.relPath} 失败：${read.error}`);
+        return fail(read.code ?? FS_ERROR_CODES.IO_ERROR, `读取 ${guarded.relPath} 失败：${read.error}`);
       }
 
       // 当前状态先快照：回滚本身也要可回滚，否则一次误回滚就永久丢内容
@@ -382,12 +490,12 @@ export function createMultiEditTool(env: FsEnv): ToolDefinition {
           items: {
             type: 'object',
             properties: {
-              file: { type: 'string', description: '文件路径（也可写作 filepath）' },
+              file: { type: 'string', description: `文件路径（也可写作 filepath）。${PATH_BOUNDARY_HINT}` },
               filepath: { type: 'string', description: 'file 的别名' },
               old: { type: 'string', description: '要被替换的原文' },
               new: { type: 'string', description: '替换后的新文本' },
-              replace_all: { type: 'boolean', description: '替换全部匹配，默认 false' },
-              occurrence: { type: 'integer', description: '只替换第 N 处匹配（1-based）' },
+              replace_all: { type: 'boolean', description: '替换全部匹配，默认 false；与 occurrence 互斥' },
+              occurrence: { type: 'integer', description: '只替换第 N 处匹配（1-based）；0 = 未指定（默认）' },
             },
             required: [],
             additionalProperties: false,
@@ -436,16 +544,16 @@ export function createMultiEditTool(env: FsEnv): ToolDefinition {
 
         let entry = files.get(fileInput);
         if (entry === undefined) {
-          const guarded = await resolveInsideRoot(ctx.workspaceRoot, fileInput, { purpose: 'multi_edit' });
+          const guarded = await resolveGuarded(env, ctx, fileInput, { purpose: 'multi_edit' });
           if (!guarded.ok) {
             const hint = guarded.code === FS_ERROR_CODES.NOT_FOUND
               ? '；multi_edit 只改已存在的文件，新建文件请用 safe_write。'
               : '';
             return fail(guarded.code, `edits[${index}]（${fileInput}）被拒绝：${guarded.reason}${hint}`);
           }
-          const read = await readTargetFile(guarded.path);
+          const read = await readTargetFile(guarded.path, env.maxEditBytes);
           if (read.error !== undefined) {
-            return fail(FS_ERROR_CODES.IO_ERROR, `读取 ${guarded.relPath} 失败：${read.error}`);
+            return fail(read.code ?? FS_ERROR_CODES.IO_ERROR, `读取 ${guarded.relPath} 失败：${read.error}`);
           }
           if (read.buffer === null) {
             return fail(FS_ERROR_CODES.NOT_FOUND, `edits[${index}]：${guarded.relPath} 不存在；新建文件请用 safe_write。`);

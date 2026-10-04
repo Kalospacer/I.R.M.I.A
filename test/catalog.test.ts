@@ -39,7 +39,7 @@ test('catalog：默认视角与真实循环一致——不列破坏性工具，�
 
   assert.ok(specs.length >= 10, `默认清单应至少有 10 件工具，实际 ${specs.length}`);
   assert.ok(specs.some((spec) => spec.name === 'safe_read'), 'fs 工具应在列');
-  assert.ok(specs.some((spec) => spec.name === 'set_timer'), 'admin 工具应在列');
+  assert.ok(specs.some((spec) => spec.name === 'timer'), 'admin 工具应在列');
 
   // 默认视角一件破坏性工具都不列（安全默认，§4.10）：用 sideEffect 判定而不是猜工具名
   for (const spec of specs) {

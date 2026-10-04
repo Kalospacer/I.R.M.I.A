@@ -8,6 +8,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:irmia_gui/api.dart';
 import 'package:irmia_gui/app.dart';
 import 'package:irmia_gui/onboarding.dart';
+// 信任范围那一步的两档字面量与那个二选一控件都在设置页里（两处共用一份，见 TrustModeChoice）
+import 'package:irmia_gui/pages/settings_page.dart';
 import 'package:irmia_gui/theme.dart';
 import 'package:irmia_gui/ui_state.dart';
 
@@ -273,6 +275,21 @@ void main() {
   Map<String, dynamic> lastPostFor(String path) =>
       posts.lastWhere((entry) => entry['path'] == path, orElse: () => <String, dynamic>{});
 
+  /// 信任范围那一步的某一档现在是不是选中的。
+  ///
+  /// 判据是**屏上真的画出来的那一眼**（[TrustModeChoice] 选中态的描边比未选中粗），
+  /// 不是"页面自己记了什么"——这个断言要锁的正是"默认高亮哪一档"。
+  /// 与 settings_page_test 里那份同一个读法（两处各留一份：测试文件之间不互相 import）。
+  bool trustChoiceSelected(WidgetTester tester, String mode) {
+    final box = tester.widget<Container>(
+      find
+          .descendant(of: find.byKey(ValueKey('trust-mode-$mode')), matching: find.byType(Container))
+          .first,
+    );
+    final border = (box.decoration as BoxDecoration).border as Border;
+    return border.top.width > 1;
+  }
+
   int postsOf(String path) => posts.where((entry) => entry['path'] == path).length;
 
   /// 读状态文件里的开关。
@@ -445,7 +462,7 @@ void main() {
       );
       await tester.enterText(personaField, writtenIdentity);
       await tester.pump();
-      await tapPrimary(tester); // 「完成」
+      await tapPrimary(tester); // 「继续」→ 最后一步
 
       expect(postsOf('/api/commands/persona-edit'), 2, reason: '第一步一次（名字）、第四步一次（正文）');
       expect(lastPostFor('/api/commands/persona-edit')['body'], {
@@ -455,6 +472,21 @@ void main() {
       });
       expect(lastPostFor('/api/commands/persona-edit')['confirm'], isNull,
           reason: 'persona-edit 在 CONFIRM_PHRASES 里是 null');
+
+      // ── 第 5 步：信任范围（默认档 = 配置默认值，不动它就不写盘） ──
+      await pumpUntil(tester, find.text('信任范围').first);
+      expect(trustChoiceSelected(tester, kTrustFull), isTrue,
+          reason: '默认高亮「完全信任」——与 src/config/config.ts 的默认值同一个字面量');
+      expect(trustChoiceSelected(tester, kTrustWorkspace), isFalse);
+      expect(find.text('她能读写整台电脑上的文件、也能在任意目录跑命令。'), findsOneWidget);
+      expect(find.textContaining('她只能在'), findsOneWidget,
+          reason: '两种选择各一句后果说明（只限工作目录那句要把路径念出来）');
+      expect(postsOf('/api/commands/config-update'), 1,
+          reason: '还没点完成：到这一步为止只写过通道开关那一次');
+      await tapPrimary(tester); // 「完成」
+
+      expect(postsOf('/api/commands/config-update'), 1,
+          reason: '信任范围与盘上那份一致（都是默认的 full）→ 一个字节都不写');
       expect(find.text(kOnboardingTitle), findsNothing, reason: '完成之后卡片应关掉');
 
       // 「不再弹」是落盘的，不是内存里记了一笔
@@ -602,6 +634,48 @@ void main() {
       expect(postFor('/api/commands/set-mention-keywords')['body'], {
         'keywords': <String>[],
       }, reason: '清空是人写下的值，原样写进去（空 = 只认平台的 @）');
+      await closeOut(tester);
+    });
+
+    testWidgets('信任范围那一步：默认高亮完全信任；改选工作目录才写 trust.mode', (tester) async {
+      useStateFile('onboarding-trust');
+      // 盘上那份就是配置默认值（服务端把 workspaceRoot 一起算出来给界面念）
+      (config)['trust'] = {'mode': 'full', 'workspaceRoot': r'C:\path\to\config\workspace'};
+      await pumpHost(tester);
+      await expectCardShown(tester);
+
+      // 前四步一路往前走（不填、不改）：这一条只看最后那一屏。
+      // 第 1~3 步走卡脚的「跳过这一步」（真的一个字都不写），第 4 步走主按钮
+      // ——**不能一直按「跳过」**：它在最后一步上等价于「完成」，会把卡直接关掉。
+      for (var i = 0; i < 3; i++) {
+        await tapAndSettle(tester, find.text(kOnboardingSkipLabel));
+      }
+      await tapPrimary(tester); // 第 4 步（人格）不填 → 往前走一步到信任范围
+      await pumpUntil(tester, find.text('信任范围').first);
+      expect(posts, isEmpty, reason: '前四步什么都没填 = 一个字节都没写过');
+
+      // ① **默认高亮「完全信任」**（与 src/config/config.ts 的 buildDefaults 同一个字面量）
+      expect(trustChoiceSelected(tester, kTrustFull), isTrue);
+      expect(trustChoiceSelected(tester, kTrustWorkspace), isFalse);
+      // ② 两种选择各一句后果说明，且受限那档要把路径念出来
+      expect(find.text('她能读写整台电脑上的文件、也能在任意目录跑命令。'), findsOneWidget);
+      expect(
+        find.text(r'她只能在 C:\path\to\config\workspace 里活动；越界的读写与命令会被拒绝。'),
+        findsOneWidget,
+      );
+
+      // ③ 改选「只限工作目录」：走既有的 config-update 通道，带 X-Confirm
+      await tester.tap(find.byKey(const ValueKey('trust-mode-workspace')));
+      await tester.pump();
+      expect(trustChoiceSelected(tester, kTrustWorkspace), isTrue, reason: '点哪一档就选哪一档');
+      expect(trustChoiceSelected(tester, kTrustFull), isFalse);
+      await tapPrimary(tester); // 「完成」→ 结算这一步
+
+      expect(postFor('/api/commands/config-update')['body'], {
+        'fields': {'trust.mode': 'workspace'},
+      });
+      expect(postFor('/api/commands/config-update')['confirm'], 'config-update');
+      expect(find.text(kOnboardingTitle), findsNothing, reason: '完成之后卡片应关掉');
       await closeOut(tester);
     });
   });

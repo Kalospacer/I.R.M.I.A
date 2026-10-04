@@ -18,7 +18,7 @@ import 'page_chrome.dart';
 import 'webhook_secret.dart';
 
 // 设置页 —— 锚点 + 分区卡片（docs/astrbot-ux-interaction.md「改造后适用」第一条）：
-//   · 左侧 180px 分区锚点（模型 / 界面 / 发言 / 外部依赖 / 协议端 / 外部回调 / 系统 / 账号与安全 / 关于），
+//   · 左侧 180px 分区锚点（模型 / 界面 / 发言 / 外部依赖 / 协议端 / 外部回调 / 记忆 / 系统 / 账号与安全 / 关于），
 //     点击滚动到右侧对应分区；
 //   · 右侧每组一张卡片（surface + outlineVariant 描边 + radiusCard），卡头 = 组名 + 一句说明；
 //   · 模型组字段两列排布，窄窗降一列；
@@ -42,11 +42,11 @@ class SettingsPage extends StatefulWidget {
 /// GUI 版本号：与 gui/pubspec.yaml 的 version 同步维护（pubspec 那份是 `0.1.0+1`）。
 /// Flutter 没有运行时读取 pubspec 的内置途径，零依赖前提下写成常量。
 ///
-/// 为什么带 `v` 与 `-beta.2` 而 pubspec 里没有：pubspec 的 version 要喂给 Windows 资源
+/// 为什么带 `v` 与 `-beta.3` 而 pubspec 里没有：pubspec 的 version 要喂给 Windows 资源
 /// 版本号（windows/runner/Runner.rc 的 FILEVERSION 是 4 个整数）与安装器，容不下预发布
 /// 标记——beta 只体现在这里与包名/说明里；后端那边对同一版号的口径是 `AGENT_VERSION`
 /// （不带 v，见 src/main.ts）。
-const guiVersion = 'v0.1.0-beta.2';
+const guiVersion = 'v0.1.0-beta.3';
 
 /// 锚点侧栏宽度（AstrBot 的左侧 section 导航）
 const _railWidth = 180.0;
@@ -84,6 +84,17 @@ const _anchors = <_Anchor>[
   // 它与那两张卡是同一类东西（框架管的外部程序 / 外部系统怎么接进来），
   // 而它是一次**可写的运维动作**（生成），不该混进只读的「系统」快照里。
   (id: 'webhook', label: '外部回调', icon: Icons.webhook_rounded),
+  // 记忆（2026-10-04 加）：**框架代管记忆**的总开关（`persona.memoryEnabled`）。
+  // 为什么单独一个分区、而不是塞进「系统」快照里：它是"她怎么活"的一条开关（框架替不替她
+  // 管长期记忆），与监听地址/预算那种**整台实例的启动参数**不是一类东西；而它也不是人格资产
+  // 本身——人格资产页编的是文件内容，这条决定那些文件由谁维护。紧邻「系统」之前：
+  // 两者都是"这台实例这一层"的话，但这条更靠近她。
+  (id: 'memory', label: '记忆', icon: Icons.psychology_outlined),
+  // 信任范围（`trust.mode`）：**她的活动边界有多宽**——整台电脑，还是只有一个工作目录。
+  // 为什么紧挨在「系统」之前、而不是塞进「系统」那张表里：系统卡是"这台实例怎么启动"
+  // （监听地址、预算、数据目录），而这一条是"她这个人能碰多远"——它和「记忆」属于同一族
+  // （她的行为边界），只是这一条更硬：越过它就是拒绝，不是提醒。
+  (id: 'trust', label: '信任范围', icon: Icons.shield_outlined),
   (id: 'system', label: '系统', icon: Icons.dns_outlined),
   // 账号与安全（B10）：改密码与登出。排在这里而不是塞进「模型」卡里：它改的是**进来的方式**
   // （凭据），与"她怎么说话、用哪个模型"毫无关系；而它与「系统」同属"整台实例这一层"，
@@ -371,6 +382,141 @@ const _sysFields = <_SysField>[
   _sysSoftRatio,
   _sysFailStreak,
 ];
+
+/// 信任范围的两档（`trust.mode`）——**取值与字面量与 `src/config/config.ts` 的
+/// `TrustMode` 逐字对齐**（那边只认这两个字面量，拼错即报错），界面不许自己造第三档、
+/// 也不许把标签当成写入值（标签是给人看的，写进去的永远是这两个 id 之一）。
+const kTrustFull = 'full';
+const kTrustWorkspace = 'workspace';
+
+/// 二选一的**后果话术**（两处共用：设置页与首次引导页）。
+///
+/// 为什么把文案抽出来：这两句话是这一档的全部意义所在——用户要的是"两种选择各一句后果
+/// 说明"，而且**两处必须一模一样**。各写一份的下场是引导页说"只能在某个目录里"、
+/// 设置页说成别的，人根本判断不了自己选了什么。
+///
+/// 「只限工作目录」那句里带上 [root]（= `trust.workspaceRoot`，由服务端解析器算出来），
+/// 因为"被关在一个目录里"这件事不说清是哪个目录就等于没说——被拦下的那一刻他才知道，
+/// 那就太晚了。
+String trustModeConsequence(String mode, String root) {
+  if (mode == kTrustWorkspace) {
+    return root.isEmpty
+        ? '她只能在配置里的工作目录（trust.workspaceRoot）中活动；越界的读写与命令会被拒绝。'
+        : '她只能在 $root 里活动；越界的读写与命令会被拒绝。';
+  }
+  return '她能读写整台电脑上的文件、也能在任意目录跑命令。';
+}
+
+/// 二选一那一行的**标题**（同样两处共用）
+String trustModeLabel(String mode) =>
+    mode == kTrustWorkspace ? '只限工作目录' : '完全信任';
+
+/// 二选一的一个可点选项（**设置页与首次引导页共用同一份实现**）。
+///
+/// 为什么两处共用而不是各画一张：这两处的选择是同一件事（`trust.mode`），版式一分为二
+/// 之后就会出现"引导页强调的那档与设置页高亮的那档不一样"这种没人会发现的漂移。
+///
+/// 形状是**成对的选择行**：左边一枚 Radio、右边标题 + 一句后果。为什么不用 SegmentedButton
+/// （「界面」卡里那个）：它一行只放得下一个短标签，装不下"她能读写整台电脑上的文件"这句话
+/// ——而把后果压成"选中之后才显示"的一行，就等于把另一半蒙起来让人选。
+///
+/// 选中态有三处冗余的提示（Radio 的点、描边加粗、底色），这不是装饰：这一行决定的是
+/// **边界**，选错的那一档不该靠"对比两行颜色的深浅"才看得出来。
+class TrustModeChoice extends StatelessWidget {
+  const TrustModeChoice({
+    super.key,
+    required this.mode,
+    required this.selected,
+    required this.consequence,
+    this.enabled = true,
+    required this.onPick,
+  });
+
+  /// 这一行代表哪一档（取值就是写进 config.json 的那两个字面量）
+  final String mode;
+
+  /// 是不是当前选中的那档
+  final bool selected;
+
+  /// 选它之后会发生什么（一句话，两处共用 [trustModeConsequence]）
+  final String consequence;
+
+  /// 写入中：整行按下（避免连点两次打两个请求）
+  final bool enabled;
+
+  /// 人点了它——**点已选中的那一行同样会回调**：要不要写一次盘由调用方判
+  /// （"与盘上那份一样就不写"的判据在页面手里，这一行只负责报"他点了"）
+  final ValueChanged<String> onPick;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: selected ? scheme.primary.withValues(alpha: 0.06) : scheme.surface,
+      borderRadius: BorderRadius.circular(IrmiaTheme.radiusCtl),
+      child: InkWell(
+        key: ValueKey('trust-mode-$mode'),
+        borderRadius: BorderRadius.circular(IrmiaTheme.radiusCtl),
+        onTap: enabled ? () => onPick(mode) : null,
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(6, 8, 12, 8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(IrmiaTheme.radiusCtl),
+            border: Border.all(
+              color: selected ? scheme.primary.withValues(alpha: 0.55) : scheme.outlineVariant,
+              // 选中那一行描边加粗一档：灰度截图或色弱时"深浅"不一定分得出来，"粗细"分得出
+              width: selected ? 1.5 : 1,
+            ),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // 每一行自己是一个 RadioGroup（成员只有它那一枚 Radio，取值恒为 true）——
+              // 而不是两行共用一个：共用的那个"组值"必须来自两行之外的某个地方，而这两行
+              // 本来就分属两个 widget，组值会变成第二份"当前选中的是哪档"的真相。
+              // 分组只为了**不踩 deprecation**（3.35 起 Radio.groupValue/onChanged 已废弃，
+              // 替代品正是 RadioGroup 这个祖先），选中状态仍由上面的 [selected] 一个来源决定。
+              // `toggleable` 不开：二选一必有一档生效，"两档都不选"不是一个状态。
+              RadioGroup<bool>(
+                groupValue: true,
+                // 写入中给一个不做事的回调（RadioGroup.onChanged 是必填）：加上下面
+                // Radio 的 enabled=false，键盘与鼠标两条路都点不动
+                onChanged: enabled ? (_) => onPick(mode) : (_) {},
+                child: Radio<bool>(
+                  value: true,
+                  enabled: enabled,
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      trustModeLabel(mode),
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                        color: scheme.onSurface,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      consequence,
+                      style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 /// 系统卡的**行**（交互单位）：行 id → 这一行管的字段。
 ///
@@ -978,6 +1124,11 @@ class _SettingsPageState extends State<SettingsPage> {
       _sectionBlock('protocol', [_protocolCard()]),
       const SizedBox(height: 18),
       _sectionBlock('webhook', [_webhookCard()]),
+      const SizedBox(height: 18),
+      _sectionBlock('memory', [_memoryCard()]),
+      const SizedBox(height: 18),
+      // 信任范围紧挨在「系统」之前：她是"这个人能碰多远"，系统是"这个进程怎么起来"
+      _sectionBlock('trust', [_trustCard()]),
       const SizedBox(height: 18),
       _sectionBlock('system', [_systemCard()]),
       const SizedBox(height: 18),
@@ -2598,7 +2749,273 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  // ── 分区八：系统（逐行就地编辑：监听地址 / 时区 / 六条预算） ──
+  // ── 分区八：记忆（框架代管记忆的总开关） ──
+
+  /// 「记忆」卡：一个开关 —— `persona.memoryEnabled`。
+  ///
+  /// **为什么放在设置页而不是人格配置页**：人格配置页编的是 `MEMORIES/` 里那些文件的**内容**
+  /// （她的资产），这一条决定的是**那些文件由谁维护**——框架替她管，还是她自知有这些文件、
+  /// 自己去读去写去整理。它改的是运行行为，不是资产，所以归设置页。
+  ///
+  /// 文案口径（用户要求）：**说清后果**，不是"启用记忆系统"四个字。
+  /// 开 = 框架生成 `MEMORIES/INDEX.md`、每轮把索引注入固定块、每日整理一次、
+  /// 并维护 `!pinned` 与条目 TTL；关 = 框架不生成索引、不注入任何记忆、不跑整理，
+  /// 她只从装置自述知道 `MEMORIES/`（facts.md / episodes/ / jargon.md / style-notes.md /
+  /// aliases.md）与 `diary/` 存在，读写维护全归她自己。
+  ///
+  /// 关掉时旁边**必须**摆出那句代价（这里做成只在关掉时出现的一行警示）：
+  /// 她可能忘了整理、`facts.md` 会一直长下去、索引不再更新。理由很直白——
+  /// 关掉这个开关不会有任何报错、也不会有任何东西变红，代价是**几天后才显形**的那种；
+  /// 不在按下去的那一刻说清，人只会以为"界面变安静了"。
+  ///
+  /// 不受它影响的两条路也写在卡头里（`aliases.md` 参与会话认人属于通道侧；
+  /// `STATE.md` 是独立的一层）：免得下一个人以为关掉就全没了。
+  Widget _memoryCard() {
+    final scheme = Theme.of(context).colorScheme;
+    final enabled = _at(cfg, 'persona.memoryEnabled') != false;
+    final pending = pendingRestart.contains('persona.memoryEnabled');
+    return _SectionCard(
+      title: '记忆',
+      note: '长期记忆（MEMORIES/ 与 diary/）由谁维护：框架替你管，还是她自己读、自己写、自己整理。',
+      trailing: pending ? _badge('尚未生效', IrmiaTheme.warn) : null,
+      children: [
+        _FieldCell(
+          label: '让框架自动管记忆（关掉 = 她只知道自己有这些文件，读、写、整理全归她）',
+          field: Align(
+            alignment: Alignment.centerLeft,
+            child: Switch(
+              key: const ValueKey('memory-enabled'),
+              value: enabled,
+              onChanged: _memorySaving ? null : (next) => unawaited(_saveMemoryEnabled(next)),
+            ),
+          ),
+          note: '开着：框架生成 MEMORIES/INDEX.md（一份指针表）、每轮把索引注入固定块、'
+              '按 wake.memoryMaintainCron 每日整理一次（过期流水账并进 facts.md、写一篇 diary/），'
+              'facts.md 的 !pinned 分区与条目 TTL 也由框架维护。',
+        ),
+        // 关掉时才出现的代价行：与卡头的说明分开，是因为它只在关掉这一种状态下成立
+        if (!enabled) ...[
+          const SizedBox(height: 12),
+          _memoryCostNote(),
+        ],
+        const SizedBox(height: 12),
+        _readOnlyRow(
+          '当前生效',
+          enabled ? '框架自动管记忆（每轮注入索引、每日整理）' : '她自己管（框架不生成、不注入、不整理）',
+          restart: true,
+        ),
+        _footnote('不受这个开关影响的两条路：MEMORIES/aliases.md 参与「会话认人 / 关注名单」'
+            '属于**通道侧**；STATE.md（她当前状态）是**独立的一层**。'),
+        _footnote('这一项是进程启动时读的：保存写进 config.json，重启后接管。'
+            '关掉不会删任何文件，也不会阻止她自己动那些文件。'),
+        Text(
+          '为什么留这个开关：给"只想让 agent 自己管记忆"的人一条干净的路。',
+          style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+
+  /// 关掉记忆托管时的那句代价（只在关掉时出现）。
+  ///
+  /// 用警示色而不是灰字：它是这一页上唯一"按下去什么都不会报错、代价却要过几天才显形"的开关。
+  Widget _memoryCostNote() {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      decoration: BoxDecoration(
+        color: IrmiaTheme.warn.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(IrmiaTheme.radiusCtl),
+        border: Border.all(color: IrmiaTheme.warn.withValues(alpha: 0.28)),
+      ),
+      child: Text(
+        '代价：她可能忘记整理，facts.md 会一直长下去，索引也不再更新——这些都归她自己。',
+        style: TextStyle(fontSize: 11.5, height: 1.7, color: scheme.onSurface),
+      ),
+    );
+  }
+
+  bool _memorySaving = false;
+
+  /// 落盘（走既有的 config-update 通道，与发言卡的打字节奏开关同一条路）。
+  ///
+  /// **需重启才生效**，判据不是我在这里猜的：服务端按"盘上那份 vs 本进程启动时那份"算
+  /// `$pending.restartRequired`，`persona.` 前缀本来就在 RESTART_REQUIRED_FIELDS 里
+  /// （而 HOT_RELOAD_FIELDS 目前是空名单——全部字段都要重启），所以保存后回读会把这一条
+  /// 报回来，卡头那枚「尚未生效」徽章与这行只读的「需重启」都是直接显示服务端结论。
+  /// 说得准的理由还有一层：她这一轮的上下文与索引注入方式是在 turn 装配时定下的，
+  /// 半新半旧地接管会让"这一轮到底注入了没有"变成没人说得清的事。
+  Future<void> _saveMemoryEnabled(bool value) async {
+    setState(() => _memorySaving = true);
+    try {
+      await widget.state.api.post(
+        '/api/commands/config-update',
+        {
+          'fields': {'persona.memoryEnabled': value},
+        },
+        confirm: 'config-update',
+      );
+      await _loadConfig(seed: true);
+      if (!mounted) return;
+      _toast(value ? '已改为框架自动管记忆（重启后接管）' : '已改为她自己管记忆（重启后接管）');
+    } catch (err) {
+      if (mounted) _toast('保存失败：$err', kind: ToastKind.warn);
+    } finally {
+      if (mounted) setState(() => _memorySaving = false);
+    }
+  }
+
+  // ── 分区九：信任范围（`trust.mode`：完全信任 / 只限工作目录） ──
+
+  /// 「信任范围」卡：**她的活动边界有多宽**——整台电脑，还是只有一个工作目录。
+  ///
+  /// 为什么是一条独立的卡、而不是系统卡里的一行：系统卡那些字段问的是"这个进程怎么启动"
+  /// （监听地址、预算、数据目录），这一条问的是"她这个人能碰多远"。后者是**边界**：
+  /// 越过它就是拒绝（越界的读写与命令直接被拦），不是提醒、不是降级、也不是"下次注意"。
+  ///
+  /// 三处口径刻意不自己造：
+  ///   · **当前值读盘上那份**（`/api/config?source=saved`，与这一页其余字段同一来源）——
+  ///     读生效配置的话，保存成功后回读会把刚选的那档冲回去；
+  ///   · **需不需要重启**只认服务端算出来的 `$pending.restartRequired`（判据见下方
+  ///     [_trustPending]），本页不另算一份；
+  ///   · **「只限工作目录」的路径**取 `trust.workspaceRoot`（解析器算出来的那份）。
+  ///     它与执行器真正拦的路径是**同一个来源**——界面显示 A 而拦在 B 是最难查的一类故障。
+  ///
+  /// 写入走这一页既有的通道（`POST /api/commands/config-update`，`X-Confirm: config-update`），
+  /// 与「记忆」卡的开关同一条路：点一下即写、写前问一次（放宽边界那一档要多问一句后果）。
+  /// 选中的那一档会**马上**从盘上回读，所以界面显示的永远是"盘上那份"而不是"我以为写下去的"。
+  Widget _trustCard() {
+    final scheme = Theme.of(context).colorScheme;
+    final mode = _trustMode();
+    final root = _text('trust.workspaceRoot');
+    final pending = _trustPending;
+    return _SectionCard(
+      title: '信任范围',
+      note: '她的活动边界：整台电脑，或只有一个工作目录。越界就是拒绝，不是提醒。',
+      trailing: pending ? _badge('尚未生效', IrmiaTheme.warn) : null,
+      children: [
+        _FieldCell(
+          label: '她能碰到多远',
+          field: Column(
+            children: [
+              TrustModeChoice(
+                mode: kTrustFull,
+                selected: mode == kTrustFull,
+                consequence: trustModeConsequence(kTrustFull, root),
+                enabled: !_trustSaving,
+                onPick: (picked) => unawaited(_saveTrustMode(picked)),
+              ),
+              const SizedBox(height: 8),
+              TrustModeChoice(
+                mode: kTrustWorkspace,
+                selected: mode == kTrustWorkspace,
+                consequence: trustModeConsequence(kTrustWorkspace, root),
+                enabled: !_trustSaving,
+                onPick: (picked) => unawaited(_saveTrustMode(picked)),
+              ),
+            ],
+          ),
+          note: '两档各自管什么写在选项里，改哪一档就按哪一档的后果算。'
+              '这一条**同时**管 fs 工具族（safe_read / safe_write / edit_file / list_dir / '
+              'rg_search 等）与 pwsh：前者经同一条路径判定，后者的 workdir 与命令行里的路径一起受管。',
+        ),
+        const SizedBox(height: 12),
+        // 只读的「当前生效」行：与「记忆」卡同形（服务端说了要重启就摆"需重启"，
+        // 盘上那份与生效那份真的不一样时另有一行提示——见下面那条 footnote）
+        _readOnlyRow(
+          '当前生效',
+          mode == kTrustWorkspace
+              ? (root.isEmpty ? '只限工作目录（路径未读到）' : '只限工作目录 · $root')
+              : '完全信任（整台电脑）',
+          restart: true,
+        ),
+        if (pending)
+          _footnote('上面选的那一档**还没生效**：盘上已经写下了，但正跑着的这个进程用的仍是'
+              '启动时读到的那份——重启后接管。在那之前，她照旧按当前生效的那一档活动。'),
+        _footnote('工作目录由服务端算出来（默认 <配置目录>/workspace），界面上不手填：'
+            '同一条边界写两个值，就一定会出现"配置说 A、实际拦在 B"。'),
+        _footnote('它是**边界，不是提醒**：越界的读写与命令一律被拒绝。'
+            '它与 destructive 开关、pwsh 命令黑名单是各自独立的三道门——这一条管的是"范围"，'
+            '不代替那两道。'),
+        Text(
+          '为什么默认完全信任：她是一台无人值守的常驻 agent，"能自己去找、去修、去装"本来'
+          '就是她存在的方式；默认把她关进一个空目录，等于出厂就让她大多数本事用不出来。',
+          style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+
+  /// 盘上那份的 `trust.mode`。**缺字段当 `'full'`**（与 `src/config/config.ts` 的
+  /// `buildDefaults` 同源：那边默认就是完全信任）——绝不因为"界面没读到"就显示成受限那一档：
+  /// 界面说到底该显示的是"她实际按哪一档跑"，猜一个更安全的答案同样是撒谎。
+  String _trustMode() {
+    final raw = _text('trust.mode');
+    return raw == kTrustWorkspace ? kTrustWorkspace : kTrustFull;
+  }
+
+  /// 这一档**要不要重启**——判据只有服务端那一份（`$pending.restartRequired`，它是
+  /// "盘上那份 vs 本进程启动时那份"的逐字段差异）。
+  ///
+  /// 为什么不去自己找一套口径：`src/config/watcher.ts` 的字段归类里，
+  /// `HOT_RELOAD_FIELDS` 是**空名单**（全部字段都要重启才生效，`trust.mode` 自然也在其中），
+  /// 而 `trust.` 并不在 `RESTART_REQUIRED_FIELDS` 那几个前缀里——那两处只决定"事件里怎么记、
+  /// 日志里怎么喊"。界面要答的问题更简单也更硬：**盘上这份与生效那份是否一致**。
+  /// 那正是 `$pending.restartRequired` 的答案，所以这里只读它、只显示它。
+  bool get _trustPending => pendingRestart.contains('trust.mode');
+
+  bool _trustSaving = false;
+
+  /// 落盘一档边界（`trust.mode`）。
+  ///
+  /// 两条分寸：
+  ///   · **改到放宽的那一档（完全信任）要多问一句**：确认框里写的就是那句后果，而不是
+  ///     "确定吗"——按错一次就等于撤掉一条边界；
+  ///   · **与盘上那份相同就什么都不做**：点已经选中的那一行不该产生一次写入（那会让
+  ///     "$pending 里凭空多一条 trust.mode"，界面上突然冒出"尚未生效"，而人什么都没改）。
+  Future<void> _saveTrustMode(String mode) async {
+    if (mode != kTrustFull && mode != kTrustWorkspace) return; // 不认识的值一个字节都不写
+    if (mode == _trustMode()) return;
+
+    if (mode == kTrustFull) {
+      final ok = await confirm(
+        context,
+        title: '改成完全信任',
+        body: '改成完全信任之后：${trustModeConsequence(kTrustFull, _text('trust.workspaceRoot'))}'
+            '这是一条边界，撤掉它她是真的能做到上面这些事。确定吗？',
+        confirmLabel: '改成完全信任',
+        danger: true,
+      );
+      if (ok != true || !mounted) return;
+    }
+
+    setState(() => _trustSaving = true);
+    try {
+      await widget.state.api.post(
+        '/api/commands/config-update',
+        {
+          'fields': {'trust.mode': mode},
+        },
+        confirm: 'config-update',
+      );
+      // 写完立刻按**盘上那份**回读（本页其余字段同一条纪律）：服务端可能拒了、也可能归一化过，
+      // "我以为写下去的"不作数
+      await _loadConfig(seed: true);
+      if (!mounted) return;
+      _toast(
+        mode == kTrustWorkspace
+            ? '已改为只限工作目录；越界的读写与命令会被拒绝（重启进程后接管）'
+            : '已改为完全信任（重启进程后接管）',
+      );
+    } catch (err) {
+      if (mounted) _toast('保存失败：$err', kind: ToastKind.warn);
+    } finally {
+      if (mounted) setState(() => _trustSaving = false);
+    }
+  }
+
+  // ── 分区十：系统（逐行就地编辑：监听地址 / 时区 / 六条预算） ──
 
   /// 系统卡（用户 ⑪ 起可改，⑭ 起改成**逐行**就地编辑）。
   ///
@@ -2821,7 +3238,7 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  // ── 分区九：账号与安全（B10） ──
+  // ── 分区十一：账号与安全（B10） ──
 
   /// 「账号与安全」卡：**改密码** 与 **登出**。
   ///
@@ -2914,7 +3331,7 @@ class _SettingsPageState extends State<SettingsPage> {
     await widget.state.logout();
   }
 
-  // ── 分区十：关于 ──
+  // ── 分区十二：关于 ──
 
   Widget _aboutCard() {
     final scheme = Theme.of(context).colorScheme;

@@ -318,18 +318,20 @@ describe('read_channel · 她自己点开信箱', () => {
     assert.ok(bodyAt < result.content.indexOf('[/external_event]'), '正文在闭标签之前');
   });
 
-  test('管理员工具清单是十件，read_channel/send_media/ask_human 按序排在最后', () => {
+  test('管理员工具清单是八件，read_channel/send_media/ask_human 按序排在最后', () => {
     const tk = toolkitWith(null, recorder());
     assert.deepEqual(
       tk.tools.map((tool) => tool.name),
       [
-        'write_persona', 'set_timer', 'cancel_timer', 'list_timers', 'speak', 'report', 'todo',
+        'write_persona', 'timer', 'speak', 'report', 'todo',
         'read_channel', 'send_media', 'ask_human',
       ],
       // ask_human 是 v27 删、design §6.5 恢复的那一件（"错在等，不在问"）：它排在最后，
       // 于是老前缀一个字节不动，新增的那份 schema 只加在尾部。
       // send_media（2026-10-03，官 bot 富媒体）插在 read_channel 与它之间——同样的道理：
       // 加一件必须是有意为之，因为清单顺序是请求的缓存前缀。
+      // v35 把 set_timer / cancel_timer / list_timers 三件并成一件 `timer`（-2 件）：
+      // 合并后仍占原来 set_timer 的位置（write_persona 之后），后面几件整体前移。
       '工具清单的顺序是 render 的输入（缓存前缀），加一件必须是有意为之',
     );
   });

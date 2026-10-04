@@ -56,6 +56,14 @@ export interface FsToolOptions {
   maxReadBytes?: number;
   /** safe_read 单次返回的行数上限，默认 2000 行 */
   maxReadLines?: number;
+  /**
+   * 写工具族的**单文件字节上限**，默认 20 MiB（`DEFAULT_MAX_EDIT_BYTES`）。
+   *
+   * 两道门同值：① 目标文件本身超过它 → 拒绝读取，绝不"读一部分写整篇"；
+   * ② 这次要落盘的内容超过它 → 拒绝写入。调大它等于接受更大的单次编辑内存占用，
+   * 所以只提供"显式调大"，默认值不随环境漂移。
+   */
+  maxEditBytes?: number;
   /** 递归扫描时跳过的目录名（rg/es 的 TS fallback 共用） */
   skipDirNames?: string[];
   /**
@@ -66,6 +74,16 @@ export interface FsToolOptions {
    * 默认覆盖 skills/ 与 .agents/skills/。
    */
   readOnlyPrefixes?: readonly string[];
+  /**
+   * 每个只读区前缀 → **一句"那该走哪条路"**（相对前缀，键与前缀同字面量）。
+   *
+   * 为什么要有它：拒绝的语义是「这里不许这样写」，但**每个只读区各有各的正确通道**
+   * ——技能目录只能由人确认后变更，人格资产走 `write_persona`（它记 `persona/updated`
+   * 并留人格版本）。把这句写死在 fs 包里，等于让最底层的文件工具去知道 persona 是什么；
+   * 交给装配层（`catalog.ts`）传进来，fs 包就只管"这个前缀不许写"这一件事。
+   * 没给提示的前缀退回一句通用文案。
+   */
+  readOnlyHints?: Readonly<Record<string, string>>;
   /**
    * 受保护文件（**绝对路径**，如 `data/hooks.json`）：写工具一律拒绝覆盖。
    *
@@ -123,6 +141,14 @@ export const FS_ERROR_CODES = {
   NOT_A_FILE: 'E_NOT_A_FILE',
   NOT_A_DIRECTORY: 'E_NOT_A_DIRECTORY',
   BINARY_FILE: 'E_BINARY_FILE',
+  /**
+   * 目标文件已存在，而这次调用的语义是"新建"（`safe_write` 未给 `overwrite`）。
+   *
+   * 单独一个码而不是复用 INVALID_ARGS：这对宿主是**两件不同的事**——
+   * "参数写错了"要模型改参数，"文件已存在"要模型**改主意**（去 safe_edit 改局部，
+   * 或明确说"我就是要整体覆盖"）。宿主与观测侧按码分流才不会把后者当成一次调用失误。
+   */
+  FILE_EXISTS: 'E_FILE_EXISTS',
   AMBIGUOUS_MATCH: 'E_AMBIGUOUS_MATCH',
   NO_MATCH: 'E_NO_MATCH',
   SYNTAX_ERROR: 'E_SYNTAX_ERROR',

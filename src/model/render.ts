@@ -12,9 +12,11 @@
  */
 import type { AppEvent, ChannelMessage, ModelLane } from '../log/types.js';
 import { humanAskSourceOf } from '../log/types.ts';
-import { injectionNoteOf, noteForFlagged, scanForInjection, type InjectionWarnFacts } from '../channel/injection.ts';
+import { noteForFlagged, ruleNoteFor, type InjectionWarnFacts } from '../channel/injection.ts';
+import type { WarnExemptJudge } from '../channel/warn-exempt.ts';
 import { SELF_BRIEF, renderAskNote, renderContactNote, renderInjectionNote, renderMentionNote, type ContactFacts, type OpenAskFacts } from './self-brief.ts';
 import { DEFAULT_SOFT_RATIO } from '../runtime/budget-guard.ts';
+import { DEFAULT_STATE_BUDGET_BYTES } from '../config/config.ts';
 import {
   HISTORY_HEAD_ITEMS, hashOf, segmentOfText,
   type ContextBreakdown, type ContextSegment,
@@ -23,6 +25,61 @@ import { estimateTokens } from '../tools/registry.ts';
 
 /**
  * 渲染模板版本：任何模板变更必须递增并接受一次缓存全 miss。
+ *
+ * v32（STATE 预算提醒进此刻层，2026-10-05 用户的口径）：用户说
+ *      「STATE 如果超预算的话，就加个提醒 `[STATE.md]预算超限，记得维护，将过时内容移入记忆文件或删除`」，
+ *      并明确选了**只提醒、不截断**（框架不动她的文件，她看到提醒自己去维护）。
+ *      ① **框架量**：`persona/STATE.md` 的字节数（口径与 `write_persona` 一致：`Buffer.byteLength`），
+ *         由 `deriveRequest` 在装配点上量一次（运行期/重放/界面预览因此同源，不各量一份）；
+ *      ② **越线才出现**：`stateBytes > stateBudgetBytes`（`config.persona.stateBudgetBytes`，
+ *         默认 8 KB）时，此刻层多一行 `[STATE.md] …——预算超限，记得维护，…`，措辞用用户的原话；
+ *      ③ **它在这一层（此刻层）不是固定块**：那一刻她正在动手的地方就是此刻层（固定块 v31 起
+ *         第 2 步就摘了，放那里她根本看不见）；而它本身是**逐 step 变**的那一类（她压下来之后
+ *         下一次量到的新尺寸就落回预算内，提醒自动消失），进固定块反而会破坏"轮内逐字节不变"。
+ *      ④ **确定性**：这一行只由 `(stateBytes, stateBudgetBytes, 固定文案)` 决定，**不带时间戳、
+ *         不带百分比**——同一轮的同一份 STATE 量出同一个数，就渲染出同一串字节；她改了 STATE
+ *         （尺寸真的变了）才会变，而那本来就是"她正在做的事"。
+ *      为什么必须递增：此刻层的字节变了，与 v31 的记录逐字节不可比。
+ *      调用方**可以不改**：`stateBudgetBytes` 缺省取 `DEFAULT_STATE_BUDGET_BYTES`（与配置默认值同源）。
+ *
+ * v31（**顺序改回用户定稿的那一版 + 第 1 步之后摘掉注入块**，2026-10-04 用户的口径）：
+ *      两件事一起做，因为它们本来就是一条设计：
+ *      ① **顺序**：`[指令 + 工具 + 长期记忆层 + 历史]` → **`[本轮新输入]`** →
+ *         `[记忆索引 + 固定块]` → `[此刻层]`。改前新输入压在**最尾**（此刻层之后），
+ *         于是下一轮它作为历史出现在**中间**时，前缀从固定块那一格起就接不上——跨轮前缀只能
+ *         延长到历史末尾。挪到历史之后，它和"下一轮历史里的同一条"是同一个位置、同一串字节
+ *         （两条路都走 `renderExternalEvent`），**"历史每轮往后接一段"这条性质才真正成立**。
+ *      ② **第 1 步之后摘掉固定块**（用户的原话：「在开始 tool call 的第一次请求，就直接摘掉」）：
+ *         第 ≥2 步的请求 = `[指令 + 工具 + 历史(含新输入) + 本轮工具往来… + 此刻层]`，固定块
+ *         （状态 / 关系档案 / 记忆索引 / 本轮记忆正文，约 5900 token）**不再出现**、也**从不进历史**。
+ *         **代价（主任明确接受，不是我们忘了）**：她动手期间看不到"当前状态 / 关系档案 / 本轮
+ *         记忆正文"——那几样只在轮首那一次请求的尾巴上。**此刻层照旧每步都发**（时刻、进度、
+ *         有没有人在等）：它只有 ~600 token/步，而"现在几点、走到第几步"她动手时真的要用（见下面 ⑤）。
+ *      为什么必须递增：input 的段顺序与字节都动了，与 v30 的记录逐字节不可比。
+ *      **调用方无需改动**：`memoryIndex` / `turnBlock` / `taskCard` 三个字段一个没变，
+ *      换的只是渲染层把它们排在哪一步、哪一层（步号取自 `taskCard.step`，缺任务卡的路径按第 1 步）。
+ *
+ * v30（B3：**记忆索引从 input 头部挪进本轮固定块**，2026-10-05 用户当场指出的设计错误）：
+ *      v29 把索引放进**长期记忆层**（头部）时给的理由是"索引文件只在记忆增删时重建，跨轮稳定"
+ *      ——当晚的实测推翻了这个假设：
+ *          05:08:45  `MEMORIES/facts.md` 被改写
+ *          05:30:01  `MEMORIES/INDEX.md` 被重建（她刚写了自己的流水账）
+ *          05:30:03  下一次调用 → 哨兵：缓存前缀失守（memory）——**从第 1 条 input 起失守**
+ *      她写一笔记忆（facts / episodes / diary）索引就重建一次，而索引在头部 → **整段历史**跟着
+ *      作废：她越勤快记东西，这一笔越贵。所以这一版把索引挪进**本轮固定块**
+ *      （`TURN_BLOCK_BANNER` 那一段，历史之后、此刻层之前）：
+ *      ① 头部（长期记忆层）只留**真正低频**的东西：技能目录、最近摘要（压缩产物）。
+ *         头部从此不再因她写记忆而失守——"历史是长前缀"这件事才真正成立。
+ *      ② 固定块本来就是**一轮一变**（状态、本轮选中的记忆正文都在里面），索引进去不新增代价
+ *         口径：索引变只让固定块变，而固定块的代价上限是**它自己**（此前是"它 + 整段历史"）。
+ *      ③ 铁律因此更硬：**一轮之内不许重建索引**。索引与状态、选中的正文同源同拍——宿主在轮首
+ *         建/读一次，整轮共用同一份（`real-loop` 的 `agentDeps()`），所以块内仍然逐字节不变，
+ *         同一轮的后续 step 照样整段命中。索引在块内的位置也照"会变的靠后"排：**固定块的尾部**。
+ *         "她写了一笔"正是"其余都不变、只有这一段变"的那一种变化——放在尾部时前缀能一直命到
+ *         索引之前（状态 / 关系档案 / 选中的正文都保住）。
+ *      为什么必须递增：input 的段边界与字节都动了，与 v29 的记录不可比。
+ *      **调用方无需改动**：索引仍然从 `RenderInput.memoryIndex` 进来（`real-loop` 与 `replay`
+ *      传的是同一个字段、同一个参数名），换的只是渲染层把它排在哪一层。
  *
  * v29（B2：状态与记忆改「一轮一次 + 索引 + 按需读」，2026-10-04）：
  *      整份 `STATE.md` 原来塞在**此刻层**里，而此刻层是**逐 step 变**的——KV 缓存是前缀匹配，
@@ -36,8 +93,11 @@ import { estimateTokens } from '../tools/registry.ts';
  *      （取回的内容落在工具结果里，天然进历史、天然可缓存）；③ 此刻层只留真正逐 step 变的东西
  *      （时刻 / 本机 / 用度 / 预警 / 联络 / 会话 / 在等你答复 / 点名 / 任务卡）。
  *      为什么必须递增：此刻层与 input 的装配都动了字节，与 v28 的记录不可比。
- *      一处有意的取舍：`persona.state` 在 real-loop 里原来是 getter（她 turn 内改 STATE，
- *      后续 step 立刻看得见）——固定块取**本轮快照**，改动下一轮才可见。缓存前缀的纪律优先。
+ *      一处有意的取舍：状态改由**轮首快照**承载（`render.ts` 的 `TurnBlockFacts.state`），
+ *      她 turn 内用 `write_persona` 改 STATE.md，改动**下一轮**才进她自己的上下文
+ *      （原先 `real-loop` 里的 `deps.persona.state` 是 getter，同轮后续 step 立刻看得见——
+ *      2026-10-05 核实时确认那个 getter 已经**没有任何消费者**，只剩"同轮可见"这句过期注释）。
+ *      缓存前缀的纪律优先于同轮立刻可见。
  *
  * v28（群里被提及的那一轮：**通知进、正文不进**，2026-10-02 用户定的设计）：
  *      用户的原话：「为什么卡片的 wake 让她先回话了，然后又调用了 channel，然后再回了一次话。
@@ -158,7 +218,7 @@ import { estimateTokens } from '../tools/registry.ts';
  *
  * v2：`instructions` 尾部（人格三层之后、任务卡之前）插入装置自述（self-brief.ts 的 SELF_BRIEF）。
  */
-export const RENDER_VERSION = '29';
+export const RENDER_VERSION = '32';
 
 /**
  * 哪次工具调用没有回执时，补给它（也补给她）的那句话。
@@ -362,9 +422,15 @@ export interface RenderPersona {
  * 三样东西的来路各不相同，但"一轮之内不变"这条要求是一样的：
  *   • `state` —— `persona/STATE.md` 的本轮快照；
  *   • `relationship` —— 本轮唤醒命中的情景档案（缺省=本轮没有）；
- *   • `memory` —— 本轮选中的记忆正文（`memory/selected` 事件的渲染形态），**心跳轮为空**。
+ *   • `memory` —— **恒为 null**（2026-10-04 用户的口径：「只看索引，如果需要，heavy 自己去读，
+ *     随后跟随 tool call 留在上下文」）。字段留着是为了"要改回去只需把它重新填上"，
+ *     渲染层印它的那一小段已经删了；现在固定块里关于记忆的只有下面的索引。
  *
- * 全空（三项都没有内容）时整块不出现——不写空段。
+ * 固定块里还有**第三样：记忆索引**（v30 起）。它刻意**不在这个接口里**，走
+ * `RenderInput.memoryIndex` 那条已有的入参——调用方（`real-loop` / `replay`）本来就把它传在
+ * 顶层，这样"挪层"就只是渲染层内部的事，调用方一行都不用改（见本文件头 v30 那条）。
+ *
+ * 全空（都没有内容）时整块不出现——不写空段。
  */
 export interface TurnBlockFacts {
   /** `persona/STATE.md` 的本轮快照（可缺：她把自己的状态清空过） */
@@ -388,6 +454,26 @@ export interface RenderInput {
   wakeEvent: AppEvent | null;
   /** 任务卡素材（openTurn 为空则 null） */
   taskCard: { title: string; turn: number; step: number; todoOpen: string[] } | null;
+  /**
+   * `persona/STATE.md` 的**字节数**（v32 的预算提醒素材）。
+   *
+   * 由调用方量（`Buffer.byteLength(persona.state)`，与 `write_persona` 的字节口径同源）：
+   * 渲染层不读文件系统——这条纪律没有因为它而破例。`deriveRequest` 那一处调用点量一次，
+   * 运行期 / 重放 / 界面预览三条路因此拿到的是同一个数。
+   *
+   * null/缺省 = 没量（子代理、诊断、自带 `RenderInput` 的老调用点）：预算提醒**整行不出现**，
+   * 与引入它之前逐字节相同。
+   */
+  stateBytes?: number | null;
+  /**
+   * `persona/STATE.md` 的字节预算（v32；`config.persona.stateBudgetBytes`，默认
+   * [DEFAULT_STATE_BUDGET_BYTES] = 8 KB）。
+   *
+   * 缺省取默认值（而不是"不设预算"）：预算的默认值属于**代码口径**，调用方漏传时也该按
+   * 出厂口径判——否则"提醒怎么不出现"会变成一个只在某条路径上复现的谜。
+   * 真要关掉这一行，把自己的 STATE 压回预算内即可（它是提醒，不是开关）。
+   */
+  stateBudgetBytes?: number | null;
   /** 当前时刻 ISO（调用方给；渲染层不读时钟） */
   now: string;
   timezone: string;
@@ -412,9 +498,16 @@ export interface RenderInput {
   /**
    * 记忆索引文本（B2：`MEMORIES/INDEX.md` 的渲染形态）。
    *
-   * 进**长期记忆层**（input 头部那一段，与技能目录同处）：索引本身是**指针表**，
-   * 只在记忆文件增删时变——跨轮稳定，所以它该待在可命中的前缀里，而不是每轮跟着状态块走。
-   * 正文一律不来这里：要读哪一条，模型自己用 `safe_read` 按索引给的路径与行号现取。
+   * 进**本轮固定块**（v30；v29 时在长期记忆层 = input 头部）：索引是**指针表**——每条只有
+   * 「路径:行号 + 一行摘要 + `!pinned`」，正文要 `safe_read` 现取（取回的内容落在工具结果里，
+   * 天然进历史、天然可缓存）。
+   *
+   * 为什么不留在头部：索引**只在记忆增删时重建**这个假设是错的——她每写一笔记忆
+   * （facts / episodes / diary），索引就重建一次，而它在头部意味着**整段历史从第 1 条起失守**。
+   * 放进固定块之后，她写记忆的代价封顶在"固定块自己"（固定块本来就一轮一变），
+   * 头部只留技能目录与摘要这两个真正低频的东西（见本文件头 v30 那条实测）。
+   * 与固定块同一条纪律：**一轮之内不许重建**——素材由宿主轮首读一次，整轮共用。
+   *
    * null/缺省表示没有索引（重放与诊断场景不传），该段整体不出现。
    */
   memoryIndex?: string | null;
@@ -422,7 +515,7 @@ export interface RenderInput {
    * 本轮固定块的素材（B2，见 [TurnBlockFacts]）：历史之后、此刻层之前。
    *
    * **一轮之内逐字节不变**，这是它的全部意义（见 docs/memory-injection.md §2）。
-   * 缺省 / 三项全空 = 整块不出现。
+   * 缺省 / 素材全空 = 整块不出现（记忆索引在 `memoryIndex` 那一项里，见上）。
    */
   turnBlock?: TurnBlockFacts | null;
   /**
@@ -481,6 +574,20 @@ export interface RenderInput {
    */
   injection?: readonly InjectionWarnFacts[] | null;
   /**
+   * 「这条通道消息豁免吗」——宿主递进来的判据（2026-10-04）。
+   *
+   * 为什么要它：规则命中变成警告有**两个出口**——唤醒路径落 `injection/noted`（在 real-loop
+   * 里判），以及本模块 `renderExternalEvent` 的兜底扫描（**渲染时现算**）。用户现场踩到的那条
+   * 消息走的正是后者：她跑到一半时消息才到、被中途认领，于是没有任何落库的结论可读。
+   * 判据**只有一处实现**（`channel/warn-exempt.ts` 的 `WarnExemptBook.isExempt`）；渲染层自己
+   * 一个字都不判、不读盘（缓存铁律 1）——这只用入参里那个函数，名单的真源在宿主手里
+   * （运行期 `real-loop` 装配 deps 时给、重建 `replay` 按盘上那份给，两处同一份口径）。
+   *
+   * 缺省/不配 = **谁都不豁免**（"预警开着"是安全的那一侧）：子代理、诊断、以及不带它的旧调用点
+   * 都是这一支——渲染出来与引入它之前逐字节相同。
+   */
+  warnExempt?: WarnExemptJudge | null;
+  /**
    * 尾部插播的提示（软阈值提示 / 钩子注入）：**不落库**，只进这一次请求。
    *
    * 它在这里而不是在 `deriveRequest` 里追加（2026-10-03 挪进来）：渲染层要为自己的上下文
@@ -534,13 +641,12 @@ export function render(input: RenderInput): RenderedRequest {
   // 别处一律读结论。四条 input 段的分界靠"压栈前先量长度"拿下标，不靠事后猜内容。
   const memoryStart = items.length;
 
-  // ① 长期记忆层（头部）：技能目录、**记忆索引**、最近摘要——只在技能确认 / 记忆增删 / 压缩
-  //    发生时变，其余时候逐字节稳定。它是 input 的起点，稳定它就稳定了一整段历史前缀。
-  //    记忆索引（B2）就是在这里：它是**指针表**（路径 + 一行摘要 + `!pinned`），不是正文——
-  //    正文要按需 `safe_read`（取回的内容落在工具结果里，天然进历史、天然可缓存）。
-  const memoryLayer = renderMemoryLayer(
-    latestSummary, coveredUpToSeq, input.skillCatalog ?? null, input.memoryIndex ?? null,
-  );
+  // ① 长期记忆层（头部）：技能目录、最近摘要——只在技能确认 / 压缩发生时变，其余时候逐字节稳定。
+  //    它是 input 的起点，稳定它就稳定了一整段历史前缀。
+  //    **记忆索引不在这里**（v30 起）：它是唯一"她写一笔记忆就重建一次"的素材，放头部等于
+  //    她越勤快、整段历史越容易从第 1 条起作废（实测与理由见本文件头 v30 那条）；
+  //    它现在在固定块里（下面 ③）。头部只剩这两样真正低频的东西。
+  const memoryLayer = renderMemoryLayer(latestSummary, coveredUpToSeq, input.skillCatalog ?? null);
   if (memoryLayer !== '') items.push({ type: 'message', role: 'developer', content: memoryLayer });
   const memorySegment = segmentOfItems(items.slice(memoryStart));
 
@@ -556,41 +662,17 @@ export function render(input: RenderInput): RenderedRequest {
   const historyStart = items.length;
   items.push(...renderEvents(
     events, coveredUpToSeq, requeued, images, input.channelRender, channelNotes,
-    input.mentionNotice ?? null,
+    input.mentionNotice ?? null, input.warnExempt ?? null,
   ));
   const historyItems = items.slice(historyStart);
 
-  // ③ 本轮固定块（B2）：历史之后、此刻层之前——**一轮之内逐字节不变**的那一段。
+  // ③ 本轮新输入（v31）：**紧接历史**——这是主任定的那版顺序里最要紧的一格。
   //
-  //    为什么是这里而不是头部或尾部（docs/memory-injection.md §2）：放头部会让整段历史从第一条
-  //    起失配（v4 的教训：input[0] 每轮都变，历史一条都命不中）；放尾部就是改造前的样子
-  //    ——状态与记忆跟逐 step 变的此刻层绑在一起，每步重新编码。只有在历史之后、此刻层之前，
-  //    "历史是长前缀"与"此刻层是易变尾巴"两件事才能同时成立：块变的是**轮**，不是**步**。
-  const turnBlockStart = items.length;
-  const turnBlock = renderTurnBlock(input.turnBlock ?? null);
-  if (turnBlock !== '') items.push({ type: 'message', role: 'developer', content: turnBlock });
-  const turnBlockSegment = segmentOfItems(items.slice(turnBlockStart));
-
-  // ④ 此刻层（尾部）：**只留真正逐 step 变的东西**——时刻、本机、用度、预警、通道、会话、
-  //    她问出去的事、点名、任务卡（它带「已 M 步」，每步都变）。放头部会让整个 input 从第一条
-  //    就失配，放尾部则前面全部成为可命中的前缀，只有这一条与新增事件落空。
-  //    她的状态与关系档案**不在这里**（B2 起在固定块）：它们一轮之内不变，留在这里等于每步重发。
-  const nowStart = items.length;
-  items.push({
-    type: 'message', role: 'developer',
-    content: renderNowLayer(
-      now, timezone,
-      input.contact ?? null,
-      taskCard, input.asks ?? [],
-      input.machine ?? null, input.usage ?? null,
-      input.injection ?? [],
-      // 提及那一轮：通知已经在她这一轮的输入里了，此刻层不再重复写「点名：」
-      input.mentionNotice ?? null,
-    ),
-  });
-  const nowSegment = segmentOfItems(items.slice(nowStart));
-
-  // ⑤ 本轮新输入
+  //    为什么不能像 v29/v30 那样放在最尾（此刻层之后）：那样"她收到的那句话"落在整个注入块的
+  //    **后面**，下一轮它作为历史出现在**中间**时，前缀从固定块那一格起就接不上了
+  //    （跨轮前缀只能延长到历史末尾）。挪到历史之后，"这一轮的新输入"与"下一轮历史里的同一条"
+  //    就是**同一个位置、同一串字节**（两条路都走 `renderExternalEvent`，见 renderWake 与
+  //    renderEvents），历史于是真的变成"每轮往后接一段"的前缀延长。
   const wakeStart = items.length;
   if (wakeEvent) {
     // 群里被提及的那一条：**换成框架通知**（正文她自己 read_channel 取）——与事件流里那条
@@ -609,6 +691,7 @@ export function render(input: RenderInput): RenderedRequest {
         requeued,
         input.channelRender,
         wakeNote,
+        input.warnExempt ?? null,
       );
     const parts = useNotice ? [] : images.partsFor(wakeEvent);
     items.push({
@@ -619,7 +702,64 @@ export function render(input: RenderInput): RenderedRequest {
   }
   const wakeSegment = segmentOfItems(items.slice(wakeStart));
 
-  // ⑥ 尾部插播（软阈值提示 / 钩子注入）：只追加，绝不改动已渲染历史（否则摧毁 KV 前缀）
+  /**
+   * 是不是本轮的**第 1 步**——**本轮固定块**只在第 1 步发（v31）。
+   *
+   * ⚠️ **此刻层不受它管**（它每步都发，见下面 ⑤）：这个判据只管固定块那一条。
+   * 2026-10-05 核对时抓到这句注释原来写成"注入块（固定块 + 此刻层）只在第 1 步发"——
+   * 与代码、与 ⑤ 的注释都相反；照它去读代码的人会以为她动手期间连时刻和步数都看不见。
+   *
+   * 判据取任务卡的步号（`deriveAt` 每步都带；诊断/子代理那种没有任务卡的路径按"第 1 步"处理，
+   * 也就是**照旧发**——少发一次固定块是性能取舍，不值得为它赌一条判据不明的路径）。
+   */
+  const firstStep = taskCard === null || taskCard.step <= 1;
+
+  // ④ 本轮固定块（B2；记忆索引 v30 起也在这里）：**只在第 1 步**（v31 起）。
+  //
+  //    v31 改口径的依据是主任 2026-10-04 的原话：「在开始 tool call 的第一次请求，就直接摘掉」。
+  //    它一轮之内逐字节不变、只服务"这一轮该怎么想"，第 2 步起每步重发一遍纯属浪费；摘掉之后
+  //    本轮请求的形状是 `[指令+工具+历史(含新输入)] + [本轮工具往来…]`，块**从不进历史**。
+  //
+  //    **代价（用户明确接受，不是我们忘了）**：她动手（tool call）期间看不到"当前状态 / 关系档案 /
+  //    记忆索引"——那几样只在轮首那一次请求里。取舍归用户；要改回去，把这个条件去掉即可。
+  //
+  //    **不在这份代价里的是此刻层那几样**（时刻 / 本机 / 用度 / 预警 / 联络 / 会话 / 在等你答复 /
+  //    点名 / 任务卡）：它们每步都发（见 ⑤）。任务卡尤其重要——待办清单就挂在它身上
+  //    （2026-10-04 起载体是 STATE 的两节，见 persona/todo-state.ts），她动手期间必须看得见。
+  const turnBlockStart = items.length;
+  const turnBlock = firstStep ? renderTurnBlock(input.turnBlock ?? null, input.memoryIndex ?? null) : '';
+  if (turnBlock !== '') items.push({ type: 'message', role: 'developer', content: turnBlock });
+  const turnBlockSegment = segmentOfItems(items.slice(turnBlockStart));
+
+  // ⑤ 此刻层（尾部，**每步都发**）：时刻、本机、用度、预警、通道、会话、她问出去的事、点名、
+  //    任务卡（带「已 M 步」）。它**不跟着固定块一起摘**——摘掉它，她动手期间就不知道现在几点、
+  //    自己走到第几步、有没有人在等她答复了（v26 那次"她拿 UTC 当本地时间"的教训说明这几行
+  //    她真的在用）；而它只有 ~600 token/步，比固定块小一个数量级。放尾部是为了让前面全部
+  //    成为可命中的前缀——它逐 step 变，前缀断在它这一格是设计内的。
+  //    她的状态与关系档案**不在这里**（B2 起在固定块），记忆索引也不在这里（v30 起在固定块）。
+  const nowStart = items.length;
+  items.push({
+    type: 'message', role: 'developer',
+    content: renderNowLayer(
+      now, timezone,
+      input.contact ?? null,
+      taskCard, input.asks ?? [],
+      input.machine ?? null, input.usage ?? null,
+      input.injection ?? [],
+      // 提及那一轮：通知已经在她这一轮的输入里了，此刻层不再重复写「点名：」
+      input.mentionNotice ?? null,
+      // STATE 预算提醒（v32）：素材是"她的 STATE 有多少字节"与"预算多少"两个数，
+      // 由调用方给（`deriveRequest` 在装配点上量一次）。没量到就整行不出现。
+      input.stateBytes ?? null,
+      input.stateBudgetBytes ?? DEFAULT_STATE_BUDGET_BYTES,
+    ),
+  });
+  const nowSegment = segmentOfItems(items.slice(nowStart));
+
+  // ⑥ 尾部插播（软阈值提示 / 钩子注入）：**照旧每步都发**——它不属于"轮首注入块"：
+  //    预算软线是"框架此刻要你知道的一件事"（每步重算、可能每步不同），钩子注入也是这一次的事。
+  //    摘掉它等于让预算提示在她动手期间消失，而那正是最该看见它的时候。
+  //    只追加，绝不改动已渲染历史（否则摧毁 KV 前缀）。
   const hintStart = items.length;
   const hint = input.softHint ?? null;
   if (hint !== null && hint !== '') items.push({ type: 'message', role: 'developer', content: hint });
@@ -690,28 +830,24 @@ export function renderInstructions(persona: RenderPersona): string {
 // ── 状态层 ──
 
 /**
- * 长期记忆层（头部，低频变化）：技能目录 + **记忆索引** + 最近摘要。
+ * 长期记忆层（头部，低频变化）：技能目录 + 最近摘要。
  *
- * 为什么这三样放头部：它们是**跨轮稳定**的长期素材，放头部能撑住一整段可命中的前缀；
- * 而它们变化的时机（技能被确认、记忆文件增删、上下文压缩）本身就是低频事件，代价可接受。
+ * 为什么这两样放头部：它们是**真正跨轮稳定**的长期素材——技能目录只在技能被确认时变，
+ * 摘要只在上下文压缩时变，两者都是低频事件，代价可接受；放头部能撑住一整段可命中的前缀。
  *
- * 记忆索引（B2）放在这里而不是固定块里：它是**指针表**——索引文件只在记忆增删时重建，
- * 一轮之内、乃至很多轮之内都逐字节相同。放进固定块等于每轮重发一份不变的表（白付），
- * 而放进头部它就成了历史之前那段稳定前缀的一部分。
+ * **记忆索引不在这里**（v30 起在固定块里）：它看着像"只在记忆增删时重建"，实际上她写一笔
+ * 记忆就重建一次；放头部时那份波动会打掉**整段历史**（实测与理由见本文件头 v30 那条、
+ * 以及 docs/memory-injection.md §8）。头部只留"变了就是大事"的东西。
  */
 function renderMemoryLayer(
   latestSummary: string | null,
   coveredUpToSeq: number,
   skillCatalog: string | null,
-  memoryIndex: string | null,
 ): string {
   const sections: string[] = [];
   // 技能索引（design §4.19 渐进披露第 1 层）：只有名称与描述，正文按需 safe_read
   const skills = (skillCatalog ?? '').trim();
   if (skills !== '') sections.push(skills);
-  // 记忆索引（B2）：同样只有指针（路径 + 一行摘要 + !pinned），正文按需 safe_read
-  const index = (memoryIndex ?? '').trim();
-  if (index !== '') sections.push(index);
   if (latestSummary !== null) {
     sections.push(`[早期历史摘要 · 覆盖至 seq ${coveredUpToSeq}]\n${latestSummary}`);
   }
@@ -721,30 +857,45 @@ function renderMemoryLayer(
 /**
  * 本轮固定块（B2，历史之后、此刻层之前）：**这一轮里不会再变**的状态与记忆。
  *
- * 三样东西的顺序是刻意的，从"她是谁"到"这一轮多知道什么"：
+ * 两样东西的顺序是刻意的，从"她是谁"到"能去哪儿查"：
  *   ① `[当前状态]`（`STATE.md`）；
  *   ② `[关系档案 · X]`（本轮唤醒命中的那个人）；
- *   ③ 本轮选中的记忆正文（`memory/selected` 的渲染形态，**心跳轮为空**）。
+ *   ③ **记忆索引**（`MEMORIES/INDEX.md` 的渲染形态，v30 起从头部挪到这里）。
+ *
+ * **不再有"本轮选中的记忆正文"那一段**（2026-10-04 用户的口径）：机制不替她挑正文，
+ * 只给索引（指针表），要哪一条她自己 `safe_read`——读回来的内容作为工具结果留在历史里，
+ * 长期命中前缀缓存。理由与代价见 docs/memory-injection.md §5。
+ *
+ * 为什么索引排**最后**（v30）：它是块内唯一"其余都不变、只有它变"的那一种素材——她写一笔
+ * 记忆，索引就重建一次。KV 缓存是 **token 前缀**匹配，把它放尾部时前缀能一直命到索引之前
+ * （状态 / 关系档案都保住）；它与前面几样挤在一起时，它一变、后面跟着一起赔。
+ * 与整个 input 的排法同一条原则：会变的靠后。
  *
  * 为什么要有段头：它与此刻层一样是框架给的，但**变化节奏不同**（一轮 vs 一步）。
  * 段头把这件事说给她听（这些不是"刚刚发生的事"），也给读日志的人一个认层的锚点——
  * 测试与诊断按它认层，不按索引认（与 `NOW_LAYER_BANNER` 同一条做法）。
  *
- * 三项全空时返回空串：**不写空段**（与记忆层同一条纪律——空段占位又会被读成"有什么"）。
- * 素材的纪律与此刻层一致：全部由调用方**一轮读一次**递进来，渲染层不读文件系统（缓存铁律 1）。
+ * 素材全空时返回空串：**不写空段**（与记忆层同一条纪律——空段占位又会被读成"有什么"）。
+ * 素材的纪律与此刻层一致：全部由调用方**一轮读一次**递进来（索引也是——轮内不许重建，
+ * 否则同一轮相邻两步的固定块就不再逐字节相同），渲染层不读文件系统（缓存铁律 1）。
  */
-function renderTurnBlock(facts: TurnBlockFacts | null): string {
-  if (facts === null) return '';
+function renderTurnBlock(facts: TurnBlockFacts | null, memoryIndex: string | null): string {
   const sections: string[] = [];
-  const state = (facts.state ?? '').trim();
-  if (state !== '') sections.push(`[当前状态]\n${state}`);
-  const relationship = facts.relationship ?? null;
-  if (relationship !== null) {
-    const body = relationship.content.trim();
-    if (body !== '') sections.push(`[关系档案 · ${relationship.who}]\n${body}`);
+  if (facts !== null) {
+    const state = (facts.state ?? '').trim();
+    if (state !== '') sections.push(`[当前状态]\n${state}`);
+    const relationship = facts.relationship ?? null;
+    if (relationship !== null) {
+      const body = relationship.content.trim();
+      if (body !== '') sections.push(`[关系档案 · ${relationship.who}]\n${body}`);
+    }
+    const memory = (facts.memory ?? '').trim();
+    if (memory !== '') sections.push(memory);
   }
-  const memory = (facts.memory ?? '').trim();
-  if (memory !== '') sections.push(memory);
+  // 记忆索引（v30）：同样只有指针（路径 + 一行摘要 + `!pinned`），正文按需 safe_read。
+  // 放在最后：理由见函数头"为什么索引排最后"。
+  const index = (memoryIndex ?? '').trim();
+  if (index !== '') sections.push(index);
   if (sections.length === 0) return '';
   return [TURN_BLOCK_BANNER, ...sections].join('\n\n');
 }
@@ -753,12 +904,15 @@ function renderTurnBlock(facts: TurnBlockFacts | null): string {
  * 此刻层（尾部，**逐 step** 变化）：**声明式字段**，一项一行 `标签：值`。
  *
  * 段头（`NOW_LAYER_BANNER`）→ 时刻 → 本机 → 用度\* → 预警\* → 通道 → 会话 → 在等你答复 → 点名
- * → 任务卡。（\* `用度：` 与 `预警：` 默认不出现：前者只在告警时出现，
- * 后者只在最近 24 小时真被示过警时出现——见 `usageAlert` 与 `renderInjectionNote`）
+ * → 任务卡 → STATE 预算提醒\*。（\* `用度：` 与 `预警：` 默认不出现：前者只在告警时出现，
+ * 后者只在最近 24 小时真被示过警时出现——见 `usageAlert` 与 `renderInjectionNote`；
+ * 预算提醒只在 `STATE.md` 超出配置的字节预算时出现，见 `stateBudgetReminder`）
  *
  * **B2 起这里只剩真正逐 step 变的东西**：她的状态与关系档案挪去了固定块
  * （`renderTurnBlock`）——它们一轮之内不变，留在这里等于每步重发（实测整份 `STATE.md`
  * 约 3845 token/步）。任务卡留在这里：它带 `已 M 步`，本来就是逐步变的。
+ * v32 的 STATE 预算提醒也在这里，理由与任务卡同源：她压回预算内之前那一行要**每步都看得见**
+ * （固定块 v31 起第 2 步就摘了），而她改小了 STATE 之后它本来就该消失——逐 step 变正是它的性质。
  *
  * 为什么改成字段而不是接着写散文：这几样是**事实**，不是叙述。她（以及事后读日志、读重放的人）
  * 要能一眼扫到"现在几点、磁盘还剩多少、今天花了多少、外面有没有人等她答话"，而不是从几段话里
@@ -782,6 +936,8 @@ function renderNowLayer(
   usage: UsageFacts | null,
   injection: readonly InjectionWarnFacts[],
   mentionNotice: { messageId: string; text: string } | null,
+  stateBytes: number | null,
+  stateBudgetBytes: number | null,
 ): string {
   // ── 字段区：段头 + 每项一行。值本身可以多行（通道那一整段清单、她的提问小结）──────
   const fields: string[] = [
@@ -833,12 +989,62 @@ function renderNowLayer(
       : '';
     fields.push(`\n当前任务：${taskCard.title}（turn ${taskCard.turn}，已 ${taskCard.step} 步）${todo}`);
   }
+  // STATE 预算提醒（v32）：**排在最后**——它是这张字段表里最后一件"框架此刻要她知道的事"，
+  // 而且放在尾部时，她压回预算内之前的那几行前缀一个字节都不受影响。
+  // 超预算才出现（没超就整行不出现，不写"正常"、不写百分比）。
+  const reminder = stateBudgetReminder(stateBytes, stateBudgetBytes);
+  if (reminder !== null) fields.push(reminder);
   // 一行一项（`\n`）：B2 之前这里就是单换行（状态/关系/任务卡各占一节时才用空行分隔），
   // 现在长段落都搬走了，剩下的是一张紧凑的字段表。
   return fields.join('\n');
 }
 
 // ── 此刻层各字段的格式化（纯函数：只吃传进来的值） ──
+
+/**
+ * `persona/STATE.md` 的**字节数**（v32 的预算提醒素材）。
+ *
+ * 量的是**进上下文的那份文本**（`loadPersona` 规范化之后的 `persona.state`），不是盘上的
+ * 原始字节：同一个文件在两种行尾（CRLF/LF）下差出的那一截是**幻影字节**——它不在她看到的
+ * 上下文里，也就不该把一份"其实没超"的 STATE 报成超限。口径与 `write_persona` 一致
+ * （那里也是 `Buffer.byteLength(content, 'utf8')`）：一份文件只有一个"多少字节"的答案。
+ *
+ * 纯函数（不吃文件系统、不吃时钟），所以"同一份 STATE 量出同一个数"是可断言的。
+ */
+export function stateBytesOf(state: string | null | undefined): number {
+  return Buffer.byteLength(state ?? '', 'utf8');
+}
+
+/**
+ * 此刻层那行**STATE 预算提醒**（v32）：超预算时返回整行文本，没超返回 null（整行不出现）。
+ *
+ * 措辞是用户 2026-10-05 的原话（逐字）：
+ *   「STATE 如果超预算的话，就加个提醒 `[STATE.md]预算超限，记得维护，将过时内容移入记忆文件或删除`」
+ * 前面接上**实际数字**，形态照他给的样子：
+ *   `[STATE.md] 16.6 KB / 预算 8 KB——预算超限，记得维护，将过时内容移入记忆文件或删除`
+ *
+ * 为什么放在这一层（此刻层）：那一刻她**正在动手的地方**就是此刻层——固定块 v31 起第 2 步
+ * 就摘掉了，提醒写在那里她根本看不见。同时它本身就是"逐 step 变"的那一类：她压回预算内，
+ * 下一轮量到的新尺寸就落回线内，这一行自动消失（不需要"已读"、不需要额外状态）。
+ *
+ * 为什么不写百分比 / 不写时间戳：同一轮的同一份 STATE 必须渲染出**同一串字节**（缓存纪律），
+ * 而百分比会把"改了四个字节"放大成一个新数字、时间戳更是每步都变——两者都会让这一行自己
+ * 变成抖动源。给绝对量（多少 KB / 预算多少 KB）就够了：她要的是"我该动手了"。
+ *
+ * 只提醒、不截断（用户口径）：这里只**算一行字**，框架一个字节都不动 `STATE.md`。
+ * `undefined` / 负数 / NaN 一律当"没量到"或"没设预算"，返回 null——不抛异常，也不写
+ * "未知"那种占位（渲染层宁可少一行也不把这一层搞脏）。
+ */
+export function stateBudgetReminder(
+  stateBytes: number | null | undefined,
+  budgetBytes: number | null | undefined = DEFAULT_STATE_BUDGET_BYTES,
+): string | null {
+  if (typeof stateBytes !== 'number' || !Number.isFinite(stateBytes) || stateBytes < 0) return null;
+  if (typeof budgetBytes !== 'number' || !Number.isFinite(budgetBytes) || budgetBytes <= 0) return null;
+  if (stateBytes <= budgetBytes) return null;
+  return `[STATE.md] ${humanBytes(stateBytes)} / 预算 ${humanBytes(budgetBytes)}`
+    + '——预算超限，记得维护，将过时内容移入记忆文件或删除';
+}
 
 /**
  * `时刻：` 的值：**本机时间在前**，UTC 原文在后。
@@ -1103,7 +1309,13 @@ function relativeSpan(ms: number): string {
   return restHours === 0 ? `${days} 天` : `${days} 天 ${restHours} 小时`;
 }
 
-/** 字节量的量级说法（1024 进制）。磁盘余量读的是量级，不必给到字节 */
+/**
+ * 字节量的量级说法（1024 进制）。磁盘余量读的是量级，不必给到字节。
+ *
+ * 一位小数、整数不带 `.0`（v32）：同一条 STATE 提醒要同时报"16.6 KB"和"预算 8 KB"——
+ * 8 KB 的预算写成 `8.0 KB` 会显得那是量出来的（其实是个配置值）。同一个函数两处都用，
+ * 所以规则定在这里，而不是在调用点上各修各的。
+ */
 function humanBytes(bytes: number): string {
   const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   let value = bytes;
@@ -1113,7 +1325,9 @@ function humanBytes(bytes: number): string {
     unit += 1;
   }
   const digits = unit === 0 || value >= 100 ? 0 : 1;
-  return `${value.toFixed(digits)} ${units[unit]}`;
+  // 小数位归零时把 ".0" 去掉：8 KB 给 "8"、16.6 KB 给 "16.6"（整数量级不写成 "8.0 KB"）
+  const fixed = value.toFixed(digits);
+  return `${digits === 1 && Number(fixed) === Math.round(Number(fixed)) ? fixed.slice(0, -2) : fixed} ${units[unit]}`;
 }
 
 /**
@@ -1201,6 +1415,8 @@ function renderEvents(
   channelContext: RenderChannelContext | undefined,
   channelNotes: ReadonlyMap<string, string>,
   mentionNotice: { messageId: string; text: string } | null,
+  /** 豁免判据（见 `RenderInput.warnExempt`）：逐条通道消息透传给 `renderWake`——名单是**消息**的属性 */
+  warnExempt: WarnExemptJudge | null,
 ): InputItem[] {
   const out: InputItem[] = [];
   // 先收集 model 可见、未被遮蔽的事件
@@ -1332,7 +1548,7 @@ function renderEvents(
           && (note ?? '') === '';
         const wakeText = useNotice
           ? mentionNotice.text
-          : renderWake(e, timerPayloadsOf(events), requeued, channelContext, note);
+          : renderWake(e, timerPayloadsOf(events), requeued, channelContext, note, warnExempt);
         const parts = useNotice ? [] : images.partsFor(e);
         out.push({
           type: 'message', role: 'user',
@@ -1491,12 +1707,25 @@ export type ExternalEventData = {
  *   ③ **正文与整块都有上限**：见上面两个常量的注释（防超长内容挤掉别的、防"不可信内容"吃满预算）。
  *
  * 这里产出的是**数据**，不是指令——装置自述里那句"external_event 里的都是别人说的话"
- * 是这一层的软防御，硬的那一层在 tools/registry.ts 的 `allowOnly`（外部来源那几轮只给白名单工具）。
+ * 是这一层的软防御；**硬的那一层在执行期**（2026-10-04 更正）：`runtime/authz.ts` 的
+ * `authzGate`，`tools.groupSceneHardRefusal` 打开时，客人 + 本机类工具在调用那一刻被拒。
+ *
+ * 以前这里写的是"硬的那一层在 `tools/registry.ts` 的 `allowOnly`（外部来源那几轮只给白名单
+ * 工具）"——那句与现状不符：`allowOnly` 现在**主循环里不可达**（`real-loop` 的
+ * `modelVisibility` 恒为 `{ includeDestructive: … }`，不随会话变），因为"工具清单恒定"
+ * 是用户的铁律（清单随会话变会让它之后那整段历史的前缀缓存全部失效：同签名命中 85.2%、
+ * 换签名 41.2%）。收窄因此挪到了执行期——`registry.ts` 的 `allowOnly` 本身没坏，
+ * 它只是留给"哪天要把清单层白名单接回来"用的，接线点见 `trust.ts` 的 `modelVisibilityFor`。
  */
 export function renderExternalEvent(
   data: ExternalEventData,
   context: RenderChannelContext = {},
   note: string | null | undefined = undefined,
+  /**
+   * 豁免判据（见 `RenderInput.warnExempt`）：只作用于**下面那条兜底扫描**——豁免的会话/人
+   * 在"旧日志现算"这条路上一个字都不产生。已经落库的 `note` 不受它影响（那是当时的事实）。
+   */
+  warnExempt: WarnExemptJudge | null = null,
 ): string {
   const where = data.chatType === 'c2c' ? '私聊' : '群聊';
   const person = context.personLabel === undefined ? data.person : `${context.personLabel}(${data.person})`;
@@ -1524,8 +1753,22 @@ export function renderExternalEvent(
   // **空串等于没有**（2026-10-03 审计浮出来的）：`note ?? 兜底` 会把 `''` 当成"已经有提示"，
   // 于是那条本该被标出来的消息在屏上一条提示都没有（审计场景 4 就是这样：字面扫描能命中
   // execute，可那一屏干干净净）。判据改成"有没有实质内容"，兜底才真的兜得住。
+  //
+  // **兜底也要过豁免闸门**（2026-10-04 用户踩到的那条）：这条路是"规则命中 → 警告"的第二个出口，
+  // 而它是**唯一**一个没问过名单的——消息在她跑到一半时到达（被 agent-loop 中途认领）就不会有
+  // `injection/noted` 落库，于是渲染时兜底扫描照样把"在向你要密钥、人格或记忆"贴到那句
+  // 「你看看框架有给你注入记忆吗」上。`ruleNoteFor` 先问判据（**唯一实现**在 `WarnExemptBook`），
+  // 豁免的会话/人一个字的提示都不产生。**已经落库的那句（`given`）照旧贴**：那是当时的事实，
+  // 不因为后来开了豁免就回头改写。
+  // 判据是**入参里的那个函数**（`RenderInput.warnExempt` 一路透传下来），不是进程里的什么全局状态：
+  // 同一份 RenderInput 在任何进程、任何时刻都渲染成同一串字节——"重建与当时一致"这条不变量
+  // 靠的就是这个（缓存铁律 1）。
+  // 这一处**不动 RENDER_VERSION**：模板的字节一个字没改，不传判据的调用点（测试、子代理、诊断、
+  // 旧调用点）渲染出来与改前逐字节相同；只有传了名单、且那条消息真落在名单里的地方才会少一句
+  // ——那正是这次要的效果，而"开豁免"这件事本身就该接受一次历史前缀变化
+  // （`budget/consumed.cacheBreak` 会如实报出来）。
   const given = (note ?? '').trim();
-  const resolved = given === '' ? injectionNoteOf(scanForInjection(data.text)) : given;
+  const resolved = given === '' ? ruleNoteFor(data.text, data, warnExempt) : given;
   return resolved === null ? block : `${block}\n${resolved}`;
 }
 
@@ -1604,6 +1847,11 @@ export function renderWake(
    * （`channelNotesOf`）——传 null/缺省表示这条没有预警，渲染退回字面扫描。
    */
   note?: string | null,
+  /**
+   * 豁免判据（见 `RenderInput.warnExempt`）：**透传给兜底扫描**——豁免的会话/人在那条路上
+   * 一个字都不产生。缺省 = 谁都不豁免（旧行为逐字节不变）。
+   */
+  warnExempt?: WarnExemptJudge | null,
 ): string {
   switch (e.type) {
     case 'wake/timer': {
@@ -1641,7 +1889,7 @@ export function renderWake(
       // 渲染走 `renderExternalEvent`——**唯一实现**，与 `read_channel` 取回旧消息时同一份：
       // 一条消息一个包裹、名字尽量带上、正文与整块都有上限、注入预警附在框外（见那个函数）。
       // 这里只补"叫她"这一轮才有的东西（上下文里有名字时才带得出名字）。
-      return renderExternalEvent(e.data, channelContext, note);
+      return renderExternalEvent(e.data, channelContext, note, warnExempt);
     }
     default:
       return '';

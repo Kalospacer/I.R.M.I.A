@@ -63,7 +63,7 @@ import { CONFIG_FILE_NAME, MENTION_KEYWORD_LEN_MAX, MENTION_KEYWORD_MAX, configH
 import { diffConfigFields } from '../config/watcher.ts';
 import { resolveRestartShell } from '../runtime/restart-shell.ts';
 import { deriveRequest } from '../runtime/agent-loop.ts';
-import { contactFactsForReplay } from '../runtime/replay.ts';
+import { contactFactsForReplay, turnBlockFactsForReplay, warnExemptJudgeOf } from '../runtime/replay.ts';
 import { GroupMemberBook } from '../channel/group-members.ts';
 import { WarnExemptBook } from '../channel/warn-exempt.ts';
 import { installSnowLuma } from '../services/install-snowluma.ts';
@@ -85,6 +85,7 @@ import type {
 import { collectSessions, normalizeSid, parseAliases, resolveSessionName, sidLookupKeys } from '../channel/sessions.ts';
 import { readEndpointFromConfig, resolveServiceDir } from '../services/snowluma.ts';
 import { loadPersona } from '../persona/loader.ts';
+import { readMemoryIndexTextReadOnly } from '../persona/memory-injection.ts';
 import {
   DIARY_DIR_NAME,
   EPISODE_ARCHIVE_DIR_NAME,
@@ -94,13 +95,15 @@ import {
   diaryDir,
   memoriesDir,
 } from '../persona/memory-maintain.ts';
-import { ownerPersonOf } from '../persona/relationship.ts';
+import { ownerPersonOf, relationshipForWake } from '../persona/relationship.ts';
+// 待办清单的唯一载体是 STATE 的两节（预览必须与真实请求同源，见 buildReplay 里的任务卡）
+import { openTodoItems } from '../persona/todo-state.ts';
 import { writePersonaVersion } from '../persona/versions.ts';
 import { runDoctor } from '../runtime/doctor.ts';
 import type { RenderInput, RenderedRequest } from '../model/render.js';
-import { CACHE_HIT_LOW, CACHE_SAMPLE_MIN, inputContentText, render } from '../model/render.ts';
+import { CACHE_HIT_LOW, CACHE_SAMPLE_MIN, clipTaskTitle, inputContentText, render, wakeTitle } from '../model/render.ts';
 import {
-  CACHE_BREAK_CLASS_LABEL, CACHE_BREAK_LABEL, CONTEXT_LABEL, describeContext,
+  CACHE_BREAK_CLASS_LABEL, CACHE_BREAK_LABEL,
 } from '../model/context-audit.ts';
 import { SKILL_DESCRIPTION_MAX_CHARS, SKILL_FILE_NAME, SkillManager, skillNameProblem } from '../skill/skills.ts';
 import { applyOne, finalizePressure, wakeSourceOf } from '../state/fold.ts';
@@ -195,13 +198,16 @@ export const FRAMEWORK_NOTES_LIMIT = 20;
 /** `?limit=` 的硬上限：这条端点只服务摘要卡，放开到任意大等于把事件流从这里漏出去 */
 export const FRAMEWORK_NOTES_MAX_LIMIT = 100;
 /**
- * 上下文归因在卡片里单独占的格数（2026-10-03）。
+ * 上下文归因在卡片里单独占的格数。
  *
- * 它是"每一步一条"的事实（约 500 条/天），和告警共用一个总额度的话，一天之内就能把
- * 注入预警与真告警挤出这张卡——那正是这次要修的刷屏。所以给它一个**小**额度：
- * 卡上留最近几步，够人对上"她刚才那一拍背着多重的上下文"，要翻全部归因去运行情况页/日志。
+ * **2026-10-04 起为 0：归因整个不进这张卡**（用户第二次报"还在刷屏"之后定的口径）。
+ * 走过的两步记在这里，免得下次有人又想把它加回来：
+ *   ① 最初是"每步一条"（约 500 条/天）——两分钟就把卡刷满，注入预警与真告警全被挤下去；
+ *   ② 改成"一轮只留最后一步"——仍然嫌吵：每条占两行（标题 + 整条等式），
+ *      而它说的根本不是"提示"。**归因是事实，事实去日志页看**（`budget/consumed.context` 一直在）。
+ * 这个常量保留为 0 是为了"想加回来的人先读到这段"。
  */
-export const CONTEXT_NOTES_LIMIT = 5;
+export const CONTEXT_NOTES_LIMIT = 0;
 /** 单条提示里每个引用片段的字数上限：外部原文可能几千字，整段丢出去会把响应撑大，界面也摆不下 */
 export const FRAMEWORK_NOTE_QUOTE_MAX_CHARS = 200;
 /** 单条提示最多带几个引用片段：判定给的是"最可疑的几处"，再多就是噪音 */
@@ -1816,6 +1822,7 @@ export function buildReplay(input: {
     : '';
 
   const persona = loadPersona(dirname(resolve(input.personaRoot)));
+  const replayDataDir = dirname(resolve(input.personaRoot));
   // **工具清单恒定**（2026-10-04 用户定稿）：与运行期同一条口径——不再按当轮信任级增减。
   // 清单随场景变会让"它之后那整段历史"的前缀缓存失效（实测同签名 85% vs 换签名 41%），
   // 所以能力收窄挪到了执行期的场景门（runtime/authz.ts）；重建必须跟着一起恒定，
@@ -1842,13 +1849,35 @@ export function buildReplay(input: {
     }
     : null;
 
-  const wakeTitle = wakeEvent === null ? `turn ${input.turn}` : summarizeEvent(wakeEvent);
+  // 任务卡标题：**与运行期、与 CLI 的重建同一处口径**（`wakeTitle`，不是 `summarizeEvent`）。
+  // 原来这里用 `summarizeEvent`，而它对 `wake/channel` 落进 default 分支、把整个事件 data
+  // **序列化成 JSON** 塞进标题——预览的当前任务因此变成 `{"channel":…}` 一坨机器话，
+  // 而真实请求里是 `[external_event …]` 那行人话（agent-loop 的 taskCard 用 wakeTitle）。
+  // `summarizeEvent` 是给日志页"一行摘要"用的，不是任务卡口径；两者混用过一次，
+  // 代价是预览的任务卡与当时发出去的不是同一串字节。
+  const cardTitle = wakeEvent === null ? `turn ${input.turn}` : clipTaskTitle(wakeTitle(wakeEvent));
   const eventsBefore = input.events.filter(
     // 扣掉本轮那条 wake：与运行期同一个契约（首 step 的本轮输入**不在** events 里，见 agent-loop
     // 的协同契约；CLI 的 rebuildRenderedRequest 也是这么过滤的）。不扣就会在重建里出现两遍
     // ——一遍在事件流、一遍在本轮输入（2026-10-02 实测到的重放失真）。
     (event) => event.seq < stepStart.seq && event.seq !== wakeEvent?.seq,
   );
+  // 联络事实：与 CLI 的重放共用同一份重建（会话簿/话题折事件，联系人与别名取现在这份）。
+  //
+  // **会话清单要把本轮那条 wake 一起折**（2026-10-04 补）：`wake/channel` 本身就是一条会话事件
+  //（sessions.ts 的 isChannelEvent 认它），运行期是先把它并进会话簿再算 contactFacts 的。
+  // 上面那刀把它从事件流里扣掉了，于是预览的「外部会话（想指定对象就用 speak 的 to 填 sid）」
+  // 整段消失、只剩"还没有外部会话"——她当时明明有那个会话，预览却说没有。
+  // 折进去只影响会话簿/话题这两件"从事件算"的事，不碰 `wakeMessage`（那是另一个字段）。
+  const contact = contactFactsForReplay({
+    events: wakeEvent === null ? eventsBefore : [...eventsBefore, wakeEvent],
+    wakeEvent,
+    qqOfficial: input.config.channels.qqOfficial.enabled,
+    onebot: input.config.channels.onebot.enabled,
+    alertWebhook: (input.config.alerts.webhookUrl ?? '') !== '',
+    contacts: new Map(Object.entries(input.config.persona.contacts)),
+    aliases: aliasesUnder(replayDataDir),
+  });
   // **走 `deriveRequest`**（与运行期、与 CLI 的重放同一个函数）：这条路径原来自己手拼渲染输入，
   // 于是少了「会话：」「点名：」这类要从事件/配置算出来的字段——重放出来的请求与当时发出去的不是
   // 同一份，复盘就白做（2026-10-02 修；`asks`/`injection` 也随之由同一个函数从事件算出来）。
@@ -1866,24 +1895,54 @@ export function buildReplay(input: {
     })),
     wakeEvent,
     taskCard: {
-      title: wakeTitle,
+      title: cardTitle,
       turn: input.turn,
       step: input.step,
-      todoOpen: [],
+      // 待办清单：**从她的 STATE 那两节读**，与运行期（agent-loop 的 `taskCard()`）、
+      // 与 CLI 的重放（replay.ts 的 `rebuildRenderedRequest`）**同一处实现**。
+      //
+      // 这一格原来恒为 `[]`：夹具里没有待办，于是"预览比真实请求少整段「未完成计划」"
+      // 一直没人发现（2026-10-05 核对时抓到）。待办自 2026-10-04 起只有 STATE 一处载体，
+      // 所以这里读的就是 persona.state——预览与真实请求同源，且不新增第二份真相。
+      todoOpen: openTodoItems(persona.state ?? ''),
     },
     now: stepStart.ts,
     timezone: input.config.timezone,
     model: stepStart.data.model,
     lane: stepStart.data.lane,
-    // 联络事实：与 CLI 的重放共用同一份重建（会话簿/话题折事件，联系人与别名取现在这份）
-    contact: contactFactsForReplay({
-      events: eventsBefore,
-      wakeEvent,
-      qqOfficial: input.config.channels.qqOfficial.enabled,
-      onebot: input.config.channels.onebot.enabled,
-      alertWebhook: (input.config.alerts.webhookUrl ?? '') !== '',
-      contacts: new Map(Object.entries(input.config.persona.contacts)),
-      aliases: aliasesUnder(dirname(resolve(input.personaRoot))),
+    // 联络事实：上面按"要把本轮 wake 一起折"的口径算好了，这里只转手
+    contact,
+    // 豁免判据（2026-10-04 补）：**与运行期、与 CLI 的重放同一处判据**。原来这条预览路径漏了它，
+    // 于是对豁免会话，预览里会多出那句规则提示而真实请求没有——"重建与当时逐字节一致"当场作废。
+    // dataDir 从 personaRoot 的父目录取，与上面 contactFactsForReplay 的 aliasesUnder 同源
+    //（本服务依赖注入的约定：personaRoot 形如 <dataDir>/persona，见 currentPersonaHashOf 的注释）。
+    warnExempt: warnExemptJudgeOf(replayDataDir),
+    // 记忆索引（**本轮固定块**里那一段，v30 起在块里）：与 CLI 的重建同一条路——**只读**读现在的
+    // `MEMORIES/INDEX.md`（重建不建文件，这是那个模块的承诺）。漏了它，预览的固定块里就少索引整段。
+    // 2026-10-04 起固定块里关于记忆的**只有**它（用户口径：只看索引，需要就 heavy 自己去读）。
+    //
+    // **关掉框架代管记忆时给 null**（v32，docs/persona.md §3.1）：判据是 `persona.memoryEnabled`
+    // ——与 CLI 的重建（replay.ts 的 `rebuildRenderedRequest` 读同一个字段）、与运行期
+    //（real-loop 的 agentDeps）**同一处口径**，三条路谁都不另判一次。盘上那份旧索引留着不管它：
+    // 框架不再重建、也不再注入，"预览里还有索引"正是这一行要消掉的那种假象。
+    memoryIndex: input.config.persona.memoryEnabled === false
+      ? null
+      : readMemoryIndexTextReadOnly(replayDataDir),
+    // **本轮固定块**（2026-10-04 补）：原来这条预览路径整个漏了它——预览比真实请求少整整一条
+    // （`[当前状态]` + 关系档案 + 上面的索引）。装配走与 CLI **同一个函数**，
+    // 不在这里另写一份，理由见 turnBlockFactsForReplay 的注释。
+    turnBlock: turnBlockFactsForReplay({
+      persona: {
+        identity: persona.identity,
+        constitution: persona.constitution,
+        style: persona.style,
+        state: persona.state,
+        personaHash: persona.personaHash,
+        relationship: relationshipForWake(wakeEvent, replayDataDir),
+      },
+      tools: [],
+      timezone: input.config.timezone,
+      dataDir: replayDataDir,
     }),
     // 用度是"当时那一刻的累计值"：日志里只有这一 step 自己那笔，所以按它给个下界
     //（此刻层只在告警时才写这一行，重建时给个诚实的近似比给 null 更有用）
@@ -1895,6 +1954,10 @@ export function buildReplay(input: {
       failStreak: 0,
       failStreakMax: input.config.budget?.failStreakMax ?? null,
     },
+    // STATE 预算（v32）：预览要显示的此刻层那一行提醒，阈值取**这次预览用的那份配置**——
+    // 与 CLI 重建（replay.ts 从 config.json 读）读的是同一个字段，所以"预览里有没有那一行"
+    // 与"她当时看不看得见"不会分岔。
+    stateBudgetBytes: input.config.persona.stateBudgetBytes,
   });
 
   const currentConfigHash = configHash(input.config);
@@ -5163,26 +5226,15 @@ class WebServerImpl implements WebServer {
     // 从尾部往前扫：要的是"最近若干条"。日志按 seq 追加，seq 序即时间序——
     // 几种类型混着走一遍就是全局时间倒序，不需要再排一次（`?limit=` 小的时候还提前停）
     //
-    // **每种类型各自计数**（2026-10-03）：上下文归因是"每步一条"（约 500 条/天），
-    // 它与告警共用一个总额度的话，一天之内就能把注入预警与真告警全部挤出这张卡——
-    // 那正是用户这次抱怨的那种刷屏。所以归因只占它自己那一小格（见 CONTEXT_NOTES_LIMIT），
-    // 告警与注入预警照旧各拿到完整的 limit。
+    // **归因不进这张卡**（2026-10-04 用户第二次报"还在刷屏"之后定的口径）：
+    // 它先是"每步一条"（约 500 条/天，两分钟刷满一屏），改成"一轮只留最后一步"之后**仍然嫌吵**
+    // ——每条都要占两行（标题 + 整条等式），而且它说的根本不是"提示"：**归因是事实，事实去日志页看**
+    // （事件 `budget/consumed.context` 一直都在，想核对的人打开日志就能逐条读）。
+    // 所以这张卡只留"要人看一眼"的三类：注入预警、告警、缓存破坏，各自拿到完整的 limit。
     const notes: Array<Record<string, unknown>> = [];
-    const used: Record<string, number> = { injection: 0, alarm: 0, context: 0 };
-    const quota: Record<string, number> = {
-      injection: limit,
-      alarm: limit,
-      context: Math.min(limit, CONTEXT_NOTES_LIMIT),
-    };
+    const used: Record<string, number> = { injection: 0, alarm: 0 };
+    const quota: Record<string, number> = { injection: limit, alarm: limit };
     const full = (): boolean => Object.keys(quota).every(kind => used[kind]! >= quota[kind]!);
-    /**
-     * 已经出过归因的那几轮（**一轮只留一条**，2026-10-04）。
-     *
-     * 归因是"每一步一条"的事实（约 500 条/天），全摆出来两分钟就把这张卡刷满——用户报的
-     * 「还在刷屏」就是它。倒着扫（新→旧）时，某一轮**第一次**遇到的那条正是这一轮的
-     * 最后一步，也就是"这一轮最后长成什么样"——人要看的是这个，不是中间每一步的快照。
-     */
-    const seenTurns = new Set<number>();
 
     for (let index = events.length - 1; index >= 0 && !full(); index -= 1) {
       const event = events[index]!;
@@ -5239,7 +5291,6 @@ class WebServerImpl implements WebServer {
       // 没有 `cacheBreak` 的那几百条**不进这张卡**——它们不是"框架提示"，只是每次都有的归因事实。
       if (event.type === 'budget/consumed') {
         const data = event.data;
-        const breakdown = data.context;
         const cacheBreak = data.cacheBreak;
         if (cacheBreak !== undefined) {
           if (used['alarm']! >= quota['alarm']!) continue;
@@ -5263,34 +5314,8 @@ class WebServerImpl implements WebServer {
             name: null,
           });
         }
-        if (breakdown !== undefined) {
-          // 一轮只留最后一步（倒着扫，第一次遇到就是最后一步）。已经出过的那一轮直接跳过——
-          // 连额度都不占，免得几步就把 CONTEXT_NOTES_LIMIT 那几格用光、更早的轮次全被挤掉。
-          if (seenTurns.has(data.turn)) continue;
-          if (used['context']! >= quota['context']!) continue;
-          seenTurns.add(data.turn);
-          used['context'] = used['context']! + 1;
-          notes.push({
-            seq: event.seq,
-            at: event.ts,
-            kind: 'context',
-            label: CONTEXT_LABEL,
-            // 归因是**事实**不是警告：info 让它在卡片里安静地待着
-            level: 'info',
-            // 说清这是 **input 段**：instructions 与 tools 是另外两个顶层字段，不在这个数里
-            // （旧版只写 "input …"，与下面那行"整条 = 指令 + 工具 + input 段"对不上号）
-            title: `第 ${data.turn} 轮第 ${data.step} 步的上下文：`
-              + `input 段 ${breakdown.input.tokens} token / ${breakdown.input.items} 条`,
-            reason: `${describeContext(breakdown)}（渲染版本 ${breakdown.renderVersion}）`,
-            quotes: [],
-            by: null,
-            fingerprint: null,
-            sid: null,
-            person: '',
-            chatType: '',
-            name: null,
-          });
-        }
+        // 归因（`context`）到这里就结束了——**不再进这张卡**（见本函数开头那段口径）。
+        // 事件本身照旧落在日志里（`budget/consumed.context`），日志页可以逐条读。
       }
     }
 
@@ -5648,7 +5673,7 @@ interface McpProbeOutcome {
  */
 class McpProbeHost implements McpConnectionHost {
   // version 与 `main.ts` 的 AGENT_VERSION 同步（两处必须一起改）
-  readonly clientInfo = { name: 'irmia-agent', version: '0.1.0-beta.2' };
+  readonly clientInfo = { name: 'irmia-agent', version: '0.1.0-beta.3' };
   readonly protocolVersion = DEFAULT_PROTOCOL_VERSION;
   readonly progressHardCapMs = 60_000;
   readonly defaultRequestTimeoutMs: number;

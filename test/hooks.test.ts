@@ -33,6 +33,7 @@ import {
   type AppEvent, type ModelLane, type PolicyDenied, type Projection, type ToolCall, type ToolResult,
 } from '../src/log/types.ts';
 import type { DsClient, DsRequest, DsStreamResult } from '../src/model/ds-client.ts';
+import { NOW_LAYER_BANNER, TURN_BLOCK_BANNER } from '../src/model/render.ts';
 import { runTurn, type AgentLoopDeps, type AgentLoopPersona } from '../src/runtime/agent-loop.ts';
 import { applyOne, fold } from '../src/state/fold.ts';
 import { buildFsTools } from '../src/tools/fs/index.ts';
@@ -329,11 +330,26 @@ async function makeLoopHarness(t: TestContext, dir: string): Promise<LoopHarness
   return { log, projection, registry, append, depsOf, readAll };
 }
 
-/** 尾部注入的 developer 消息：软提示与钩子注入共用这一条通道 */
+/**
+ * 尾部注入的 developer 消息：软提示与钩子注入共用这一条通道。
+ *
+ * v31 起**不能按"末项"找它**：装配顺序改成 `[历史] → [本轮新输入] → [固定块] → [此刻层] → [插播]`，
+ * 插播后面还跟着此刻层，末项是此刻层而不是注入。所以这里按**段头**把两个已知的层排除掉
+ * （与 render.test.ts 认层的做法一致：认段头，不认索引），剩下的最后一条 developer 就是注入。
+ *
+ * 判据不比原来松：原来查"末项是 developer 且带这段字"，现在查"这一段真的发出去了，且它不在
+ * 此刻层/固定块那两个框架段里"。没有注入时返回 null 的那条断言照旧成立（此刻层与固定块都被排除）。
+ */
 function trailingDeveloper(request: DsRequest): string | null {
   const input = request.input as Array<{ type: string; role?: string; content?: unknown }>;
-  const last = input[input.length - 1];
-  if (last === undefined || last.role !== 'developer' || typeof last.content !== 'string') return null;
+  const layers = [NOW_LAYER_BANNER, TURN_BLOCK_BANNER];
+  const rest = input.filter((item) =>
+    item.type === 'message'
+    && item.role === 'developer'
+    && typeof item.content === 'string'
+    && !layers.some((banner) => (item.content as string).startsWith(banner)));
+  const last = rest[rest.length - 1];
+  if (last === undefined || typeof last.content !== 'string') return null;
   return last.content;
 }
 

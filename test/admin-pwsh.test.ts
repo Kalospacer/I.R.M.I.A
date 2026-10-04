@@ -21,6 +21,9 @@ import {
   MAX_TODO_ITEMS,
   ONDEMAND_WARN_BYTES,
   PERSONA_PROTECTED_FILES,
+  SPEAK_SEGMENT_MAX,
+  SPEAK_TEXT_REMIND_MAX,
+  SPEAK_TEXT_SUGGESTED_MAX,
   createAdminTools,
   setSleepForTest,
   type AdminEventEmitter,
@@ -140,6 +143,17 @@ function firstLineOf(content: string): string {
   return normalizeNewlines(content).split('\n', 1)[0] ?? '';
 }
 
+/**
+ * 计字口径：一个字算一个（emoji / 增补平面字符也算一个）——与 `speak` 里那条分段判据
+ * （`chat-split.ts` 的 `charCount`）同一个数法，也与 `speak` 的 `maxLength` 同源。
+ *
+ * 用例里要数夹具的字数时**走这里，不要用 `text.length`**：后者把 emoji 数成两个，
+ * 夹具的"正好 45"就会在带表情时悄悄飘到另一侧，边界用例变成一条假绿。
+ */
+function charCount(text: string): number {
+  return [...text].length;
+}
+
 // ──────────────────────────────── write_persona ────────────────────────────────
 
 describe('write_persona：persona 唯一写通道与只读保护', () => {
@@ -257,6 +271,118 @@ describe('write_persona：persona 唯一写通道与只读保护', () => {
     assert.equal(await exists(join(personaRoot, 'RELATIONSHIPS', `alex.md.tmp.${process.pid}`)), false);
   });
 
+  test('局部替换（old/new）：只换那一段，其余逐字节不动，且同样留审计', async () => {
+    // 这一条钉的是 P2 的**另一半**：光把 fs 写入口对 data/persona 堵上（见 tool-catalog 的
+    // 只读区用例）不够——她改一行 STATE.md 要重吐整篇 65 行，是被逼着走 safe_edit 的
+    // （实测 87 次改动里 62 次走了 safe_edit，因而没有 persona/updated、也不进人格版本库）。
+    // 形态与门必须同时到位。
+    const ws = await workspace('persona-partial');
+    const personaRoot = join(ws, 'persona');
+    const recorder = makeRecorder();
+    const updated: Array<{ file: string; diffHash: string; by: string }> = [];
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: recorder.emit,
+      personaRoot,
+      onPersonaUpdated: (payload) => updated.push(payload),
+    });
+    const ctx = makeCtx(ws);
+    const tool = toolkit.byName('write_persona');
+
+    const original = '# 状态\n\n## 心情\n还行\n\n## 手头的事\n等 coder 打包\n';
+    await mkdir(personaRoot, { recursive: true });
+    await writeFile(join(personaRoot, 'STATE.md'), original, 'utf8');
+
+    const result = await tool.handler({ file: 'STATE.md', old: '还行', new: '不错' }, ctx);
+    assert.equal(result.isError, undefined, result.content);
+    const after = await readFile(join(personaRoot, 'STATE.md'), 'utf8');
+    assert.equal(after, original.replace('还行', '不错'), '除了那一段，其余逐字节不变');
+    assert.match(result.content, /局部替换/, '回执要说清这次走的是局部替换');
+
+    // 与整体替换**同一条审计线**：persona/updated + 语义回调一个都不能少
+    const expectedHash = createHash('sha256').update(after, 'utf8').digest('hex');
+    assert.deepEqual(recorder.last('persona/updated'), {
+      file: 'STATE.md',
+      diffHash: expectedHash,
+      by: 'agent',
+    });
+    assert.equal(updated.length, 1, '局部替换也要触发宿主回调（personaHash 靠它刷新）');
+
+    // new 省略 = 删掉这一段
+    // 注意 old 里**不带结尾换行**：匹配跑在"按行拼回来"的形态上（与 safe_edit 同一条内核、
+    // 同一个口径），文件末尾那个换行不在匹配文本里。这也是她抄原文时会踩的那一脚。
+    const removed = await tool.handler({ file: 'STATE.md', old: '## 手头的事\n等 coder 打包' }, ctx);
+    assert.equal(removed.isError, undefined, removed.content);
+    assert.doesNotMatch(await readFile(join(personaRoot, 'STATE.md'), 'utf8'), /等 coder 打包/);
+  });
+
+  test('局部替换的三种走不通：找不到 / 多匹配 / 与 content 同时给', async () => {
+    const ws = await workspace('persona-partial-miss');
+    const personaRoot = join(ws, 'persona');
+    await mkdir(personaRoot, { recursive: true });
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: makeRecorder().emit,
+      personaRoot,
+    });
+    const ctx = makeCtx(ws);
+    const tool = toolkit.byName('write_persona');
+    const path = join(personaRoot, 'STATE.md');
+    await writeFile(path, '# 状态\n- 同一条\n- 同一条\n', 'utf8');
+
+    // ① 找不到：要给下一步，不能只说"没命中"
+    const missing = await tool.handler({ file: 'STATE.md', old: '根本不存在的一段', new: 'x' }, ctx);
+    assert.equal(missing.isError, true);
+    assert.match(missing.content, /没动手/);
+    assert.match(missing.content, /safe_read/, '要告诉她怎么确认原文');
+
+    // ② 多匹配：必须显式消歧，不许猜一处改
+    const ambiguous = await tool.handler({ file: 'STATE.md', old: '同一条', new: 'x' }, ctx);
+    assert.equal(ambiguous.isError, true);
+    assert.match(ambiguous.content, /命中 2 处/);
+    assert.equal(await readFile(path, 'utf8'), '# 状态\n- 同一条\n- 同一条\n', '多匹配时一个字都不许落盘');
+
+    // ③ 两种形态同时给：不知道她想怎样，当场问清楚
+    const both = await tool.handler({ file: 'STATE.md', content: '整篇', old: '同一条', new: 'x' }, ctx);
+    assert.equal(both.isError, true);
+    assert.equal(both.error?.code, 'E_INVALID_ARGS');
+    assert.match(both.content, /二选一/);
+
+    // ④ 什么都没给
+    const neither = await tool.handler({ file: 'STATE.md' }, ctx);
+    assert.equal(neither.isError, true);
+    assert.equal(neither.error?.code, 'E_INVALID_ARGS');
+
+    // ⑤ 文件还不存在：局部替换没法改不存在的文件，要指路 content
+    const absent = await tool.handler({ file: 'RELATIONSHIPS/nobody.md', old: 'a', new: 'b' }, ctx);
+    assert.equal(absent.isError, true);
+    assert.match(absent.content, /content/, '第一次写要告诉她用整体替换');
+  });
+
+  test('局部替换不许绕过两道门：IDENTITY/CONSTITUTION 只读、STYLE 只收提案', async () => {
+    // 门是按**目标文件**判的，与走哪条形态无关——这条用例防的是"新开的那条路漏了门"。
+    const ws = await workspace('persona-partial-gates');
+    const personaRoot = join(ws, 'persona');
+    await mkdir(personaRoot, { recursive: true });
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: makeRecorder().emit,
+      personaRoot,
+    });
+    const ctx = makeCtx(ws);
+    const tool = toolkit.byName('write_persona');
+    await writeFile(join(personaRoot, 'IDENTITY.md'), '我是谁\n', 'utf8');
+    await writeFile(join(personaRoot, 'STYLE.md'), '说话方式\n', 'utf8');
+
+    for (const file of ['IDENTITY.md', 'CONSTITUTION.md', 'STYLE.md']) {
+      const denied = await tool.handler({ file, old: '我是谁', new: 'x' }, ctx);
+      assert.equal(denied.isError, true, `${file} 的局部替换也必须被拒`);
+      assert.equal(denied.error?.code, 'E_PROTECTED_TARGET');
+    }
+    assert.equal(await readFile(join(personaRoot, 'IDENTITY.md'), 'utf8'), '我是谁\n', '被拒就不许落盘');
+    assert.equal(await readFile(join(personaRoot, 'STYLE.md'), 'utf8'), '说话方式\n');
+  });
+
   test('按需层超过 4KB 只警告不拒绝；硬上限则拒绝', async () => {
     const ws = await workspace('persona-size');
     const personaRoot = join(ws, 'persona');
@@ -317,10 +443,12 @@ describe('write_persona：persona 唯一写通道与只读保护', () => {
   });
 });
 
-// ──────────────────────────────── 定时器三件 ────────────────────────────────
+// ──────────────────────────────── 定时器：一件工具、三个动作 ────────────────────────────────
 
-describe('set_timer / cancel_timer / list_timers：包装 TimerStore', () => {
-  test('布防 → 列表可见 → 取消 → 列表为空', async () => {
+describe('timer：一件工具三个动作（v35 把 set_timer / cancel_timer / list_timers 并成一件）', () => {
+  // 合并的账在 design §4.18 与 tools-audit.md §3.4；这里钉的是**三个能力一个都没丢**：
+  // 设一个 → 列得出 → 撤得掉。少任何一条，合并就是"省了 token、丢了出口"。
+  test('action=set 布防 → action=list 列得出（含 id）→ action=cancel 撤得掉', async () => {
     const ws = await workspace('timers');
     const timers = new TimerStore(null);
     const recorder = makeRecorder();
@@ -328,53 +456,99 @@ describe('set_timer / cancel_timer / list_timers：包装 TimerStore', () => {
     const ctx = makeCtx(ws);
     const due = new Date(Date.now() + 3_600_000).toISOString();
 
-    const listed0 = await toolkit.byName('list_timers').handler({}, ctx);
+    const listed0 = await toolkit.byName('timer').handler({ action: 'list' }, ctx);
+    assert.equal(listed0.isError, undefined, listed0.content);
     assert.match(listed0.content, /没有任何未触发的定时器/);
 
-    const set = await toolkit.byName('set_timer').handler({ at: due, payload: { note: '喝水' } }, ctx);
+    const set = await toolkit.byName('timer').handler(
+      { action: 'set', at: due, payload: { note: '喝水' } },
+      ctx,
+    );
     assert.equal(set.isError, undefined, set.content);
     const timerId = /id=(\S+?)，/.exec(set.content)?.[1];
     assert.equal(typeof timerId, 'string', `应回报 timerId：${set.content}`);
     assert.equal(timers.list().length, 1);
+    // 布防的回执必须自带"怎么撤"——合并之后撤销不再是一件独立的工具，她得从回执里知道
+    assert.match(set.content, /action=cancel/, '布防回执要指出撤销走哪个动作');
 
-    const listed = await toolkit.byName('list_timers').handler({}, ctx);
+    const listed = await toolkit.byName('timer').handler({ action: 'list' }, ctx);
+    assert.equal(listed.isError, undefined, listed.content);
     assert.match(listed.content, /一次性/);
     assert.match(listed.content, /喝水/);
+    assert.ok(listed.content.includes(timerId), `列表每行要带 id（撤销靠它）：${listed.content}`);
 
-    const cancelled = await toolkit.byName('cancel_timer').handler({ timer_id: timerId }, ctx);
+    const cancelled = await toolkit.byName('timer').handler({ action: 'cancel', timer_id: timerId }, ctx);
     assert.equal(cancelled.isError, undefined);
     assert.match(cancelled.content, /已取消/);
     assert.equal(timers.list().length, 0);
 
-    const again = await toolkit.byName('cancel_timer').handler({ timer_id: timerId }, ctx);
+    const again = await toolkit.byName('timer').handler({ action: 'cancel', timer_id: timerId }, ctx);
     assert.equal(again.isError, undefined, '重复取消不是错误：如实回报“不在表里”');
     assert.match(again.content, /不在表里/);
   });
 
-  test('非法输入与缺失参数给出可操作的错误', async () => {
-    const ws = await workspace('timers-bad');
+  test('action=set 的 cron 分支照旧：周期条目在列表里带出下一拍', async () => {
+    const ws = await workspace('timers-cron');
+    const timers = new TimerStore(null);
     const toolkit = createAdminTools({
-      timers: new TimerStore(null),
+      timers,
       emit: makeRecorder().emit,
       personaRoot: join(ws, 'persona'),
     });
     const ctx = makeCtx(ws);
 
-    const none = await toolkit.byName('set_timer').handler({}, ctx);
+    const set = await toolkit.byName('timer').handler({ action: 'set', cron: '0 9 * * 1-5' }, ctx);
+    assert.equal(set.isError, undefined, set.content);
+    assert.match(set.content, /周期/);
+
+    const listed = await toolkit.byName('timer').handler({ action: 'list' }, ctx);
+    assert.match(listed.content, /周期 0 9 \* \* 1-5/);
+  });
+
+  test('非法 action 与缺参数给出可操作的错误（一处判据：缺字段 / 取值非法分开说）', async () => {
+    const ws = await workspace('timers-bad');
+    const timers = new TimerStore(null);
+    const toolkit = createAdminTools({
+      timers,
+      emit: makeRecorder().emit,
+      personaRoot: join(ws, 'persona'),
+    });
+    const ctx = makeCtx(ws);
+
+    // ① 整个 action 字段没给：与全仓其它工具同一条措辞
+    const noAction = await toolkit.byName('timer').handler({ at: '2030-01-01T00:00:00+08:00' }, ctx);
+    assert.equal(noAction.isError, true);
+    assert.equal(noAction.error?.code, 'E_INVALID_ARGS');
+    assert.match(noAction.content, /action/);
+
+    // ② 给了但不是三个取值之一：必须把三个取值摆出来，否则她只能瞎试
+    const badAction = await toolkit.byName('timer').handler({ action: 'frobnicate' }, ctx);
+    assert.equal(badAction.isError, true);
+    assert.equal(badAction.error?.code, 'E_INVALID_ARGS');
+    assert.match(badAction.content, /set \/ cancel \/ list/);
+
+    // ③ action=set 但 at/cron 一个都没给
+    const none = await toolkit.byName('timer').handler({ action: 'set' }, ctx);
     assert.equal(none.isError, true);
+    assert.equal(none.error?.code, 'E_INVALID_ARGS');
     assert.match(none.content, /at 或 cron/);
 
-    const badAt = await toolkit.byName('set_timer').handler({ at: '2026-09-30 14:00' }, ctx);
+    const badAt = await toolkit.byName('timer').handler({ action: 'set', at: '2026-09-30 14:00' }, ctx);
     assert.equal(badAt.isError, true);
     assert.match(badAt.content, /ISO 8601/);
 
-    const badCron = await toolkit.byName('set_timer').handler({ cron: '99 * * * *' }, ctx);
+    const badCron = await toolkit.byName('timer').handler({ action: 'set', cron: '99 * * * *' }, ctx);
     assert.equal(badCron.isError, true);
     assert.match(badCron.content, /cron/);
 
-    const noId = await toolkit.byName('cancel_timer').handler({}, ctx);
+    // ④ action=cancel 但没给 timer_id
+    const noId = await toolkit.byName('timer').handler({ action: 'cancel' }, ctx);
     assert.equal(noId.isError, true);
+    assert.equal(noId.error?.code, 'E_INVALID_ARGS');
     assert.match(noId.content, /timer_id/);
+
+    // ⑤ 五条非法输入一个都不许落进表里（布防失败却留下条目是最坏的那种"看起来成功了"）
+    assert.equal(timers.list().length, 0);
   });
 });
 
@@ -426,11 +600,13 @@ describe('speak：告警出口与三路投递', () => {
     });
     const ctx = makeCtx(ws);
 
-    // 拆分是概率的、逐段之间要按打字节奏等：两个都注入固定值，否则这条用例在赌随机而且会真睡
+    // 逐段之间要按打字节奏等：把 sleep 注入成空实现，否则这条用例会真睡
     setSleepForTest(async () => {});
     t.after(() => { setSleepForTest(null); });
 
-    const spoken = '长任务跑完了，共 42 个文件。';
+    // 45 字以内才按标点分段（`SPEAK_SEGMENT_MAX`）：这条夹具只有 15 字，稳在分段区内。
+    // 边界那两侧（正好 45 仍分段 / 46 起整条发出）在「分段上限」那条用例里钉着。
+    const spoken = '长任务跑完了，共 42 个文件';
     const result = await toolkit.byName('speak').handler({ text: spoken }, ctx);
     assert.equal(result.isError, undefined, result.content);
     assert.match(result.content, /日志\/前端：按聊天节奏发成 2 条/);
@@ -451,7 +627,7 @@ describe('speak：告警出口与三路投递', () => {
       .filter((event) => event.type === 'speak/sent')
       .map((event) => (event.data as { chars: number }).chars)
       .sort((a, b) => a - b);
-    assert.deepEqual(charCounts, [6, 8, 16, 16], 'log 路按段计字数；notify 与 reply-url 按整篇计');
+    assert.deepEqual(charCounts, [6, 8, 15, 15], 'log 路按段计字数；notify 与 reply-url 按整篇计');
     assert.equal(pushed.length, 1, '告警出口整篇一条，不刷屏');
     assert.equal(posted.length, 2, '回投逐段发：IM 那边一条条收');
     assert.equal(posted[0]?.target.idempotencyKey, 'turn-7', '幂等键 = turn 号');
@@ -784,8 +960,10 @@ describe('speak：告警出口与三路投递', () => {
     const ws = await workspace('speak-receipt-shape');
     const recorder = makeRecorder();
     let epoch = 0;
-    // 六个逗号 → 六条气泡；第三条落库之后人插话
-    const text = '第一句话在这里，第二句话在这里，第三句话在这里，第四句话在这里，第五句话在这里，第六句话在这里。';
+    // 六个逗号 → 六条气泡；第三条落库之后人插话。
+    // **整段必须压在 45 字以内**（`SPEAK_SEGMENT_MAX`）：46 字起 speak 就不分段了（整条一次发出），
+    // 那时候这个夹具只会发出一条、插话落在它后面，这条用例锁的"第 4 条起没出去"整个失效。
+    const text = '第一句在这里，第二句在这里，第三句在这里，第四句在这里，第五句在这里，第六句在这里。';
     const toolkit = createAdminTools({
       timers: new TimerStore(null),
       emit: (type, data) => {
@@ -805,14 +983,14 @@ describe('speak：告警出口与三路投递', () => {
     const lines = result.content.split('\n');
     assert.equal(lines.length, 4, `回执就四行（多了就是把同一段话抄两遍）：\n${result.content}`);
     assert.match(lines[0]!, /发言被打断：他刚说「和我的私聊是私有的，没关系」。/);
-    assert.match(lines[1]!, /^- 已经发出去的（收不回来了）：3 条——第一句话在这里／第二句话在这里／第三句话在这里$/);
+    assert.match(lines[1]!, /^- 已经发出去的（收不回来了）：3 条——第一句在这里／第二句在这里／第三句在这里$/);
     assert.match(
       lines[2]!,
-      /^- 没来得及发的（3 条）：1\. 第四句话在这里／2\. 第五句话在这里／3\. 第六句话在这里$/,
+      /^- 没来得及发的（3 条）：1\. 第四句在这里／2\. 第五句在这里／3\. 第六句在这里$/,
       '未发的必须逐条编号点名——她据此才看得出"第 4 条起没出去"',
     );
     // 第三行不重复已发的内容（重复 = 同一段话在上下文里出现两次，且容易让她把已发的重讲一遍）
-    assert.ok(!lines[2]!.includes('第一句话'), `未发那行不许夹带已发的内容：${lines[2]}`);
+    assert.ok(!lines[2]!.includes('第一句'), `未发那行不许夹带已发的内容：${lines[2]}`);
     assert.match(lines[3]!, /重新组织语言/);
     assert.match(lines[3]!, /^别把剩下这半截硬接上去/);
   });
@@ -942,23 +1120,170 @@ describe('speak：告警出口与三路投递', () => {
     assert.match(result.content, /向该会话发送消息时存在权限问题，不必重试/);
     assert.doesNotMatch(result.content, /report|改道|别再说一遍/, '不该给建议');
   });
+
+  // ── speak 的长度口径：描述与判据同源；翻回 25 是用户定的风格；45 是分段上限 ──
+
+  test('描述里的字数上限由常量拼出来（描述与判据不许两处真相）', async () => {
+    const ws = await workspace('speak-desc');
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: makeRecorder().emit,
+      personaRoot: join(ws, 'persona'),
+    });
+    const description = toolkit.byName('speak').description;
+
+    // 两条并列：描述里必须出现 `SPEAK_TEXT_SUGGESTED_MAX 字内`（描述由常量拼出来），
+    // **且**那个数就是常量本身。第二条不是重复：`/25 字/` 这种**手写**的 25 过一次，
+    // 常量改成别的值时第一条会红、而手写的那个字面量仍然看着对——把数取出来比一遍才封死。
+    assert.match(
+      description,
+      new RegExp(`${SPEAK_TEXT_SUGGESTED_MAX} 字内`, 'u'),
+      `描述里的上限必须来自 SPEAK_TEXT_SUGGESTED_MAX：${description}`,
+    );
+    const onDescription = /(\d+) 字内/u.exec(description);
+    assert.notEqual(onDescription, null, `描述里没有「N 字内」这个口径：${description}`);
+    assert.equal(
+      Number(onDescription![1]),
+      SPEAK_TEXT_SUGGESTED_MAX,
+      `描述里手写了一个数（${onDescription![1]}），必须与 SPEAK_TEXT_SUGGESTED_MAX 同源`,
+    );
+
+    // **25 是用户定的说话风格目标**（短句、像打字聊天），不是从日志分布里挑的分位数：
+    // 所以它被放宽过一次（25 → 60，按实测 p90 取整），2026-10-05 按用户的原话改回 25。
+    // 这一条钉的就是"不许再照着实测分布把它放宽"，以及"最多两个逗号"这条风格没丢。
+    assert.equal(SPEAK_TEXT_SUGGESTED_MAX, 25, '25 是用户定的说话风格目标，不许按实测分布放宽');
+    assert.match(description, /最多两个逗号/u, '「最多两个逗号」是用户风格口径的一部分');
+  });
+
+  test('超限提醒只在越过提醒线时发：25 字不提醒、26 字（刚过线）要提醒', async () => {
+    const ws = await workspace('speak-remind');
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: makeRecorder().emit,
+      personaRoot: join(ws, 'persona'),
+      // 关掉打字节奏：这一条锁的是提醒的有无，不是节奏（节奏有自己的用例）
+      speakTyping: { typingEffect: false, charsPerMinute: 90 },
+    });
+    const tool = toolkit.byName('speak');
+
+    // ① 正好等于提醒线：判据是「越过」，所以**不**提醒。
+    //    提醒是纠偏不是判错，线本身不能是"到了就追一句"。
+    const onLine = await tool.handler({ text: '甲'.repeat(SPEAK_TEXT_REMIND_MAX) }, makeCtx(ws));
+    assert.equal(onLine.isError, undefined, onLine.content);
+    assert.doesNotMatch(onLine.content, /提醒：/u, '判据是 text.length > 提醒线，正好压线不提醒');
+
+    // ② **刚过线一个字就要提醒**（2026-10-05 用户把提醒线定回 25：他宁愿每次超 25 都被提醒一句）。
+    //    与"超过目标不追一句"的旧口径相反，这两条断言是刻意的——别把它改回去。
+    const justOver = await tool.handler(
+      { text: '甲'.repeat(SPEAK_TEXT_REMIND_MAX + 1) },
+      makeCtx(ws),
+    );
+    assert.equal(justOver.isError, undefined, justOver.content);
+    assert.match(justOver.content, /提醒：/u, '越过提醒线一个字就该追一句（纠偏的机会）');
+    assert.match(justOver.content, /report/u, '要给出路，不能只说"太长了"');
+
+    // ③ 远过线：提醒照发（提醒的密度与文本多长无关，判据只有一条线）
+    const wayOver = await tool.handler({ text: '甲'.repeat(SPEAK_TEXT_REMIND_MAX + 10) }, makeCtx(ws));
+    assert.equal(wayOver.isError, undefined, wayOver.content);
+    assert.match(wayOver.content, /提醒：/u, '明显异常时提醒不能一起消失：那是唯一的纠偏机会');
+    assert.match(wayOver.content, /report/u, '要给出路，不能只说"太长了"');
+  });
+
+  test('分段上限：正好 45 字仍按标点分段，46 字起整条一次发出', async () => {
+    const ws = await workspace('speak-segment');
+    const recorder = makeRecorder();
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: recorder.emit,
+      personaRoot: join(ws, 'persona'),
+      // 关掉打字节奏：这一条只锁"切没切"，不锁等多久（节奏有自己的用例）
+      speakTyping: { typingEffect: false, charsPerMinute: 90 },
+    });
+    const tool = toolkit.byName('speak');
+
+    // ① **正好 45 字仍分段**：逗号在 20 字处 → 两条。
+    const atMax = `${'甲'.repeat(20)}，${'乙'.repeat(24)}`;
+    assert.equal(charCount(atMax), SPEAK_SEGMENT_MAX, '夹具必须正好压在 45 上');
+    const segmented = await tool.handler({ text: atMax }, makeCtx(ws));
+    assert.equal(segmented.isError, undefined, segmented.content);
+    assert.match(segmented.content, /按聊天节奏发成 2 条/u, '45 字仍走标点分段（"像人打字"的节奏还在）');
+    assert.deepEqual(
+      recorder.events
+        .filter((event) => event.type === 'message/assistant')
+        .map((event) => (event.data as { text: string }).text),
+      ['甲'.repeat(20), '乙'.repeat(24)],
+      '45 字：逗号处断、标点摘掉',
+    );
+
+    // ② **46 字（刚过线）不分段**：只发一条，且是整段原文——长话再按标点切是刷屏，
+    //    而且切点越来越随意。逗号还在里面，说明这一条锁的确实是"没切"。
+    const overMax = `${'甲'.repeat(21)}，${'乙'.repeat(24)}`;
+    assert.equal(charCount(overMax), SPEAK_SEGMENT_MAX + 1, '夹具必须正好是 46（45 的下一侧）');
+    const whole = await tool.handler({ text: overMax }, makeCtx(ws));
+    assert.equal(whole.isError, undefined, whole.content);
+    assert.match(whole.content, /按聊天节奏发成 1 条/u, '46 字起整条一次发出');
+    assert.equal(
+      recorder.count('message/assistant'),
+      3,
+      '只多出一条发言记录（①的两条 + ②的一条）——②没有被切成多条',
+    );
+    assert.deepEqual(
+      recorder.events
+        .filter((event) => event.type === 'message/assistant')
+        .map((event) => (event.data as { text: string }).text)
+        .at(-1),
+      overMax,
+      '46 字整条发出、一个字节不改（连逗号也还在）',
+    );
+  });
 });
 
 // ──────────────────────────────── todo ────────────────────────────────
 
-describe('todo：全量替换语义与回调', () => {
-  test('写 todo/updated、触发回调，第二次调用是整体替换', async () => {
+describe('todo：全量替换语义与回调（2026-10-04 起载体是 STATE 的两节）', () => {
+  /**
+   * 造一份"她自己的" STATE.md：里面有**别的节**、有心情、有说明行——
+   * 判据就是"写清单只动 `## 当前任务` / `## 接着干` 两节的正文，其余一个字节不改"，
+   * 所以夹具里必须有可被误伤的内容，否则那条断言是空的。
+   */
+  async function stateFixture(ws: string, taskBody: string, ongoingBody: string): Promise<string> {
+    const personaRoot = join(ws, 'persona');
+    await mkdir(personaRoot, { recursive: true });
+    const text = [
+      '# 当前状态',
+      '',
+      '心情：松的。这一行是**她写的**，谁都不许动。',
+      '',
+      '## 当前任务',
+      taskBody,
+      '## 接着干',
+      ongoingBody,
+      '## 群的边界（10-02 夜·用户定）',
+      '- 测试群聊1 = 真·私有场子。这些字也要逐字节不变。',
+      '',
+      '## 工具常识（已验）',
+      '- 一条早就会了的常识。',
+      '',
+    ].join('\n');
+    await writeFile(join(personaRoot, 'STATE.md'), text, 'utf8');
+    return text;
+  }
+
+  test('写进 STATE 两节、落两条账、触发两个回调；第二次调用是整体替换', async () => {
     const ws = await workspace('todo');
     const recorder = makeRecorder();
     const seen: TodoItem[][] = [];
+    const personaSeen: string[] = [];
     const toolkit = createAdminTools({
       timers: new TimerStore(null),
       emit: recorder.emit,
       personaRoot: join(ws, 'persona'),
       onTodoUpdated: (items) => seen.push([...items]),
+      onPersonaUpdated: (payload) => personaSeen.push(payload.file),
     });
     const ctx = makeCtx(ws);
     const tool = toolkit.byName('todo');
+    const before = await stateFixture(ws, '（还没写清单）\n', '（也没排队）\n');
 
     const first: TodoItem[] = [
       { content: '扫描仓库', status: 'completed' },
@@ -967,22 +1292,72 @@ describe('todo：全量替换语义与回调', () => {
     ];
     const result = await tool.handler({ items: first }, ctx);
     assert.equal(result.isError, undefined, result.content);
+    // ① 两条账都落：todo/updated（给投影/界面）与 persona/updated（给人格缓存与归因）
     assert.deepEqual(recorder.last('todo/updated'), { items: first });
+    assert.equal(recorder.last('persona/updated')?.['file'], 'STATE.md');
     assert.equal(seen.length, 1);
     assert.deepEqual(seen[0], first, '回调必须收到完整清单');
-    assert.match(result.content, /清单已更新（3 项）/);
+    assert.deepEqual(personaSeen, ['STATE.md'], '人格回调要跟着发，否则这一轮的状态快照是旧的');
+    assert.match(result.content, /清单已写进 STATE\.md/);
 
-    // 全量替换：第二次只给一项，清单就只剩一项
+    // ② 盘上真的变了：两节按顺序分（第一项进「当前任务」，其余进「接着干」）
+    const onDisk = await readFile(join(ws, 'persona', 'STATE.md'), 'utf8');
+    assert.match(onDisk, /## 当前任务\n- \[x\] 扫描仓库\n\n## 接着干/);
+    assert.match(onDisk, /## 接着干\n- \[~\] 生成报告\n- \[ \] 发送摘要\n\n## 群的边界/);
+    // ③ 其余字节一个不动：把两节正文换成占位符，剩下的必须与夹具逐字节相同
+    const strip = (text: string): string => text
+      .replace(/## 当前任务\n[\s\S]*?\n## 接着干/, '## 当前任务\n<BODY>\n## 接着干')
+      .replace(/## 接着干\n[\s\S]*?\n## 群的边界/, '## 接着干\n<BODY>\n## 群的边界');
+    assert.equal(strip(onDisk), strip(before), '只有那两节的正文允许变');
+
+    // 全量替换：第二次只给一项，两节就只剩这一项
     const second: TodoItem[] = [{ content: '等人工确认', status: 'in_progress' }];
     await tool.handler({ items: second }, ctx);
     assert.deepEqual(recorder.last('todo/updated'), { items: second });
-    assert.equal(seen.length, 2);
     assert.deepEqual(seen[1], second);
+    const afterSecond = await readFile(join(ws, 'persona', 'STATE.md'), 'utf8');
+    assert.match(afterSecond, /## 当前任务\n- \[~\] 等人工确认\n\n## 接着干\n\n## 群的边界/);
+    assert.equal(afterSecond.includes('扫描仓库'), false, '旧项被整体替换掉');
 
-    // 空数组 = 清空
+    // 空数组 = 清空（两节都空，但节还在）
     const cleared = await tool.handler({ items: [] }, ctx);
     assert.match(cleared.content, /已清空/);
     assert.deepEqual(recorder.last('todo/updated'), { items: [] });
+    const afterClear = await readFile(join(ws, 'persona', 'STATE.md'), 'utf8');
+    assert.match(afterClear, /## 当前任务\n\n## 接着干\n\n## 群的边界/);
+
+    // ④ 幂等：同一份清单再写一次**不落盘、不落账**（否则下一轮的固定块白失守一次）
+    const writes = recorder.count('persona/updated');
+    const again = await tool.handler({ items: [] }, ctx);
+    assert.equal(again.isError, undefined, again.content);
+    assert.match(again.content, /没有变化|已经是空的/);
+    assert.equal(recorder.count('persona/updated'), writes, '内容没变就不该产生 persona/updated');
+  });
+
+  test('那两节不在时如实报错，且文件一个字节都不动', async () => {
+    const ws = await workspace('todo-no-section');
+    const personaRoot = join(ws, 'persona');
+    await mkdir(personaRoot, { recursive: true });
+    // 只留「当前任务」：故意缺「接着干」
+    const text = '# 当前状态\n\n心情：好。\n\n## 当前任务\n\n- [ ] 一件旧事\n';
+    await writeFile(join(personaRoot, 'STATE.md'), text, 'utf8');
+
+    const recorder = makeRecorder();
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: recorder.emit,
+      personaRoot,
+    });
+    const result = await toolkit.byName('todo').handler(
+      { items: [{ content: '新的一件', status: 'pending' }] },
+      makeCtx(ws),
+    );
+
+    assert.equal(result.isError, true, '缺节必须报错，不能静默整体重写');
+    assert.match(result.content, /找不到「## 接着干」/);
+    assert.match(result.content, /一个字节都没动/);
+    assert.equal(await readFile(join(personaRoot, 'STATE.md'), 'utf8'), text, '文件必须原样');
+    assert.equal(recorder.count('persona/updated'), 0, '没写成就不能落 persona/updated');
   });
 
   test('非法清单被拒绝：非数组、未知状态、超上限', async () => {
@@ -994,6 +1369,7 @@ describe('todo：全量替换语义与回调', () => {
     });
     const ctx = makeCtx(ws);
     const tool = toolkit.byName('todo');
+    await stateFixture(ws, '\n', '\n');
 
     const notArray = await tool.handler({ items: 'a,b' }, ctx);
     assert.equal(notArray.isError, true);

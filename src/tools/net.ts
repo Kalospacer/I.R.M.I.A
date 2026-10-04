@@ -25,6 +25,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { mkdir, open, rename, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
+import { PATH_BOUNDARY_HINT } from './boundary.ts';
 import { resolveInsideRoot } from './fs/path-guard.ts';
 import {
   TOOL_ERROR_CODES,
@@ -673,12 +674,12 @@ export function createNetTools(options: NetToolsOptions = {}, depsOverride: Part
     tools.push({
       name: 'http_download',
       description:
-        `把 http/https 资源下载到工作目录内（二进制安全，不经过上下文），返回落盘路径与字节数。上限 ${Math.round(DEFAULT_MAX_DOWNLOAD_BYTES / (1024 * 1024))}MB：Content-Length 预检 + 流式计数双重把关，超限即中止并清理临时文件。默认关闭。`,
+        `把 http/https 资源下载到指定路径（二进制安全，不经过上下文），返回落盘路径与字节数。上限 ${Math.round(DEFAULT_MAX_DOWNLOAD_BYTES / (1024 * 1024))}MB：Content-Length 预检 + 流式计数双重把关，超限即中止并清理临时文件。默认关闭。${PATH_BOUNDARY_HINT}。`,
       parameters: {
         type: 'object',
         properties: {
           url: { type: 'string', description: '目标 http/https 绝对地址' },
-          dest_path: { type: 'string', description: '工作目录内的落盘路径（相对或绝对，越界拒绝）' },
+          dest_path: { type: 'string', description: `落盘路径（相对或绝对），越界拒绝。${PATH_BOUNDARY_HINT}` },
           headers: { type: 'object', description: '附加请求头（键值字符串）' },
         },
         required: ['url', 'dest_path'],
@@ -694,10 +695,14 @@ export function createNetTools(options: NetToolsOptions = {}, depsOverride: Part
           const url = requiredString(a, 'url', { maxLength: 8_192 });
           const destInput = requiredString(a, 'dest_path', { maxLength: 4_096 });
 
-          // 沙箱白名单复用 fs 包的 path-guard：符号链接展开后再比前缀，返回的 path 才用于写盘
+          // 沙箱白名单复用 fs 包的 path-guard：符号链接展开后再比前缀，返回的 path 才用于写盘。
+          // 边界与 fs 工具族**同一份**（`ctx.boundaryRoot` 三态原样传，判读只归 boundary.ts）：
+          // `trust.mode = 'workspace'` 时落盘目标也只在 trust.workspaceRoot 内——少了这一条，
+          // 这个工具就成了那条边界上唯一一个"没人读它"的入口。
           const guard = await resolveInsideRoot(ctx.workspaceRoot, destInput, {
             allowMissing: true,
             purpose: 'http_download',
+            ...(ctx.boundaryRoot === undefined ? {} : { boundaryRoot: ctx.boundaryRoot }),
           });
           if (!guard.ok) return errorResult(`拒绝写入：${guard.reason}`, guard.code);
 

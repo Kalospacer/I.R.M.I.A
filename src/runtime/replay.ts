@@ -29,15 +29,18 @@ import type { AppEvent, MemorySelected, ModelLane } from '../log/types.js';
 import type { InputItem, RenderPersona, RenderedRequest } from '../model/render.js';
 import { NOW_LAYER_BANNER, RENDER_VERSION, clipTaskTitle, inputContentText, wakeTitle } from '../model/render.ts';
 import type { ContactFacts } from '../model/self-brief.ts';
+import type { TurnBlockFacts } from '../model/render.js';
 import { collectSessions, parseAliases } from '../channel/sessions.ts';
+import { WarnExemptBook, type WarnExemptJudge } from '../channel/warn-exempt.ts';
 import { CONFIG_FILE_NAME, loadConfig, systemTimezone } from '../config/config.ts';
 import { readEventsReadOnly } from '../log/read-only.ts';
 import { loadPersona } from '../persona/loader.ts';
-import { readExcerpt, readMemoryIndexTextReadOnly, renderSelectedMemory, type MemoryExcerpt } from '../persona/memory-injection.ts';
+import { readMemoryIndexTextReadOnly } from '../persona/memory-injection.ts';
 import { relationshipForWake } from '../persona/relationship.ts';
+// 待办清单的唯一载体是 STATE 的两节：运行期、CLI 重放、界面预览三处都从这里读
+import { openTodoItems } from '../persona/todo-state.ts';
 import { catalogToolSpecs } from '../tools/catalog.ts';
 import { sha256Hex } from '../persona/versions.ts';
-import { fold } from '../state/fold.ts';
 import { deriveRequest } from './agent-loop.ts';
 import { isSlashCommandEvent } from './slash-commands.ts';
 import { EVENT_LOG_DIR_NAME } from './recover.ts';
@@ -119,7 +122,6 @@ export function locateStep(events: readonly AppEvent[], turn: number, step: numb
   // 第 1 步之外的 step 没有"本轮新输入"：它与首步看到的是同一份历史（只多了自己产生的工具结果）
   const wakeEvent = step === 1 ? firstWake : null;
 
-  const projection = fold(eventsBefore);
   const payloads = timerPayloadsOf(eventsBefore);
   // 标题口径必须与运行期逐字节一致（agent-loop 的 taskCard 用的是 wakeTitle，不是 renderWake）
   const title = firstWake === null ? '' : clipTaskTitle(wakeTitle(firstWake, payloads));
@@ -143,7 +145,10 @@ export function locateStep(events: readonly AppEvent[], turn: number, step: numb
       title,
       turn,
       step,
-      todoOpen: projection.todoList.filter((item) => item.status !== 'completed').map((item) => item.content),
+      // 待办清单**不在这里算**：`locateStep` 只拿事件，拿不到她的 STATE。
+      // 真正把清单填进任务卡的是 `rebuildRenderedRequest`（它手里有 persona，从 STATE 那两节读）。
+      // 留一个空数组在这里，是这个快照"事件侧能确定的字段"的诚实表示。
+      todoOpen: [],
     },
     coveredUpToSeq,
   };
@@ -252,6 +257,22 @@ function readAliasesForReplay(dataDir: string): ReadonlyMap<string, string> {
   }
 }
 
+/**
+ * 重建用的豁免判据：**读现在这份** `data/warn-exempt.json`（界面改的东西，不在事件里）。
+ *
+ * 与 `readAliasesForReplay` 同一条纪律（只读、读不到就当空），但后果不同：这个**必须给**。
+ * 不给的后果不是"少一段内容"，而是**多出一句提示**——规则命中在渲染期是现算的
+ * （见 `RebuildOptions.warnExempt`），而重建与当时必须逐字节一致。
+ *
+ * **导出**（2026-10-04）：界面那条"重建请求体"预览（`web/server.ts` 的 `buildReplay`）走的是
+ * 另一个入口，它当初漏传了这个判据，于是对豁免会话预览里多出那句提示、真实请求里没有——
+ * 同一个洞在两处各修一遍迟早漂移，所以判据只留这一份实现，两条重建路径都问它。
+ */
+export function warnExemptJudgeOf(dataDir: string): WarnExemptJudge {
+  const book = new WarnExemptBook(dataDir);
+  return (subject) => book.isExempt(subject);
+}
+
 // ──────────────────────────────── 重建 ────────────────────────────────
 
 export interface RebuildOptions {
@@ -286,6 +307,61 @@ export interface RebuildOptions {
    * 重建时读到的是现在这份。不给 = 那一段不出现。
    */
   memoryIndex?: string | null;
+  /**
+   * `persona.memoryEnabled`（v32 起真的接上了执行路径，见 docs/persona.md §3.1）。
+   *
+   * 关掉时**固定块里的索引整段不出现**——与运行期同一条判据（real-loop 的 agentDeps 读的是
+   * 同一个配置字段），而不是"重建这条路上另判一次"。盘上的 `INDEX.md` 可能还在（框架只是不再
+   * 动它），但那一轮她的固定块里确实没有它，重建必须如实照做。
+   *
+   * 缺省（不给）= 开着：这是**出厂默认**，也是所有旧调用点（老测试、脚本）原来的行为——
+   * 这一版不该让它们重建出另一串字节。
+   */
+  memoryEnabled?: boolean;
+  /**
+   * `persona.stateBudgetBytes`（v32）：此刻层那行 STATE 超预算提醒的阈值。
+   *
+   * 与人格资产同一条限制：它是**配置**，不在事件里，所以重建读到的是"现在这份配置"里的那个数
+   *（`buildReplayReport` 从 config.json 读，报告 notes 里已就配置漂移说过一次）。
+   * 不给 = `deriveRequest` 的兜底（`DEFAULT_STATE_BUDGET_BYTES`，出厂 8 KB）。
+   */
+  stateBudgetBytes?: number;
+  /**
+   * 「这条通道消息豁免吗」的判据（2026-10-04）：**重建必须与当时同源**的那一半。
+   *
+   * 为什么它非有不可：规则命中变成警告的第二个出口是渲染期现算（`renderExternalEvent` 的兜底
+   * 扫描）——被豁免的会话在那条路上一个字都不贴。重建若不带这份判据，同一批事件就会渲染出
+   * 多出那句提示的**另一串字节**（而"同一份日志重建同一份请求"是仓库的核心不变量）。
+   *
+   * 与联系人和别名同一条限制：豁免名单也是**文件**（`data/warn-exempt.json`，界面上改的东西），
+   * 不在事件里——所以重建读到的是**现在这份**，报告 notes 里明说这一点。
+   * 不给 = 谁都不豁免（"预警开着"那一侧；子代理与诊断路径就是这一支）。
+   */
+  warnExempt?: WarnExemptJudge | null;
+}
+
+/**
+ * **本轮固定块**（v29/B2）的重建素材：`[当前状态]` + 关系档案。
+ *
+ * 两样都取**当前**人格资产（与 instructions 的重建口径一致：日志只留聚合哈希，
+ * 逐文件历史不可解，所以"人格层的重建"本就是现在这份）。
+ *
+ * **没有"选中的记忆正文"那一段**（2026-10-04 用户的口径：「只看索引，如果需要，heavy 自己去读，
+ * 随后跟随 tool call 留在上下文」）：固定块里关于记忆的只有 `options.memoryIndex` 那份索引。
+ * 所以这里不需要 `dataDir`，也不需要 `memory/selected` 事件——重建与运行期同为"只有索引"。
+ *
+ * 为什么单独抽成一个函数：重建有**两个入口**——CLI 的 `rebuildRenderedRequest`
+ * 与界面的 `buildReplay`。界面那个当初漏了这一整块，于是预览比真实请求少整整一条固定块
+ * （而预览正是用户夜里用来看"她当时到底收到了什么"的那一屏）。把装配抽到这里、
+ * 两个入口都调它，是唯一能防住"两条重建路径各写一份、迟早漂移"的做法。
+ */
+export function turnBlockFactsForReplay(options: RebuildOptions): TurnBlockFacts {
+  return {
+    state: options.persona.state,
+    relationship: options.persona.relationship ?? null,
+    // 记忆正文不再进固定块（见上面）：只留索引，索引由 `memoryIndex` 那条路给。
+    memory: null,
+  };
 }
 
 /**
@@ -318,59 +394,49 @@ export function rebuildRenderedRequest(
     lane: position.stepStart.data.lane,
     events,
     wakeEvent: position.wakeEvent,
-    taskCard: position.taskCard,
+    // 任务卡：标题与步号取事件侧那份快照，**待办清单从她的 STATE 那两节现读**
+    // （2026-10-04 合并：`todo` 工具写的就是那两节，不再有并行的 `projection.todoList`）。
+    // 口径与运行期（agent-loop 的 `taskCard()`）、与界面预览（web/server.ts）**同一处实现**：
+    // 三处各写一份"怎么从 STATE 里数未完成项"，迟早会漂成三种口径。
+    //
+    // 与人格资产同一条限制（报告里那句"人格层按当前内容重建"覆盖了它）：日志里没有逐轮的
+    // STATE 快照，所以读的是**现在这份**里的那两节——漂移范围就是那两节。
+    taskCard: { ...position.taskCard, todoOpen: openTodoItems(options.persona.state ?? '') },
     now: nowOverride ?? options.now ?? position.stepStart.ts,
     model: position.stepStart.data.model,
-    // **本轮固定块**（v29/B2）：与运行期同一形状——`[当前状态]` + 关系档案 + 本轮选中的记忆正文。
-    // 前两样取**当前**人格资产（与 instructions 的重建口径一致：日志只留聚合哈希，
-    // 逐文件历史不可解，所以"人格层的重建"本就是现在这份）；
-    // 第三样取自 `memory/selected` 事件——那是"当时选了哪几条"的唯一记录。
-    turnBlock: {
-      state: options.persona.state,
-      relationship: options.persona.relationship ?? null,
-      memory: selectedMemoryTextOf(position, options),
-    },
+    // **本轮固定块**（v29/B2）：与运行期同一形状、与界面预览**同一份装配**
+    //（见 turnBlockFactsForReplay 的注释：抽出来就是为了两个入口不再各写一份）
+    turnBlock: turnBlockFactsForReplay(options),
     // 记忆索引（长期记忆层那一段）：与人格资产同一条限制——它是个**文件**，重建读到的是现在这份。
     // 走只读那条路（readMemoryIndexTextReadOnly）：重建不能创建文件，"只读重建"是这个模块的承诺。
-    memoryIndex: options.memoryIndex ?? null,
+    //
+    // **关掉框架代管记忆时给 null**（`options.memoryEnabled`，见 docs/persona.md §3.1）：
+    // 判据与运行期（real-loop 的 agentDeps）**同一个配置字段**，不另写一份（`buildReplayReport`
+    // 从 config.json 读一次、传进来；界面预览那条路读的是同一个字段）。关掉之后盘上的 INDEX.md
+    // 可能还在（框架只是不再动它），照旧把它渲染进重建结果就等于让重建显示一份"她当时根本没看见"
+    // 的东西——而"重建必须等于当时"是这个模块的全部意义。
+    memoryIndex: options.memoryEnabled === false ? null : (options.memoryIndex ?? null),
+    // STATE 预算（v32）：重建要用的阈值与运行期同一个来源（当时生效的那份 config.json）。
+    // 缺省 = 出厂 8 KB（`deriveRequest` 的兜底）；CLI 与界面两条重建路都从这里进，口径一致。
+    ...(options.stateBudgetBytes === undefined ? {} : { stateBudgetBytes: options.stateBudgetBytes }),
+    // 豁免判据：与人格/别名同一条"现在这份"的限制，但**必须传**——不传就会多渲染出那句
+    // 规则提示，重建与当时逐字节一致这条承诺当场作废（见 RebuildOptions.warnExempt）。
+    warnExempt: options.warnExempt ?? null,
     // 软提示不落库（见文件头）：这里只能是 null，并在报告里明说
     softHint: null,
   });
 }
 
 /**
- * 本轮的固定块里那一段"选中的记忆正文"。
+ * 取该 turn 的**记忆索引注入账**（**最后一条** `memory/selected`）；没有就是 null。
  *
- * 选**哪几条**：只认 `memory/selected` 事件——这是可重放的地基（docs/memory-injection.md §4）：
- * "这一轮选了哪几条"如果是运行期临时算的，事后重建就得重算一遍，而重算要看**现在**的索引文件
- * （她随时可能改自己的记忆），重建结果与当时就对不上了。
+ * 2026-10-04 起它只是账（记"注入了没有 + 当时那份索引的指纹与条数"）：固定块里那段索引由
+ * `RebuildOptions.memoryIndex` 从盘上读回（运行期与重放同源），所以重建**不再需要**它来装配请求。
+ * 留着这个读取口是给诊断/审计用的——事后要回答"这一轮到底注入了没有、注进去的是哪一版"，
+ * 只有它答得上来（盘上的索引是**现在**那份，未必等于当时那份）。
  *
- * 正文从盘上按 `path:line` 现取：与运行期同一份素材（同一条纪律——正文永远在文件里，
- * 上下文里只有指针）。取不到那一条（文件被改、行号漂了）就跳过，不臆造内容。
- */
-function selectedMemoryTextOf(position: ReplayPosition, options: RebuildOptions): string | null {
-  if (options.dataDir === undefined) return null;
-  const selection = lastMemorySelection(position);
-  if (selection === null) return null;
-  const excerpts: MemoryExcerpt[] = [];
-  for (const entry of selection.selected) {
-    const excerpt = readExcerpt(options.dataDir, {
-      path: entry.path,
-      line: entry.line,
-      summary: entry.summary,
-      pinned: entry.pinned,
-    });
-    if (excerpt !== null) excerpts.push(excerpt);
-  }
-  const text = renderSelectedMemory(excerpts);
-  return text === '' ? null : text;
-}
-
-/**
- * 取该 turn 的选材结论（**最后一条** `memory/selected`）；没有就是 null（那一轮没注入记忆）。
- *
- * 选材事件在**轮首**写下，所以正常情形下它落在 `eventsBefore` 里（seq 小于该 turn 的每个
- * step/start）。取"最后一条"与运行期的读取口径一致：崩溃后重投同一个 turn 时可能再写一条，
+ * 事件在**轮首**写下，所以正常情形下它落在 `eventsBefore` 里（seq 小于该 turn 的每个 step/start）。
+ * 取"最后一条"与运行期的读取口径一致：崩溃后重投同一个 turn 时可能再写一条，
  * 两条里最后那条才是这一轮实际用的。
  */
 export function lastMemorySelection(position: ReplayPosition): MemorySelected['data'] | null {
@@ -596,6 +662,11 @@ export async function buildReplayReport(
   let configCurrent: string | null = null;
   let configSource = 'none';
   let contactGate: RebuildOptions['contact'];
+  // v32：框架代管记忆的总开关与 STATE 字节预算都从**盘上那份配置**读（与联系人表、豁免名单
+  // 同一条"不在事件里、只能取现在这份"的口径）。两个字段的判据只有这一处实现，界面预览
+  //（web/server.ts）读的是同一个字段名——两条重建路径不许各写一份。
+  let memoryEnabled = true;
+  let stateBudgetBytes: number | undefined;
   const configPath = join(cwd, CONFIG_FILE_NAME);
   if (existsSync(configPath)) {
     try {
@@ -603,6 +674,8 @@ export async function buildReplayReport(
       configCurrent = loaded.configHash;
       configSource = 'config.json';
       if (timezone === null) timezone = loaded.config.timezone;
+      memoryEnabled = loaded.config.persona.memoryEnabled;
+      stateBudgetBytes = loaded.config.persona.stateBudgetBytes;
       // 联络事实里"只能从盘上拿"的那几样（联系人表、别名表、两条通道开没开）：
       // 会话簿与话题由 rebuildContact 从事件折，其余只能取**现在**这份——报告里会明说。
       contactGate = {
@@ -640,9 +713,17 @@ export async function buildReplayReport(
     located,
     {
       persona, tools, timezone,
-      // v29/B2：固定块里那段"选中的记忆正文"要从盘上现取（`memory/selected` 只记指针）
+      // v29/B2：固定块里的记忆索引从盘上读回（只读，不建文件）。`dataDir` 仍要传：
+      // 重建联系人/别名那条路要用它（见 rebuildContact），不是为记忆正文。
       dataDir,
       memoryIndex: readMemoryIndexTextReadOnly(dataDir),
+      // v32：框架代管记忆的总开关与 STATE 字节预算，都照**盘上那份配置**判（上面读一次）。
+      // 与运行期同一个字段、同一条口径：关掉时重建出来的固定块里没有索引——那才是她当时看到的。
+      memoryEnabled,
+      ...(stateBudgetBytes === undefined ? {} : { stateBudgetBytes }),
+      // 豁免名单也是盘上的东西（界面在改），与别名/联系人同一条口径：**读现在这份**。
+      // 判据本身只有一处实现（WarnExemptBook.isExempt），这里只把它递给重建。
+      warnExempt: warnExemptJudgeOf(dataDir),
       ...(contactGate === undefined ? {} : { contact: contactGate }),
     },
   );
@@ -653,6 +734,9 @@ export async function buildReplayReport(
       now: options.compareNow ?? new Date().toISOString(),
       dataDir,
       memoryIndex: readMemoryIndexTextReadOnly(dataDir),
+      memoryEnabled,
+      ...(stateBudgetBytes === undefined ? {} : { stateBudgetBytes }),
+      warnExempt: warnExemptJudgeOf(dataDir),
       ...(contactGate === undefined ? {} : { contact: contactGate }),
     },
   );
@@ -664,17 +748,31 @@ export async function buildReplayReport(
     // 联络事实拆成两半：会话簿/话题按当时的事件重建，联系人与别名只能取现在这份
     '此刻层的「会话」「点名」按**当时**的事件重建（会话簿由 wake/channel 折、话题取 channel/topic）；'
     + '「通道」里的**联系人表与别名表用的是现在这份**（它们不在事件里），人改过名字时那一句会与当时不同',
+    // 豁免名单同属"不在事件里、只能取现在这份"，但它影响的是**有没有那句框架提示**：
+    // 不写这一条，开关前后重建出来的字节差异会被当成"渲染 bug"查半天
+    '框架预警的**豁免名单**（data/warn-exempt.json）不在事件里，重建用的是**现在这份**：'
+    + '开关改过之后，重建结果里那条消息可能比当时多（或少）一句规则层的框架提示',
     // 三件"只存在于运行期"的事实：它们不是事件，日志里没有。不写这一条，看重建结果的人就会把
     // 「未知」读成"当时就是这样"——那是把重建的局限当成事实。
     '此刻层的「本机」「用度」只存在于运行期（进程/磁盘/投影的瞬时值不落日志）：'
     + '重建结果里它们写「未知」或不出现，与当时的真值不同；要看真值请查 step/start 前后的 budget/consumed 事件与进程日志',
-    // 本轮固定块（B2）里那一段的两半来路不同，各自说清
-    '本轮固定块里的「选中的记忆正文」按 `memory/selected` **当时选的那几条**从盘上现取正文；'
-    + '正文若已被她改写，读回来的是现在的内容——选中哪几条是当时的事实，正文本身取现在这份',
-    '长期记忆层里的**记忆索引**（MEMORIES/INDEX.md 的渲染形态）与人格资产同一条限制：'
-    + '它是个文件，重建时读到的是现在这份；索引只含指针（路径 + 一行摘要），'
-    + '所以漂移的范围是那一行摘要，不是记忆正文',
+    // 固定块里的记忆索引与人格资产同一条限制，说清漂移范围
+    '本轮固定块里的**记忆索引**（MEMORIES/INDEX.md 的渲染形态）与人格资产同一条限制：'
+    + '它是个文件，重建时读到的是**现在**这份。索引只含指针（路径 + 行号 + 一行摘要），'
+    + '所以漂移的范围是那些指针行，不是记忆正文；'
+    + '要核对"当时注进去的是哪一版"，看该 turn 的 `memory/selected.indexHash`',
+    // 2026-10-04 起固定块里**没有**"选中的记忆正文"那一段（只给索引，正文她按需 safe_read）：
+    // 所以重建不需要、也不该再声称"按当时选的那几条现取正文"
+    '固定块里**只有索引**（不注入记忆正文）：正文由她自己 `safe_read` 现取，'
+    + '所以它不在固定块里，而在本次请求的历史段（工具结果）里',
   ];
+  // 关掉框架代管记忆时索引整段不出现——这一条要写出来，否则"重建结果里没有索引"会被当成漏装配。
+  // 判据是上面读进来的那个值（与重建装配用的是同一个），不是另算一次。
+  if (!memoryEnabled) {
+    notes.push('框架代管记忆已关（config.json 的 persona.memoryEnabled = false）：'
+      + '重建结果里**没有**记忆索引那一段，与运行期一致；'
+      + '盘上若还留着 MEMORIES/INDEX.md，那是历史文件，框架不再重建也不再注入它');
+  }
   if (!personaMatches) {
     notes.push(`当时的人格资产（${recordedPersonaHash.slice(0, 8)}）与当前（${current.personaHash.slice(0, 8)}）不同：`
       + '人格层已按当前内容重建，逐文件历史请用 persona diff/log 从版本库比对');

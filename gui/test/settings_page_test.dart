@@ -22,6 +22,8 @@ import 'package:irmia_gui/ui_state.dart';
 ///
 /// ⑭ 起系统卡是**逐行就地编辑**（紧凑表 + 每行一枚「编辑」胶囊）：只动这一行、只写这一行、
 /// 取消就丢、默认只露 4 行能展开收起、两条只读行没有胶囊——这七条锁在文件末尾。
+/// 「记忆」卡（`persona.memoryEnabled`）三条锁在最后：开关读盘上那份、点一下走 config-update、
+/// **关掉时那句代价必须在**（它是一句"什么都不会报错、代价过几天才显形"的话）。
 void main() {
   /// GET /api/protocol-side 的样例（v34）：配置齐备、已就绪、正在跑。
   /// 各用例按需改其中几个键（没配置 / 读失败 / 需重启 / 已停止）。
@@ -108,7 +110,8 @@ void main() {
         'generatedAt': '2026-10-01T00:00:00.000Z',
       };
 
-  const config = <String, dynamic>{
+  /// GET /api/config?source=saved 的回执。**可变**：记忆卡那两条用例要按开关的开/关各喂一份。
+  var config = <String, dynamic>{
     'dataDir': 'D:/irmia/data',
     'web': {'host': '127.0.0.1', 'port': 7788},
     'timezone': 'Asia/Shanghai',
@@ -134,6 +137,9 @@ void main() {
     },
     'tools': {'destructiveEnabled': false},
     'speak': {'typingEffect': true, 'charsPerMinute': 90},
+    // persona.memoryEnabled 是记忆卡的读源；$pending 是服务端给"盘上已改、进程还没接管"的元信息
+    'persona': {'memoryEnabled': true, 'contacts': <String, dynamic>{}},
+    r'$pending': {'source': 'saved', 'restartRequired': <String>[]},
   };
 
   late HttpServer server;
@@ -186,6 +192,23 @@ void main() {
     lastPost = null;
     lastConfirm = null;
     postCount = 0;
+    config = {
+      'dataDir': 'D:/irmia/data',
+      'web': {'host': '127.0.0.1', 'port': 7788},
+      'timezone': 'Asia/Shanghai',
+      'models': {
+        'heavy': {'model': 'gpt-4o-mini', 'baseUrl': 'https://api.example.com', 'apiKeyEnv': 'IRMIA_KEY_HEAVY'},
+        'light': {'model': 'gpt-4o-mini-lite', 'baseUrl': 'https://api.example.com', 'apiKeyEnv': 'IRMIA_KEY_LIGHT'},
+      },
+      'budget': {
+        'stepTools': 8, 'turnSteps': 30, 'taskTokens': 120000,
+        'dailyTokens': 2000000, 'softRatio': 0.8, 'failStreakMax': 3,
+      },
+      'tools': {'destructiveEnabled': false},
+      'speak': {'typingEffect': true, 'charsPerMinute': 90},
+      'persona': {'memoryEnabled': true, 'contacts': <String, dynamic>{}},
+      r'$pending': {'source': 'saved', 'restartRequired': <String>[]},
+    };
     depsFails = false;
     installReply = <String, dynamic>{'ok': true, 'step': 'done', 'version': '1.1.0.38'};
     protocolSide = protocolView();
@@ -394,7 +417,7 @@ void main() {
     await drain(tester);
   }
 
-  testWidgets('七个分区锚点与分区卡片同时就位（含 v30 的「外部依赖」与 v34 的「协议端」）', (tester) async {
+  testWidgets('十一个分区锚点与分区卡片同时就位（含 v30 的「外部依赖」、v34 的「协议端」、新加的「记忆」与「信任范围」）', (tester) async {
     await pumpSettings(tester);
 
     // 锚点在左栏（「模型」只属于锚点；「外部依赖」也只有锚点——卡头与它同名但只渲染一次，
@@ -409,6 +432,12 @@ void main() {
     // v34 的锚点：左栏一处，卡头是「协议端（可选）」（不同名，所以锚点只有一处）
     expect(find.text('协议端'), findsOneWidget);
     expect(find.text('协议端（可选）'), findsOneWidget);
+
+    // 「记忆」分区的锚点与卡头同名：左栏一处、卡头一处，正好两处
+    expect(find.text('记忆'), findsNWidgets(2));
+
+    // 「信任范围」同形（与 trust.mode 那笔一起加的）：锚点一处 + 卡头一处
+    expect(find.text('信任范围'), findsNWidgets(2));
 
     // 模型组两条 lane 各一张卡片，卡头 = 组名 + 一句说明
     expect(find.text('主循环（heavy）'), findsOneWidget);
@@ -1337,6 +1366,175 @@ void main() {
     expect(postCount, 1);
     expect(lastPost?['fields'], {'web.host': '0.0.0.0', 'web.port': 8899});
     expect(lastConfirm, 'config-update');
+    await drain(tester);
+  });
+
+  // ── 「记忆」卡：框架代管记忆的总开关（persona.memoryEnabled） ──
+
+  testWidgets('记忆卡：开关读 persona.memoryEnabled，点一下走 config-update 写它', (tester) async {
+    config['persona'] = {'memoryEnabled': false, 'contacts': <String, dynamic>{}};
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    final toggle = find.byKey(const ValueKey('memory-enabled'));
+    // 读：开关显示的是**盘上那份**的值，不是一个写死的默认（否则"关着却显示开着"没人能发现）
+    expect(tester.widget<Switch>(toggle).value, isFalse, reason: '开关要显示配置里的值');
+
+    // 关着时那行只读要说"她自己管"，与开着的说法分开——两种状态两句话
+    expect(find.text('她自己管（框架不生成、不注入、不整理）'), findsOneWidget);
+
+    // 写：点一下立刻提交（开关是二值项，没有"改到一半"的中间态）
+    await tapInCard(tester, toggle);
+    await pumpUntil(tester, find.text('已改为框架自动管记忆（重启后接管）'));
+    expect(postCount, 1);
+    expect(lastPost?['fields'], {'persona.memoryEnabled': true});
+    expect(lastConfirm, 'config-update', reason: '写配置必须带 X-Confirm');
+    await drain(tester);
+  });
+
+  testWidgets('记忆卡：关掉时那句代价必须在，且标明要重启才接管', (tester) async {
+    // 服务端口径：这一条是启动参数，盘上改了、进程还没接管 → $pending 里报回来
+    config['persona'] = {'memoryEnabled': false, 'contacts': <String, dynamic>{}};
+    config[r'$pending'] = {
+      'source': 'saved',
+      'restartRequired': <String>['persona.memoryEnabled'],
+    };
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    final cost = find.text('代价：她可能忘记整理，facts.md 会一直长下去，索引也不再更新——这些都归她自己。');
+    expect(cost, findsOneWidget, reason: '关掉是一句"什么都不会报错、代价过几天才显形"的选择，代价必须摆在旁边');
+    expect(
+      find.text('让框架自动管记忆（关掉 = 她只知道自己有这些文件，读、写、整理全归她）'),
+      findsOneWidget,
+      reason: '开关自己那句要说清后果，不是"启用记忆系统"四个字',
+    );
+
+    // 「需重启」按服务端算出来的结论显示，这一页不另算一份
+    expect(find.text('尚未生效'), findsOneWidget);
+    expect(tester.widget<Switch>(find.byKey(const ValueKey('memory-enabled'))).value, isFalse);
+    await drain(tester);
+  });
+
+  testWidgets('记忆卡：开着时不摆那句代价（它是"关掉"这一种状态的话）', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+
+    expect(tester.widget<Switch>(find.byKey(const ValueKey('memory-enabled'))).value, isTrue);
+    expect(find.textContaining('代价：她可能忘记整理'), findsNothing);
+    expect(find.text('框架自动管记忆（每轮注入索引、每日整理）'), findsOneWidget);
+    // 开关**不能**顶替锚点：这一页的分区名与卡头同名，两处都在
+    expect(find.text('记忆'), findsNWidgets(2));
+    await drain(tester);
+  });
+
+  // ── 信任范围卡（`trust.mode`：完全信任 / 只限工作目录） ──
+
+  /// 信任卡里的两行（[TrustModeChoice] 的 key 是 `trust-mode-<档>`）
+  Finder trustRow(String mode) => find.byKey(ValueKey('trust-mode-$mode'));
+
+  /// 这一行现在是不是选中的那一档。
+  ///
+  /// 选中态由三处冗余提示之一读出来（这里是描边宽度，见 [TrustModeChoice]）：
+  /// 不按"点一下之后页面自己记了什么"判断，而是按**屏上真的画出来的**那一份判断
+  /// ——那正是这个断言要锁的东西（"默认高亮完全信任"）。
+  bool trustRowSelected(WidgetTester tester, String mode) {
+    final box = tester.widget<Container>(
+      find.descendant(of: trustRow(mode), matching: find.byType(Container)).first,
+    );
+    final border = (box.decoration as BoxDecoration).border as Border;
+    return border.top.width > 1;
+  }
+
+  testWidgets('信任范围卡：读到盘上那档并说清后果，点「完全信任」改回默认那档要走确认', (tester) async {
+    config['trust'] = {'mode': 'workspace', 'workspaceRoot': r'C:\path\to\workspace'};
+    await pumpSettings(tester, size: const Size(1350, 3600));
+
+    // 锚点（左栏）与卡头同名：一处锚点 + 一处卡头
+    expect(find.text('信任范围'), findsNWidgets(2));
+
+    // ① **读到盘上那份**：受管那一档是当前选中，另一档没选中
+    expect(trustRow('workspace'), findsOneWidget);
+    expect(trustRow('full'), findsOneWidget);
+    expect(trustRowSelected(tester, 'workspace'), isTrue, reason: '选中态要跟着盘上那份走，不是写死');
+    expect(trustRowSelected(tester, 'full'), isFalse);
+
+    // ② 两种选择的后果各一句，且「只限工作目录」那句要把 workspaceRoot 念出来
+    expect(find.text('她能读写整台电脑上的文件、也能在任意目录跑命令。'), findsOneWidget);
+    expect(find.text(r'她只能在 C:\path\to\workspace 里活动；越界的读写与命令会被拒绝。'), findsOneWidget);
+    // 只读的「当前生效」行说清现在按哪一档跑
+    expect(find.text(r'只限工作目录 · C:\path\to\workspace'), findsOneWidget);
+    // 这一条的定性要在卡上（它是边界，不是提醒）
+    expect(find.textContaining('它是**边界，不是提醒**'), findsOneWidget);
+
+    // ③ 点「完全信任」= 放宽边界：先出确认框，取消就一个请求都不发
+    await tapInCard(tester, trustRow('full'));
+    await tester.pump(const Duration(milliseconds: 200));
+    await pumpUntil(tester, find.widgetWithText(FilledButton, '改成完全信任'));
+    expect(
+      find.textContaining('她能读写整台电脑上的文件、也能在任意目录跑命令。'),
+      findsNWidgets(2),
+      reason: '确认框里写的是那句后果，不是"确定吗"（卡上那句 + 框里那句）',
+    );
+    await tester.tap(find.text('取消'));
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(postCount, 0, reason: '取消不该发出写请求');
+
+    // ④ 确认才写：走既有的 config-update 通道，带 X-Confirm；写的是一个字段
+    await tapInCard(tester, trustRow('full'));
+    await pumpUntil(tester, find.widgetWithText(FilledButton, '改成完全信任'));
+    await tester.tap(find.widgetWithText(FilledButton, '改成完全信任'));
+    await pumpUntil(tester, find.textContaining('已改为完全信任'));
+    expect(postCount, 1);
+    expect(lastPost?['fields'], {'trust.mode': 'full'});
+    expect(lastConfirm, 'config-update', reason: '写配置必须带 X-Confirm');
+    await drain(tester);
+  });
+
+  testWidgets('信任范围卡：默认完全信任、切到工作目录时后果文案在，并显示服务端算出的「需重启」', (tester) async {
+    // 起点 = 配置默认值（`trust.mode` 就是 full；workspaceRoot 由服务端算出来）
+    config['trust'] = {'mode': 'full', 'workspaceRoot': r'C:\path\to\config\workspace'};
+    await pumpSettings(tester, size: const Size(1350, 3600));
+
+    // ① 默认档：完全信任是选中的那一档
+    expect(trustRowSelected(tester, 'full'), isTrue, reason: '默认高亮「完全信任」（与配置默认值一致）');
+    expect(trustRowSelected(tester, 'workspace'), isFalse);
+    expect(find.text('完全信任（整台电脑）'), findsOneWidget);
+    // 还没改过任何东西：此刻没有"需重启"要喊（喊多了这句话就不值钱了）
+    expect(find.text('尚未生效'), findsNothing);
+
+    // ② 与盘上那份一致时点一下**什么都不写**：不该凭空多出一条"改了还没重启"
+    await tapInCard(tester, trustRow('full'));
+    await drain(tester);
+    expect(postCount, 0, reason: '点已经选中的那一档不该写盘');
+    expect(find.text('尚未生效'), findsNothing);
+
+    // ③ 切到「只限工作目录」：这一档不拦（收窄边界是安全方向），直接写
+    await tapInCard(tester, trustRow('workspace'));
+    await pumpUntil(tester, find.textContaining('已改为只限工作目录'));
+    expect(postCount, 1);
+    expect(lastPost?['fields'], {'trust.mode': 'workspace'});
+    expect(lastConfirm, 'config-update');
+    await drain(tester);
+  });
+
+  testWidgets('信任范围卡：盘上那份与生效那份不同时，照服务端的结论显示「需重启」', (tester) async {
+    // 服务端口径：`$pending.restartRequired` 是"盘上那份 vs 本进程启动时那份"的逐字段差异。
+    // `trust.mode` 属 `trust.` 前缀，不在 watcher.ts 的 HOT_RELOAD_FIELDS 里
+    // （那份名单是空的：全部字段都要重启），所以盘上改过的这一档会被报回来。
+    config['trust'] = {'mode': 'workspace', 'workspaceRoot': r'C:\path\to\config\workspace'};
+    config[r'$pending'] = {
+      'source': 'saved',
+      'restartRequired': <String>['trust.mode'],
+    };
+    await pumpSettings(tester, size: const Size(1350, 3600));
+
+    // 界面只显示服务端算出来的结论：徽章是「尚未生效」（= 盘上与生效**真的**不同），
+    // 而不是笼统的「需重启」（那只是"这类字段改完要重启"的常态说明）
+    expect(find.text('尚未生效'), findsOneWidget);
+    expect(find.textContaining('上面选的那一档**还没生效**'), findsOneWidget);
+    expect(find.textContaining('重启后接管'), findsWidgets);
+    // 那一档本身照旧摆在卡上（选中的仍是盘上那份：将来跑的就是它）
+    expect(trustRowSelected(tester, 'workspace'), isTrue);
+    expect(find.text(r'她只能在 C:\path\to\config\workspace 里活动；越界的读写与命令会被拒绝。'),
+        findsOneWidget);
     await drain(tester);
   });
 }

@@ -17,12 +17,15 @@ import { join } from 'node:path';
 
 // blob 目录名与 blobId 形状的唯一定义点在 state/blob-store.ts（写入端同源），这里只做转发
 import { BLOB_DIR_NAME, BLOB_ID_PATTERN } from '../../state/blob-store.ts';
+import { PATH_BOUNDARY_HINT } from '../boundary.ts';
 import type { FsEnv } from './env.ts';
+import { resolveGuarded } from './env.ts';
 import { resolveInsideRoot } from './path-guard.ts';
 import { readDirEntries } from './search-core.ts';
 import {
   decodeText,
   formatBytes,
+  LINE_NUMBER_WIDTH,
   looksBinary,
   splitLines,
   withLineNumbers,
@@ -46,7 +49,22 @@ import {
 
 export { BLOB_DIR_NAME, BLOB_ID_PATTERN };
 
-/** 不设硬上限就会在无人值守时把内存吃干；超出部分靠截断 + 提示处理 */
+/**
+ * `safe_read` 单次**解析**的字节上限：不设它就会在无人值守时把内存吃干。
+ *
+ * 它**不是**编辑器那一侧的上限，两者职责不同、也**不该相同**：
+ *   · 这里是"一次读进内存多少"——超出的部分不解析，所以算出来的**行数只是前半截的**；
+ *   · 编辑侧（`DEFAULT_MAX_EDIT_BYTES`，20 MiB）是"整个文件要不要拒绝编辑"——超了直接拒，
+ *     不存在"只编辑一半"。
+ *
+ * ⚠ **两边数值不同本身没问题，"不同却不说明"才是问题**：8~20 MiB 的文件里，
+ * `safe_read` 报的行数只覆盖前 8 MiB，而 `safe_edit` 的 `insert_at_line`/`delete_lines`
+ * 是按**整文件**的行号结算的。她照一个偏小的行数去 `insert_at_line`，会插在文件中间
+ * **而且不报错**（实测：16 万行的文件 `safe_read` 报 129056 行，真实 160000 行）。
+ *
+ * 所以这条上限**必须**在触顶时把"只读到哪、行号只在哪一段内有效"说出来——
+ * 见下面 `truncatedAtLimit` 那一段与它写进回执的话。
+ */
 const HARD_READ_LIMIT = 8 * 1024 * 1024;
 
 function blobDir(env: FsEnv, ctx: ToolContext): string {
@@ -108,19 +126,40 @@ function decodeWithEncoding(
   }
 }
 
+/**
+ * 按 UTF-8 字节把**单个字符串**截到上限以内，不切坏代理对（emoji / 生僻字）。
+ *
+ * 只在"一行本身就超过字节上限"时用得上：那时按行截断没有位置可切，只能切行内。
+ * 二分而不是逐字符累加——4 MB 的行逐字符算字节是 O(n²)，会把一次 safe_read 变成几十秒。
+ */
+function cutToByteBudget(line: string, budget: number): string {
+  if (budget <= 0) return '';
+  if (Buffer.byteLength(line, 'utf8') <= budget) return line;
+  let lo = 0;
+  let hi = line.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    // 落在代理对中间时退一格：半个代理对编出来是替换字符，不如少一个字符
+    const end = mid > 0 && mid < line.length && /[\uD800-\uDBFF]/u.test(line[mid - 1] as string) ? mid - 1 : mid;
+    if (Buffer.byteLength(line.slice(0, end), 'utf8') <= budget) lo = mid;
+    else hi = mid - 1;
+  }
+  return line.slice(0, lo);
+}
+
 // ──────────────────────────────── safe_read ────────────────────────────────
 
 export function createSafeReadTool(env: FsEnv): ToolDefinition {
   return {
     name: 'safe_read',
     description:
-      '读取工作目录内的文本文件，**每行都带真实行号前缀**（`  12│ 内容`，safe_edit 的三种模式都认这个行号）。' +
-      'offset/limit 取区间、head/tail 取两端。自动检测编码（BOM/UTF-8/GBK）。只读。',
+      '读取文本文件，**每行都带真实行号前缀**（`  12│ 内容`，safe_edit 的三种模式都认这个行号）。' +
+      `offset/limit 取区间、head/tail 取两端。自动检测编码（BOM/UTF-8/GBK）。只读。${PATH_BOUNDARY_HINT}。`,
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: '文件路径，相对工作目录或绝对路径（必须在工作目录内）' },
-        offset: { type: 'integer', description: '起始行号，1-based，默认 1' },
+        path: { type: 'string', description: `文件路径：相对工作根或绝对路径；MEMORIES/ 与 diary/ 会自动落到记忆目录。${PATH_BOUNDARY_HINT}` },
+        offset: { type: 'integer', description: '起始行号，1-based，默认 1（0 与 1 等价，都表示从头）' },
         limit: { type: 'integer', description: '最多返回多少行，默认全部（受上限保护）' },
         head: { type: 'integer', description: '只读前 N 行，与 offset/limit/tail 互斥' },
         tail: { type: 'integer', description: '只读后 N 行，与 offset/limit/head 互斥' },
@@ -153,7 +192,24 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
       const pathInput = readString(args, 'path');
       if (pathInput === null || pathInput === '') return invalidArgs('safe_read', '缺少 path');
 
-      const offsetRes = readOptionalInt(args, 'offset', 1, Number.MAX_SAFE_INTEGER);
+      // offset 的语义：**起始行号，1-based**（不是 devkit 的"hex 字节偏移"）。
+      //
+      // 为什么保留行号语义、不改名：本仓库 `offset` 的行内坐标是**处处一致**的
+      // ——`safe_read` 的 offset / `limit` 与 `head`/`tail`、`safe_edit` 的
+      // `insert_at_line`/`delete_lines` 行号、`withLineNumbers` 印出来的真实行号
+      // 共用同一套地址（read-tools.ts 的模块注释第 3 条、design.md:778）。
+      // 改成字节偏移会把这条唯一的"读→改"地址链拆成两套坐标，而 `read_blob` 已经
+      // 是字节坐标了（它服务的是工具结果外置后的回读），两件工具同名不同根正是
+      // 模型最容易算错的地方。devkit 那边 `offset` 只服务 `mode=hex`，它的行寻址
+      // 用的是另一个参数 `start_line`（`tools/safe_read.py:661,677`）——本仓库没有
+      // hex 模式，所以**没有**这个同名冲突面。改名（offset → start_line）留给用户拍板：
+      // 它要动 skills/ 与文档里的既有写法，收益只是"与源同名"，不是修 bug。
+      //
+      // 但 `offset: 0` 必须收下：devkit 的 `start_line` 默认就是 0、0 表示"从头"
+      // （`_registry.py:1194-1263`），模型照那边的习惯回填 `offset: 0` 时本地会当场
+      // 报"必须是 >= 1 的整数"（docs/devkit-migration-audit.md §3.1 #9）——同一个意思
+      // 在两处一个合法一个报错，是纯心智负担。所以这里**最小仍是 0，0 归一成 1**。
+      const offsetRes = readOptionalInt(args, 'offset', 0, Number.MAX_SAFE_INTEGER);
       if ('error' in offsetRes) return invalidArgs('safe_read', offsetRes.error);
       const limitRes = readOptionalInt(args, 'limit', 1, 200_000);
       if ('error' in limitRes) return invalidArgs('safe_read', limitRes.error);
@@ -173,7 +229,7 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
         return invalidArgs('safe_read', 'head/tail 与 offset/limit 互斥；要区间就用 offset+limit，要两端就只用 head 或 tail');
       }
 
-      const guarded = await resolveInsideRoot(ctx.workspaceRoot, pathInput, { purpose: 'safe_read' });
+      const guarded = await resolveGuarded(env, ctx, pathInput, { purpose: 'safe_read' });
       if (!guarded.ok) return fail(guarded.code, guarded.reason);
 
       let size = 0;
@@ -212,8 +268,23 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
       const split = splitLines(decoded.text);
       const totalLines = split.lines.length;
 
+      // ── 只解析了前 HARD_READ_LIMIT 字节时，**行数是"前半截的"** ──
+      //
+      // 这是会真丢内容的那个坑（核查报告 L1）：`totalLines` 是照**已读进来的字节**数出来的，
+      // 文件更大时它偏小；而 `safe_edit` 的 `insert_at_line`/`delete_lines` 按**整文件**
+      // 行号结算。实测 160000 行的文件这里报 129056 行，她据此 `insert_at_line 129056`
+      // 以为在追加，**实际插在文件中间且不报错**；更糟的是编辑回执里同时印着
+      // "原文件共 160000 行"与"在第 129056 行之后插入"，两句互相矛盾却不指出。
+      //
+      // 处置（判据只紧不松）：把"行数不完整"变成回执里**不可能漏看**的一件事——
+      // ① 头部那格直接改写成 `约 N 行（仅前 X 内，未数完）`，她不会把 N 当总数；
+      // ② 提示里明说**行号只在前 X 内有效**，并明说不要拿它去 insert_at_line/delete_lines。
+      // 不给"假装数完"留任何形状。
+      const truncatedAtLimit = size > readLen;
+
       // 区间决议：head/tail 优先于 offset/limit（互斥已在上方挡住混用）
-      let startLine = offset ?? 1;
+      // 0 与 1 等价：都表示"从头"（devkit 的 start_line=0 就是这个意思）
+      let startLine = offset === undefined || offset === 0 ? 1 : offset;
       let endLine: number;
       if (head !== undefined) {
         startLine = 1;
@@ -234,25 +305,78 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
       const slice = totalLines === 0 ? [] : split.lines.slice(startLine - 1, endLine);
       const lineLimit = env.maxReadLines;
       const beyondLineLimit = slice.length > lineLimit;
-      const shown = beyondLineLimit ? slice.slice(0, lineLimit) : slice;
+      const lineWindow = beyondLineLimit ? slice.slice(0, lineLimit) : slice;
+
+      // ── 字节硬顶（P0）：行数上限挡不住"一行 4MB" ──
+      //
+      // 旧实现只有 2000 行的上限，`env.maxReadBytes`（默认 256 KiB）**只用来加一句提示**，
+      // 不参与截断：实测 3 行 × 1MB 的文件返回 3,145,941 字节、单个 4MB 长行返回 4,194,502
+      // 字节，两者都不带截断标记（docs/devkit-migration-audit.md §1 #5）。
+      // devkit 的对应常量是 `MAX_BYTES_PER_CALL = 128 * 1024`（`tools/safe_read.py:44`），
+      // 在**完整行边界**上截断并给 `truncated` + `next_call`。
+      //
+      // 为什么这条同时是"省 token"的关键：4 MB 进上下文不是"多花点钱"，是那一次调用本身
+      // 就把窗口撑爆，后面所有步骤都在为它让路。停在一行边界上，模型还能用续读参数接着拿。
+      const byteLimit = env.maxReadBytes;
+      const numbered = withLineNumbers(lineWindow, startLine);
+      // 行号前缀（`   1│ `，宽 4 右对齐 + │ + 空格）也占字节，按 UTF-8 数进去：
+      // 判据必须是"**真正要发出去的字节**"，否则每行都少算几字节，攒起来正好越界。
+      const prefixBytes = LINE_NUMBER_WIDTH + Buffer.byteLength('│ ', 'utf8');
+      const shownNumbered: string[] = [];
+      let bodyBytes = 0;
+      let beyondByteLimit = false;
+      for (const line of numbered) {
+        // 至少留一行：一行本身就超限时也要给她看到开头（并如实说明被截了多少），
+        // "什么都不返回"比"返回一个被切掉的行"更难处理。
+        const lineBytes = Buffer.byteLength(line, 'utf8') + prefixBytes + 1;
+        if (shownNumbered.length > 0 && bodyBytes + lineBytes > byteLimit) {
+          beyondByteLimit = true;
+          break;
+        }
+        shownNumbered.push(line);
+        bodyBytes += lineBytes;
+        if (bodyBytes > byteLimit) {
+          beyondByteLimit = true;
+          break;
+        }
+      }
+      const shown = shownNumbered;
       const shownEnd = startLine === 0 ? 0 : startLine + shown.length - 1;
 
       // 行号是**无条件**的，没有开关：它是 safe_edit 行号寻址（insert_at_line / delete_lines）
       // 唯一的地址来源。给模型一个 line_numbers:false 就等于给一个"关掉自己眼睛"的按钮，
       // 而唯一的收益是省几个 token——参数本身也是常驻开销，所以这里只做减法（v27 删掉了它）。
-      const body = withLineNumbers(shown, startLine).join('\n');
+      let body = shown.join('\n');
 
-      const truncated = size > readLen || beyondLineLimit || shown.length < slice.length;
+      // 上面那个循环保证"至少留一行"，所以**第一行本身就超限**时它整行都在（可能 4 MB）。
+      // 这一段把它切到预算内：按行截断在"一行就是整个文件"时没有位置可切，但"什么都不返回"
+      // 或"返回 4 MB"都不可接受——后者正是这条修复要治的那个病（实测旧实现单行 4MB 照回）。
+      if (beyondByteLimit && shown.length === 1 && Buffer.byteLength(body, 'utf8') > byteLimit) {
+        body = cutToByteBudget(body, byteLimit);
+      }
+
+      const truncated = size > readLen || beyondLineLimit || beyondByteLimit || shown.length < slice.length;
+      // 行数那格：**没数完就绝不说成总数**（`约` + `仅前 X 内` + `未数完` 三处一起说）。
+      // 这一格是 edit 侧行号寻址的地址来源，它说错就是"她照着改错行"。
+      const linesCell = truncatedAtLimit
+        ? `约 ${totalLines} 行（仅前 ${formatBytes(readLen)} 内，未数完）`
+        : `${totalLines} 行`;
       const header =
         `${guarded.relPath} · ${decoded.encoding}（${decoded.confidence}） · ${formatBytes(size)} · ` +
-        `${totalLines} 行 · 显示 ${startLine}-${shownEnd}`;
+        `${linesCell} · 显示 ${startLine}-${shownEnd}`;
 
       const hints: string[] = [];
       for (const note of decoded.notes) hints.push(`编码说明：${note}`);
-      if (size > readLen) {
+      if (truncatedAtLimit) {
+        // 这条与上面那个 `linesCell` 是**一对**：一个改头部、一个说清后果。缺任何一个，
+        // "把偏小的行数当总数"这条路就又通了。
         hints.push(
-          `文件 ${formatBytes(size)} 超过本次读取上限 ${formatBytes(HARD_READ_LIMIT)}，只解析了前 ${formatBytes(readLen)}；` +
-            '要完整内容请用 offset/limit 分段读，或在 rg_search 里定位后再取区间。',
+          `文件 ${formatBytes(size)} 超过单次解析上限 ${formatBytes(HARD_READ_LIMIT)}，只解析了前 ${formatBytes(readLen)}：`
+            + `**上面那个行数只是前 ${formatBytes(readLen)} 内的行数，不是全文件的行数**。`
+            + `因此**本次回显的行号只在前 ${formatBytes(readLen)} 内有效**——`
+            + '不要拿它去 insert_at_line / delete_lines（编辑器按**整文件**行号结算，靠后的行号会对不上，'
+            + '而且不会报错）。要动这么大的文件：先用 rg_search 定位，再按定位到的**区间**读；'
+            + '确实要整篇处理时由人在外部编辑器里做。',
         );
       }
       if (beyondLineLimit) {
@@ -261,7 +385,15 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
             `继续读请用 offset=${shownEnd + 1}&limit=${lineLimit}。`,
         );
       }
-      if (size > env.maxReadBytes) {
+      if (beyondByteLimit) {
+        // 说清三件事：被截了、截在多少字节、怎么接着读。少任何一件，模型都会以为这就是全文。
+        hints.push(
+          `本次返回内容已达单次字节上限 ${formatBytes(byteLimit)}（返回 ${formatBytes(bodyBytes)}），` +
+            `**这不是文件全文**——只发到第 ${shownEnd} 行就停了（该行可能也被切短）。` +
+            `继续读请用 offset=${shownEnd + 1}&limit=${lineLimit}，或用 rg_search 定位后只取那一小段。`,
+        );
+      }
+      if (!beyondByteLimit && size > env.maxReadBytes) {
         hints.push(`提示：文件较大（${formatBytes(size)}），若这是外置的工具结果，用 read_blob 分页取更省上下文。`);
       }
       if (totalLines > 0 && shownEnd < totalLines) {
@@ -297,10 +429,10 @@ export function createListDirTool(env: FsEnv): ToolDefinition {
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: '目录路径，默认 "." （工作目录根）' },
+        path: { type: 'string', description: `目录路径，默认 "."（工作根）。${PATH_BOUNDARY_HINT}` },
         depth: { type: 'integer', description: '递归层数，1 表示只列直接子项，默认 1，上限 5' },
         max_entries: { type: 'integer', description: '最多返回多少条，默认 200' },
-        include_hidden: { type: 'boolean', description: '是否包含以 . 开头的条目，默认 true' },
+        include_hidden: { type: 'boolean', description: '是否包含以 . 开头的条目，默认 false（要 .env 这类隐藏文件时显式传 true）' },
         sort_by: { type: 'string', enum: ['name', 'size', 'mtime'], description: '排序字段，默认 name' },
       },
       required: [],
@@ -319,10 +451,14 @@ export function createListDirTool(env: FsEnv): ToolDefinition {
       if ('error' in maxRes) return invalidArgs('list_dir', maxRes.error);
       const depth = depthRes.value ?? 1;
       const maxEntries = maxRes.value ?? 200;
-      const includeHidden = readOptionalBool(args, 'include_hidden') ?? true;
+      // 默认 false = 不列隐藏条目。依据是 devkit 的同名参数（那边叫 show_hidden，
+      // `tools/dir_list.py:11-13` 默认 False）；本仓库旧实现默认 true，实测默认输出里
+      // `.secret` 直接出现（docs/devkit-migration-audit.md §1 #28）。隐藏文件对"看目录结构"
+      // 是噪音，而她真需要 `.env` / `.gitignore` 时显式传 include_hidden:true 只有一次调用成本。
+      const includeHidden = readOptionalBool(args, 'include_hidden') ?? false;
       const sortBy = readOptionalString(args, 'sort_by') ?? 'name';
 
-      const guarded = await resolveInsideRoot(ctx.workspaceRoot, pathInput, {
+      const guarded = await resolveGuarded(env, ctx, pathInput, {
         purpose: 'list_dir',
         requireDirectory: true,
       });

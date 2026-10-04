@@ -447,6 +447,37 @@ export interface BudgetToppedUp extends EventEnvelope<'budget/topped-up', {
   layer: BudgetLayer; addedTokens: number; by: string;
 }> {}
 
+/**
+ * 暂停解除：那条 `budget/exhausted` 记下的可恢复暂停**已经解开**（internal）。
+ *
+ * 为什么它必须是一条自己的事件（2026-10-04 修的真 bug）：投影里的 `lastExhausted` 是**日志的
+ * 折叠结果**——"上限调大 + 重启"只是把同一条 `budget/exhausted` 原样重放一遍，记录照样回来，
+ * 于是配置变了、进程也重读了配置，唤醒门仍然拿那条历史记录拦住所有输入（现场：用户发的
+ * `wake/manual` 躺在队列里没有 turn 起来；一加注、`budget/topped-up` 刚到，紧接着就
+ * `turn/start`）。**解除是一件事，就得落成事件**：只改投影不落库，下一次重启会被日志推翻。
+ *
+ * 与 `budget/topped-up` 的分工：加注那条路自己就是凭据（`topped-up` 一到，fold 同样清掉该层
+ * 记录），所以它不再补写这条；本事件记的是**上限被抬高之后、投影里那条记录还没被清掉**的那一路
+ * ——`reason` 说清上限是谁抬起来的，`limit` / `actual` 是**解除那一刻**的两个数
+ * （判定用的就是它们；当时撞线的那个数在它前面那条 `budget/exhausted` 里）。
+ */
+export interface BudgetResumed extends EventEnvelope<'budget/resumed', {
+  layer: BudgetLayer;
+  /** 解除那一刻的**有效上限** = 基础上限 + 累计人工加注 */
+  limit: number;
+  /** 解除那一刻的**已用量**（进度一个字节都没被改写） */
+  actual: number;
+  /**
+   * 上限是被谁抬起来的：
+   *   - `limit-raised` —— 配置改了（budget.* 是启动参数，重启后生效）；
+   *   - `topup`        —— 配置没动，是累计加注把它抬上去的。
+   *
+   * 正常路径上人工加注走 `budget/topped-up`（那条自己就把记录清了），所以 `topup` 这一档
+   * 是给"记录还在、而上限已被加注抬高"的情形兜底（例如投影缓存落后于日志时重建）。
+   */
+  reason: 'limit-raised' | 'topup';
+}> {}
+
 // ──────────────────────────────── 策略与运维 ────────────────────────────────
 
 export interface PolicyDenied extends EventEnvelope<'policy/denied', {
@@ -605,44 +636,68 @@ export interface MemoryMaintained extends EventEnvelope<'memory/maintained', {
 }> {}
 
 /**
- * 本轮的记忆选材（B2，docs/memory-injection.md §4）。
+ * 本轮的**记忆索引注入账**（B2，docs/memory-injection.md §4；2026-10-04 简化）。
  *
  * **为什么它必须是事件**：本仓库的地基是**可重放**——`deriveRequest` 必须能只凭事件日志重建
- * 逐字节相同的请求。"这一轮选了索引里的哪几条"如果是运行期临时算出来的，事后重建就得重算，
- * 而重算依赖当时的索引文件（她随时可能改自己的记忆），重建结果就与当时对不上了。
- * 写成事件之后，`deriveRequest` 只读最后一个 `memory/selected{turn}`，两条路径同一份结论。
+ * 逐字节相同的请求。而"这一轮到底注入了没有、注入的多大"如果在运行期临时算，事后就没人答得上来
+ * （索引文件是她自己随时会改的东西，现在的盘不等于当时那一份）。
  *
- * 它同时回答**为什么没选其余**：事后读日志的人要能分清"心跳轮本就不注入"与"索引上限截断了"
- * ——只记选中的那几条，这个问题就永远没人答得上来。
+ * **只记指纹与规模，不记内容**（2026-10-04 用户的口径：「只看索引，如果需要，heavy 自己去读，
+ * 随后跟随 tool call 留在上下文」）：注入的那段索引本身就是从 `MEMORIES/INDEX.md` 渲染出来的，
+ * 全文落进事件等于**把同一份东西存两遍**——而它有上限一兆字节量级的风险，日志是 append-only 的。
+ * 所以这里留 `indexHash`（当时那份索引文本的指纹，用来事后核对"注进去的是哪一版"）与
+ * `entries`（条数，用来判断规模）。要读当时那一版全文，去 `MEMORIES/INDEX.md` 的快照/审计路径，
+ * 而不是把它塞进每轮一条的事件里。
  *
- * 可见性 internal：它是**装配账**（哪几条进了请求是日志的事实），不是给她的输入。
- * 真正给她看的是本轮固定块里那几条正文本身（见 model/render.ts 的 `TurnBlockFacts`）。
+ * 它同时回答**这一轮为什么没注入**：心跳轮整轮不注入（`injection: 'heartbeat'`），
+ * 只记"注入了"的话，这个问题就永远没人答得上来。
+ *
+ * 可见性 internal：它是**装配账**（哪一版索引进过请求是日志的事实），不是给她的输入。
+ * 真正给她看的是本轮固定块里那段索引本身（见 model/render.ts 的 `TurnBlockFacts`）。
  */
 export interface MemorySelected extends EventEnvelope<'memory/selected', {
   /** 归属的 turn（轮首写，所以它的 seq 落在该 turn 的第一个 step/start 之前） */
   turn: number;
   /** 本轮的注入理由：心跳轮不注入；有人跟她说话时注入 */
   injection: 'human' | 'heartbeat';
-  /** 本轮选中的条目（**指针**：路径 + 行号 + 一行摘要 + 置顶标记；正文不落事件） */
-  selected: Array<{
-    /** 相对工作根的 posix 路径（`safe_read` 的 path 用它） */
-    path: string;
-    /** 条目在文件里的行号（1 起，与 safe_read 回显同一口径） */
-    line: number;
-    /** 一行摘要（索引里印出来的那一行） */
-    summary: string;
-    /** `!pinned`：永不衰减、永不归档，心跳轮与超预算时也照样注入 */
-    pinned: boolean;
-  }>;
-  /** 没被选中的条数与原因（只记数：逐条记会让事件膨胀成索引的副本） */
-  notSelected: {
-    /** 心跳轮整轮不选（没人在跟她说话） */
-    heartbeat: number;
-    /** 非置顶条目，且本轮条数上限已满 */
-    notNeeded: number;
-  };
-  /** 写这条账时的索引规模（条数）——事后能判断"当时索引有多大" */
-  indexSize: number;
+  /**
+   * 当时注入的那段索引文本的指纹（sha256 十六进制）。
+   *
+   * 它是"注进去的是哪一版"的唯一凭据：索引文件会被重建，事后从盘上读到的是**现在**那份，
+   * 与当时未必相同——有指纹才分得清"重建对不上"是因为索引变了还是因为重建错了。
+   */
+  indexHash: string;
+  /** 写这条账时注入的索引条数（规模；不是索引全文） */
+  entries: number;
+}> {}
+
+/**
+ * 一次"按索引指针读记忆"的**访问账**（design §4.17 第 2 条"访问强化"）。
+ *
+ * **为什么要有它**：§4.17 第 2 条写的是"文件内排序即权重——整理任务把**近期召回命中的**
+ * 条目往前提"，但"哪一条被读过、读了几次"这件事在此之前**没有任何地方记**：`tool/call`
+ * 里虽然有 `memory_read` 的参数，可那是"她调了哪件工具"的流水，要靠解析工具入参才能
+ * 折出访问计数——把排序建在"解析别人的入参"上，等于让整理任务去依赖另一件工具的参数
+ * 形状。这条事件是把那份数据放到**fold 能直接消费**的位置上。
+ *
+ * **只放指针、不放正文**（与 `memory/selected` 同一条纪律）：读到的内容作为**工具结果**
+ * 已经留在历史里了，再往事件里存一份就是同一份东西存两遍，而日志是 append-only 的。
+ * 这里要回答的问题只有"哪一条、什么时候、被读了几行"。
+ *
+ * 可见性 internal：它是**账**，不是给她的输入（她这一轮已经拿到正文了，再回一句
+ * "你刚读了 facts.md:9"只是把同一件事渲染两遍）。
+ */
+export interface MemoryRead extends EventEnvelope<'memory/read', {
+  /** 归属的 turn（工具在 turn 内执行，所以它落在 turn/start 之后） */
+  turn: number;
+  /** 相对工作根的 posix 路径（如 `MEMORIES/facts.md`）——与索引里的指针同一写法 */
+  path: string;
+  /** 条目的起始行号（1 起，与 `safe_read` 回显的行号同一口径） */
+  line: number;
+  /** 这次一共取了几行 */
+  lines: number;
+  /** 取到的那一条是不是 `!pinned`（整理时的"重要记忆保护"要用，避免把置顶条目往前提） */
+  pinned: boolean;
 }> {}
 
 // ──────────────────────────────── 扩展面 ────────────────────────────────
@@ -730,6 +785,18 @@ export interface IntentionActed extends EventEnvelope<'intention/acted', {
   intentionId: string; turn: number;
 }> {}
 
+/**
+ * `todo/updated` —— 清单**写进 STATE 两节**的同一拍，记一笔"写的是哪一份"。
+ *
+ * 2026-10-04 的合并（用户：「state……甚至就应该取代 todo」→「或者说合并」）之后，这条事件的
+ * 地位与 `memory/selected` 类似：**它是账，不是载体**。
+ *   • 载体：`STATE.md` 的「## 当前任务」/「## 接着干」两节（`persona/todo-state.ts`）；
+ *   • 任务卡（此刻层 `未完成计划：`）从**载体**读，不从这条事件读；
+ *   • 那为什么还写它：① 旧日志里"她当时的清单"只有这一条线索（那时没有 STATE 快照），
+ *     读旧账、回放旧请求都要它；② 观测/界面要能回答"最近一次写入是哪一份"。
+ *
+ * 可见性 `internal`（不进上下文）：进她上下文的是 STATE 那两节本身。
+ */
 export interface TodoUpdated extends EventEnvelope<'todo/updated', {
   items: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
 }> {}
@@ -897,12 +964,12 @@ export type AppEvent =
   | ChannelMessage | ChannelRead | ChannelTopic | InjectionFlagged | InjectionNoted
   | ImageAttached
   | TimerSet | TimerFired | TimerCancelled
-  | BudgetConsumed | BudgetRollover | BudgetExhausted | BudgetToppedUp
+  | BudgetConsumed | BudgetRollover | BudgetExhausted | BudgetToppedUp | BudgetResumed
   | PolicyDenied | AuthzDenied | LogRepaired | InstanceTakeover
   | InputClaimed | InputDeadLetter | InputRequeued | ToolZombie
   | SlashHandled
   | AlarmSent | ReviewResolved | SnapshotCheckpoint | CompactionSummary
-  | PersonaUpdated | ConfigChanged | MemoryMaintained | MemorySelected
+  | PersonaUpdated | ConfigChanged | MemoryMaintained | MemorySelected | MemoryRead
   | McpServerStarted | McpServerStopped | SkillInstalled | HookFired | SpeakSent
   | IntentionRaised | IntentionActed | TodoUpdated
   | JobStarted | JobFinished
@@ -936,6 +1003,10 @@ export const EVENT_VISIBILITY: Record<string, Visibility> = {
   'injection/noted': 'internal',
   // 她自己要求放进来的图：与 wake/channel 的附件同一条出口（渲染层注入 input_image）
   'image/attached': 'model',
+  // 抬上限解除暂停：与 session/* 同一条口径——它是**簿记**（谁解的、凭什么解的），
+  // 不是给她的输入。她该看见的是"又能干活了"这件事本身（下一次 turn），
+  // 而不是框架内部的解扣动作；写出来是为了让"这条线是有意画的"看得见
+  'budget/resumed': 'internal',
   'human/asked': 'model', 'human/answered': 'model',
   // 超时事实同样进上下文：她必须**得知**"人可能不在机器旁、或没注意到"才能自己决定下一步
   // （design §6.1：换个方式找人是她的判断）。写成 internal 等于让这件事只留在日志里，
@@ -952,6 +1023,9 @@ export const EVENT_VISIBILITY: Record<string, Visibility> = {
   // 选材是**装配账**（这一轮往固定块里放了哪几条记忆），不是给她的输入：正文才进上下文，
   // 账本身只服务于"同一份日志重建同一份请求"与事后复盘（B2，docs/memory-injection.md §4）
   'memory/selected': 'internal',
+  // 访问账同上：她这一轮已经拿到正文了，再回一句"你刚读了 facts.md:9"只是把同一件事
+  // 渲染两遍。它服务的是 design §4.17 第 2 条的访问强化（整理任务据此把常读的往前提）
+  'memory/read': 'internal',
   // 换锁是本机的运维事实：她要办事时会撞上"进不去"，但"谁什么时候设了密码"本身
   // 不该占她一拍上下文（与 session/* 同一条口径）
   'auth/password-set': 'internal',
@@ -1122,7 +1196,15 @@ export interface Projection {
   claimedByTurn: Record<number, number[]>;
   /** 意图簿（INTENTIONS.md 的事件镜像；到期判定由调度器读时钟做，fold 只折叠） */
   intentions: Array<{ intentionId: string; content: string; triggerAt?: string; condition?: string }>;
-  /** 任务内计划清单（todo/updated 折叠） */
+  /**
+   * 任务内计划清单（`todo/updated` 折叠）。
+   *
+   * **2026-10-04 起不再是谁的真相源**：待办清单的唯一载体是 `STATE.md` 的「## 当前任务」/
+   * 「## 接着干」两节（`persona/todo-state.ts`），任务卡从那里读（`agent-loop` 的 `taskCard()`）。
+   * `todo` 工具照旧落一条 `todo/updated`，于是这一格仍然等于**最近一次写入的那份清单**——
+   * 它现在的用途是**读旧日志**（既有日志里只有这条事件，没有 STATE 快照）与观测，
+   * **不要拿它当"她现在的待办"**：她可能直接改 STATE（人在界面上也能改），那一改不落事件。
+   */
   todoList: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
   /** 运行中的后台任务 */
   jobs: Record<string, { command: string; turn: number; startedAt: string }>;
@@ -1136,8 +1218,20 @@ export interface Projection {
   humanAsks: HumanAskEntry[];
   /** 执行中挂起等待人答（`human/asked` 未 paired）——**只认系统来源**（计划批准那种挂起） */
   waitingHuman: { question: string; turn: number; at: string } | null;
-  /** 各层最近一次 budget/exhausted（paused 派生：存在且无后续 topped-up） */
-  lastExhausted: Partial<Record<BudgetLayer, { at: string; limit: number; actual: number }>>;
+  /**
+   * 各层最近一次 budget/exhausted（paused 派生：存在且无后续 `budget/topped-up` /
+   * `budget/resumed`）。
+   *
+   * `resumable: false` **只在不可恢复的暂停上出现**（正常写入口写的都是 `true`，于是这一位
+   * 恒为 undefined）：抬上限那条规则（`BudgetGuard.liftedPauses`）跳过带它的记录——一条不是
+   * "预算用尽"的硬停，不该被"上限比已用大了"顺手解开。事件类型里 `resumable` 是字面量 `true`，
+   * 所以这一位只有手写日志（或将来真的加了硬停）才会出现；留一位是为了让那种日志不被误放行，
+   * 而不是说今天存在这种暂停。
+   */
+  lastExhausted: Partial<Record<BudgetLayer, {
+    at: string; limit: number; actual: number;
+    resumable?: false;
+  }>>;
   /** dedupe 窗口：最近 1000 个 wake 幂等键（FIFO 淘汰） */
   dedupeKeys: string[];
   /** 最后一次成功的模型调用，用于判断水位是否停滞 */

@@ -111,7 +111,6 @@ final _onebotSpecs = <_Spec>[
 ];
 final _hookSpecs = <_Spec>[
   (label: '入站监听地址', path: 'web.host · web.port', custom: _listenOf),
-  (label: '文件监听范围', path: 'paths.workspaceAllowlist', custom: _allowlistOf),
 ];
 
 /// 左列表三项：定义来自客户端（等于 config 结构本身），因此配置读不到时列表照常可点，
@@ -150,7 +149,7 @@ final _channels = <_ChannelDef>[
     enabledPath: 'alerts.webhookUrl',
     switchPath: null,
     channel: _hookChannelId,
-    hint: '出口地址为空时告警仅写入日志；文件监听范围由 paths.workspaceAllowlist 指定。',
+    hint: '出口地址为空时告警仅写入日志。',
     blurb: '告警出口 · 入站监听',
     fields: _hookFields,
     specs: _hookSpecs,
@@ -1833,13 +1832,6 @@ String? _endpointOf(_ChannelsPageState state) {
 String? _listenOf(_ChannelsPageState state) {
   final port = _at(state.cfg, 'web.port');
   return port is num ? 'http://${state._text('web.host') ?? '127.0.0.1'}:${port.toInt()}' : null;
-}
-
-String? _allowlistOf(_ChannelsPageState state) {
-  final value = _at(state.cfg, 'paths.workspaceAllowlist');
-  if (value is! List || value.isEmpty) return null;
-  final first = value.first.toString();
-  return value.length == 1 ? first : '$first 等 ${value.length} 个目录';
 }
 
 String _clip(String text, int max) {

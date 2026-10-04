@@ -89,6 +89,32 @@ const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * 挑一个用户不在场的时刻，避免它和真实输入抢同一批预算与注意力。
  */
 export const DEFAULT_MEMORY_MAINTAIN_CRON = '0 4 * * *';
+/**
+ * `persona/STATE.md` 的字节预算（默认 8 KB）——越过它就在**此刻层**多一行提醒，让**她**去维护。
+ *
+ * **为什么是 8 KB**（2026-10-05 用户定稿："STATE 如果超预算的话，就加个提醒……将过时内容
+ * 移入记忆文件或删除"）：
+ *   • 8 KB ≈ 1.8k token，够放**当前任务 + 接着干 + 几条边界**这三样——也就是"下一拍真的要用"
+ *     的那点状态。这三个数（1.8k token / 下面那份 16.6 KB）都是实测：目视 `data/persona/STATE.md`
+ *     量到 17007 字节，按本仓库的 token 估算口径约 3.8k token/次**每轮都在重发**。
+ *   • 现在那份 16.6 KB 里有一批**本不该常驻**的东西，正是这条提醒要她去处理的两类：
+ *     `旧账（结论已存 facts.md）`（结论已经有家，正文留在 STATE 只是重复付费）与
+ *     `工具常识（已验）`（验过一次的机制知识属于记忆文件，不属于"当前状态"）。
+ *   • 定 8 而不是 4：她真的在干活时（当前任务 + 排队 + 边界 + 两条心情）就是 5~7 KB，
+ *     压到 4 KB 会逼她为了躲提醒而删掉还在用的东西——那是**为了指标损害质量**。
+ *     也不是 16：那等于"什么都不用改"，这条提醒就成了摆设。
+ *
+ * **它只提醒、不截断**（用户的原话："框架不动她的文件；她看到提醒自己去维护"）：
+ * 框架一个字节都不动 `STATE.md`，也不替她搬内容——搬去哪、删什么由她判断。
+ * 提醒的措辞与格式见 `src/model/render.ts` 的 `stateBudgetReminder`（唯一一处实现）。
+ *
+ * 单位是**字节**（照 `write_persona` 里 `Buffer.byteLength` 那套既有口径），不是字符：
+ * 这份文件几乎全是中文，一个汉字 3 字节，"多少字"和"多少字节"差三倍。
+ *
+ * ⚠️ 改这个数要**同时**改 `buildDefaults()` 里 `persona.stateBudgetBytes` 的那个字面量：
+ * 出包脚本拿它与这里比对（理由写在那行旁边），只改一处出包会红。
+ */
+export const DEFAULT_STATE_BUDGET_BYTES = 8 * 1024;
 
 // ──────────────────────────────── JSON 值类型 ────────────────────────────────
 
@@ -161,14 +187,6 @@ export interface WakeConfig {
    * 到期以 `wake/timer` 唤醒，real-loop 按 payload.kind 认出这是整理而不是普通 turn。
    */
   memoryMaintainCron: string;
-}
-
-export interface PathsConfig {
-  /**
-   * 工作目录白名单：文件操作解析后必须落在其中任一目录内（design.md §4.10 第 1 条）。
-   * 空数组 = 一个都不允许（用户显式选择），不会悄悄放行。
-   */
-  workspaceAllowlist: string[];
 }
 
 /** 发言节奏（design.md §4.20 的 speak 三路投递） */
@@ -303,6 +321,79 @@ export interface WebConfig {
 export type ContactBook = Record<string, string>;
 
 /**
+ * 信任范围（2026-10-04 用户拍板）：她的活动边界有多宽。
+ *
+ * ⚠️ **与本文件别处的 "trust" 不是一回事**，两个词在仓库里各有所指，别混：
+ *   • 这里的 `trust`＝**她的活动范围**（能碰哪些路径、能在哪儿跑命令）；
+ *   • `src/runtime/trust.ts` 的 trust＝**这一轮的来源可不可信**（用户 / 客人 / 外部群），
+ *     那是按 turn 判的鉴权，与配置无关。
+ *
+ * 两档，没有第三档：
+ *   • `'full'`（默认）＝她能读写**整台电脑**上的文件、也能在**任意目录**跑命令。
+ *   • `'workspace'` ＝她**只能在** [TrustConfig.workspaceRoot] 里活动：越界的读写与命令**被拒绝**。
+ *     这一档的根默认取**智能体自己的工作根**（配置目录），也就是 fs 工具族今天用的那个根
+ *     ——于是"切到 workspace"= 回到今天的行为，"切到 full"= 新放开的那一档。
+ *
+ * 为什么默认是 full（而不是"安全起见先关起来"）：用户 2026-10-04 的原话——
+ * 「**能够触碰整个电脑是默认行为**」。这是**有意的默认**，不是漏洞、也不是还没做完：
+ *   • 她是一台无人值守的常驻 agent，"能自己去找、去修、去装"本来就是她存在的方式；
+ *     默认把她关进一个空目录，等于出厂就让她大多数本事用不出来。
+ *   • 真正的破坏性动作另有**三道门**在挡（design.md §4.10）：destructive 默认关、
+ *     pwsh 的命令黑名单、执行期的场景鉴权。信任范围是**边界**，不是唯一一道闸。
+ *   • 而"我设过一条边界"这件事必须是真的：所以这个开关要么真的管住全部路径入口，
+ *     要么就不该存在——同一个文件里刚删掉过一条**写着边界、其实没人读**的配置
+ *     （`paths.workspaceAllowlist`，见 docs/tools-audit.md），不留第二例。
+ *
+ * **这个开关同时管 fs 工具族与 pwsh**（两条路都要读它，缺一条就是上面那种谎）：
+ *   • fs 工具族：`safe_read` / `safe_write` / `edit_file` / `insert_at_line` / `delete_path` /
+ *     `list_dir` / `search_in_files` / `rg_search` / `es_search` … 一律经 `resolveInsideRoot`
+ *     那一道判定；
+ *   • `pwsh`：既管它的 `workdir` 参数，也管命令行里出现的路径（`cd`、重定向、脚本路径）。
+ *
+ * 它是**启动期读一次**的参数：边界在工具装配与执行器那两处落地，改完要重启进程才接管。
+ */
+export interface TrustConfig {
+  /** 活动边界：`'full'`（默认，整台电脑）| `'workspace'`（只限 [workspaceRoot]） */
+  mode: TrustMode;
+  /**
+   * 「工作目录」的绝对路径——`mode === 'workspace'` 时**唯一**允许她活动的根。
+   *
+   * **默认 = 智能体自己的工作根（配置目录）**，2026-10-05 定的。为什么是这个根，而不是别的：
+   *   • 它正是 **fs 工具族今天用的那个根**（`agent-loop.ts` 的 `deps.workspaceRoot ?? process.cwd()`，
+   *     而 real-loop 不传它）——于是两档的语义干净：**`workspace` = 今天的行为**、
+   *     `full` = 新放开的那一档（整台电脑）；
+   *   • 她的资产都长在配置目录之下：`<dataDir>/workspace/MEMORIES/`（记忆）、`<dataDir>/persona/`
+   *     （人格）、`skills/`。默认若取更窄的 `<配置目录>/workspace`，这些**全在边界之外**——
+   *     `workspace` 档会变成"连自己的记忆与人格都读不到"，那不是边界是锁门（实测见
+   *     `test/trust-boundary.test.ts` 的那组用例）。
+   *
+   * 它是**派生量**：解析器算出来，界面（`GET /api/config` 直接回这份 config）与执行器
+   * （`trustBoundaryRoot`）读的是同一个值。原因：同一条边界在两处各写一个值，就一定会出现
+   * "配置说 A、实际拦在 B"——界面显示的路径与执行器拦的路径必须是**同一个来源**。
+   * 盘上有显式值时以盘上为准（`pickNonEmptyString`），所以要换根就写 `trust.workspaceRoot`。
+   */
+  workspaceRoot: string;
+}
+
+/** 信任范围的两档（与 [TrustConfig.mode] 同源；界面上的二选一也读它） */
+export type TrustMode = 'full' | 'workspace';
+
+/**
+ * `trust` 配置 → **工具层的活动边界**（`ToolContext.boundaryRoot`）。**只此一处**。
+ *
+ *   · `'full'`      → `null`：不设边界（整台电脑）。
+ *   · `'workspace'` → `trust.workspaceRoot`：只允许在这个根内活动。
+ *
+ * 为什么单独一个函数：这条映射会被两处消费（主循环 `real-loop` 的 `agentDeps`、启动日志），
+ * 而它一旦被写两遍，就会出现"界面说限在 A、执行器拦在 B"。判读三态的那一半在
+ * `tools/boundary.ts` 的 `effectiveBoundaryRoot`（`undefined` = 历史行为），两处合起来才是
+ * 完整的决议链：**配置 → 边界 → 判定**。
+ */
+export function trustBoundaryRoot(trust: TrustConfig): string | null {
+  return trust.mode === 'workspace' ? trust.workspaceRoot : null;
+}
+
+/**
  * 解析联系人表。非法项一律跳过（人名写错一个字不该让整份配置打不开），
  * 键必须是会话标识形态（含 `:`）—— 否则那多半是写错了地方。
  */
@@ -337,6 +428,47 @@ export interface PersonaConfig {
    * IM 来的人不走它——那些走 openid / user_id，档案按那串标识命名。
    */
   owner: string;
+  /**
+   * **框架代管记忆的总开关**（默认 true = 现在这套自带记忆系统）。
+   *
+   * 开（true，默认）＝框架管记忆：
+   *   • 启动时生成 / 重建 `<dataDir>/workspace/MEMORIES/INDEX.md`（指针表：相对路径:行号 + 一行摘要）；
+   *   • 每个 turn 的固定块里注入那份索引（见 docs/memory-injection.md §2/§3）；
+   *   • 按 `wake.memoryMaintainCron` 跑每日整理：过期流水账并进 `facts.md`、写一篇 `diary/`；
+   *   • `facts.md` 的 `!pinned` 分区与条目 TTL 也由框架维护。
+   *
+   * 关（false）＝框架**不生成索引、不注入任何记忆、不跑整理**：她仍然从装置自述（SELF_BRIEF）
+   * 知道 `MEMORIES/`（`facts.md` / `episodes/` / `jargon.md` / `style-notes.md` / `aliases.md`）
+   * 与 `diary/` 存在，但**读、写、整理全归她自己**——这正是"仅知晓这些文件存在，并自觉读取、
+   * 修改、维护"那条路。代价写在明面上：她可能忘了整理，`facts.md` 会一直长下去，索引也不再更新。
+   *
+   * 为什么留这个开关：给"只想让 agent 自己管记忆"的人一条干净的路，
+   * 而不是逼他去删文件、改 cron、把索引文件写成只读。
+   *
+   * **不受它影响的两条路**（别以为关掉就全没了）：
+   *   • `MEMORIES/aliases.md` 参与"会话认人 / 关注名单"（`src/channel/inbox.ts` 的
+   *     `WATCHED_SESSION_SOURCES`）属于**通道侧**，不在这个开关范围；
+   *   • `STATE.md`（她当前状态）是**独立的一层**，与本开关无关。
+   *
+   * 它是一个启动期读一次的开关（装配参数），改完要重启进程才接管。
+   */
+  memoryEnabled: boolean;
+  /**
+   * `persona/STATE.md` 的**字节预算**（默认 [DEFAULT_STATE_BUDGET_BYTES] = 8 KB）。
+   *
+   * 越过它时，框架在**此刻层**（每步都发的那一段）多一行：
+   * `[STATE.md] 16.6 KB / 预算 8 KB——预算超限，记得维护，将过时内容移入记忆文件或删除`。
+   * 放在那里是因为她**正在动手的地方**就是此刻层：她压下来之后（下一轮量到的新尺寸落回预算内）
+   * 那一行自动消失，不需要任何"已读"状态。
+   *
+   * **只提醒、不截断**（2026-10-05 用户的口径）：框架不动她的文件，也不替她搬内容——
+   * 哪一段过时、搬进哪个记忆文件、还是直接删，都是她的判断。这一行的全部作用是把一件
+   * "她看不见的成本"摆到她眼前（整份 STATE 每轮重发，见 docs/memory-injection.md §2 的实测）。
+   *
+   * 为什么它属于 `persona.` 前缀：STATE 是人格资产的一层（persona.md §2），预算的判据与它同源。
+   * 与 `memoryEnabled` 一样是**启动期读一次**的参数（渲染输入由宿主装配，改完重启才接管）。
+   */
+  stateBudgetBytes: number;
   /**
    * 框架维护的联系人表：会话标识（sid）→ 名字（"这个会话是谁"）。
    *
@@ -456,13 +588,14 @@ export interface AppConfig {
   schemaVersion: number;
   /** 数据根目录（绝对路径）：事件日志、投影缓存、锁、persona 都在它下面 */
   dataDir: string;
+  /** 信任范围（她的活动边界：整台电脑 / 只限工作目录）。默认完全信任，见 TrustConfig */
+  trust: TrustConfig;
   models: ModelsConfig;
   budget: BudgetConfig;
   wake: WakeConfig;
   vision: VisionConfig;
   speak: SpeakConfig;
   persona: PersonaConfig;
-  paths: PathsConfig;
   tools: ToolsConfig;
   /** 外部依赖（pwsh / rg / es）的用户指定路径；探测的第一段 */
   deps: DepsConfig;
@@ -512,6 +645,18 @@ function buildDefaults(dir: string): AppConfig {
   return {
     schemaVersion: CONFIG_VERSION,
     dataDir: join(dir, DEFAULT_DATA_DIR_NAME),
+    // 默认**完全信任**：用户 2026-10-04 的明确决定（"能够触碰整个电脑是默认行为"）。
+    // 字面量 'full' 是刻意的：出包脚本按正则从这一行抓默认值（见下面 persona.stateBudgetBytes 那条说明）
+    //
+    // `workspaceRoot` 的默认是 **`dir`＝配置目录＝智能体自己的工作根**（= fs 工具族今天用的那个根，
+    // 也是 `agent-loop.ts` 的 `deps.workspaceRoot ?? process.cwd()`）。2026-10-05 改的，
+    // 原来写的是 `<dir>/workspace`，那个默认**是错的**：`workspace` 档下她连自己的
+    // `<dataDir>/workspace/MEMORIES/`（记忆）与 `<dataDir>/persona/`（人格资产）都读不到——
+    // 记忆与人格都在配置目录之下、而在 `<dir>/workspace` 之外，那不是"只限工作目录"，
+    // 是把她锁在门外（实测见 test/trust-boundary.test.ts 的那组用例）。
+    // 改完之后两档的语义干净了：**`workspace` 档 = 今天的行为**（与 fs 工具今天用的根同一个），
+    // **`full` 档 = 新放开的那一档**（整台电脑）。
+    trust: { mode: 'full', workspaceRoot: dir },
     models: {
       heavy: { model: DEFAULT_MODEL, baseUrl: DEFAULT_BASE_URL, apiKeyEnv: DEFAULT_API_KEY_ENV },
       light: { model: DEFAULT_MODEL, baseUrl: DEFAULT_BASE_URL, apiKeyEnv: DEFAULT_API_KEY_ENV },
@@ -544,9 +689,17 @@ function buildDefaults(dir: string): AppConfig {
       handoffBudgetTokens: 4_096,
       handoffFoldTokens: 1_024,
       owner: 'owner',
+      // 默认 true = 现在这套自带记忆系统（框架生成索引、每轮注入、每日整理）。
+      // 改成 false 是**显式选择**"让她自己管记忆"，不该由一次手误变成默认行为
+      memoryEnabled: true,
+      // 8 KB ≈ 1.8k token：够放"当前任务 + 接着干 + 几条边界"。理由与实测见上面那条常量
+      // ⚠️ 这里写**字面量** 8192（不写 `DEFAULT_STATE_BUDGET_BYTES` 这个标识符）：出包脚本
+      // `tools/make-config-example.ps1` 的 Read-CodeDefaults 按正则抓字段默认值，常量表来自
+      // `const NAME = 字面量`——上面那条常量是 `8 * 1024`（算式），它解不出来，抓不到就**当场报错**
+      // 拒绝出包（"字段改名了？"）。字面量让那条断言照旧生效：改常量忘了改这里，出包就会红。
+      stateBudgetBytes: 8192,
       contacts: {},
     },
-    paths: { workspaceAllowlist: [join(dir, DEFAULT_WORKSPACE_DIR_NAME)] },
     tools: {
       destructiveEnabled: false, groupSceneHardRefusal: false, planMode: false, disabled: [],
       askHumanTimeoutMin: DEFAULT_ASK_HUMAN_TIMEOUT_MIN,
@@ -744,18 +897,22 @@ function defaultDocument(dir: string): JsonObject {
         'compactionThresholdTokens：可见历史估算超过它就在 turn 结束时压缩（写 compaction/summary，历史只遮蔽不重写）。',
         'handoffBudgetTokens / handoffFoldTokens：交接笔记的总预算与最近条目的单条满预算。',
         'owner：本机用户的档案标识。你在聊天框说话时它会作为 person 注入，于是 persona/RELATIONSHIPS/<owner>.md 自动生效——文件名必须和这里一致（默认 owner）。',
+        'memoryEnabled：**框架代管记忆**的总开关，默认 true（框架生成 MEMORIES/INDEX.md、每轮注入索引、每日 4 点整理、并维护 !pinned 与条目 TTL）。',
+        '  关掉（false）＝框架不生成索引、不注入任何记忆、不跑整理；她只从装置自述知道 MEMORIES/（facts.md / episodes/ / jargon.md / style-notes.md / aliases.md）与 diary/ 存在，读写维护全归她自己。',
+        '  关掉的代价写在明面上：她可能忘了整理、facts.md 会一直长下去、索引不再更新。不受影响的：MEMORIES/aliases.md 参与"会话认人/关注名单"属于通道侧，STATE.md（她当前状态）是独立的一层。',
+        'stateBudgetBytes：persona/STATE.md 的**字节预算**，默认 8192（8 KB ≈ 1.8k token）。',
+        '  越过它时框架在**此刻层**（每步都发的那一段）多一行「[STATE.md] …——预算超限，记得维护，将过时内容移入记忆文件或删除」，让她自己去把过时内容搬进记忆文件或删掉。',
+        '  为什么是 8 KB：够放「当前任务 + 接着干 + 几条边界」这三样（下一拍真的要用）的那点状态；出厂的 STATE.md 实测 17007 字节 ≈ 3.8k token/次，而且是**每轮都在重发**。',
+        '  只提醒、不截断：框架不动她的文件，也不替她搬内容。她压回预算内之后那一行自动消失（不需要"已读"）。单位是字节（与 write_persona 的字节口径同源）；改完要重启进程才接管。',
         'contacts：联系人表（会话 sid → 名字）。QQ 不给昵称，也不提供查成员的接口，所以“这个 QQ 会话是用户”只能在这里声明；优先于她自己的 MEMORIES/aliases.md。',
       ],
       compactionThresholdTokens: d.persona.compactionThresholdTokens,
       handoffBudgetTokens: d.persona.handoffBudgetTokens,
       handoffFoldTokens: d.persona.handoffFoldTokens,
       owner: d.persona.owner,
-    },
-    paths: {
-      $comment: [
-        '工作目录白名单：文件操作解析后必须落在其中任一目录内；空数组 = 一个都不允许。',
-      ],
-      workspaceAllowlist: [...d.paths.workspaceAllowlist],
+      memoryEnabled: d.persona.memoryEnabled,
+      stateBudgetBytes: d.persona.stateBudgetBytes,
+      contacts: { ...d.persona.contacts },
     },
     tools: {
       $comment: [
@@ -944,6 +1101,26 @@ function pickEnvName(raw: JsonValue | undefined, where: string, fallback: string
   return name;
 }
 
+/**
+ * 信任范围：只认 `'full'` 与 `'workspace'` 两个字面量，**拼错即报错**。
+ *
+ * 为什么不宽容（比如把 `'Full'` / `'true'` 归一化过去）：这是一条**边界**，它决定
+ * "她能不能碰整台电脑"。一个拼错的边界值如果被静默当成某一档，那多半会被当成**更宽**的那档
+ * （`'Full'` → 猜成 full），而人以为自己设的是什么完全说不准——"我配了却不生效"里
+ * 最难查、后果最重的一类。两档都写得出、写错就停，是这里唯一说得通的分寸。
+ *
+ * 缺字段 → 默认 `'full'`（与 buildDefaults 同源，见 TrustConfig 里"为什么默认完全信任"）。
+ */
+function pickTrustMode(raw: JsonValue | undefined, where: string, fallback: TrustMode): TrustMode {
+  if (raw === undefined || raw === null) return fallback;
+  if (raw === 'full' || raw === 'workspace') return raw;
+  throw new ConfigError(
+    `${where} 只能是 "full"（完全信任：能读写整台电脑、能在任意目录跑命令）`
+      + ` 或 "workspace"（只限工作目录），收到 ${describeValue(raw)}`,
+    where,
+  );
+}
+
 function pickTimezone(raw: JsonValue | undefined, where: string, fallback: string): string {
   const tz = pickNonEmptyString(raw, where, fallback);
   try {
@@ -964,25 +1141,6 @@ function pickHttpUrlOptional(raw: JsonValue | undefined, where: string): string 
     throw new ConfigError(`${where} 必须以 http:// 或 https:// 开头（收到 ${JSON.stringify(url)}）`, where);
   }
   return url;
-}
-
-/** 路径白名单：逐项解析为绝对路径并去重（保留首次出现顺序，保证同一份文件加载结果稳定） */
-function pickPathList(raw: JsonValue | undefined, where: string, fallback: string[], dir: string): string[] {
-  if (raw === undefined || raw === null) return [...fallback];
-  if (!Array.isArray(raw)) throw new ConfigError(`${where} 必须是字符串数组，收到 ${describeValue(raw)}`, where);
-  const seen = new Set<string>();
-  const out: string[] = [];
-  raw.forEach((item, index) => {
-    const itemWhere = `${where}[${index}]`;
-    if (typeof item !== 'string' || item.trim() === '') {
-      throw new ConfigError(`${itemWhere} 必须是非空字符串路径，收到 ${describeValue(item)}`, itemWhere);
-    }
-    const abs = resolve(dir, item);
-    if (seen.has(abs)) return;
-    seen.add(abs);
-    out.push(abs);
-  });
-  return out;
 }
 
 function parseLane(raw: JsonValue | undefined, where: string, base: ModelLaneConfig): ModelLaneConfig {
@@ -1247,14 +1405,24 @@ function parseAppConfig(doc: JsonObject, dir: string): AppConfig {
       1,
     ),
     owner: pickString(personaRaw['owner'], 'persona.owner', base.persona.owner).trim(),
-    contacts: readContacts(personaRaw['contacts'], 'persona.contacts'),
-  };
-
-  const pathsRaw = objectOr(doc['paths'], 'paths');
-  const paths: PathsConfig = {
-    workspaceAllowlist: pickPathList(
-      pathsRaw['workspaceAllowlist'], 'paths.workspaceAllowlist', base.paths.workspaceAllowlist, dir,
+    // 只收 true / false（`pickBoolean` 的纪律）：写成 "false" 或 0 在这里当场报错，
+    // 而不是让"关掉的记忆系统"变成一句没人看见的注释——它是这一层的总开关，含糊不起
+    memoryEnabled: pickBoolean(
+      personaRaw['memoryEnabled'],
+      'persona.memoryEnabled',
+      base.persona.memoryEnabled,
     ),
+    // 下限 1 KB（比"当前任务 + 接着干"还小的预算必然每轮都在叫，那是噪音不是提醒）、
+    // 上限 64 KB（= write_persona 的单文件硬上限 PERSONA_HARD_LIMIT_BYTES：比它还大的预算
+    // 永远越不过，写进去只会让人以为自己设了这条线）。单位是字节，理由见字段注释与那条常量
+    stateBudgetBytes: pickInt(
+      personaRaw['stateBudgetBytes'],
+      'persona.stateBudgetBytes',
+      base.persona.stateBudgetBytes,
+      1024,
+      64 * 1024,
+    ),
+    contacts: readContacts(personaRaw['contacts'], 'persona.contacts'),
   };
 
   const toolsRaw = objectOr(doc['tools'], 'tools');
@@ -1326,9 +1494,21 @@ function parseAppConfig(doc: JsonObject, dir: string): AppConfig {
     ),
   };
 
+  // 信任范围（她的活动边界）。`mode` **只认两个字面量**（见 pickTrustMode：拼错即停，
+  // 因为这是一条边界，"我配了却不生效"比"当场报错"难查得多）；`workspaceRoot` 缺省继承
+  // 默认值（`<配置目录>/workspace`），运行期**不给人手填**——它是派生量，填错了就会出现
+  // "界面说限在工作目录、实际限在别处"这种最难查的错。
+  const trustRaw = objectOr(doc['trust'], 'trust');
+  const trust: TrustConfig = {
+    mode: pickTrustMode(trustRaw['mode'], 'trust.mode', base.trust.mode),
+    workspaceRoot: pickNonEmptyString(
+      trustRaw['workspaceRoot'], 'trust.workspaceRoot', base.trust.workspaceRoot,
+    ),
+  };
+
   return {
-    schemaVersion, dataDir, models, budget, wake, vision, speak, persona, paths, tools, deps, channels,
-    alerts, contextAudit, web, timezone,
+    schemaVersion, dataDir, models, budget, wake, vision, speak, persona, tools, deps, channels,
+    alerts, contextAudit, web, timezone, trust,
   };
 }
 

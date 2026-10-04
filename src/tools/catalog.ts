@@ -18,7 +18,7 @@ import { join } from 'node:path';
 
 import type { TimerStore } from '../wake/timer-store.js';
 import type { JobManager } from '../runtime/job-manager.js';
-import type { WakeChannel } from '../log/types.js';
+import type { WakeChannel, MemoryRead } from '../log/types.js';
 import type { DepsManager } from '../deps/manager.js';
 import type { MediaPoster, AdminEventEmitter, ChannelNameResolver, ChannelReader, ChannelSpokenReader, Notifier, PersonaUpdatedPayload, ReplyPoster } from './admin.js';
 import type { ToolDefinition } from './types.js';
@@ -27,17 +27,30 @@ import type { VisionModelClient } from './vision.js';
 import { createAdminTools } from './admin.ts';
 import { createNetTools } from './net.ts';
 import { createPwshTool } from './pwsh.ts';
-import { buildFsTools } from './fs/index.ts';
+import { buildFsTools, DEFAULT_READ_ONLY_PREFIXES } from './fs/index.ts';
 import { createVisionTools } from './vision.ts';
+import { createMemoryReadTool } from './memory-tools.ts';
 import { ToolRegistry } from './registry.ts';
 import { TimerStore as TimerStoreClass } from '../wake/timer-store.ts';
+
+// ──────────────────────────────── 只读区 ────────────────────────────────
+
+/**
+ * 人格资产在**工作根口径**下的路径（相对 `ctx.workspaceRoot` = 仓库根）。
+ *
+ * 为什么是字面量而不是从 `dataDir` 拼：`readOnlyPrefixOf` 比的是 `guarded.relPath`
+ * （相对工作根），而 personaRoot 是 `<dataDir>/persona`。两者只有在 dataDir 恰好是
+ * `<仓库根>/data` 时才重合——那是本仓库的约定（`config.ts` 的默认值就是它），
+ * 而且 `write_persona` 的落点与它必须一致才有意义。改这两处之一时，另一处要一起看。
+ */
+export const PERSONA_READ_ONLY_PREFIX = 'data/persona';
 
 // ──────────────────────────────── 选项 ────────────────────────────────
 
 export interface ToolCatalogOptions {
   /** 数据目录：fs 工具白名单根、vision 缓存、admin 的 personaRoot 都以它为准 */
   dataDir: string;
-  /** 定时器存储（admin 的三件定时器工具用；CLI 只读场景传一份不布防的实例即可） */
+  /** 定时器存储（admin 的 `timer` 工具用；CLI 只读场景传一份不布防的实例即可） */
   timers: TimerStore;
   /** 事件写入口（admin 工具的唯一出口；没有它这些动作不可复盘） */
   emit: AdminEventEmitter;
@@ -64,6 +77,16 @@ export interface ToolCatalogOptions {
    * 这类文件定义的是「谁能改我」——agent 能写它就等于没有门，因此拦在写入点而不是提示词里。
    */
   protectedPaths?: readonly string[];
+  /**
+   * `memory_read` 的访问账出口（design §4.17 第 2 条"访问强化"）。
+   *
+   * 拿到的是**完整的 `memory/read` payload（含 turn）**，宿主直接 `emit('memory/read', data)` 即可
+   * ——turn 由工具层从 `ctx.turn` 交出来，所以这里不需要"当前是哪一轮"这种跨层状态。
+   *
+   * 不传时 `memory_read` 照常注册、只是不记账。**但那时必须有人在别处说清楚**：
+   * §4.17 第 2 条一直"设计里有、实现里没有"，别让这条通道又变成那样。
+   */
+  memoryReadRecorder?: (data: MemoryRead['data']) => void;
   /**
    * 后台任务管理器（design §4.21 jobs）。传了它，pwsh 的 `runInBackground` 才能用。
    * 不传时后台模式被拒绝并说明原因（不静默降级成前台阻塞）。
@@ -199,6 +222,26 @@ export async function buildToolCatalog(options: ToolCatalogOptions): Promise<Too
       // 依赖探测的唯一来源：两件搜索工具注册与否都照它的结论（没装就不注册）
       ...(options.deps !== undefined ? { deps: options.deps } : {}),
       ...(options.onNote !== undefined ? { onNote: options.onNote } : {}),
+      // ── 人格资产只读（P2，2026-10-04）──
+      //
+      // 实测：STATE.md 被改 87 次，其中 62 次（71%）走 `safe_edit`——那条路**不写
+      // `persona/updated`、也不进人格版本库**（版本快照落在 workspace scope，
+      // `irmia persona log/diff/rollback` 读的是 persona scope，看不见）。
+      // "persona/ 只有 write_persona 一个写通道"这句话写了好几个版本，但从来没在代码里落过：
+      // fs 包不知道 persona 的存在，只读区的默认值只有 skills/ 与 .agents/skills/。
+      //
+      // 现在把它真正拦在写入口（拦截点早就在 `guardedWrite` 的第零步，只是没登记这个前缀）。
+      // **必须与 write_persona 的局部替换形态同批上线**：只堵洞不加形态，等于把她从
+      // "改一行"逼成"重写整篇 65 行的 STATE.md"——那是拿审计问题换质量与成本问题。
+      //
+      // 前缀是**相对 ctx.workspaceRoot（仓库根）**的路径，与 `personaRootOf` 的落点同源；
+      // P1 的别名表把 `persona/STATE.md` 也改写到同一处，所以两种写法都拦得住。
+      readOnlyPrefixes: [...DEFAULT_READ_ONLY_PREFIXES, PERSONA_READ_ONLY_PREFIX],
+      readOnlyHints: {
+        [PERSONA_READ_ONLY_PREFIX]:
+          '人格资产请用 write_persona 改（给 content 整体替换，或给 old/new 只换那一段）——'
+          + '它才会记 persona/updated 并留下人格版本；用通用文件工具改，那条改动在人格时间线里是隐形的。',
+      },
     }),
     ...createNetTools(
       // 出网写入类（http_post / http_download）是 destructive 工具：§4.10 的第三级门要求
@@ -217,6 +260,16 @@ export async function buildToolCatalog(options: ToolCatalogOptions): Promise<Too
       // 写这一种事件的能力，不该拿到任意写权限。
       emit: (type, data) => options.emit(type, data),
       imagesToContext: options.visionImagesToContext === true,
+    }),
+    // `memory_read`（用户的原话：「读记忆时能指定读对应索引的记忆，而不是用 read 工具，
+    // 导致反复把 state、memory 的全文读入」）。放在这里而不是 fs 族里：它的根是
+    // `<dataDir>/workspace/MEMORIES`（不是工作根），判据也不是"路径在不在白名单里"。
+    // 访问账包一层：工具层只该有"写这一种事件"的能力，与上面 vision 那条同一条纪律。
+    createMemoryReadTool({
+      dataDir: options.dataDir,
+      ...(options.memoryReadRecorder === undefined
+        ? {}
+        : { onAccess: (data) => options.memoryReadRecorder!(data) }),
     }),
     ...adminKit.tools,
     ...buildShellTools(options),

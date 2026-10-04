@@ -5,14 +5,17 @@ import 'package:flutter/material.dart';
 
 import 'app.dart';
 import 'her_name.dart';
+// 「信任范围」那一步与设置页读**同一份**文案与**同一个**二选一控件：
+// 两处各写一份的下场是"引导页默认 A、设置页默认 B"这种没人会发现的漂移。
+import 'pages/settings_page.dart';
 import 'theme.dart';
 import 'ui_kit.dart';
 import 'ui_state.dart';
 
-/// 首次启动引导（四步：她叫什么 / API 配置 / 消息适配器 / 人格）。
+/// 首次启动引导（五步：她叫什么 / API 配置 / 消息适配器 / 人格 / 信任范围）。
 ///
 /// 形制与「她在问」的那张卡同族（[AskCardHost]）：**顶层**（包住整个壳，人在哪一页都看得见）、
-/// 遮罩之上一次只一张、四步在同一张卡里前后走完——不是新开一页。
+/// 遮罩之上一次只一张、五步在同一张卡里前后走完——不是新开一页。
 ///
 /// 三件事先说清：
 ///   ① **判据**（[shouldShowOnboarding]）：见那个函数的注释，一句话——人格还是种子模板、
@@ -27,6 +30,12 @@ import 'ui_state.dart';
 ///                 + `POST /api/commands/set-key`（`X-Confirm: set-key`）
 ///        · 通道 → `POST /api/commands/config-update`（`X-Confirm: config-update`）
 ///        · 人格 → `POST /api/commands/persona-edit`（危险表里是 null，不带确认短语）
+///        · 信任范围 → `POST /api/commands/config-update`（`X-Confirm: config-update`）
+///
+/// **为什么信任范围这一步排在最后**（2026-10-05 加）：前四步填的是"她是谁、怎么说话"，
+/// 这一步定的是"她能碰多远"。放最后是因为它是**一次边界声明**——前四步没有一步会问她
+/// "你能动我的电脑吗"，而这件事必须在第一次运行时就问过一遍（默认值是**完全信任**，
+/// 与配置里的默认值同一个字面量，见 [defaultTrustMode]）。
 ///
 /// **第一步为什么写两件事**：这一屏问的其实是两件事——"她叫什么"（她的人格身份，落在
 /// persona/IDENTITY.md）与"群里喊什么算在叫她"（机器配置 channels.mentionKeywords）。
@@ -58,6 +67,14 @@ const kOnboardingTitle = '首次启动引导';
 /// 也不跟着窗口无限长：卡片再宽就成"第二层窗口"，与它"浮在壳之上的一张卡"的定位不符。
 const kOnboardingCardWidth = 620.0;
 
+/// 信任范围那一步的**默认档**——`'full'`，与 `src/config/config.ts` 的
+/// `buildDefaults()`（`trust: { mode: 'full', … }`）以及设置页缺字段时的回落**同一个字面量**。
+///
+/// 为什么把它拎成一个常量并在注释里点名另外两处：用户的要求是"默认高亮完全信任，
+/// 与配置默认值一致，不许出现引导页默认 A、配置默认 B"。三处各自写一个 `'full'` 也能跑，
+/// 但下一次有人改默认值时就只会改一处——这个常量是那条要求唯一能落地的形状。
+const defaultTrustMode = 'full';
+
 /// 步骤区的最小高度：四步的内容长短不一，不钉住高度就会一跳一跳
 const _bodyMinHeight = 268.0;
 
@@ -76,6 +93,8 @@ class OnboardingSignals {
     required this.mentionKeywords,
     required this.identityContent,
     required this.herName,
+    required this.trustMode,
+    required this.trustRoot,
   });
 
   /// 人格是否**确定**还停在种子模板（IDENTITY.md 里还有 `<!-- SEED` 那行）。
@@ -104,6 +123,14 @@ class OnboardingSignals {
   /// 她现在的名字（从 [identityContent] 里认出来的；null = 认不出）。
   /// 回填第一步的名字格——老实例（名字写在正文散文里）也能被回填成结构化那一行。
   final String? herName;
+
+  /// 盘上那份的 `trust.mode`（`'full'` / `'workspace'`）。缺字段按 [defaultTrustMode] 回落
+  /// ——与配置默认值一致：这里绝不显示成"受限"那一档（界面要显示的是"她实际按哪一档跑"）。
+  final String trustMode;
+
+  /// 盘上那份的 `trust.workspaceRoot`（解析器算出来的那个目录）。
+  /// 「只限工作目录」那句后果要把这个路径念出来，否则人不知道自己被关在哪。
+  final String trustRoot;
 }
 
 /// 该不该弹首次引导。
@@ -230,6 +257,11 @@ Future<OnboardingSignals> readOnboardingSignals(AppState state) async {
     // 名字就地认出来（同一份正文，不必再发一条请求）：口径全在 her_name.dart——
     // 认不出来就是 null，第一步的名字格留空，界面显示回退值，**不猜**。
     herName: herNameFromIdentity(identityContent),
+    // 信任范围（2026-10-05 加）：读的是同一份 `/api/config`（生效配置）。
+    // 缺字段按 defaultTrustMode 回落（= 配置默认值），**不猜成受限那一档**——
+    // 界面要显示的是"她实际按哪一档跑"，猜一个更安全的答案同样是撒谎。
+    trustMode: _text(cfg, 'trust.mode') == 'workspace' ? 'workspace' : defaultTrustMode,
+    trustRoot: _text(cfg, 'trust.workspaceRoot'),
   );
 }
 
@@ -298,7 +330,7 @@ class _OnboardingHostState extends State<OnboardingHost> {
   Widget build(BuildContext context) => widget.child;
 }
 
-/// 四步的标题与一句人话（标题也当步骤条的标签用：一处措辞，两处显示）
+/// 五步的标题与一句人话（标题也当步骤条的标签用：一处措辞，两处显示）
 class _Step {
   const _Step(this.key, this.title, this.note);
 
@@ -312,6 +344,9 @@ const _steps = <_Step>[
   _Step('api', 'API 配置', '她用的是哪家模型。写进 config.json 与 data/.keys.json，进程重启后接管。'),
   _Step('channel', '消息适配器', '她从哪个通道收消息。密钥与端点细节在「消息适配器」页里补齐。'),
   _Step('persona', '人格', '她是谁。这一段写进 persona/IDENTITY.md，是她的常驻人格。'),
+  // 最后一步（2026-10-05 加）：**活动边界**。它排在最后是因为前四步都在填"她是谁、
+  // 怎么说话"，没有一步会问"她能碰多远"——而那件事必须在第一次就摆到人面前一次。
+  _Step('trust', '信任范围', '她能碰到多远：整台电脑，还是只有一个工作目录。二选一，默认完全信任。'),
 ];
 
 /// 打开引导卡，返回**有没有真的写进去过东西**（false = 四步都跳过了或原地关掉）。
@@ -393,9 +428,15 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   late bool qqOn = widget.signals.qqEnabled;
   late bool onebotOn = widget.signals.onebotEnabled;
 
-  // ── 第四步：人格 ──
+  /// 第四步：人格
   late final TextEditingController personaCtl =
       TextEditingController(text: widget.signals.identityContent ?? '');
+
+  /// 第五步：信任范围（盘上那份的当前档 + 人这次选的档）。
+  ///
+  /// 默认值就是 [defaultTrustMode]（= `'full'`，配置默认值）——**不是**"没选"：
+  /// 引导页上必须有一档是选中的，而且那一档要与配置里的默认值一致（用户的原话）。
+  late String trustMode = widget.signals.trustMode;
 
   /// 第四步输入框的**基准**（= 服务端那句"现正文"）。
   ///
@@ -501,7 +542,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
                   ],
                 ),
                 const SizedBox(height: 4),
-                Text('四步把她的基本配置填完，跳过的那几项之后在设置页里随时能改。',
+                Text('${_steps.length} 步把她的基本配置填完，跳过的那几项之后在设置页里随时能改。',
                     style: TextStyle(fontSize: 12, height: 1.6, color: scheme.onSurfaceVariant)),
               ],
             ),
@@ -692,7 +733,8 @@ class _OnboardingCardState extends State<_OnboardingCard> {
           0 => _nameStep(scheme),
           1 => _apiStep(scheme),
           2 => _channelStep(scheme),
-          _ => _personaStep(scheme),
+          3 => _personaStep(scheme),
+          _ => _trustStep(scheme),
         },
       ],
     );
@@ -907,6 +949,54 @@ class _OnboardingCardState extends State<_OnboardingCard> {
     );
   }
 
+  /// 第五步：信任范围（`trust.mode`）——**二选一，默认高亮「完全信任」**。
+  ///
+  /// 两条纪律（用户的原话）：
+  ///   · **默认档必须与配置默认值同一个字面量**：这里用的是 [defaultTrustMode]（`'full'`），
+  ///     两侧共用同一个常量，不许出现"引导页默认 A、配置默认 B"；
+  ///   · **两种选择各一句后果说明**：文案取自 [trustModeConsequence]（与设置页同一份），
+  ///     不在这一页另写一遍——两处措辞一分叉，人就判断不了自己选了什么。
+  ///
+  /// 控件也复用设置页那一枚（[TrustModeChoice]），所以两处的形状、高亮口径、点击手感
+  /// 是同一套东西。这里多点一层"改哪一档就按哪一档的后果算"的旁注，是因为这一屏的人
+  /// 大多第一次见这个概念：他只看到两个选项，得知道选了之后**谁来执行**这条边界。
+  Widget _trustStep(ColorScheme scheme) {
+    final root = widget.signals.trustRoot;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        TrustModeChoice(
+          mode: kTrustFull,
+          selected: trustMode == kTrustFull,
+          consequence: trustModeConsequence(kTrustFull, root),
+          enabled: !busy,
+          onPick: (picked) => setState(() {
+            trustMode = picked;
+            problem = null;
+          }),
+        ),
+        const SizedBox(height: 8),
+        TrustModeChoice(
+          mode: kTrustWorkspace,
+          selected: trustMode == kTrustWorkspace,
+          consequence: trustModeConsequence(kTrustWorkspace, root),
+          enabled: !busy,
+          onPick: (picked) => setState(() {
+            trustMode = picked;
+            problem = null;
+          }),
+        ),
+        _note(
+          '这是**边界，不是提醒**：选「只限工作目录」之后，越界的读写与命令会被拒绝。'
+          '它同时管 fs 工具族（safe_read / safe_write / edit_file / list_dir 等）与 pwsh。'
+          '${trustMode == widget.signals.trustMode ? '与现在盘上那份一致，这一屏不会写任何东西。' : '与现在盘上那份不同：点「完成」时写进 config.json，重启进程后接管。'}'
+          '之后在设置页「信任范围」里随时能改。',
+          scheme,
+        ),
+      ],
+    );
+  }
+
   // ── 结算 ──
 
   /// 把第 [i] 步结算掉（没写过就跳过）并记下；返回失败原因（null = 成了）
@@ -1037,8 +1127,10 @@ class _OnboardingCardState extends State<_OnboardingCard> {
         return _settleApi();
       case 'channel':
         return _settleChannel();
-      default:
+      case 'persona':
         return _settlePersona();
+      default:
+        return _settleTrust();
     }
   }
 
@@ -1166,6 +1258,30 @@ class _OnboardingCardState extends State<_OnboardingCard> {
     wrote = true;
     // 名字行可能刚补上或刚被改掉：界面上的称呼跟着重读一遍（读不到就保持现状，见 refreshHerName）
     await widget.state.refreshHerName();
+    return null;
+  }
+
+  /// 第五步 → `POST /api/commands/config-update`（短语 config-update），只提交 `trust.mode`。
+  ///
+  /// **与盘上那份一致就一个字节都不写**：引导页的默认高亮就是配置默认值（[defaultTrustMode]），
+  /// 也就是说绝大多数人这一屏根本不会改任何东西——那时还硬写一次 config.json，换来的是
+  /// `$pending.restartRequired` 里凭空多一条 `trust.mode`：设置页会因此显示"尚未生效"、
+  /// 人什么都没改却被告知"有一项边界改了还没重启"。同一份默认值写不写盘没有区别，
+  /// 那就别写。
+  Future<String?> _settleTrust() async {
+    if (trustMode == widget.signals.trustMode) return null;
+    try {
+      await widget.state.api.post(
+        '/api/commands/config-update',
+        {
+          'fields': {'trust.mode': trustMode},
+        },
+        confirm: 'config-update',
+      );
+    } catch (err) {
+      return '信任范围没写进去：$err';
+    }
+    wrote = true;
     return null;
   }
 }

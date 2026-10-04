@@ -46,6 +46,19 @@
  *    `taskkill /T /F` 杀**进程树**——只杀父进程会留下仍在写盘的后代，
  *    那是 review.md 缺陷 6 的 zombie。输出截断头 8k + 尾 2k 并附续读指导。
  *
+ * 6. **活动边界**（`config.trust.mode`，2026-10-05）：`'full'`（默认）**不拦**——她能在任意
+ *    目录跑命令；`'workspace'` 时两处要判：① `workdir` 必须落在 `trust.workspaceRoot` 内
+ *    （此前 `assertWorkdir` 只判 `isDirectory()`，实测可以选 `C:\Windows`）；② 命令行里出现的
+ *    **绝对路径字面量**（`[A-Za-z]:\` 与 `\\` 开头）必须在边界内，否则整条命令拒绝、原因说清
+ *    边界在哪。判据与 fs 工具族**同一份**（`tools/boundary.ts` 的 `isInside`）。
+ *
+ *    ⚠️ 这条边界管的是"能在哪儿动"，**不是**"能改什么"：`FORBIDDEN_PATTERNS` 黑名单照旧
+ *    （删除、格式化、注册表、关机…在两种模式下都拒绝），destructive 默认关闭也照旧。
+ *
+ *    已知不覆盖（刻意的"够用"边界，不是漏洞承诺）：相对路径的 `..` 上升、以及通过
+ *    `$env:TEMP`/变量拼出来的路径，不在扫描范围内——shell 里做完整路径分析需要自己写一个
+ *    PowerShell 解析器，代价远超收益。真正兜底的是 destructive 门与人工确认（同第 5 条口径）。
+ *
  * 内存有界：捕获层（BoundedText）与展示层（truncateOutput）是两道独立的闸，
  * 前者防一个 `Get-Content 大文件` 把进程吃爆，后者防大输出撑爆上下文。
  */
@@ -56,11 +69,12 @@ import {
   type ChildProcessWithoutNullStreams,
 } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { statSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 
+import { boundaryFixHint, boundaryScopeNote, effectiveBoundaryRoot, isInside } from './boundary.ts';
 import type { ToolContext, ToolDefinition, ToolHandlerResult } from './types.js';
 import {
   TOOL_ERROR_CODES,
@@ -148,7 +162,7 @@ export interface PwshToolOptions {
   jobs?: JobCallbacks;
   /** 后台任务输出落盘目录；给了才会在 job/finished 里带 outputRef */
   jobsDir?: string;
-  /** 默认工作目录；省略时用 ctx.workspaceRoot */
+  /** 默认工作目录；省略时用边界根（`'workspace'` 模式）或 `ctx.workspaceRoot`（完全信任） */
   defaultWorkdir?: string;
   /** 默认超时；省略时 PWSH_TIMEOUT_MS */
   defaultTimeoutMs?: number;
@@ -270,6 +284,77 @@ export function screenCommand(command: string): ForbiddenPattern | null {
     if (rule.pattern.test(normalized)) return rule;
   }
   return null;
+}
+
+// ──────────────────────────────── 活动边界（trust.mode） ────────────────────────────────
+
+/** 绝对路径字面量的起点：盘符路径（`C:\` / `C:/`）与 UNC 或 `\\?\` 前缀（`\\`） */
+const ABSOLUTE_PATH_START = /[A-Za-z]:[\\/]|\\\\/gu;
+
+/**
+ * 路径 token 的终止字符：空白、引号、以及命令行里有语法意义的分隔符。
+ * 路径里可以有空格，但那样必须带引号——引号内的路径走下面的引号分支，不按这些字符截断。
+ */
+const PATH_TOKEN_END = /[\s"'`,;)\]}>|&^=+]/u;
+
+/**
+ * 扫出命令里出现的**绝对路径字面量**（按出现顺序，可能重复）。
+ *
+ * 为什么是这个"够用"的口径：shell 命令没有结构化的路径信息，穷尽它等于自己写一个
+ * PowerShell 解析器；而真要绕开这条边界，`$env:TEMP`、`..`、变量拼接都是口子——
+ * 这条检查挡的是**误伤与惯性**（模型顺手写 `C:\Windows\...`），不是对抗性绕过。
+ * 真正兜底的是 destructive 默认关 + 命令黑名单 + 人工确认（design §4.10 三道门）。
+ *
+ * 两种截断口径：字面量紧跟在引号后面（`'C:\Program Files\x'`）时按**同种引号**收尾，
+ * 带空格的路径因此不会被切半；其余按空白与命令行分隔符截断。
+ */
+export function absolutePathLiteralsIn(command: string): string[] {
+  const found: string[] = [];
+  ABSOLUTE_PATH_START.lastIndex = 0;
+  for (let match = ABSOLUTE_PATH_START.exec(command); match !== null; match = ABSOLUTE_PATH_START.exec(command)) {
+    const start = match.index;
+    const previous = start > 0 ? command[start - 1] : undefined;
+    const quote = previous === '"' || previous === "'" ? previous : null;
+    let end = start + match[0].length;
+    while (end < command.length) {
+      const char = command[end] as string;
+      if (quote === null ? PATH_TOKEN_END.test(char) : char === quote) break;
+      end += 1;
+    }
+    found.push(command.slice(start, end));
+  }
+  return found;
+}
+
+/** 目标不存在时的边界判定仍要有意义：退到字符串层的 `resolve`（`..` 照样被吃掉） */
+function effectivePathOf(target: string): string {
+  try {
+    return realpathSync(target);
+  } catch {
+    return resolve(target);
+  }
+}
+
+/**
+ * `workdir` 的边界判定（`'workspace'` 模式）。
+ * 返回 null = 在边界内；否则是给模型看的完整原因（边界在哪、怎么改）。
+ */
+export function workdirBoundaryError(workdir: string, boundary: string): string | null {
+  const effective = effectivePathOf(workdir);
+  if (isInside(boundary, effective)) return null;
+  return `工作目录 ${workdir} 落在信任边界 ${boundary} 之外（解析后的真实路径 ${effective}）：`
+    + `${boundaryScopeNote(boundary)}。${boundaryFixHint(boundary)}`
+    + `省略 workdir 时，本次会用边界根 ${boundary} 作为工作目录。`;
+}
+
+/** 命令行里某条绝对路径字面量的边界判定；返回 null 表示在边界内 */
+export function commandPathBoundaryError(literal: string, boundary: string): string | null {
+  const effective = effectivePathOf(literal);
+  if (isInside(boundary, effective)) return null;
+  return `命令被拒绝：命令行里的绝对路径 ${literal} 落在信任边界 ${boundary} 之外`
+    + `（解析后的真实路径 ${effective}）：${boundaryScopeNote(boundary)}。${boundaryFixHint(boundary)}`
+    + '如果它只是命令里的字符串或正则字面量、并不真去访问该路径，'
+    + '请改写成不含盘符、也不含 \\\\ 开头的写法再试。';
 }
 
 // ──────────────────────────────── 输出处理 ────────────────────────────────
@@ -1004,6 +1089,11 @@ interface PreparedCall {
   timeoutMs: number;
   persistent: boolean;
   background: boolean;
+  /**
+   * 本次调用的有效边界（`trust.mode` 的执行形态）：`null` = 完全信任（不拦），
+   * string = 只允许在这个根内。决议来自 `tools/boundary.ts`，本文件不自己判。
+   */
+  boundary: string | null;
 }
 
 export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinition {
@@ -1044,7 +1134,12 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
     const args = argsRecord(rawArgs, PWSH_TOOL_NAME);
     const command = requiredString(args, 'command', { maxLength: 100_000 });
     const requestedWorkdir = optionalString(args, 'workdir', { maxLength: 4096 });
-    const workdir = requestedWorkdir ?? options.defaultWorkdir ?? ctx.workspaceRoot;
+    // 边界决议只此一处（tools/boundary.ts）：`undefined` = 历史默认（ctx.workspaceRoot 即边界），
+    // `null` = 完全信任，string = 只限这个根。
+    const boundary = effectiveBoundaryRoot(ctx);
+    // 默认工作目录：`'workspace'` 模式下**就是边界根**——否则默认值本身越界，这个模式一调用
+    // 就全被拒（那不是安全，是坏掉）。完全信任时照旧用 ctx.workspaceRoot。
+    const workdir = requestedWorkdir ?? options.defaultWorkdir ?? boundary ?? ctx.workspaceRoot;
     const timeoutMs = optionalInteger(args, 'timeoutMs', defaultTimeoutMs, {
       min: PWSH_MIN_TIMEOUT_MS,
       max: PWSH_MAX_TIMEOUT_MS,
@@ -1058,7 +1153,26 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
       timeoutMs,
       persistent,
       background,
+      boundary,
     };
+  };
+
+  /**
+   * 活动边界的执行点（`'workspace'` 模式）。两处一起判，判据都是 `tools/boundary.ts` 的
+   * `isInside`——与 fs 工具族同一份，绝不在这里另写一套前缀比较。
+   *
+   * 返回 null = 放行（`'full'` 模式**永远**是 null：用户在这一档要的就是"任意目录"）。
+   */
+  const screenBoundary = (call: PreparedCall): string | null => {
+    const boundary = call.boundary;
+    if (boundary === null) return null;
+    const workdirProblem = workdirBoundaryError(call.workdir, boundary);
+    if (workdirProblem !== null) return workdirProblem;
+    for (const literal of absolutePathLiteralsIn(call.command)) {
+      const problem = commandPathBoundaryError(literal, boundary);
+      if (problem !== null) return problem;
+    }
+    return null;
   };
 
   /** 工作目录必须先存在再 spawn：否则子进程只会给一句难以定位的 ENOENT */
@@ -1130,6 +1244,13 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
         + '若你只是想清理临时产物，把范围收敛到具体路径内再试。',
         TOOL_ERROR_CODES.denied,
       );
+    }
+
+    // 活动边界（trust.mode = 'workspace' 才拦）：workdir 与命令行里的绝对路径。
+    // 放在黑名单**之后**：黑名单管"改什么"（两种模式下都拒绝），这一道管"能在哪儿动"。
+    const boundaryProblem = screenBoundary(call);
+    if (boundaryProblem !== null) {
+      return errorResult(boundaryProblem, TOOL_ERROR_CODES.unsafePath);
     }
 
     if (ctx.signal.aborted) {
@@ -1264,7 +1385,7 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
       type: 'object',
       properties: {
         command: { type: 'string', description: '要执行的 PowerShell 命令文本，可多行' },
-        workdir: { type: 'string', description: '工作目录；省略则继承持久会话当前目录（首轮为 workspace 根）' },
+        workdir: { type: 'string', description: '工作目录；省略则继承持久会话当前目录（首轮为工作根；只限工作目录模式为边界根）' },
         timeoutMs: {
           type: 'integer',
           description: `超时毫秒数（${PWSH_MIN_TIMEOUT_MS}..${PWSH_MAX_TIMEOUT_MS}），默认 ${PWSH_TIMEOUT_MS}`,

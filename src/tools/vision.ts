@@ -29,6 +29,7 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/p
 import { basename, isAbsolute, join, relative } from 'node:path';
 import type { Dirent } from 'node:fs';
 
+import { PATH_BOUNDARY_HINT } from './boundary.ts';
 import { resolveInsideRoot } from './fs/path-guard.ts';
 import { FS_ERROR_CODES } from './fs/types.ts';
 import type { DsResponse } from '../model/ds-client.ts';
@@ -475,12 +476,16 @@ export function createVisionTools(options: VisionToolsOptions): ToolDefinition[]
     } catch {
       kind = 'missing';
     }
+    // 边界与 fs 工具族同一份（`ctx.boundaryRoot` 三态原样传，判读只归 boundary.ts）
     const guard = await resolveInsideRoot(
       ctx.workspaceRoot,
       raw,
-      kind === 'directory'
-        ? { requireDirectory: true, purpose: 'vision_read' }
-        : { allowMissing: true, purpose: 'vision_read' },
+      {
+        ...(kind === 'directory'
+          ? { requireDirectory: true, purpose: 'vision_read' }
+          : { allowMissing: true, purpose: 'vision_read' }),
+        ...(ctx.boundaryRoot === undefined ? {} : { boundaryRoot: ctx.boundaryRoot }),
+      },
     );
     if (!guard.ok) return { ok: false, result: errorResult(`路径被拒绝：${guard.reason}`, guard.code) };
     if (kind === 'missing') {
@@ -501,7 +506,7 @@ export function createVisionTools(options: VisionToolsOptions): ToolDefinition[]
         paths: {
           type: 'array',
           items: { type: 'string' },
-          description: '图片文件或目录路径（相对工作目录），目录会递归收集图片；GIF 只取首帧',
+          description: `图片文件或目录路径（相对工作根），目录会递归收集图片；GIF 只取首帧。${PATH_BOUNDARY_HINT}`,
         },
         question: { type: 'string', description: '针对这批图片的问题；不传则用通用描述要求' },
         inline: {

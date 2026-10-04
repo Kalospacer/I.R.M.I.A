@@ -214,7 +214,7 @@ test('wakeSourceOfType 只认唤醒事件', () => {
 test('at 型定时器的 payload 跟着 wake/timer 事件走（触发后条目已删，查表拿不到）', async (t) => {
   // 一次实测事故的锁：`/dream` 排的那条唤醒跑成了普通 turn。根因是认领方只查表拿 payload，
   // 而 **at 型定时器一触发就从表里删掉** —— 查表必然 null。cron 型条目触发后保留，
-  // 所以这个洞只在一次性定时器上现形，而一次性正是最常用的那种：她自己 `set_timer` 布的
+  // 所以这个洞只在一次性定时器上现形，而一次性正是最常用的那种：她自己 `timer`（action=set）布的
   // "到点提醒我做什么"同样是这句话一个字都留不下，而工具描述里明写着 payload 会给她看。
   const fx = setup(t);
   const log = await fx.open();

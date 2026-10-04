@@ -20,8 +20,9 @@ import { EventLog } from '../src/log/event-log.ts';
 import type { AppEvent, ModelLane, Projection } from '../src/log/types.js';
 import { defaultVisibility } from '../src/log/types.ts';
 import type { DsClient, DsRequest, DsStreamResult } from '../src/model/ds-client.ts';
-import { NOW_LAYER_BANNER } from '../src/model/render.ts';
+import { NOW_LAYER_BANNER, TURN_BLOCK_BANNER } from '../src/model/render.ts';
 import { loadPersona } from '../src/persona/loader.ts';
+import { ensureMemoryIndex, readMemoryIndexTextReadOnly } from '../src/persona/memory-injection.ts';
 import { runTurn, type AgentLoopDeps, type AgentLoopPersona } from '../src/runtime/agent-loop.ts';
 import { buildReplayReport, formatReplaySummary, locateStep } from '../src/runtime/replay.ts';
 import { applyOne, fold } from '../src/state/fold.ts';
@@ -109,6 +110,19 @@ async function makeHarness(t: TestContext): Promise<Harness> {
   // config.json：configHash 是 render 三指纹之一，用它验证"当时的配置"可被取回
   writeFileSync(join(dir, 'config.json'), JSON.stringify(defaultConfig(dir), null, 2), 'utf8');
 
+  // 记忆索引（B3 / v30）：给这一份夹具一份**真的**索引（`workspace/MEMORIES/facts.md` → `INDEX.md`）。
+  // 为什么必须给：索引 v30 起在**本轮固定块**里，而"重放要能重建逐字节相同的请求"这条纪律
+  // 必须覆盖它——不给索引，M6-5 那两条就只在 `memoryIndex = null` 这条支路上成立。
+  mkdirSync(join(dir, 'workspace', 'MEMORIES'), { recursive: true });
+  writeFileSync(
+    join(dir, 'workspace', 'MEMORIES', 'facts.md'),
+    '# Facts\n\n## 稳定事实\n\n'
+    + '- [valid 2026-10-01] 备份目录在 D 盘根下。\n'
+    + '- [valid 2026-10-02] 周五下午通常有例会。\n',
+    'utf8',
+  );
+  ensureMemoryIndex(dir);
+
   const log = await EventLog.open(join(dir, 'events'));
   const projection = fold([]);
   t.after(() => {
@@ -173,6 +187,9 @@ async function makeHarness(t: TestContext): Promise<Harness> {
       // 本轮固定块（v29/B2）：与真循环同一形状——宿主在轮首把 STATE / 关系档案装好递进来。
       // 重放侧由 `rebuildRenderedRequest` 用**当前**人格资产重建同一份（见 runtime/replay.ts）。
       turnBlock: { state: persona.state, relationship: null },
+      // 记忆索引（v30 起在固定块里）：运行期那一侧读盘给文本（真循环里由 agentDeps 在轮首读一次），
+      // 重放那一侧由 `buildReplayReport` 走只读那条路读同一个文件。两边同源，正是这条要钉的。
+      memoryIndex: readMemoryIndexTextReadOnly(dir),
     }),
   };
 }
@@ -221,6 +238,19 @@ test('M6-5 单步：replay 重建的请求体与当时真实下发的逐字段�
     'input 列表必须逐字节一致（状态层 + 事件流 + 本轮新输入）',
   );
   assert.equal(JSON.stringify(rebuilt.tools), JSON.stringify(actual.tools), '工具清单一致');
+
+  // B3（v30）：索引真的在这份重建结果里，而且在**本轮固定块**那一条里——否则上面那两条
+  // "逐字节一致"只是在 `memoryIndex = null` 的支路上成立（等于空断言）。
+  const blockItem = rebuilt.input.find(
+    (i) => i.type === 'message' && typeof i.content === 'string'
+      && i.content.startsWith(TURN_BLOCK_BANNER),
+  ) as { content?: string } | undefined;
+  assert.ok(blockItem?.content?.includes('# 记忆索引（机制生成'), '索引在重放结果的本轮固定块里');
+  assert.equal(
+    rebuilt.input.filter((i) => JSON.stringify(i).includes('记忆索引（机制生成')).length,
+    1,
+    '索引只出现一次，且就在固定块那一条里（重放与运行期同一布局）',
+  );
 
   // 三指纹：当时的记录必须能与当前口径对上
   assert.equal(built.report.fingerprints.renderVersion.matches, true);

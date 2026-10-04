@@ -1962,6 +1962,9 @@ IconData _toolIcon(String name) {
       return Icons.image_outlined;
     case 'pwsh':
       return Icons.terminal_rounded;
+    case 'timer':
+    // v35 把定时器三件并成一件 `timer`；旧名留在表里是因为**历史日志**里的工具名还是它们
+    // （消息列表要照旧渲染旧记录），不是给新调用用的。
     case 'set_timer':
     case 'cancel_timer':
     case 'list_timers':

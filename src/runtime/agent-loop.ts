@@ -54,7 +54,8 @@
 import type { DsClient, DsRequest, DsStreamResult } from '../model/ds-client.js';
 import { isDsClientError } from '../model/ds-client.ts';
 import type { MachineFacts, RenderImageRef, RenderPersona, RenderedRequest, TurnBlockFacts, UsageFacts } from '../model/render.js';
-import { RENDER_VERSION, clipTaskTitle, render, renderWake, wakeTitle } from '../model/render.ts';
+import { RENDER_VERSION, clipTaskTitle, render, renderWake, stateBytesOf, wakeTitle } from '../model/render.ts';
+import { DEFAULT_STATE_BUDGET_BYTES } from '../config/config.ts';
 import {
   DEFAULT_CACHE_BREAK_THRESHOLDS, detectCacheBreak, lastAuditedCall,
   type AuditedCall, type CacheBreakThresholds,
@@ -62,6 +63,8 @@ import {
 import type { ContactFacts } from '../model/self-brief.ts';
 import { renderMentionNote } from '../model/self-brief.ts';
 import { sidOf } from '../channel/sessions.ts';
+// 待办清单的唯一载体是 STATE 的两节（见 persona/todo-state.ts）：任务卡只从那里读
+import { openTodoItems } from '../persona/todo-state.ts';
 import type { EventLog } from '../log/event-log.js';
 import type {
   AppEvent, AppEventType, MemorySelected, ModelLane, Projection, TurnEndReason, WakeSource,
@@ -81,6 +84,7 @@ import type {
 } from '../tools/executor.js';
 import { executeToolCalls } from '../tools/executor.ts';
 import { notedWarningsOf } from '../channel/injection.ts';
+import type { WarnExemptJudge } from '../channel/warn-exempt.ts';
 import { ASK_HUMAN_BLOCKED_BY, hasPendingSystemAsk, pendingAgentAsks } from './plan-mode.ts';
 import type { ListForModelOptions, ToolDefinition } from '../tools/registry.js';
 import type { ToolRegistry } from '../tools/registry.js';
@@ -147,6 +151,14 @@ export interface AgentLoopDeps {
   lane?: ModelLane;
   /** 文件类工具的路径白名单根；默认 process.cwd() */
   workspaceRoot?: string;
+  /**
+   * 活动边界根（`config.trust.mode` 的执行形态，见 `tools/types.ts` 的 `ToolContext.boundaryRoot`）：
+   * `undefined` = 用 [workspaceRoot] 当边界（历史行为）；`null` = 不设边界；string = 只限该根。
+   *
+   * 它在**装配层**由 `trustBoundaryRoot(config.trust)` 算出（real-loop 与子代理各转手一次），
+   * 循环层只负责透传给执行器——循环层不读配置，与 `workspaceRoot` 同一条纪律。
+   */
+  boundaryRoot?: string | null;
   /** 外部取消（shutdown）：透传给模型请求与工具执行 */
   signal?: AbortSignal;
   /**
@@ -186,14 +198,25 @@ export interface AgentLoopDeps {
   /**
    * 本轮固定块的素材（B2，见 render.ts 的 `TurnBlockFacts`）：历史之后、此刻层之前那一段。
    *
-   * **素材在一轮开始时定下**（宿主读一次 `STATE.md` / 关系档案 / 写入本轮的 `memory/selected`），
-   * 循环层每步原样转手——「一轮之内逐字节不变」这条契约的落点就在这里。
+   * **素材在一轮开始时定下**（宿主读一次 `STATE.md` / 关系档案；记忆那一半只有索引，
+   * 走下面的 `memoryIndex`），循环层每步原样转手——「一轮之内逐字节不变」这条契约的落点就在这里。
    * 缺省 = 整块不出现（子代理、重放、诊断）。
    */
   turnBlock?: TurnBlockFacts | null;
   /**
-   * 本轮的记忆选材（B2，docs/memory-injection.md §4）：给一个函数，循环层在**轮首**调它一次，
-   * 把结论写成 `memory/selected` 事件，并把同一份结论交给固定块渲染。
+   * `persona/STATE.md` 的**字节预算**（v32；`config.persona.stateBudgetBytes`，默认 8 KB）。
+   *
+   * 循环层只转手：越过它时此刻层多一行提醒（措辞与格式见 `render.ts` 的 `stateBudgetReminder`），
+   * 由她自己去把过时内容搬进记忆文件或删掉——**框架不截断、不改她的文件**（用户口径）。
+   * 缺省取 `DEFAULT_STATE_BUDGET_BYTES`：漏传时按出厂口径判，而不是"永不提醒"。
+   */
+  stateBudgetBytes?: number;
+  /**
+   * 本轮的**记忆索引注入账**（B2，docs/memory-injection.md §4）：给一个函数，循环层在**轮首**
+   * 调它一次，把结论写成 `memory/selected` 事件（索引全文不落事件）。
+   *
+   * 它**不再产生进上下文的文本**（2026-10-04 简化）：固定块里那段索引由 `memoryIndex` 直接给,
+   * 要读正文是她自己 `safe_read` 的事（用户口径见 §5）。
    *
    * 为什么由循环层调、而不是宿主自己写好：turn 号在这里才分配（`turn/start` 刚落下），
    * 而事件必须带上正确的 turn 才能被 `deriveRequest`/重放按 turn 取回。
@@ -218,6 +241,18 @@ export interface AgentLoopDeps {
   machine?: MachineFacts | null;
   /** 用度事实（此刻层 `用度：` 一行的素材，见 UsageFacts）：投影折叠结论 + 生效日上限。不配即"未知" */
   usage?: UsageFacts | null;
+  /**
+   * 「这条通道消息豁免吗」——规则层那条**渲染期现算**的出口要问的判据，由宿主传（2026-10-04）。
+   *
+   * 为什么必须有它：规则命中变成警告有两个出口——唤醒路径落 `injection/noted`（在 real-loop
+   * 里判），以及 `renderExternalEvent` 的兜底扫描（**渲染时**现算）。用户现场踩到的那条消息
+   * 走的正是后者：她跑到一半时消息才到、被中途认领，于是没有任何落库的结论可读。
+   * 判据**只有一处实现**（`channel/warn-exempt.ts` 的 `WarnExemptBook.isExempt`）；这里只把
+   * 宿主给的那个函数一路传到 `RenderInput`——渲染层不读盘、不判据，只用它（缓存铁律 1）。
+   *
+   * 不配 = 谁都不豁免（预警开着是安全的那一侧；子代理、诊断、旧调用点都是这一支）。
+   */
+  warnExempt?: WarnExemptJudge | null;
   /**
    * 图片取字节的能力（design §4.20 图片两条途径）：给了它，带图的消息才会把
    * `input_image` 放进请求——QQ 发来的图片因此"直接进上下文"，而不是只留一条地址。
@@ -286,11 +321,14 @@ export type AgentLoopCompaction = HandoffOptions & { thresholdTokens: number };
 // ──────────────────────────────── 请求派生（M2-2） ────────────────────────────────
 
 /**
- * 本轮的记忆选材（B2）：判据与取正文由宿主给，事件由循环层在轮首写。
+ * 本轮的**记忆索引注入账**（B2）：宿主给结论，事件由循环层在轮首写。
  *
  * 为什么是"注入一个纯函数"而不是让宿主自己写事件：turn 号只有循环层知道（`turn/start` 刚落下），
  * 而事件必须带正确的 turn 才能被按 turn 取回。宿主给结论，循环层落库——与 `compaction/summary`
  * 同一条分工。
+ *
+ * 2026-10-04 简化：不再"选哪几条 + 取正文"（用户定的口径是「只看索引，如果需要，heavy 自己去读」），
+ * 所以这里只回**注入了没有**与**当时那份索引的指纹 / 条数**——索引全文不落事件。
  */
 export type MemorySelector = (input: {
   /** 本轮的唤醒事件（判"是不是心跳轮"就看它） */
@@ -298,16 +336,12 @@ export type MemorySelector = (input: {
   /** 已分配的本轮 turn 号 */
   turn: number;
 }) => {
-  /** 'human' = 有人在跟她说话；'heartbeat' = 只有心跳（那一轮**不注入**记忆正文） */
+  /** 'human' = 有人在跟她说话；'heartbeat' = 只有心跳（那一轮**不注入**索引） */
   injection: 'human' | 'heartbeat';
-  /** 选中的条目（指针；正文不落事件） */
-  selected: MemorySelected['data']['selected'];
-  /** 没被选中的条数与原因 */
-  notSelected: MemorySelected['data']['notSelected'];
-  /** 写这条账时的索引规模（条数） */
-  indexSize: number;
-  /** 已渲染好的**记忆正文那一段**（进固定块）；空串 = 那一段不出现 */
-  text: string;
+  /** 当时注入的那段索引文本的指纹（"注进去的是哪一版"的唯一凭据） */
+  indexHash: string;
+  /** 注入的索引条数（规模；不是索引全文） */
+  entries: number;
 };
 
 /**
@@ -346,12 +380,23 @@ export interface RequestDerivation {
   memoryIndex?: string | null;
   /** 本轮固定块（见 AgentLoopDeps.turnBlock）：**一轮之内逐字节不变**的那一段 */
   turnBlock?: TurnBlockFacts | null;
+  /**
+   * `persona/STATE.md` 的字节预算（v32，见 AgentLoopDeps.stateBudgetBytes）：此刻层那行
+   * 「STATE 超预算」提醒的阈值。缺省 = `DEFAULT_STATE_BUDGET_BYTES`（出厂 8 KB）——
+   * 重放与预览都从**当时生效的那份配置**里取同一个数，所以三处判据一致。
+   */
+  stateBudgetBytes?: number;
   /** 联络事实（状态层素材，见 AgentLoopDeps.contact） */
   contact?: ContactFacts | null;
   /** 本机事实（此刻层 `本机：` 素材，见 AgentLoopDeps.machine）：宿主算好，循环层只转手 */
   machine?: MachineFacts | null;
   /** 用度事实（此刻层 `用度：` 素材，见 AgentLoopDeps.usage）：投影 + 生效上限，宿主算好 */
   usage?: UsageFacts | null;
+  /**
+   * 「这条通道消息豁免吗」的判据（见 AgentLoopDeps.warnExempt）：重建与运行期都要带着它，
+   * 否则"同一批事件"在两边会渲染出不同的字节（一边贴了那句规则提示、一边没贴）。
+   */
+  warnExempt?: WarnExemptJudge | null;
   /**
    * 图片取字节的能力（宿主注入，见 AgentLoopDeps.loadImage）：给了它，带图的消息才会
    * 把 `input_image` 真的放进请求。缺省 = 只渲染文字（重放与诊断场景常常没有它）。
@@ -453,19 +498,29 @@ export function deriveRequest(input: RequestDerivation): RenderedRequest {
     lane: input.lane,
     // 技能索引：与 events/persona 并列的渲染输入，重放走同一份 deriveRequest 才不会漂移
     skillCatalog: input.skillCatalog ?? null,
-    // 记忆索引（B2）：进长期记忆层（指针表，跨轮稳定）。它同 deriveRequest 的其它素材一样
-    // 由调用方给——重放时从盘上读 INDEX.md，与当时同源。
+    // 记忆索引（B2）：进**本轮固定块**（指针表，v30 起；v29 时在长期记忆层）。它同 deriveRequest
+    // 的其它素材一样由调用方给——重放时从盘上读 INDEX.md，与当时同源。心跳轮给空串（不注入）。
     memoryIndex: input.memoryIndex ?? null,
-    // 本轮固定块（B2）：历史之后、此刻层之前，**一轮之内逐字节不变**。
+    // 本轮固定块（B2）：历史之后、此刻层之前，**一轮之内逐字节不变**（v31 起只在第 1 步发）。
     // 素材由调用方在轮首定下（real-loop 的 turnBlockFacts），循环层每步原样转手；
-    // 重放时同一份素材由 `memory/selected` 事件 + 人格资产重建（replay.ts）。
+    // 重放时同一份素材由人格资产重建（replay.ts）——记忆那一段不在其中（只给索引，见 §5）。
     turnBlock: input.turnBlock ?? null,
+    // STATE 预算提醒（v32）：**在这里量**（`persona.state` 的 UTF-8 字节数）——三条路
+    // （运行期 agent-loop、重放 replay、界面预览 web）都走本函数，所以"多少字节"只有一个答案。
+    // 渲染层照旧不读文件系统；而量的是**进上下文的那份文本**（规范化之后），盘上 CRLF/BOM
+    // 多出来的那一截是幻影字节，不该把一份其实没超的 STATE 报成超限（见 stateBytesOf 的注释）。
+    stateBytes: stateBytesOf(persona.state),
+    stateBudgetBytes: input.stateBudgetBytes ?? DEFAULT_STATE_BUDGET_BYTES,
     contact: contactWithWakeStamp(input.contact ?? null, input.wakeEvent, input.timezone),
     // 本机与用度：与 contact 同一条纪律——**渲染层不读环境值**，所以磁盘余量、进程已运行多久、
     // 今日用量这些只能由拿得到 os/fs/投影的调用方算好递进来；缺省（重放、子代理、诊断）时
     // 此刻层那两行写"未知"，不抛也不编。
     machine: input.machine ?? null,
     usage: input.usage ?? null,
+    // 豁免判据（见 AgentLoopDeps.warnExempt）：**显式传**给渲染入参——渲染层不读盘、不判据，
+    // 只用这个函数（唯一实现仍是 WarnExemptBook.isExempt）。缺省 = 谁都不豁免：子代理、诊断、
+    // 以及不带它的旧调用点都走这一支，渲染结果与引入它之前逐字节相同。
+    warnExempt: input.warnExempt ?? null,
     // 她问出去、还没答复的提问（design §6）：此刻层那段小结的素材。**在这里算**（不放进
     // render）：渲染层不扫日志，而"哪几条还没被 human/answered 配对"只有事件算得出来；
     // 放这里还让 replay 白拿同一份结论——重建与当时逐字节一致靠的就是这一点。
@@ -517,6 +572,8 @@ class TurnRunner {
   private readonly projection: Projection;
   private readonly lane: ModelLane;
   private readonly workspaceRoot: string;
+  /** 活动边界（`boundaryRoot` 三态原样携带：undefined = 用 workspaceRoot 当边界） */
+  private readonly boundaryRoot: string | null | undefined;
   /** 日志快照：render 的唯一事件来源，每个 step 前与日志增量对齐 */
   private readonly events: AppEvent[] = [];
   private turn = 0;
@@ -538,13 +595,6 @@ class TurnRunner {
    * 与软阈值提示同一条尾部 developer 通道：只追加，不改已渲染历史。
    */
   private readonly hookContext: string[] = [];
-  /**
-   * 本轮选中的记忆**正文**（`renderSelectedMemory` 的产物，空 = 那一段不出现）。
-   *
-   * 它在轮首由 {@link selectMemoryForTurn} 定下，之后每个 step 原样进固定块——
-   * "一轮之内逐字节不变"就落在这个字段上（它不含任何随 step 变化的量）。
-   */
-  private turnBlockMemory: string | null = null;
 
   constructor(deps: AgentLoopDeps, wakeEvents: readonly AppEvent[]) {
     this.deps = deps;
@@ -553,6 +603,10 @@ class TurnRunner {
     this.projection = deps.projection;
     this.lane = deps.lane ?? 'heavy';
     this.workspaceRoot = deps.workspaceRoot ?? process.cwd();
+    // 活动边界：**原样**透传（`undefined` 也是有效值——它表示"用 workspaceRoot 当边界"）。
+    // 这里刻意不做 `?? workspaceRoot` 这种归一：三态的判读只允许发生在 tools/boundary.ts，
+    // 循环层一旦掺一脚，就又多出一个"哪一处说了算"的问题。
+    this.boundaryRoot = deps.boundaryRoot;
   }
 
   async run(): Promise<TurnEndReason> {
@@ -757,6 +811,10 @@ class TurnRunner {
       turn: this.turn,
       step,
       workspaceRoot: this.workspaceRoot,
+      // 活动边界（trust.mode）：与 workspaceRoot 一起进 ExecutionContext，执行器原样放进
+      // 每个 ToolContext。**条件展开**是必要的：`undefined` 与"不存在"在这里必须同义
+      // （exactOptionalPropertyTypes 下显式赋 undefined 与缺省不是一回事，而语义上是一回事）。
+      ...(this.boundaryRoot === undefined ? {} : { boundaryRoot: this.boundaryRoot }),
       // 两阶段落库：call 先拿 seq，result 引用它（§4.5）。两者都是承诺类。
       onToolCall: (call, def) => this.recordToolCall(step, call, def),
       onToolResult: (call, result, callSeq) => this.recordToolResult(step, call, result, callSeq),
@@ -1130,7 +1188,16 @@ class TurnRunner {
       title,
       turn: this.turn,
       step,
-      todoOpen: this.projection.todoList.filter(item => item.status !== 'completed').map(item => item.content),
+      // 待办**只从 STATE 那两节读**（2026-10-04 合并：todo 工具写的就是那两节）。
+      //
+      // 为什么不再读 `projection.todoList`：投影那份曾经是第二本账，`todo` 工具现在不写它了
+      // （写 STATE + 落 persona/updated），继续读它会得到一个**停在旧内容上**的看板——
+      // 那正是"两处记一套"的另一种形态，而且更难发现（界面看着有清单，其实是上一版的）。
+      //
+      // 为什么每次现取而不缓存：`deps.persona` 在运行期是 getter（real-loop），而 `todo` 写完
+      // 会触发 `onPersonaUpdated` → 从盘上重载 STATE → 同一轮的后续 step 立刻看得见新清单。
+      // 这与固定块取轮首快照那条纪律**不冲突**：任务卡在此刻层（逐 step 变），它本来就该是最新的。
+      todoOpen: openTodoItems(this.deps.persona.state ?? ''),
     };
   }
 
@@ -1168,52 +1235,44 @@ class TurnRunner {
   }
 
   /**
-   * 轮首的记忆选材（B2）：调宿主给的纯函数，把结论**写成事件**，并把同一份结论交给固定块。
+   * 轮首的**记忆索引注入账**（B2）：调宿主给的纯函数，把结论**写成事件**。
    *
-   * 两件事必须同时发生，少一件这次改造就不成立：
-   *   ① **落库**（`memory/selected`，internal）：事后重建请求时，`deriveRequest` 只能靠事件知道
-   *      "这一轮选了哪几条"（docs/memory-injection.md §4）。运行期临时算一份，重建就得再算一遍，
-   *      而重算要看**现在**的索引文件——那就不是"当时那个请求"了。
-   *   ② **进固定块**（`this.turnBlockMemory`）：选中的正文一轮注入一次。
+   * 为什么要落库（`memory/selected`，internal）：事后重建请求时，"这一轮注入了没有、注入的是哪一版
+   * 索引"只能靠事件知道（docs/memory-injection.md §4）。运行期临时算一份，重建就得再算一遍，
+   * 而重算要看**现在**的索引文件——那就不是"当时那个请求"了。
    *
-   * 为什么在这里写而不是让宿主写：turn 号刚刚由 `turn/start` 定下（就在上面几行），而事件必须
-   * 带上它，`replay`/`deriveRequest` 才能按 turn 取回。宿主只给判据与正文（它拿得到索引与文件），
-   * 落库交给唯一写入点——与 `compaction/summary` 同一条分工。
+   * 2026-10-04 起它**只是账**：固定块里那段索引由 `deps.memoryIndex` 直接给（运行期与重放同源），
+   * 这里不再产生进上下文的文本——原来那一半（"选中的正文"）按用户的口径删掉了，见
+   * {@link MemorySelector} 的注释。
    *
-   * 心跳轮（`isHeartbeatTurn`）：宿主的选择器会返回**零条**——没人在跟她说话，记忆正文不注入。
-   * 事件照写（`injection: 'heartbeat'`）：这样"为什么这一轮她没看见某一条"在日志里是有答案的，
-   * 而不是一个沉默。
+   * 心跳轮（`isHeartbeatTurn`）：宿主会回 `injection: 'heartbeat'`——没人在跟她说话，索引不注入。
+   * 事件照写：这样"为什么这一轮她没看见索引"在日志里是有答案的，而不是一个沉默。
    */
   private selectMemoryForTurn(): void {
     const selector = this.deps.memorySelector;
     if (selector === undefined || selector === null) return;
     const plan = selector({ wakeEvents: this.wakeEvents, turn: this.turn });
-    // 事件先写：写完之后它才在快照里（seq 小于第一个 step/start），固定块与账目同源
+    // 事件先写：写完之后它才在快照里（seq 小于第一个 step/start），账目与请求同源
     this.write('memory/selected', {
       turn: this.turn,
       injection: plan.injection,
-      selected: plan.selected,
-      notSelected: plan.notSelected,
-      indexSize: plan.indexSize,
+      indexHash: plan.indexHash,
+      entries: plan.entries,
     }, { sync: true });
-    this.turnBlockMemory = plan.text === '' ? null : plan.text;
   }
 
   /**
-   * 这一刻的固定块素材：宿主给的状态 / 关系档案 + 本轮选中的记忆正文。
+   * 这一刻的固定块素材：宿主给的状态 / 关系档案。
    *
    * 每次 `deriveRequest` 都重新装配一份（`TurnBlockFacts` 是个小对象），但**内容**在一轮之内
-   * 逐字节相同——状态与关系来自 deps（轮首定下），记忆来自 `turnBlockMemory`（轮首定下）。
-   * 没有宿主素材、也没有选中记忆时返回 null：整块不出现（子代理与诊断就是这种情形）。
+   * 逐字节相同——状态与关系来自 deps（轮首定下）。
+   * **记忆那一段不在这里**（2026-10-04）：机制不再替她挑正文塞进固定块，块里关于记忆的只有
+   * `deps.memoryIndex` 那份索引（指针表）。理由与代价见 docs/memory-injection.md §5。
+   *
+   * 没有宿主素材时返回 null：整块不出现（子代理与诊断就是这种情形）。
    */
   private turnBlockNow(): TurnBlockFacts | null {
-    const base = this.deps.turnBlock ?? null;
-    if (base === null && this.turnBlockMemory === null) return null;
-    return {
-      state: base?.state ?? null,
-      relationship: base?.relationship ?? null,
-      memory: this.turnBlockMemory,
-    };
+    return this.deps.turnBlock ?? null;
   }
 
   private deriveAt(args: {
@@ -1242,13 +1301,21 @@ class TurnRunner {
       // 本轮固定块：deps 里那一份是**轮首定下**的（宿主装配 deps 时算一次），
       // 每步原样转手——她 turn 内改了 STATE 要等下一轮才在自己的上下文里看见，
       // 换来的是一轮之内这一段逐字节不变（docs/memory-injection.md §2 的取舍）。
-      // 记忆那一段由**循环层**在轮首补上（`memory/selected` 与它同一时刻定下，见 selectMemoryForTurn）。
+      // 记忆那一段**不在这里**（2026-10-04）：固定块里关于记忆的只有上面那份索引（`memoryIndex`），
+      // 正文要她自己 `safe_read`（用户口径见 docs/memory-injection.md §5）。
       turnBlock: this.turnBlockNow(),
+      // STATE 预算（v32）：宿主装配 deps 时给一次（`config.persona.stateBudgetBytes`），
+      // 每步原样转手。字节数不在这里传——它在 deriveRequest 里从 `persona.state` 量，
+      // 于是运行期/重放/预览三条路量的是同一份文本、用同一个函数（stateBytesOf）。
+      stateBudgetBytes: this.deps.stateBudgetBytes ?? DEFAULT_STATE_BUDGET_BYTES,
       contact: this.deps.contact ?? null,
       // 本机与用度：宿主在**每个 turn 装配 deps 时**算一次（与 contact 同节奏）——磁盘 statfs
       // 与进程 uptime 是会失败的 IO，不适合每个 step 都做一遍；用度是"今日累计"，一拍一算是够的。
       machine: this.deps.machine ?? null,
       usage: this.deps.usage ?? null,
+      // 豁免判据：宿主装配 deps 时给一次（real-loop 的 agentDeps），每步原样转手——
+      // 与 contact/machine/usage 同一条纪律：渲染层不读盘，名单的真源在宿主手里。
+      warnExempt: this.deps.warnExempt ?? null,
       loadImage: this.deps.loadImage ?? null,
       ...(this.deps.maxContextImages === undefined
         ? {}

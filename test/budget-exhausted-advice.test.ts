@@ -6,6 +6,11 @@
  * **哪一档 + 上限多少 + 已用多少 + 这一档锁没锁住循环 + 两条出路**
  * （①「设置 → 系统」调大那一档；②加注 `irmia topup`）。
  *
+ * 出路①的那半句在 2026-10-04 改准（修 `budget/resumed` 那个 bug 时一并改的）：原来只写
+ * "改完要重启才生效"，读起来像"①单独用就能解开暂停"；实际上（当时）已经暂停的层**必须再来一次
+ * 加注**才会解除。现在写清了判据——重启后新上限只要高于已用量就自动解除，并落一条
+ * `budget/resumed` 说明是谁解的、凭什么解的。
+ *
  * 四层各驱动一次真路径（不是直接调私有方法）：
  *   · step —— 一步里发 3 个调用、上限 1 → `noteStepOverflow`；
  *   · turn —— 上限 1 步、她还要继续 → 下一步边界撞线；
@@ -204,6 +209,11 @@ function assertAdvice(input: AlertInput, layer: 'step' | 'turn' | 'task' | 'dail
   assert.match(text, /设置 → 系统/u, `${layer}：出路①要去哪儿说清楚`);
   assert.match(text, new RegExp(`irmia topup --layer ${layer} --tokens`, 'u'), `${layer}：出路②要给出可直接跑的命令`);
   assert.match(text, /两条出路/u, `${layer}：要明说这是两条路`);
+  // 出路①的准确说法（2026-10-04 修的文案）：调上限是启动参数，改完重启才生效；**已经暂停的层**
+  // 重启后只有"新上限高于已用量"才会自动解除（旧文案读起来像①单独用就能解开——用户照着做，
+  // 暂停照旧拦着，只能再加一次注）。
+  assert.match(text, /重启后新上限只要高于已用量/u, `${layer}：①要说清重启之后凭什么才解开`);
+  assert.match(text, /budget\/resumed/u, `${layer}：解除的凭据（那条事件）要点名，人才查得到是谁解的`);
   // ⑤ 不许计价
   assert.equal(PRICING.test(text), false, `${layer}：这句话里不许出现价格/货币字样`);
   // token 那两档要带上既有口径（未扣缓存、不等于花销）；次数那两档如实说数的是次数

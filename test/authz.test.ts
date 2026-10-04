@@ -52,6 +52,27 @@ test('客人 + 本机类 + 硬拒绝：拒，且理由是人话（她能拿去�
   assert.match(verdict.reason ?? '', /本机或单聊/);
 });
 
+test('硬拒绝的理由要**点明这是用户的限制**（她得能拿去跟群里的人复述）', () => {
+  // 用户 2026-10-04 的要求：拒绝的同时"再次提醒用户已禁止群聊场景的此类操作"。
+  // 少了这层归属，拒得再对也像是她自己不肯配合——而她是主体，这句话她要能说给别人听。
+  const verdict = decideAuthz({ scenario: 'guest', tool: 'safe_write', hardRefusal: true });
+  assert.equal(verdict.allow, false);
+  assert.match(verdict.reason ?? '', /用户/u, '理由里必须点明这是用户的禁令');
+  assert.match(verdict.reason ?? '', /禁止/u, '而且是"禁止过"这件事，不是她的判断');
+  // 事实说明不能为了归因被挤掉：群聊旁边有别的人，这是她判断的依据
+  assert.match(verdict.reason ?? '', /旁边有别的人/u);
+  // 出路也要在：要动这台机器去哪儿说
+  assert.match(verdict.reason ?? '', /本机或单聊/u);
+  // 工具名要带出来（她复述时得说清是哪一件事）
+  assert.match(verdict.reason ?? '', /safe_write/u);
+});
+
+test('软提醒（默认）下同样的调用放行——拒绝只归硬拒绝那一档', () => {
+  const soft = decideAuthz({ scenario: 'guest', tool: 'safe_write', hardRefusal: false });
+  assert.equal(soft.allow, true);
+  assert.equal(soft.reason, undefined, '放行不带任何理由文本');
+});
+
 test('提醒原文逐字用用户的措辞（这句是说给她听的，一个字都不能改）', () => {
   assert.equal(
     GROUP_SCENE_REMINDER,

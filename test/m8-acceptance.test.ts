@@ -45,6 +45,8 @@ import {
   workspaceVersionRelOf, writeFileVersion,
 } from '../src/persona/versions.ts';
 import { createAdminTools } from '../src/tools/admin.ts';
+// 待办清单的载体是 STATE 的两节（2026-10-04 合并）：这条验收按新载体读"未完成项"
+import { openTodoItems } from '../src/persona/todo-state.ts';
 import { executeToolCalls } from '../src/tools/executor.ts';
 import type { ExecutionContext, ToolCallRequest } from '../src/tools/executor.ts';
 import { ToolRegistry } from '../src/tools/registry.ts';
@@ -162,10 +164,35 @@ describe('M8-1/2/3 子代理（编排级复测）', () => {
 // ──────────────────────────────── M8-4：todo 注入 ────────────────────────────────
 
 describe('M8-4 todo 注入', () => {
-  test('todo/updated 后投影含未完成项，且下一轮请求的状态层把它渲染出来', async (t) => {
+  /**
+   * 造一份带那两节的 `STATE.md`（`todo` 的载体，2026-10-04 合并之后）。
+   *
+   * 夹具里**必须有别的内容**：M8-4 的口径是"清单进了她的上下文"，而写清单只许动那两节——
+   * 少了"别的内容"，"其余字节不变"这条断言就是空的。
+   */
+  function seedStateWithSections(h: EventHarness): void {
+    const dir = join(h.dataDir, 'persona');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'STATE.md'), [
+      '# 当前状态',
+      '',
+      '心情：平稳。这一行是她写的。',
+      '',
+      '## 当前任务',
+      '',
+      '## 接着干',
+      '',
+      '## 群里的分寸',
+      '- 一条她自己的规矩。',
+      '',
+    ].join('\n'), 'utf8');
+  }
+
+  test('todo 写进 STATE 两节 → 投影与此刻层都带出未完成项（其余内容逐字节不变）', async (t) => {
     const clock = new FixtureClock();
     const h = await makeHarness(t, 'm8-todo', clock);
     const kit = adminKit(h, clock);
+    seedStateWithSections(h);
 
     const result = await kit.byName('todo').handler({
       items: [
@@ -176,33 +203,42 @@ describe('M8-4 todo 注入', () => {
     }, toolCtx(h));
     assert.equal(result.isError, undefined, result.content);
 
-    // ① 投影折叠出清单
-    const projection = h.refold();
-    assert.equal(projection.todoList.length, 3);
-    // ② 未完成项 = 非 completed（agent-loop 的 taskCard 用同一条判据）
-    const todoOpen = projection.todoList
-      .filter((item: { status: string }) => item.status !== 'completed')
-      .map((item: { content: string }) => item.content);
+    // ① 载体变了：STATE 的两节按"第一项进当前任务、其余进接着干"落好
+    const onDisk = readFileSync(join(h.dataDir, 'persona', 'STATE.md'), 'utf8');
+    assert.match(onDisk, /## 当前任务\n- \[x\] 读 K8s 审计日志\n\n## 接着干\n- \[~\] 定位异常 node\n- \[ \] 写复盘\n/);
+    // ② 其余字节一个不动
+    assert.ok(onDisk.includes('心情：平稳。这一行是她写的。'), '她写的心情不许被动');
+    assert.ok(onDisk.includes('## 群里的分寸\n- 一条她自己的规矩。'), '别的节不许被动');
+
+    // ③ 清单现在从**载体**读（任务卡的口径）：未完成项 = 那两节里非 completed 的
+    const todoOpen = openTodoItems(onDisk);
     assert.deepEqual(todoOpen, ['定位异常 node', '写复盘']);
 
-    // ③ 此刻层渲染：带出「未完成计划：」段落（M8-4 的验收口径）。
+    // ④ 此刻层渲染：带出「未完成计划：」段落（M8-4 的验收口径）。
     //    走真 render，不在这里重抄一遍拼接逻辑——否则测的是测试自己。
     const text = renderNowText({ title: '排查线上抖动', turn: TURN, step: 2, todoOpen });
     assert.match(text, /未完成计划：/, '此刻层必须带出未完成项');
     assert.match(text, /- 定位异常 node/);
     assert.match(text, /- 写复盘/);
     assert.equal(text.includes('读 K8s 审计日志'), false, '已完成项不进计划段（进度看板只列未完成）');
+
+    // ⑤ 账照样落（读旧日志的人只有这条线索）
+    assert.equal(h.refold().todoList.length, 3, 'todo/updated 仍然记着"最近写的是哪一份"');
   });
 
-  test('空数组是全量替换语义：清空后未完成段落随之消失', async (t) => {
+  test('空数组是全量替换语义：清空后未完成段落随之消失（两节还在，只是空了）', async (t) => {
     const clock = new FixtureClock();
     const h = await makeHarness(t, 'm8-todo-empty', clock);
     const kit = adminKit(h, clock);
+    seedStateWithSections(h);
 
     await kit.byName('todo').handler({ items: [{ content: 'a', status: 'pending' }] }, toolCtx(h));
     await kit.byName('todo').handler({ items: [] }, toolCtx(h));
 
-    assert.deepEqual(h.refold().todoList, []);
+    const onDisk = readFileSync(join(h.dataDir, 'persona', 'STATE.md'), 'utf8');
+    assert.deepEqual(openTodoItems(onDisk), [], '载体里已经没有未完成项');
+    assert.match(onDisk, /## 当前任务\n\n## 接着干\n\n## 群里的分寸/, '两节还在（只是空了）');
+    assert.deepEqual(h.refold().todoList, [], '账上也是空的');
     const text = renderNowText({ title: 'T', turn: TURN, step: 1, todoOpen: [] });
     assert.equal(text.includes('未完成计划'), false);
   });
@@ -902,8 +938,13 @@ describe('M8-9 workspace 文件版本', () => {
     assert.equal(readFileVersion(h.dataDir, VERSION_SCOPE_WORKSPACE, 'todo.md', versions[0]!.diffHash), content);
 
     // 覆盖写入后两版都在：旧版本没被新版本挤掉（这是"回到昨日版本"能成立的前提）
+    //
+    // `overwrite: true` 是**必需的**，不是随手加的：`safe_write` 从那以后默认**拒绝整体
+    // 覆盖已存在的文件**（E_FILE_EXISTS，2026-10-04 的覆盖门，提交 28cbe69——它把
+    // "整篇覆盖"变成一个必须说出口的动作）。这一条用例要测的是"两版快照都在"，
+    // 所以第二次写必须显式声明覆盖；不给就是拿不到写入，而不是这条机制坏了。
     const next = `${content}- 复核\n`;
-    const overwritten = await safeWrite.handler({ path: 'todo.md', content: next }, ctx);
+    const overwritten = await safeWrite.handler({ path: 'todo.md', content: next, overwrite: true }, ctx);
     assert.equal(overwritten.isError, undefined, overwritten.content);
     const after = listFileVersions(h.dataDir, VERSION_SCOPE_WORKSPACE, 'todo.md');
     assert.equal(after.length, 2);

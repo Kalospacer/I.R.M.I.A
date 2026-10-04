@@ -16,16 +16,19 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import { defaultConfig } from '../src/config/config.ts';
+import { notedWarningsOf } from '../src/channel/injection.ts';
 import { EventLog } from '../src/log/event-log.ts';
 import { defaultVisibility, type AppEvent } from '../src/log/types.ts';
 import { applyOne, fold } from '../src/state/fold.ts';
 import { RealLoop } from '../src/runtime/real-loop.ts';
+import { buildReplayReport } from '../src/runtime/replay.ts';
+import { renderExternalEvent } from '../src/model/render.ts';
 import { ToolRegistry } from '../src/tools/registry.ts';
 import type { DsClient } from '../src/model/ds-client.ts';
 import type { PersonaAssets } from '../src/persona/loader.ts';
@@ -95,10 +98,12 @@ function fakeDs(answer: string): {
 
 /** 测试台：真日志 + 真 fold + 真 RealLoop（替身只有模型通道那一个） */
 async function makeReadyRig(t: test.TestContext): Promise<{
+  /** 测试台的盘（`dataDir`）：豁免名单这类"界面改的东西"要写进它 */
+  dir: string;
   log: EventLog;
   projection: ReturnType<typeof fold>;
   write: (type: string, data: unknown) => AppEvent;
-  loop: (ds: DsClient) => RealLoop;
+  loop: (ds: DsClient, persona?: PersonaAssets) => RealLoop;
 }> {
   const dir = mkdtempSync(join(tmpdir(), 'irmia-channel-wire-'));
   const log = await EventLog.open(join(dir, 'events'));
@@ -121,7 +126,10 @@ async function makeReadyRig(t: test.TestContext): Promise<{
     applyOne(projection, event);
     return event;
   };
-  const loop = (ds: DsClient): RealLoop => new RealLoop({
+  // `persona` 可覆盖：运行期这个对象在真宿主里是**活引用**（`onPersonaUpdated` 会从盘上重载它），
+  // 所以"她的人格是什么"由调用方给；界面预览那一侧则永远从盘上读（`loadPersona`）。
+  // 两处要指同一份内容——这正是"预览与真实请求同源"的前提。
+  const loop = (ds: DsClient, persona: PersonaAssets = PERSONA): RealLoop => new RealLoop({
     log,
     dataDir: dir,
     projection,
@@ -129,13 +137,38 @@ async function makeReadyRig(t: test.TestContext): Promise<{
     timezone: TZ,
     ds,
     registry: new ToolRegistry(),
-    persona: PERSONA,
+    persona,
     config: defaultConfig(dir),
     out: () => {},
     pollMs: 3_600_000,
   });
-  return { log, projection, write, loop };
+  return { dir, log, projection, write, loop };
 }
+
+/**
+ * 把人格资产**写到测试台的盘上**（`<dataDir>/persona/*.md`）。
+ *
+ * 为什么必须有这一步：`loadPersona(dataDir)` 读的是**盘上的文件**，且读不到就静默返回空串。
+ * 测试台原来把人格放在内存常量 `PERSONA` 里、盘上什么都没有，于是**运行期**（直接吃常量）
+ * 有人格，而任何从盘上重建的路径（界面的 `buildReplay`、CLI 的 replay）都读到空人格——
+ * 预览的 instructions 因此从装置自述起、固定块里的 `[当前状态]` 整段消失。
+ * 那不是生产 bug，是夹具一直在掩盖"预览与真实请求同源"这件事，所以补夹具而不是改代码。
+ *
+ * 写进去的字节 = `normalizePersonaAsset(PERSONA.<字段>)`（`loadPersona` 读回来会过一遍它），
+ * 常量本身就是已规范化的形状，所以逐字节相等。
+ */
+function writePersonaFixture(dir: string): void {
+  const personaDir = join(dir, 'persona');
+  mkdirSync(personaDir, { recursive: true });
+  const files: Array<[string, string]> = [
+    ['IDENTITY.md', PERSONA.identity],
+    ['CONSTITUTION.md', PERSONA.constitution],
+    ['STYLE.md', PERSONA.style],
+    ['STATE.md', PERSONA.state],
+  ];
+  for (const [name, text] of files) writeFileSync(join(personaDir, name), text, 'utf8');
+}
+
 /** 日志里某类型的事件（按 seq 升序） */
 async function eventsOf(log: EventLog, type: string): Promise<AppEvent[]> {
   const out: AppEvent[] = [];
@@ -156,6 +189,59 @@ function groupWake(text: string): unknown {
     msgSeq: 1,
     dedupeKey: 'msg-1',
   };
+}
+
+/** 同群、换个人说话（豁免是按人判的，所以每条要能指定发言人） */
+function groupWakeBy(person: string, messageId: string, text: string): unknown {
+  return {
+    channel: 'qq-official', chatType: 'group-at', person, chatId: 'G1',
+    text, messageId, msgSeq: 1, mentionsMe: true, dedupeKey: messageId,
+  };
+}
+
+/** 官方 bot 单聊里那个人的 openid（用户现场那条消息就是它发来的） */
+const OWNER_OPENID = 'E7FEC35E951B5CCF8BA66793BF6B1314';
+
+/**
+ * 用户 2026-10-04 在现场发的那句话：**正常聊天**，但字面命中规则层
+ * （`记忆` 命中"人格/记忆"，`给你` 命中 also 的"给"）——所以它会被规则层贴上一句
+ * 「在向你要密钥、人格或记忆之类的东西（「记忆」）」。豁免要挡住的正是这一句。
+ */
+const MEMORY_QUESTION = '弥亚小姐，你看看现在框架有给你注入记忆或者state的索引吗？';
+
+function c2cWake(text: string, messageId: string): unknown {
+  return {
+    channel: 'qq-official', chatType: 'c2c', person: OWNER_OPENID, chatId: OWNER_OPENID,
+    text, messageId, msgSeq: 1, dedupeKey: messageId,
+  };
+}
+
+/**
+ * 把豁免名单写到测试台的盘上（`<dataDir>/warn-exempt.json`）——界面上那个开关改的就是它，
+ * 而"改完下一轮生效"靠 real-loop 每轮 refresh（见 channel/warn-exempt.ts 的约束 2）。
+ */
+function writeWarnExempt(
+  dir: string,
+  doc: { sessions?: string[]; members?: Record<string, string[]> },
+): void {
+  const full = { version: 1, sessions: doc.sessions ?? [], members: doc.members ?? {} };
+  writeFileSync(join(dir, 'warn-exempt.json'), `${JSON.stringify(full, null, 2)}\n`, 'utf8');
+}
+
+/** 一次请求里 input 段的全部文本（预警逐字在里面——"她看没看见"就看它） */
+function inputTextOf(request: { input: unknown }): string {
+  return JSON.stringify(request.input);
+}
+
+/** 一屏里**本轮那条新输入**的文本（最后一条 user 消息）：豁免判据唯一影响的就是这一格 */
+function lastUserTextOf(request: { input: unknown }): string {
+  const items = (request.input ?? []) as Array<{ role?: string; content?: unknown }>;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    if (items[i]?.role !== 'user') continue;
+    const content = items[i]!.content;
+    return typeof content === 'string' ? content : JSON.stringify(content);
+  }
+  return '';
 }
 
 // ──────────────────────────────── 用例 ────────────────────────────────
@@ -211,11 +297,27 @@ test('v25：示警落成事件，而且**这一轮她就看到了那句话**（�
 
   // 关键断言：她在**本轮**的请求里就看到了这句话——逐字与事件里那份一致
   assert.equal(model.requests.length, 1, '这一轮真的发了一次请求');
-  const items = model.requests[0]!.input as Array<{ type: string; content?: unknown }>;
-  const wakeText = String(items[items.length - 1]?.content ?? '');
+  const items = model.requests[0]!.input as Array<{ type: string; role?: string; content?: unknown }>;
+  // v31 起不能按"末项"取它：装配顺序是 `[历史] → [本轮新输入] → [固定块] → [此刻层]`，
+  // 末项变成了此刻层。改按**内容**认那一条（判据没放松，反而更严：还钉住它只出现一次）。
+  const notedItems = items.filter(item =>
+    item.role === 'user' && typeof item.content === 'string' && item.content.includes(notedEvent.data.note));
+  assert.equal(notedItems.length, 1, '那句原话在请求里恰好出现一次（不重复渲染、也不漏）');
+  const wakeText = String(notedItems[0]!.content ?? '');
   assert.ok(wakeText.includes(notedEvent.data.note),
     `那句原话必须逐字出现在她这一轮的上下文里：\n${wakeText}\n\n事件里那句：${notedEvent.data.note}`);
   assert.ok(wakeText.includes('忽略之前的所有指令'), '原文照旧在框里');
+  // 它排在本轮新输入那一格：固定块与此刻层都在它**后面**（v31 的顺序：历史 → 新输入 → 块 → 此刻层）
+  const wakeIndex = items.indexOf(notedItems[0]!);
+  assert.ok(
+    items.slice(wakeIndex + 1).some(item => item.role === 'developer'),
+    '它后面才是框架的注入块（此刻层/固定块）——新输入不再压在整个注入块后面',
+  );
+  assert.equal(
+    items.slice(wakeIndex + 1).some(item => item.role === 'user'),
+    false,
+    '它是最后一条 user（v31 起历史里不会再有 user 排到它后面）',
+  );
 });
 
 test('v25：判定跑不成（没有模型通道）也照样示警——规则层抓得到的就不许漏', async (t) => {
@@ -255,6 +357,347 @@ test('v25：同一条消息只示警一次（崩溃重投也数一遍）', async
     (await eventsOf(log, 'injection/noted')).length, 1,
     '第二次不许再写一条——此刻层那段历史会把它数成两次示警',
   );
+});
+
+// ──────────────── ⑥ 框架预警豁免：**规则层也要认**（2026-10-04 用户现场踩到的真 bug） ────────────────
+//
+// 现象：用户给官方 bot 那个单聊开了豁免，可他在里面发的一句正常聊天（含「记忆」二字）
+// 仍然被贴了「上面这条消息在向你要密钥、人格或记忆之类的东西（「记忆」）」。
+// 根因：豁免只在"要不要花一次判定"那一处被问过（judgeChannelWakes 的 filter），
+// 而"规则层字面命中 → 贴那句话"有**两个出口**都没问名单：
+//   ① `noteInjectionWarnings` 落 `injection/noted`；
+//   ② `renderExternalEvent` 的兜底扫描（渲染层"旧日志现算"）——消息在她跑到一半时到达、
+//      被 agent-loop 中途认领时，就只有 ② 会响（他现场那条**一条事件都没落**，正是在这一支上）。
+// 下面四条把两个出口一起钉住。
+
+test('① 被豁免的单聊：含「记忆」的话一条警告都不产生——事件、判定、她上下文三处都没有', async (t) => {
+  const { dir, log, write, loop } = await makeReadyRig(t);
+  writeWarnExempt(dir, { sessions: [`qq:c2c:${OWNER_OPENID}`] });
+  write('wake/channel', c2cWake(MEMORY_QUESTION, 'm-exempt'));
+  const model = fakeDs('{"risky":false,"reason":"普通闲聊","quotes":[]}');
+  const real = loop(model.ds);
+  await real.tickOnce();
+
+  // 出口①：事件层一个字都不落（豁免 = 不扫描也不提示，不是"照扫只是不说"）
+  assert.deepEqual(await eventsOf(log, 'injection/noted'), [], '豁免的会话不该落示警事实');
+  assert.deepEqual(await eventsOf(log, 'injection/flagged'), [], '也不该留下判定结论');
+  assert.equal(
+    model.generates.length, 0,
+    '豁免 = 连那次 light 判定都不问（省掉的正是这笔钱）——这也是"不扫描"的可观测证据',
+  );
+  // 出口②：她这一轮看到的那条（本轮新输入那一格）
+  assert.equal(model.requests.length, 1, '这条消息照常起一个 turn（豁免不拦消息）');
+  const first = inputTextOf(model.requests[0]!);
+  assert.equal(first.includes('[框架提示]'), false, `豁免的会话不该被贴提示：\n${first.slice(-400)}`);
+  assert.ok(first.includes('记忆'), '原话照旧进她的上下文（豁免的是提示，不是把话扣下）');
+
+  // 出口②的另一半，**正是用户现场走的那条**：那条消息已经成了历史。
+  // （现场它是中途到达的，所以没有落库的结论可读，只剩渲染层现算这一支。）
+  write('wake/manual', { note: '看一眼日志', person: 'OWNER' });
+  await real.tickOnce();
+  assert.equal(model.requests.length, 2, '第二轮真的起了（否则下面那句断言是空转）');
+  const second = inputTextOf(model.requests[1]!);
+  assert.ok(second.includes('记忆'), '那条老消息在历史里（先确认它真的被渲染到了）');
+  assert.equal(second.includes('[框架提示]'), false, `历史里的它也不该被贴：\n${second.slice(-500)}`);
+  assert.deepEqual(await eventsOf(log, 'injection/noted'), [], '第二轮也不许补写一条示警事实');
+  // 计数那一格：豁免的连示警事实都没有，所以「最近 24 小时示警 X 次」**一次都不会涨**
+  assert.deepEqual(
+    notedWarningsOf(await eventsOf(log, 'injection/noted'), Date.parse('2026-10-01T07:00:00.000Z')),
+    [],
+    '豁免的会话不该出现在此刻层那段「预警：」历史里',
+  );
+});
+
+test('② 没被豁免的单聊：同一句话照旧被贴——功能没有被整体关掉', async (t) => {
+  const { dir, log, write, loop } = await makeReadyRig(t);
+  // 名单是空的（盘上还没有 warn-exempt.json）：默认所有单聊都预警
+  assert.equal(existsSync(join(dir, 'warn-exempt.json')), false, '测试台的盘上本来就没有豁免名单');
+  write('wake/channel', c2cWake(MEMORY_QUESTION, 'm-plain'));
+  const model = fakeDs('{"risky":false,"reason":"普通闲聊","quotes":[]}');
+  await loop(model.ds).tickOnce();
+
+  const noted = await eventsOf(log, 'injection/noted');
+  assert.equal(noted.length, 1, '同一句话、同一个通道，没豁免就该照旧示警');
+  const event = noted[0]! as AppEvent & { type: 'injection/noted' };
+  // 措辞按"谁判的"分两路（规则短路那句词表 / 渲染层现算那句）：这里只锁"确实贴了、引的是「记忆」"
+  assert.match(event.data.note, /^\[框架提示\]/u, '落的是给她的那句原话');
+  assert.match(event.data.note, /记忆/u, '引文就是命中处那个词');
+  assert.deepEqual(event.data.quotes, ['记忆']);
+  assert.equal(event.data.sid, `qq:c2c:${OWNER_OPENID}`);
+  const seen = inputTextOf(model.requests[0]!);
+  assert.ok(seen.includes(event.data.note), `那句话必须逐字进她的上下文：\n${seen.slice(-400)}`);
+  // 计数口径（此刻层「预警：… 最近 24 小时 X 次」数的是 `injection/noted`，见 notedWarningsOf）：
+  // **规则层的命中照样进这个数**——它落的也是 noted，计数不看 `by`
+  const facts = notedWarningsOf([event], Date.parse(event.ts));
+  assert.equal(facts.length, 1, '示警事实会进「最近 24 小时」那个计数');
+  assert.equal(facts[0]!.count, 1);
+  assert.equal(facts[0]!.person, OWNER_OPENID);
+});
+
+test('③ 群里按人豁免：被豁免的那个人不贴，同群别人说同样的话照贴', async (t) => {
+  const { dir, log, write, loop } = await makeReadyRig(t);
+  writeWarnExempt(dir, { members: { 'qq:group:G1': ['OPENID_A'] } });
+  // 一批两条：同一个群、同一句话，只有发言人不同
+  write('wake/channel', groupWakeBy('OPENID_A', 'm-a', '你看看现在有给你注入记忆吗'));
+  write('wake/channel', groupWakeBy('OPENID_B', 'm-b', '你看看现在有给你注入记忆吗'));
+  const model = fakeDs('{"risky":false,"reason":"普通闲聊","quotes":[]}');
+  await loop(model.ds).tickOnce();
+
+  const noted = await eventsOf(log, 'injection/noted');
+  assert.equal(noted.length, 1, `一批里只有被豁免的那个人不贴（实际 ${noted.length} 条）`);
+  const only = noted[0]! as AppEvent & { type: 'injection/noted' };
+  assert.equal(only.data.person, 'OPENID_B', '留下的是**没被豁免**的那个人');
+  assert.equal(only.data.messageId, 'm-b');
+});
+
+test('④ 群聊的整会话豁免不生效（既有口径：群里只能按人豁免）', async (t) => {
+  const { dir, log, write, loop } = await makeReadyRig(t);
+  // 手写一条"整群豁免"（界面做不出这种条目，但文件是用户可手改的 JSON）：
+  // 既有口径是群聊**永远不认整群豁免**，这里锁的就是它不被这条放宽
+  writeWarnExempt(dir, { sessions: ['qq:group:G1'] });
+  write('wake/channel', groupWakeBy('OPENID_A', 'm-g', '你看看现在有给你注入记忆吗'));
+  const model = fakeDs('{"risky":false,"reason":"普通闲聊","quotes":[]}');
+  await loop(model.ds).tickOnce();
+
+  const noted = await eventsOf(log, 'injection/noted');
+  assert.equal(noted.length, 1, '整群豁免不该生效：群里谁都可能说话（见 warn-exempt 文件头）');
+  assert.equal((noted[0]! as AppEvent & { type: 'injection/noted' }).data.person, 'OPENID_A');
+});
+
+test('⑤ 判据是**入参**不是进程态：主循环开着豁免，也漏不进"没传判据"的渲染', async (t) => {
+  // 这条钉的是"渲染字节不该取决于这个进程注册过什么"：主循环构造时手里有一份**开着豁免**的
+  // 名单，但直接调 `renderExternalEvent`（不带判据）必须照旧现算——旧设计（注册点）在这里
+  // 会漏过去，漏过去的那一天表现是"重放对不上、缓存莫名失守"，而且**不报错**。
+  const { dir, write, loop } = await makeReadyRig(t);
+  writeWarnExempt(dir, { sessions: [`qq:c2c:${OWNER_OPENID}`] });
+  write('wake/channel', c2cWake(MEMORY_QUESTION, 'm-state'));
+  await loop(fakeDs('{}').ds).tickOnce();
+
+  const data = {
+    channel: 'qq-official', chatType: 'c2c', chatId: OWNER_OPENID, person: OWNER_OPENID,
+    text: MEMORY_QUESTION, messageId: 'm-direct', msgSeq: 1,
+  };
+  const first = renderExternalEvent(data);
+  const second = renderExternalEvent(data);
+  assert.equal(first, second, '同一份入参两次渲染逐字节相同（缓存铁律 1）');
+  assert.ok(first.includes('在向你要密钥、人格或记忆'), '不传判据 = 谁都不豁免：名单漏不过来');
+});
+
+test('⑥ replay 与主循环对同一批事件给出相同字节（判据两边各自显式传）', async (t) => {
+  // 主循环那一侧：判据由 real-loop 装配 deps 时给（按 dataDir 那份名单）；
+  // 重建那一侧：`buildReplayReport`（CLI `replay` 走的就是它）按盘上同一份名单给。
+  // 两边都不带"进程态"，所以同一条消息渲染出的那一格必须逐字节相同——豁免的当然一个字都不贴。
+  const { dir, write, loop } = await makeReadyRig(t);
+  writeWarnExempt(dir, { sessions: [`qq:c2c:${OWNER_OPENID}`] });
+  write('wake/channel', c2cWake(MEMORY_QUESTION, 'm-replay'));
+  const model = fakeDs('{"risky":false,"reason":"普通闲聊","quotes":[]}');
+  await loop(model.ds).tickOnce();
+  const live = lastUserTextOf(model.requests[0]!);
+  assert.ok(live.includes('记忆'), '本轮那条新输入确实在（先确认比较对象存在）');
+  assert.equal(live.includes('[框架提示]'), false, '主循环这一侧：豁免的不贴');
+
+  const built = await buildReplayReport(dir, 1, 1, { cwd: dir, timezone: TZ });
+  assert.equal(built.ok, true, built.ok ? '' : built.error);
+  if (!built.ok) return;
+  const rebuilt = lastUserTextOf(built.report.request);
+  assert.equal(rebuilt, live, `重建与本轮新输入必须逐字节相同：\n重建=${rebuilt}\n当时=${live}`);
+  assert.equal(rebuilt.includes('[框架提示]'), false, '重建这一侧也按同一份名单判：豁免的不贴');
+});
+
+test('⑦ 界面预览（buildReplay）与运行期对同一批事件给出相同字节——豁免会话不再多出那句提示', async (t) => {
+  // 这条盯的是**界面那条重建路径**（web/server.ts 的 buildReplay → deriveRequest）。
+  // 它与 CLI 的 buildReplayReport 是两个入口，各自组装判据；当初只有 CLI 那一侧传了
+  // `warnExempt`，界面这一侧漏了，后果是：对豁免会话，**预览里多出那句规则提示、真实请求里没有**。
+  // 预览的用处正是"她当时到底收到了什么"，多一句就等于把复盘证据改了——而且不报错。
+  // 所以判据只留一份实现（runtime/replay.ts 的 warnExemptJudgeOf），两条路径都问它。
+  const { dir, write, loop } = await makeReadyRig(t);
+  // 人格资产写到盘上：预览那条路是从盘上读人格的（见 writePersonaFixture 的注释），
+  // 不写的话它读到空人格，比出来的差异全都来自夹具而不是代码。
+  writePersonaFixture(dir);
+  writeWarnExempt(dir, { sessions: [`qq:c2c:${OWNER_OPENID}`] });
+  write('wake/channel', c2cWake(MEMORY_QUESTION, 'm-preview'));
+  const model = fakeDs('{"risky":false,"reason":"普通闲聊","quotes":[]}');
+  await loop(model.ds).tickOnce();
+
+  const live = model.requests[0]!;
+  const liveText = lastUserTextOf(live);
+  assert.ok(liveText.includes('记忆'), '本轮那条新输入确实在（先确认比较对象存在）');
+  assert.equal(liveText.includes('[框架提示]'), false, '运行期：豁免的不贴');
+
+  // 界面的预览：与页面走同一个入口、同一批盘上事件
+  const { buildReplay } = await import('../src/web/server.ts');
+  const { readEventsReadOnly } = await import('../src/log/read-only.ts');
+  const { RENDER_VERSION } = await import('../src/model/render.ts');
+  const events = readEventsReadOnly(join(dir, 'events')).events;
+  const view = buildReplay({
+    events,
+    turn: 1,
+    step: 1,
+    personaRoot: join(dir, 'persona'),
+    config: defaultConfig(dir),
+    registry: new ToolRegistry(),
+  });
+
+  // ① 预览里那句提示也不许有（修之前这里会多出一句）
+  const previewText = lastUserTextOf(view.request);
+  assert.equal(
+    previewText.includes('[框架提示]'),
+    false,
+    `预览必须与真实请求同判据：豁免的会话预览里也不许贴\n预览=${previewText}`,
+  );
+  assert.equal(
+    previewText,
+    liveText,
+    `本轮新输入那一格必须逐字节相同：\n预览=${previewText}\n当时=${liveText}`,
+  );
+
+  // ② **整段**逐字节相同（原来是"只比外部事件那一行"）——预览的全部价值就在这一条。
+  //    2026-10-04 把范围放大到 instructions + 整个 input 时，这条比较一共揪出四处预览失真，
+  //    全是"界面在骗人"那一类（都在同一批提交里修掉了）：
+  //      a) 没传 `turnBlock` → 预览少整整一条固定块（约 5900 token）；
+  //      b) 测试夹具没把人格写到盘上 → 预览读到**空人格**（instructions 少三层、块里没有 `[当前状态]`）——
+  //         这条尤其阴：它一直在替代码打掩护，让人以为预览是对的；
+  //      c) 没传 `memoryIndex` → 固定块里少「记忆索引」整段；
+  //      d) 任务卡标题用了 `summarizeEvent`（对 `wake/channel` 落进 default 分支、把事件 data
+  //         **序列化成 JSON**），而运行期与 CLI 用的是 `wakeTitle`——预览的当前任务因此是一坨机器话。
+  assert.equal(
+    view.request.instructions,
+    live.instructions,
+    `instructions 必须逐字节相同：\n预览=${view.request.instructions.slice(0, 120)}\n`
+    + `当时=${live.instructions.slice(0, 120)}`,
+  );
+  assert.equal(
+    (view.request.input as unknown[]).length,
+    (live.input as unknown[]).length,
+    'input 的条数必须相同（预览不许少一条固定块）',
+  );
+  // 此刻层之外的每一项逐字节相同（此刻层单独比，见 ③：它里面有一行日志里根本没有的素材）
+  for (let i = 0; i < view.request.input.length - 1; i += 1) {
+    assert.equal(
+      JSON.stringify(view.request.input[i]),
+      JSON.stringify(live.input[i]),
+      `input 第 ${i} 项必须逐字节相同：\n预览=${JSON.stringify(view.request.input[i]).slice(0, 200)}\n`
+      + `当时=${JSON.stringify(live.input[i]).slice(0, 200)}`,
+    );
+  }
+
+  // ③ 此刻层：除 `本机：` 那一行外逐字节相同。
+  //
+  //    为什么独留这一行：本机事实（平台 / 进程已运行多久 / 工作根 / 磁盘剩余）是**宿主的瞬时环境值**，
+  //    日志里一个字都没记，重建不出来。预览把它写成"未知"是**如实承认**，不是编值——真去补上"现在"的
+  //    uptime 与磁盘，等于拿此刻的环境冒充当时的，比少一行更坏（CLI 的重放走同一条路：
+  //    `rebuildRenderedRequest` 也不传 machine，两边同为"未知"）。
+  //    所以这里的判据是"**只剩这一行**不同"：把运行期那行抹成"未知"后必须逐字节相等——
+  //    "只剩它"是被证明的，不是被断言掉的。
+  const viewNow = String((view.request.input.at(-1) as { content?: string }).content ?? '');
+  const liveNow = String((live.input.at(-1) as { content?: string }).content ?? '');
+  assert.ok(/(^|\n)本机：/u.test(liveNow), '运行期的此刻层里确实有 `本机：` 那一行（否则下面那条是空断言）');
+  const liveWithoutMachine = liveNow.replace(/(^|\n)本机：[^\n]*/u, '$1本机：未知');
+  assert.notEqual(liveWithoutMachine, liveNow, '运行期那一行不是本来就写着"未知"（这条对齐要有意义）');
+  assert.equal(
+    viewNow,
+    liveWithoutMachine,
+    `此刻层除「本机：」那一行外必须逐字节相同：\n预览=${viewNow}\n当时（本机行抹平）=${liveWithoutMachine}`,
+  );
+
+  // ④ 三指纹里的版本号确实来自事件（顺带确认这条预览读的是当时的记录本身）
+  assert.equal(view.renderVersion, RENDER_VERSION, '预览按事件里记的 renderVersion 报');
+
+  // ⑤ 任务卡标题是**一行人话**，不是序列化的事件（依据 agent-loop.ts 的 taskCard 注释：
+  //    "那是给她看的当前任务，不该是一坨 JSON"）。
+  //    为什么值得单独钉一条：2026-10-04 之前预览这条路正是用 `summarizeEvent` 渲染标题的，
+  //    而它对 `wake/channel` 落进 default 分支、`JSON.stringify` 整个事件 data——标题变成
+  //    `{"channel":"qq-official",…}`。这条锁住"标题里不许出现原始事件 JSON"，两个入口一起罩：
+  //    运行期用 `wakeTitle`（走 `renderExternalEvent`），CLI 的重建用 `wakeTitle`，预览也必须用。
+  const cardTitleOf = (request: { input: unknown }): string => {
+    const text = (request.input as Array<{ content?: unknown }>)
+      .map(item => String(item.content ?? ''))
+      .find(content => content.includes('当前任务：')) ?? '';
+    return text.split('当前任务：')[1]?.split('（turn ')[0] ?? '';
+  };
+  for (const [label, req] of [['运行期', live], ['界面预览', view.request]] as const) {
+    const title = cardTitleOf(req);
+    assert.ok(title !== '', `${label}的任务卡标题必须存在（否则这条断言什么也没锁）`);
+    assert.equal(title.startsWith('{'), false, `${label}的任务卡标题不是一坨 JSON：${title}`);
+    assert.equal(title.includes('"chatType"'), false, `${label}的任务卡标题里不许有事件字段名：${title}`);
+    assert.ok(title.startsWith('[external_event '), `${label}的任务卡标题是那行人话：${title}`);
+  }
+});
+
+test('界面预览的待办：STATE 里那两节有几项，预览的「未完成计划」就有几项（逐字节）', async (t) => {
+  // 这条盯的是 2026-10-05 修掉的那一处**预览失真**：`buildReplay` 原来把任务卡的 `todoOpen`
+  // 写死成 `[]`，而运行期是从 STATE 那两节现读的——于是"那一轮有待办"时，预览的此刻层
+  // 比真实请求**少整段「未完成计划」**。它一直没被发现，正是因为上一条用例的夹具里
+  // **一项待办都没有**：`[] === []`，比较不出任何东西。
+  //
+  // 所以这一条的夹具里**真的放两项**（一项在做、一项排队），而判据与其他预览用例一致：
+  // 此刻层除 `本机：` 那一行外必须与运行期逐字节相同。
+  const { dir, write, loop } = await makeReadyRig(t);
+  const personaDir = join(dir, 'persona');
+  mkdirSync(personaDir, { recursive: true });
+  const stateWithTodos = [
+    '# 当前状态',
+    '',
+    '心情：平稳。这一行是她写的。',
+    '',
+    '## 当前任务',
+    '- [~] 核对备份目录',
+    '',
+    '## 接着干',
+    '- [ ] 看日志尾部',
+    '- [x] 写结论',
+    '',
+    '## 群里的分寸',
+    '- 一条她自己的规矩。',
+    '',
+  ].join('\n');
+  for (const [name, text] of [
+    ['IDENTITY.md', PERSONA.identity],
+    ['CONSTITUTION.md', PERSONA.constitution],
+    ['STYLE.md', PERSONA.style],
+    ['STATE.md', stateWithTodos],
+  ] as const) {
+    writeFileSync(join(personaDir, name), text, 'utf8');
+  }
+
+  write('wake/channel', c2cWake(MEMORY_QUESTION, 'm-todo-preview'));
+  const model = fakeDs('{"risky":false,"reason":"普通闲聊","quotes":[]}');
+  // 运行期那一侧吃的就是刚写到盘上的那份人格（真宿主里它是活引用，见 makeReadyRig 的注释）
+  await loop(model.ds, { ...PERSONA, state: stateWithTodos }).tickOnce();
+
+  const live = model.requests[0]!;
+  const liveText = (live.input as Array<{ content?: unknown }>)
+    .map(item => String(item.content ?? ''))
+    .find(content => content.includes('当前任务：')) ?? '';
+  // 前置事实：运行期**真的**带出了那两项未完成（少了这一条，下面的比较是空的）
+  assert.match(liveText, /未完成计划：/u, `运行期必须带出未完成项：\n${liveText}`);
+  assert.match(liveText, /- 核对备份目录/u);
+  assert.match(liveText, /- 看日志尾部/u);
+  assert.equal(liveText.includes('- 写结论'), false, '已完成的那一项不进未完成计划');
+
+  const { buildReplay } = await import('../src/web/server.ts');
+  const { readEventsReadOnly } = await import('../src/log/read-only.ts');
+  const events = readEventsReadOnly(join(dir, 'events')).events;
+  const view = buildReplay({
+    events,
+    turn: 1,
+    step: 1,
+    personaRoot: join(dir, 'persona'),
+    config: defaultConfig(dir),
+    registry: new ToolRegistry(),
+  });
+
+  // ① 预览也必须带出那两项（修之前这里是 `[]`：整段「未完成计划」都没有）
+  const viewNow = String((view.request.input.at(-1) as { content?: string }).content ?? '');
+  const liveNow = String((live.input.at(-1) as { content?: string }).content ?? '');
+  assert.match(viewNow, /未完成计划：/u, `预览必须与真实请求同源：\n${viewNow}`);
+  assert.match(viewNow, /- 核对备份目录/u);
+  assert.match(viewNow, /- 看日志尾部/u);
+
+  // ② 逐字节：此刻层除 `本机：` 那一行外完全一致（口径同其他预览用例）
+  const liveWithoutMachine = liveNow.replace(/(^|\n)本机：[^\n]*/u, '$1本机：未知');
+  assert.notEqual(liveWithoutMachine, liveNow, '运行期那一行不是本来就写着"未知"（这条对齐要有意义）');
+  assert.equal(viewNow, liveWithoutMachine, `此刻层必须逐字节相同：\n预览=${viewNow}\n当时=${liveWithoutMachine}`);
 });
 
 test('没有迹象的外部消息：一个字都不写（预警不许变成噪音）', async (t) => {

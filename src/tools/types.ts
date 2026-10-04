@@ -44,6 +44,24 @@ export interface ToolContext {
   claimInterruption?: (wakeSeq: number) => void;
   /** 工作目录白名单根，文件工具必须用它做校验 */
   workspaceRoot: string;
+  /**
+   * 活动边界根（`config.trust.mode` 的执行形态）。**fs 工具族与 pwsh 的边界都只读它**：
+   *
+   *   • `undefined` = **保持历史行为**：拿 [workspaceRoot] 当边界。今天所有装配点与测试台都
+   *     不传它，因此"默认仍然是受限的"这件事一个字都不用改，也不必靠自觉维护。
+   *   • `null` = **不设边界**（`trust.mode: 'full'`，用户的原话"能够触碰整个电脑是默认行为"）：
+   *     整台电脑上的文件都能读写、任意目录都能跑命令。
+   *   • `string` = 用这个根当边界（`trust.mode: 'workspace'`）：越界的读写与命令**被拒绝**，
+   *     且拒绝原因要说清"边界在哪、怎么改"。
+   *
+   * 它只关"**能在哪儿动**"，不关"**能改什么**"：只读区（`skills/`、`data/persona`）、受保护
+   * 文件（钩子配置）、写前备份与回滚在两种模式下**行为一致**（那些判据各自有主，见
+   * `fs/edit-core.ts` 的 guardedWrite）。
+   *
+   * 决议只有一处：`tools/boundary.ts` 的 `effectiveBoundaryRoot`。**不许**在任何工具里再写一遍
+   * `ctx.boundaryRoot ?? ctx.workspaceRoot`——这条边界要么真的管住所有路径入口，要么就不该存在。
+   */
+  boundaryRoot?: string | null;
 }
 
 export interface ToolHandlerResult {

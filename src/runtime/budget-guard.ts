@@ -108,6 +108,24 @@ export interface FailStreakBreach {
   actual: number;
 }
 
+/**
+ * 「上限已经高过已用量」的那条暂停记录——抬上限就该解开它（判定与凭据一起给出）。
+ *
+ * 它是 2026-10-04 那个真 bug 的判据出口：暂停记录留在投影里（`lastExhausted`），而"上限调大 +
+ * 重启"只把同一条 `budget/exhausted` 重放一遍，记录照样在——唤醒门据此继续拒绝唤醒。
+ * 判据不能看那条历史记录，要看**活的数**（当前有效上限与当刻已用量）；判定在这里，
+ * 落 `budget/resumed` 由运行时做（本模块只回答"该不该解"）。
+ */
+export interface LiftedPause {
+  layer: BudgetLayer;
+  /** 解除那一刻的有效上限 = 基础上限 + 累计加注 */
+  limit: number;
+  /** 解除那一刻的已用量（当刻的活数，不是记录里那个旧数） */
+  actual: number;
+  /** 上限是被谁抬起来的：配置改了，还是累计加注 */
+  reason: 'limit-raised' | 'topup';
+}
+
 /** 水位停滞的观测（§4.9：有事件进来但一直没被处理） */
 export interface StallInfo {
   /** **最早那条待处理输入**已经等了多久（毫秒）——它就是判据里的"停滞时长" */
@@ -429,11 +447,53 @@ export class BudgetGuard {
   }
 
   /**
-   * 该层是否处于「撞刹车且未加注」的暂停态。
-   * 从投影派生（`lastExhausted` 存在且无后续 topped-up），所以跨重启有效。
+   * 该层是否处于「撞刹车且未解除」的暂停态。
+   * 从投影派生（`lastExhausted` 存在，且其后没有 `budget/topped-up` / `budget/resumed`），
+   * 所以跨重启有效。
+   *
+   * **注意它读的是那条记录**：记录是不是"已经该解开了"由 {@link liftedPauses} 判——运行时
+   * 每拍（与启动时）拿它判一次，该解的就落 `budget/resumed` 把记录清掉，本方法随后自然为假。
    */
   isPaused(layer: BudgetLayer, p?: Projection): boolean {
     return this.project(p).lastExhausted[layer] !== undefined;
+  }
+
+  /**
+   * **抬上限就该解开的暂停**：判据看活的数，不看那条粘在投影里的历史记录（唯一一份实现）。
+   *
+   * 四条同时成立才算（缺一条都不解）：
+   *   ① 记录不是**不可恢复**的（`resumable: false` 的暂停与"预算用尽"不是一回事，
+   *      抬上限不该顺手放行它——见 Projection.lastExhausted）；
+   *   ② 这条记录确实是**撞线**留下的（`actual >= limit`）。这一条把"人审挂起超时"那类
+   *      暂停挡在外面：它写的是当刻的 limit/actual，已用量通常低于上限，解除条件是"人答了"
+   *      （`budget/topped-up{by:'human-answer'}`），不是"上限比已用大了"；
+   *   ③ **有效上限真的被抬高了**（比记录里那个上限更高）。没有这一条，step / turn 两层会
+   *      在每次计数器归零后产出假解除（"上限没变、只是这一步重新开始数了"），而那种记录该由
+   *      它自己的语义去清，不该由"抬上限"这条规则顺手写一条 `topup` 出来；
+   *   ④ 当刻**仍然越线就不解**（`statuses().over`，四层各自的越线口径）：新上限没有高过已用，
+   *      暂停照旧——否则就是"越过硬停照跑"。
+   *
+   * 返回的 `limit` / `actual` 就是落进 `budget/resumed` 的两个数（解除的凭据），
+   * `reason` 说清上限是谁抬起来的：基础上限高过了记录里那个上限 = 配置改了，否则 = 加注累计。
+   */
+  liftedPauses(p?: Projection): LiftedPause[] {
+    const proj = this.project(p);
+    const out: LiftedPause[] = [];
+    for (const st of this.statuses(proj)) {
+      const record = proj.lastExhausted[st.layer];
+      if (record === undefined) continue;          // 这一层本来就没暂停
+      if (record.resumable === false) continue;    // ① 不可恢复的暂停：不走这条路
+      if (record.actual < record.limit) continue;  // ② 不是撞线留下的记录（例如人审挂起）
+      if (st.limit <= record.limit) continue;      // ③ 上限没被抬高：不关这条规则的事
+      if (st.over) continue;                       // ④ 当刻仍越线：硬停不动
+      out.push({
+        layer: st.layer,
+        limit: st.limit,
+        actual: st.used,
+        reason: this.limitOfConfig(st.layer) > record.limit ? 'limit-raised' : 'topup',
+      });
+    }
+    return out;
   }
 
   /** 本进程内最近一次撞刹车的时刻；未撞过返回 null（观测用，不参与判定） */
@@ -468,6 +528,10 @@ export class BudgetGuard {
   /**
    * 加预算：写 `budget/topped-up`（fold 据此清掉 lastExhausted，暂停态解除）。
    * 判定版（宿主自己写事件）请直接调 addTopUp + setTopUps。
+   *
+   * 另一条解除路径（**不经过本方法**）：上限被调大之后由运行时落 `budget/resumed`
+   * ——判定在 {@link liftedPauses}，事件由 `real-loop` 写（"没有加注、只是上限变大了"
+   * 不该伪造一条 `topped-up`）。
    */
   resume(layer: BudgetLayer, by: string, addedTokens = 0): void {
     this.emit?.(

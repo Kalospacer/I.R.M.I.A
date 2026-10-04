@@ -38,8 +38,18 @@ export const MACHINE_TOOLS: readonly string[] = [
   'multi_edit',      // 批量改文件
   'safe_rollback',   // 回滚文件
   'write_persona',   // 改她的人格资产
-  'set_timer',       // 布防定时器（会让她在无人时自己动起来）
-  'cancel_timer',    // 撤定时器
+  // 定时器（v35：set_timer / cancel_timer / list_timers 并成一件，动作由 action 选）。
+  //
+  // 为什么整件算本机类而不是"list 那个动作算社交类"：这张名单是**按名字**核对的，
+  // 它的价值就在于"人读一眼就能核对"（见上面那段）。一旦要按入参分档，它就得同时
+  // 读懂 `action` 的语义才能判断，安全边界也就没法一眼看完了。
+  //
+  // 代价写在明面上（实测过、知情接受）：合并前 `list_timers` 在社交类名单里，
+  // 所以**客人（硬拒绝档）从前能看到定时器列表，现在看不到了**。影响面很小——
+  // 硬拒绝默认是关的（软提醒档下两个名单都不参与判定，一切照旧），而"客人 + 硬拒绝"
+  // 是用户明确要收紧的那一档：定时器表里有她什么时候醒、要做什么（payload），
+  // 收进本机类与 write_persona / pwsh 同档，方向是对的。
+  'timer',           // 布防 / 撤销 / 列出定时器（会让她在无人时自己动起来）
   'http_post',       // 对外发请求（带副作用）
   'http_download',   // 往本机拉东西
 ];
@@ -47,7 +57,7 @@ export const MACHINE_TOOLS: readonly string[] = [
 /** 社交类：明确放行的那些（说话、看、发媒体）；其余按本机类处理 */
 export const SOCIAL_TOOLS: readonly string[] = [
   'speak', 'report', 'read_channel', 'send_media', 'vision_read', 'vision_query',
-  'http_get', 'todo', 'list_timers', 'list_dir', 'rg_search', 'es_search', 'read_blob',
+  'http_get', 'todo', 'list_dir', 'rg_search', 'es_search', 'read_blob',
   'ask_human',
 ];
 
@@ -73,9 +83,21 @@ export interface AuthzDecision {
   code?: string;
 }
 
-/** 硬拒绝时的拒绝理由 */
+/**
+ * 硬拒绝时的拒绝理由。
+ *
+ * 两件事各说一半，缺一件都不行（用户 2026-10-04 的要求）：
+ *   • **把规矩归到用户头上**：这不是她的洁癖、也不是框架的脾气，是**用户禁止过**。
+ *     这层归属必须写出来——她是主体，这句话她要能**拿去跟群里的人复述**：
+ *     "他禁止过我在群里做这个"。省掉这一句，拒得再对也像是她自己不肯配合。
+ *   • **保留事实说明**：群聊场合旁边有别的人。这是她判断的依据，不是修饰。
+ *
+ * 最后一句给的是**出路**（要动这台机器去哪儿说），不是道歉——与 authz 的
+ * "机制给事实，判断留给她"同一条口径：拒绝也要让她知道下一步。
+ */
 export function denyReasonFor(tool: string): string {
-  return `这台机器上的事（${tool}）不能在群聊里做——群聊场合旁边有别的人，本机上的事请在本机或单聊里跟我说。`;
+  return `用户禁止过在群聊场景里做这台机器上的事（${tool}）——群聊场合旁边有别的人，`
+    + '我不能在这儿替他做。本机上的事请在本机或单聊里跟我说。';
 }
 
 /**

@@ -1,19 +1,24 @@
 /**
- * Irmia Agent — 记忆索引与注入（B2：2026-10-04）
+ * Irmia Agent — 记忆索引与注入（B2：2026-10-04；**只给索引**改于同日）
  *
- * 与 `docs/memory-injection.md` 逐条对齐。三件事，各管一段：
+ * 与 `docs/memory-injection.md` 逐条对齐。两件事，各管一段：
  *
  *   ① **索引**（`MEMORIES/INDEX.md`）：一份**指针表**——每条只有「相对路径:行号 + 一行摘要 +
  *      有没有 `!pinned`」。正文一个字都不在里面。它是机制生成的（归属写在文件头），
- *      渲染进请求的**长期记忆层**（与技能目录同处，跨轮稳定）。
- *   ② **选材**（`selectMemory`）：一轮选哪几条、为什么不选其余——纯函数，输入只有索引与
- *      本轮唤醒来源，输出写成 `memory/selected` 事件（可重放的地基，见 docs/memory-injection.md §4）。
- *   ③ **正文装配**（`renderSelectedMemory`）：把选中条目对应的**正文**从盘上取出来，
- *      装成"本轮固定块"里的那一段（一轮一次，块内逐字节不变）。
+ *      渲染进请求的**本轮固定块**（v30 起；v29 时在长期记忆层）。
+ *   ② **注入账**（`memory/selected`）：轮首写一条事件，记"这一轮注入了没有 + 当时那份索引的指纹
+ *      与条数"（可重放/可审计的地基，见 docs/memory-injection.md §4）。**索引全文不落事件**。
  *
- * 为什么正文只走这两条路（索引 + 本轮固定块）：正文要是进长期记忆层，那就是每轮都在付；
- * 进此刻层，那就是每步都在付（改造前的样子）。按需 read（`safe_read`）落进工具结果，
- * 天然成为历史、天然可缓存；固定块里的那几条是"这一轮确实相关"的最小集合。
+ * **正文怎么进上下文（2026-10-04 用户定稿：「只看索引，如果需要，heavy 自己去读，随后跟随
+ * tool call 留在上下文」）**：机制**不再**替她挑几条正文塞进固定块。她需要哪一条，就照索引里的
+ * 路径与行号 `safe_read` 现取——读回来的内容作为**工具结果**留在历史里，从此每轮都在前缀里
+ * （KV 缓存天然命中），而不是每轮由机制重新编码一遍。
+ *
+ * 为什么这样更好（他的理由 + 代价，两边都记）：
+ *   • 好处：注入的那一段从"索引 + 挑出来的正文"缩到**只有索引**；机制不必猜"哪几条相关"
+ *     （那本来就该是她的判断），而且读回来的正文是**她自己按需取的**，相关性由她保证；
+ *   • 代价：她得**自己想起来去读**。索引里没写的东西，她当场就是不知道——
+ *     机制不再兜底"至少把置顶那几条推到她眼前"。这条取舍归用户，理由见 §5。
  *
  * 归属与边界（硬约束）：
  *   • 本模块**只读**她自己的记忆资产（`facts.md` / `jargon.md` / `style-notes.md` /
@@ -91,6 +96,20 @@ export interface MemoryIndex {
   dropped: number;
 }
 
+/**
+ * 单独一行"算条目"时的形状（{@link entryShapeAt} 的返回）。
+ *
+ * 与 {@link MemoryIndexEntry} 的区别只在**没有路径与行号**：那两样是调用方给的，
+ * 不是从这一行里读出来的。分成两个类型是为了让"核对一条指针"这件事不必先编出
+ * 一个假的 path/line 才能问出口。
+ */
+export interface MemoryEntryShape {
+  /** 这一行的摘要（判据与建索引时**完全同一份**，含截断到 40 字） */
+  summary: string;
+  /** 这一行带不带 `!pinned` */
+  pinned: boolean;
+}
+
 // ──────────────────────────────── 路径 ────────────────────────────────
 
 /** 索引文件的绝对路径（`<dataDir>/workspace/MEMORIES/INDEX.md`） */
@@ -140,6 +159,58 @@ export function buildMemoryIndex(dataDir: string): MemoryIndex {
 }
 
 /**
+ * 一份**空索引**（v32）：`persona.memoryEnabled = false` 时 real-loop 用它替掉"建/读一次"。
+ *
+ * 为什么要有这么一个显式的东西，而不是让调用方传 `''` 或者自己拼个对象：
+ *   • `buildMemoryIndex` 是**读盘**的（它要扫 facts.md / episodes/ …）——关掉框架代管记忆之后，
+ *     连"扫一眼"都不该发生：那既是多余的路由，也让"关掉"这件事没法从代码上读出来；
+ *   • 注入与账目（`memory/selected` 的指纹与条数）必须以**同一份索引**为准。给一份空索引，
+ *     两处自然都是空的（账上如实写"0 条、空指纹"），不需要在两侧各加一个 if——那样才有
+ *     "账上说注入了、请求里却没有"的空间（docs/memory-injection.md §4 那条纪律）。
+ *
+ * 它不碰盘、也不缓存任何东西：每次调用给一份新的空索引。
+ */
+export function emptyMemoryIndex(): MemoryIndex {
+  return { entries: [], dropped: 0 };
+}
+
+/**
+ * 一行 → 它"算不算索引条目、摘要是什么"。**建索引与核对指针共用的唯一判据**。
+ *
+ * 为什么要抽出来：`memory_read` 拿到的是一条**可能已经漂了的指针**，它必须回答
+ * "这一行现在还是一条条目吗"。若那边自己再写一遍"正则以 `- ` 开头 / 跳过标题"，
+ * 两处判据迟早会漂——而漂的方向恰好是最坏的那个：**建索引时算条目、核对时不算**，
+ * 于是每一条都报"指针漂了"。所以判据只有这一份，两侧都走它。
+ *
+ * @param pathOrName 相对工作根的 posix 路径或文件名**都可以**（`MEMORIES/facts.md` 与
+ *   `facts.md` 同判）——调用方手里常常只有文件名（`readMemoryEntry` 就是这种情况）
+ */
+export function entryShapeAt(pathOrName: string, line: string): MemoryEntryShape | null {
+  const name = pathOrName.replace(/\\/gu, '/').split('/').pop() ?? '';
+  if (name === 'facts.md') return factsEntryAt(line);
+  return looseEntryAt(line);
+}
+
+/** facts.md 的一行：只在"`- ` 开头 + 摘得出正文"时算条目（与文档里的条目格式一致） */
+function factsEntryAt(line: string): MemoryEntryShape | null {
+  if (!/^-\s+/u.test(line)) return null;
+  const entry = parseEntryLine(line);
+  const summary = summaryOf(entry.body);
+  if (summary === '') return null;
+  return { summary, pinned: entry.pinned };
+}
+
+/** 自由格式记忆文件（jargon / style-notes / aliases）的一行：非空、非标题、非说明行 */
+function looseEntryAt(line: string): MemoryEntryShape | null {
+  const raw = line.trim();
+  if (raw === '' || raw.startsWith('#') || raw.startsWith('（') || raw.startsWith('(')) return null;
+  const body = raw.replace(/^[-*]\s+/u, '');
+  const summary = summaryOf(body);
+  if (summary === '') return null;
+  return { summary, pinned: false };
+}
+
+/**
  * facts.md 的条目：跳过归档区，按分区优先级 + 行号升序。
  *
  * 行号是**原文件的行号**（`safe_read` 回显的就是它）：分区标题、空行、说明行都计数，
@@ -156,11 +227,9 @@ function factsEntries(text: string, path: string): MemoryIndexEntry[] {
     // 走到归档区（或任何别的 `##` 区）就停止收集：它后面的一切都不进索引
     if (/^##\s/u.test(line)) { sectionIndex = -1; continue; }
     if (sectionIndex === -1) continue;
-    if (!/^-\s+/u.test(line)) continue;
-    const entry = parseEntryLine(line);
-    const summary = summaryOf(entry.body);
-    if (summary === '') continue;
-    out.push({ path, line: i + 1, summary, pinned: entry.pinned });
+    const shape = factsEntryAt(line);
+    if (shape === null) continue;
+    out.push({ path, line: i + 1, summary: shape.summary, pinned: shape.pinned });
   }
   return out;
 }
@@ -170,17 +239,17 @@ function factsEntries(text: string, path: string): MemoryIndexEntry[] {
  *
  * 它们由她自己维护，没有 facts.md 那套行内标签——所以判据只有"非空、不是标题、不是说明行"。
  * 标题与括号开头的行是给人看的说明（种子模板里那些），当条目列出只会是噪音。
+ *
+ * 注意**没有分区过滤**：这些文件里没有归档区，所以任意一行都可能是条目——
+ * `entryShapeAt` 的核对逻辑必须与这里一致，否则"指针还成立"会被误判成"漂了"。
  */
 function looseEntries(text: string, path: string): MemoryIndexEntry[] {
   const out: MemoryIndexEntry[] = [];
   const lines = text.split(/\r?\n/u);
   for (let i = 0; i < lines.length; i += 1) {
-    const raw = (lines[i] ?? '').trim();
-    if (raw === '' || raw.startsWith('#') || raw.startsWith('（') || raw.startsWith('(')) continue;
-    const body = raw.replace(/^[-*]\s+/u, '');
-    const summary = summaryOf(body);
-    if (summary === '') continue;
-    out.push({ path, line: i + 1, summary, pinned: false });
+    const shape = looseEntryAt(lines[i] ?? '');
+    if (shape === null) continue;
+    out.push({ path, line: i + 1, summary: shape.summary, pinned: shape.pinned });
   }
   return out;
 }
@@ -273,127 +342,6 @@ export function readMemoryIndexText(dataDir: string): string {
  */
 export function readMemoryIndexTextReadOnly(dataDir: string): string {
   return readTextIfPresent(memoryIndexPath(dataDir)) ?? '';
-}
-
-// ──────────────────────────────── 选材 ────────────────────────────────
-
-/** 一条没有被选中的原因（事后读日志的人要能回答"为什么这一轮她没看见某一条"） */
-export type MemorySkipReason =
-  /** 心跳轮：没有人在跟她说话，记忆正文不注入（docs/memory-injection.md §5） */
-  | 'heartbeat'
-  /** 非置顶条目，且本轮的条数上限已经用满 */
-  | 'not-needed';
-
-/** 选材结论：选了哪些、为什么不选其余 */
-export interface MemorySelection {
-  selected: MemoryIndexEntry[];
-  /** 未被选中的条数（按原因归类，只记数——逐条记会让事件膨胀成索引的副本） */
-  skipped: { heartbeat: number; notNeeded: number };
-}
-
-/**
- * 一轮最多注入几条正文。
- *
- * 为什么是小数字：注入的是**整条正文**（facts.md 的条目可以很长），而"相关"是她的判断不是机制的
- * 判断。机制只保证"置顶的一定在、其余按上面的顺序给最近看到的几条"，要更多她自己 `safe_read`
- * ——这条路一直在（索引就在她眼前）。
- */
-export const MAX_SELECTED_ENTRIES = 8;
-
-/**
- * 选材（纯函数）：索引 + 本轮唤醒类型 → 选哪几条。
- *
- * 判据全部是**可复算的**（这条比数字本身更要紧，见 docs/memory-injection.md §7 第 5 条）：
- *   • `!pinned` 必选——置顶的语义就是"永远在场"；
- *   • **心跳轮一条都不选**——没人在跟她说话，没有谁的上下文需要对齐；她要看就 `safe_read`；
- *   • 其余按索引顺序补足到 {@link MAX_SELECTED_ENTRIES}：置顶在前、然后是她自己在文件里
- *     排在前面的那些（文件序 = 时间序，persona.md §3）。
- *
- * 不做的事：不调模型判相关性、不看正文内容、不按会话去猜。加一层模型判断会把
- * "同一份日志重建同一份请求"这条地基挖掉。
- */
-export function selectMemory(index: MemoryIndex, options: { heartbeatTurn: boolean }): MemorySelection {
-  const pinned = index.entries.filter((e) => e.pinned);
-  const rest = index.entries.filter((e) => !e.pinned);
-  if (options.heartbeatTurn) {
-    return { selected: [], skipped: { heartbeat: index.entries.length, notNeeded: 0 } };
-  }
-  const room = Math.max(0, MAX_SELECTED_ENTRIES - pinned.length);
-  const selected = [...pinned, ...rest.slice(0, room)];
-  return {
-    selected,
-    skipped: { heartbeat: 0, notNeeded: index.entries.length - selected.length },
-  };
-}
-
-// ──────────────────────────────── 正文装配（本轮固定块） ────────────────────────────────
-
-/** 一段被取出来的正文：哪一条、从哪一行开始、内容是什么 */
-export interface MemoryExcerpt {
-  path: string;
-  line: number;
-  pinned: boolean;
-  text: string;
-}
-
-/**
- * 单条正文的字符上限。超了就截断并**如实写明**——悄悄截断会让她以为自己看完了。
- *
- * 与索引的短摘要是一对：摘要是钩子（40 字），这一段是"本轮真的要用"的正文（上限放宽）。
- */
-export const EXCERPT_MAX_CHARS = 1200;
-
-/**
- * 取出一条记忆的正文：从它那一行开始，**往上不取、往下取到下一个条目/分区为止**
- * （facts.md 的条目可以折行，折行属于同一条）。
- *
- * 找不到那一条（文件被删、行号漂了）时返回 null：调用方**跳过它**而不是印一句
- * "内容缺失"——索引与文件之间的漂移不该变成她上下文里的一段噪音。
- */
-export function readExcerpt(dataDir: string, entry: MemoryIndexEntry): MemoryExcerpt | null {
-  const rel = entry.path.startsWith(`${MEMORY_DIR_NAME}/`) ? entry.path.slice(MEMORY_DIR_NAME.length + 1) : entry.path;
-  const abs = join(dataDir, 'workspace', MEMORY_DIR_NAME, rel);
-  const text = readTextIfPresent(abs);
-  if (text === null) return null;
-  const lines = text.split(/\r?\n/u);
-  const start = entry.line - 1;
-  if (start < 0 || start >= lines.length) return null;
-  const out: string[] = [];
-  for (let i = start; i < lines.length; i += 1) {
-    const line = lines[i] ?? '';
-    const isNextEntry = i > start && (/^-\s+/u.test(line) || /^#{1,6}\s/u.test(line) || /^##\s/u.test(line));
-    if (isNextEntry) break;
-    out.push(line);
-    if (out.join('\n').length >= EXCERPT_MAX_CHARS) break;
-  }
-  const body = out.join('\n').trim();
-  if (body === '') return null;
-  const clipped = body.length <= EXCERPT_MAX_CHARS
-    ? body
-    : `${body.slice(0, EXCERPT_MAX_CHARS)}\n…（这一条还没完：用 safe_read 读 ${entry.path} 第 ${entry.line} 行起）`;
-  return { path: entry.path, line: entry.line, pinned: entry.pinned, text: clipped };
-}
-
-/**
- * 选中的条目 → 本轮固定块里那一段文本（**带行号**，与 `safe_read` 同一口径）。
- *
- * 为什么带行号：她读到一段之后想改（`safe_edit` 的行号寻址）或接着往下读，
- * 手里得有地址。行号是免费的——`safe_read` 回显时也带它。
- *
- * 空选中（心跳轮、或索引为空）→ 返回空串：固定块里那一段整体不出现，**不写空段**。
- */
-export function renderSelectedMemory(excerpts: readonly MemoryExcerpt[]): string {
-  if (excerpts.length === 0) return '';
-  const blocks = excerpts.map((e) => {
-    const numbered = e.text.split('\n').map((line, i) => `${e.line + i}| ${line}`).join('\n');
-    return `## ${e.path}:${e.line}${e.pinned ? '（!pinned）' : ''}\n${numbered}`;
-  });
-  return [
-    '## 本轮选中的记忆（正文）',
-    '（以下是索引里挑出来的几条正文，只供这一轮参考；要看别的按索引里的路径 safe_read。）',
-    '',
-    blocks.join('\n\n'),
-  ].join('\n');
 }
 
 // ──────────────────────────────── 小工具 ────────────────────────────────

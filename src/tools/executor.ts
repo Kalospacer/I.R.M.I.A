@@ -233,6 +233,12 @@ export interface ExecutionContext {
   step: number;
   /** 工作目录白名单根，原样传给每个 ToolContext */
   workspaceRoot: string;
+  /**
+   * 活动边界根（`config.trust.mode` 的执行形态）：原样透传给每个 ToolContext 的 `boundaryRoot`。
+   * `undefined` = 用 `workspaceRoot` 当边界（历史行为）；`null` = 不设边界；string = 只限该根。
+   * 执行器**不解读**它——判读只有一处（`tools/boundary.ts`），这里只是搬运。
+   */
+  boundaryRoot?: string | null;
   /** 承诺类落库：tool/call */
   onToolCall: ToolCallRecorder;
   /** 承诺类落库：tool/result（按提交顺序串行调用） */
@@ -662,6 +668,9 @@ async function runInProcess(
     // 销账口同样原样透传（speak 真被打断时用它；见 ExecutionContext.claimInterruption）
     ...(ctx.claimInterruption === undefined ? {} : { claimInterruption: ctx.claimInterruption }),
     workspaceRoot: ctx.workspaceRoot,
+    // 活动边界随 workspaceRoot 一起进 ToolContext。缺省时**不放这个键**：`boundaryRoot === undefined`
+    // 与"没有这个字段"在工具层必须完全同义（那是"用 workspaceRoot 当边界"的历史默认）。
+    ...(ctx.boundaryRoot === undefined ? {} : { boundaryRoot: ctx.boundaryRoot }),
   };
   // 包一层 Promise.resolve().then：handler 同步抛错也变成 rejection，走同一条错误路径
   const running: Promise<ToolHandlerResult> = Promise.resolve().then(() => def.handler(args, toolCtx));

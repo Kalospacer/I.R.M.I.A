@@ -34,6 +34,18 @@
       "apiKeyEnv": "IRMIA_API_KEY"
     }
   },
+  "trust": {
+    "$comment": [
+      "她的活动边界：整台电脑，还是只有一个工作目录。默认 full（完全信任）——这是**有意的默认**，不是漏配。",
+      "它是一台无人值守 agent 的存在方式（能自己去找、去修、去装）；真正的破坏性动作另有 destructive 开关、",
+      "pwsh 命令黑名单与执行期鉴权三道门在挡。这一条管的是\"范围\"，不是\"要不要动手\"。",
+      "workspace 一档下她只能在 workspaceRoot 里活动，越界的读写与命令**被拒绝**（它是边界，不是提醒）。",
+      "  改成 \"workspace\" 就收窄到那个目录；空值/拼错会被解析器当场拒绝，不会静默当成某一档。",
+      "workspaceRoot **不写在出厂文档里**：它由解析器算出来（默认 <配置目录>/workspace），",
+      "  两边各写一个值就会出现\"配置说 A、实际拦在 B\"。改完要重启进程才接管。"
+    ],
+    "mode": "full"
+  },
   "budget": {
     "$comment": [
       "三层刹车 + 每日额度 + 软阈值（design.md §4.6）。全部跨重启累计。",
@@ -85,22 +97,23 @@
       "  它是**文件名**，不是昵称展示位——写什么就得有同名文件（含空格与大小写）。默认 owner。",
       "contacts：联系人表（会话 sid → 名字）。聊天平台不给昵称、也没有查成员的接口，",
       "  所以「这个会话是谁」这类知识只能在这里声明；它优先于她自己记的 MEMORIES/aliases.md。",
+      "memoryEnabled：**框架代管记忆**的总开关，默认 true（框架生成 MEMORIES/INDEX.md、每轮注入索引、每日整理、维护 !pinned 与 TTL）。",
+      "  关掉（false）＝框架不生成索引、不注入任何记忆、不跑整理；她只从装置自述知道 MEMORIES/（facts.md / episodes/ / jargon.md / style-notes.md / aliases.md）与 diary/ 存在，",
+      "  读写维护全归她自己。代价：她可能忘了整理、facts.md 会一直长下去、索引不再更新。",
+      "  不受影响的：MEMORIES/aliases.md 参与「会话认人 / 关注名单」属于通道侧；STATE.md（她当前状态）是独立的一层。",
+      "stateBudgetBytes：persona/STATE.md 的**字节预算**，默认 8192（8 KB ≈ 1.8k token）。",
+      "  越过它时框架在**此刻层**（每步都发的那一段）多一行「[STATE.md] …——预算超限，记得维护，将过时内容移入记忆文件或删除」，让她自己去把过时内容搬进记忆文件或删掉。",
+      "  为什么是 8 KB：够放「当前任务 + 接着干 + 几条边界」这三样（下一拍真的要用）的那点状态；出厂的 STATE.md 实测 17007 字节 ≈ 3.8k token/次，而且是**每轮都在重发**。",
+      "  只提醒、不截断：框架不动她的文件，也不替她搬内容。她压回预算内之后那一行自动消失（不需要\"已读\"）。单位是字节；改完要重启进程才接管。",
       "compactionThresholdTokens：可见历史估算超过它就压一次。用代码默认值起步，觉得压得太勤再往上调。"
     ],
     "compactionThresholdTokens": 32000,
     "handoffBudgetTokens": 4096,
     "handoffFoldTokens": 1024,
     "owner": "owner",
+    "memoryEnabled": true,
+    "stateBudgetBytes": 8192,
     "contacts": {}
-  },
-  "paths": {
-    "$comment": [
-      "工作目录白名单：文件操作解析后必须落在其中任一目录内；空数组 = 一个都不允许。",
-      "data\\workspace 是后端在数据目录下建的工作根（注意 JSON 里的反斜杠要写两个）。"
-    ],
-    "workspaceAllowlist": [
-      "data\\workspace"
-    ]
   },
   "tools": {
     "$comment": [

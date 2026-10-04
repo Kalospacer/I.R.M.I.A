@@ -15,6 +15,7 @@
  */
 
 import type { AppEvent } from '../log/types.ts';
+import type { WarnExemptJudge, WarnExemptSubject } from './warn-exempt.ts';
 
 /** 命中类别：给她的那句提示按这个分档，不同档的说法不一样 */
 export type InjectionKind =
@@ -214,6 +215,32 @@ export function reasonOfHints(hints: readonly InjectionHint[]): string {
 /** 规则命中的引文：命中处那几段原文（与 `injectionNoteOf` 里的样本同一来源） */
 export function quotesOfHints(hints: readonly InjectionHint[]): string[] {
   return hints.map((h) => h.sample).filter((sample) => sample !== '');
+}
+
+// ──────────────────────────── 豁免闸门（规则命中 → 警告的唯一出口） ────────────────────────────
+
+/**
+ * **规则命中 → 给她的那句警告**（`text` 是那条外部消息的原文）。豁免的会话/人返回 null：
+ * 口径是"**不扫描也不提示**"（见 channel/warn-exempt.ts 的文件头），不是"照扫只是不说"。
+ *
+ * 为什么要有这个函数：算这句话的地方有两处（唤醒路径要落库、渲染层要现贴），两处各问一次
+ * 豁免就迟早会漏一处——2026-10-04 漏的正是渲染层那条（用户现场踩到：正常聊天里的「记忆」二字
+ * 被贴成"在向你要密钥、人格或记忆之类的东西"）。所以"要不要问、问到什么程度"写在一处。
+ *
+ * `exempt` 是**调用方递进来的判据**（唯一实现：`WarnExemptBook.isExempt`）；本模块不读盘、
+ * 也不持有任何进程级状态——渲染出的字节只取决于入参（缓存铁律 1，"同一份日志重建同一份请求"
+ * 这条不变量靠的就是它）。缺省/传 null = 谁都不豁免（预警开着是安全的那一侧）。
+ *
+ * 注意它只挡**规则层新产生的**警告：已经落库的 `injection/noted` / `injection/flagged`
+ * 是当时的事实，渲染照旧原样贴出来（不回头改写别人的记录）。
+ */
+export function ruleNoteFor(
+  text: string,
+  subject: WarnExemptSubject,
+  exempt: WarnExemptJudge | null = null,
+): string | null {
+  if (exempt !== null && exempt(subject) === true) return null;
+  return injectionNoteOf(scanForInjection(text));
 }
 
 // ──────────────────────────────── 示警事实（此刻层那段历史的素材） ────────────────────────────────

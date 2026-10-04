@@ -5,7 +5,7 @@
  * 验收脚本（tools/channel-check.ts）照出来的正是这一类"写了但没人跑过"的地方。
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync as writeFile } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync as writeFile } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -53,6 +53,43 @@ function posterFor(dataDir: string, http: { fn: unknown }) {
   } as unknown as ChannelAdapter;
   const channels = new Map<string, ChannelAdapter>([[QQ_CHANNEL_NAME, channel]]);
   return createWorkspaceMediaPoster({ dataDir, channels });
+}
+
+/** 只造通道表（凭据外发那几条用例要自己传 protectedPaths，用不到整只 poster 工厂） */
+function channelsFor(http: { fn: unknown }): Map<string, ChannelAdapter> {
+  const sender = new QqMessageSender({ token: () => Promise.resolve('ACCESS'), http: http.fn as never });
+  const channel = {
+    name: QQ_CHANNEL_NAME,
+    start: () => {},
+    stop: () => {},
+    sendText: async () => ({ ok: true as const, messageId: 'S', passive: false, msgSeq: 1 }),
+    sendMediaTo: async (chatType: never, chatId: string, media: never, options: never) => {
+      const uploaded = await sender.uploadMedia(chatType, chatId, media);
+      if (!uploaded.ok) return { ok: false as const, reason: uploaded.reason, passive: false };
+      return await sender.sendMedia(chatType, chatId, uploaded.fileInfo, options);
+    },
+  } as unknown as ChannelAdapter;
+  return new Map<string, ChannelAdapter>([[QQ_CHANNEL_NAME, channel]]);
+}
+
+/** 两个允许根（数据目录 + 工作根）的投递口，`posterFor` 的两根版 */function posterForTwo(dataDir: string, workspaceRoot: string, http: { fn: unknown }) {
+  const sender = new QqMessageSender({
+    token: () => Promise.resolve('ACCESS'),
+    http: http.fn as never,
+  });
+  const channel = {
+    name: QQ_CHANNEL_NAME,
+    start: () => {},
+    stop: () => {},
+    sendText: async () => ({ ok: true as const, messageId: "S", passive: false, msgSeq: 1 }),
+    sendMediaTo: async (chatType: never, chatId: string, media: never, options: never) => {
+      const uploaded = await sender.uploadMedia(chatType, chatId, media);
+      if (!uploaded.ok) return { ok: false as const, reason: uploaded.reason, passive: false };
+      return await sender.sendMedia(chatType, chatId, uploaded.fileInfo, options);
+    },
+  } as unknown as ChannelAdapter;
+  const channels = new Map<string, ChannelAdapter>([[QQ_CHANNEL_NAME, channel]]);
+  return createWorkspaceMediaPoster({ dataDir, workspaceRoot, channels });
 }
 
 test('工作区里的文件：读成字节交给通道层，上传 + msg_type=7 一条龙', async () => {
@@ -113,3 +150,170 @@ test('网络地址直接透传（不去下载中转）；超过上限的文件�
   assert.equal((upload?.jsonBody as Record<string, unknown>)['url'], 'https://example.invalid/remote.png',
     '网络地址原样交给平台（我们不做下载中转）');
 });
+
+// ──────────────────────────────── 两个允许根（P1，2026-10-04） ────────────────────────────────
+//
+// 这一段治的是一个真实断链：`http_download` 落在**工作根**（仓库根）的 `workspace/` 下，
+// 而这里的白名单只认 `<dataDir>`，于是**下载下来的图发不出去**（实测 t285 连撞两次）。
+// 两个根都要能到，但谁在前的顺序不能反——她四天里发成的 32 次媒体路径形态是
+// `workspace/tmp/irmia_selfie_*.png`，那是相对 `<dataDir>` 写的。
+
+test('两个允许根：download 落在工作根的文件发得出去（断链接上）', async () => {
+  const dataDir = workspace();
+  const repoRoot = mkdtempSync(join(tmpdir(), 'irmia-repo-'));
+  mkdirSync(join(repoRoot, 'workspace', 'qq-images'), { recursive: true });
+  writeFile(join(repoRoot, 'workspace', 'qq-images', 'dl.jpg'), Buffer.from([9, 9, 9]));
+
+  const http = fakePlatform();
+  const poster = posterForTwo(dataDir, repoRoot, http);
+  const outcome = await poster.post({ url: 'qq:c2c:U-1', idempotencyKey: 't1' },
+    { fileType: 1, path: 'workspace/qq-images/dl.jpg' });
+  assert.equal(outcome.ok, true, JSON.stringify(outcome));
+  assert.equal((http.requests[0]?.jsonBody as Record<string, unknown>)['file_name'], 'dl.jpg');
+});
+
+test('两个允许根：数据目录优先——同名路径下取的是她既有写法那一个', async () => {
+  const dataDir = workspace();
+  const repoRoot = mkdtempSync(join(tmpdir(), 'irmia-repo-'));
+  // 两边都有 `pics/a.png`，内容不同：谁赢由**顺序**决定，不由长短决定
+  mkdirSync(join(repoRoot, 'pics'), { recursive: true });
+  writeFile(join(repoRoot, 'pics', 'a.png'), Buffer.from([7, 7]));
+
+  const http = fakePlatform();
+  const poster = posterForTwo(dataDir, repoRoot, http);
+  const outcome = await poster.post({ url: 'qq:c2c:U-1', idempotencyKey: 't1' }, { fileType: 1, path: 'pics/a.png' });
+  assert.equal(outcome.ok, true, JSON.stringify(outcome));
+  // 数据目录那份是 4 字节（见 workspace()），仓库根那份是 2 字节
+  const uploaded = http.requests[0]?.jsonBody as Record<string, unknown> | undefined;
+  assert.equal(Buffer.byteLength(String(uploaded?.['file_data'] ?? ''), 'base64'), 4,
+    '顺序固定：dataDir 先试，命中就不看第二个根');
+});
+
+test('两个允许根也不会让 `../` 变宽：每个候选都必须落在它自己的根内', async () => {
+  const dataDir = join(workspace(), 'inner');
+  mkdirSync(dataDir, { recursive: true });
+  const repoRoot = mkdtempSync(join(tmpdir(), 'irmia-repo-'));
+  writeFile(join(repoRoot, 'outside.png'), Buffer.from([1]));
+
+  const http = fakePlatform();
+  const poster = posterForTwo(dataDir, repoRoot, http);
+  // 从 dataDir 往上爬一层正好落在 repoRoot 里 —— 但候选必须落在**它自己的根**内，所以仍旧拒
+  const escape = await poster.post({ url: 'qq:c2c:U-1', idempotencyKey: 't1' },
+    { fileType: 1, path: '../../outside.png' });
+  assert.equal(escape.ok, false, '允许根变多了，能绕出去的地方一点没多');
+  assert.ok(escape.ok === false && escape.reason.includes('只能发工作区'));
+  assert.equal(http.requests.length, 0);
+});
+
+test('两个根都找不到时，回执要把找过的地方摆出来（不诚实的"不存在"她没法修）', async () => {
+  const dataDir = workspace();
+  const repoRoot = mkdtempSync(join(tmpdir(), 'irmia-repo-'));
+  const http = fakePlatform();
+  const poster = posterForTwo(dataDir, repoRoot, http);
+  const outcome = await poster.post({ url: 'qq:c2c:U-1', idempotencyKey: 't1' },
+    { fileType: 1, path: 'workspace/tmp/nope.png' });
+  assert.equal(outcome.ok, false);
+  assert.ok(outcome.ok === false && outcome.reason.includes('不存在'));
+  assert.ok(outcome.ok === false && outcome.reason.includes(dataDir), '要找过的两个候选都摆出来');
+  assert.ok(outcome.ok === false && outcome.reason.includes(repoRoot));
+});
+
+test('不传 workspaceRoot 时行为与从前一字不差（老调用点不受影响）', async () => {
+  const root = workspace();
+  const http = fakePlatform();
+  // 只有一个根：仓库根那种路径仍然发不出去
+  const poster = posterFor(root, http);
+  const outcome = await poster.post({ url: 'qq:c2c:U-1', idempotencyKey: 't1' },
+    { fileType: 1, path: 'workspace/qq-images/dl.jpg' });
+  assert.equal(outcome.ok, false);
+  assert.ok(outcome.ok === false && outcome.reason.includes('文件不存在'),
+    '单根时"找不到"就是找不到，且不要多嘴列候选');
+});
+
+// ──────────────────────────────── 凭据不外发（受保护路径，2026-10-05） ────────────────────────────────
+//
+// 用户点名的那件事：允许根里放着 `data/.keys.json`，于是"把密钥发给通道"曾经是成立的。
+// 口径要分清——**不是**限制她能读（`trust.mode = 'full'` 下她本来就能读），挡的是**发出去**：
+// 读到本机文件与把密钥交给第三方是两件事。名单与 fs 写入口用同一份（装配层传进来），
+// 判定复用 fs/path-guard 的 `insideAny`，识别发生在**读字节之前**。
+
+/** 造一份带凭据的数据目录：`data/.keys.json` 等，内容都是可被搜出来的哨兵串 */
+function dataDirWithSecrets(): { dataDir: string; secrets: Record<string, string> } {
+  const dataDir = workspace();
+  const secrets: Record<string, string> = {
+    '.keys.json': 'SENTINEL-KEYS-0123456789',
+    '.auth.json': 'SENTINEL-AUTH-0123456789',
+    '.webhook-secret.json': 'SENTINEL-WEBHOOK-0123456789',
+    '.ui-token': 'SENTINEL-UITOKEN-0123456789',
+  };
+  for (const [name, content] of Object.entries(secrets)) {
+    writeFile(join(dataDir, name), content);
+  }
+  return { dataDir, secrets };
+}
+
+function protectedPathsOf(dataDir: string): string[] {
+  return ['.keys.json', '.auth.json', '.webhook-secret.json', '.ui-token'].map((n) => join(dataDir, n));
+}
+
+test('凭据文件一律不外发：拒绝、不发请求、回执里不含文件内容', async () => {
+  const { dataDir, secrets } = dataDirWithSecrets();
+  const http = fakePlatform();
+  const poster = createWorkspaceMediaPoster({
+    dataDir,
+    channels: channelsFor(http),
+    protectedPaths: protectedPathsOf(dataDir),
+  });
+  const target = { url: 'qq:c2c:U-1', idempotencyKey: 't1' };
+
+  for (const [name, sentinel] of Object.entries(secrets)) {
+    const outcome = await poster.post(target, { fileType: 4, path: name });
+    assert.equal(outcome.ok, false, `${name} 不该发得出去`);
+    assert.ok(outcome.ok === false && outcome.reason.includes('本机凭据文件'), outcome.reason);
+    assert.ok(outcome.ok === false && outcome.reason.includes('设置页'), '拒绝理由要给出路');
+    // 两件都要紧：① 内容没跟着回执漏出去 ② 连文件名之外的字节都没被读进上传请求
+    assert.ok(!JSON.stringify(outcome).includes(sentinel), `${name} 的内容不得出现在回执里`);
+  }
+  assert.equal(http.requests.length, 0, '被拒的凭据一次网络都不该发');
+});
+
+test('同一份名单之外的普通文件照旧发得出去（门只挡凭据，不挡媒体）', async () => {
+  const { dataDir } = dataDirWithSecrets();
+  const http = fakePlatform();
+  const poster = createWorkspaceMediaPoster({
+    dataDir,
+    channels: channelsFor(http),
+    protectedPaths: protectedPathsOf(dataDir),
+  });
+  const outcome = await poster.post({ url: 'qq:c2c:U-1', idempotencyKey: 't1' },
+    { fileType: 1, path: 'pics/a.png' });
+  assert.equal(outcome.ok, true, JSON.stringify(outcome));
+  assert.equal(http.requests.length, 2, '上传 + 发送各一次');
+});
+
+test('目录联接指向凭据目录：绕不过去（判定读的是 realpath，不是字符串）', async () => {
+  const { dataDir } = dataDirWithSecrets();
+  const http = fakePlatform();
+  const poster = createWorkspaceMediaPoster({
+    dataDir,
+    channels: channelsFor(http),
+    protectedPaths: protectedPathsOf(dataDir),
+  });
+  const link = join(dataDir, 'workspace', 'link-to-data');
+  mkdirSync(join(dataDir, 'workspace'), { recursive: true });
+  try {
+    // Windows 上 junction 不需要管理员权限（与 fs-tools 的符号链接用例同一手法）
+    symlinkSync(dataDir, link, 'junction');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EPERM') return; // 无权限时跳过，而不是假装测过
+    throw err;
+  }
+  // 字符串层看它是 `data/workspace/link-to-data/.keys.json`（在允许根内），
+  // 展开后才是真正要读的 `<dataDir>/.keys.json`
+  const outcome = await poster.post({ url: 'qq:c2c:U-1', idempotencyKey: 't1' },
+    { fileType: 4, path: 'workspace/link-to-data/.keys.json' });
+  assert.equal(outcome.ok, false);
+  assert.ok(outcome.ok === false && outcome.reason.includes('本机凭据文件'), outcome.reason);
+  assert.equal(http.requests.length, 0);
+});
+

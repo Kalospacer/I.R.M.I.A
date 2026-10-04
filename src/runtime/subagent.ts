@@ -255,6 +255,8 @@ export function createTaskTool(deps: TaskToolDeps): ToolDefinition {
           parentTurn: ctx.turn,
           taskText: renderTaskText(description, context),
           workspaceRoot: ctx.workspaceRoot,
+          // 边界原样继承父的（三态照带）：子代理的工具与父是同一批，边界也必须同一条
+          ...(ctx.boundaryRoot === undefined ? {} : { boundaryRoot: ctx.boundaryRoot }),
           signal: ctx.signal,
         });
         return await run.execute();
@@ -282,6 +284,8 @@ interface SubagentRunOptions {
   parentTurn: number;
   taskText: string;
   workspaceRoot: string;
+  /** 活动边界（三态原样继承父的；见 TaskToolDeps.boundaryRoot） */
+  boundaryRoot?: string | null;
   signal: AbortSignal | undefined;
 }
 
@@ -299,6 +303,8 @@ class SubagentRun {
   private readonly parentTurn: number;
   private readonly taskText: string;
   private readonly workspaceRoot: string;
+  /** 活动边界（三态原样携带；undefined = 用 workspaceRoot 当边界） */
+  private readonly boundaryRoot: string | null | undefined;
   private readonly signal: AbortSignal | undefined;
   private readonly guard: TaskBudgetGuard;
   /** 子代理自己的投影：从父投影的预算累计起算（隔离三件套之二） */
@@ -319,6 +325,7 @@ class SubagentRun {
     this.parentTurn = options.parentTurn;
     this.taskText = options.taskText;
     this.workspaceRoot = options.workspaceRoot;
+    this.boundaryRoot = options.boundaryRoot;
     this.signal = options.signal;
     this.guard = options.deps.guard ?? new BudgetGuard({ ...FALLBACK_LIMITS });
     this.projection = childProjectionOf(options.deps.projection);
@@ -367,6 +374,9 @@ class SubagentRun {
       timezone: d.timezone,
       lane: d.lane ?? 'heavy',
       workspaceRoot: this.workspaceRoot,
+      // 边界与 workspaceRoot 同行（子代理链的边界必须与父**逐字相同**，否则同一次任务里
+      // 内外两层的可活动范围会不一样，而她对这件事没有任何可见线索）
+      ...(this.boundaryRoot === undefined ? {} : { boundaryRoot: this.boundaryRoot }),
       budget: this.budgetHook(),
       // 上下文隔离：从空事件序列起
       eventFilter: childEventFilter(this.callId),

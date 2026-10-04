@@ -61,7 +61,12 @@ export interface ContextBreakdown {
   instructions: ContextSegment;
   /** 工具清单（JSON 形态的 name/description/parameters） */
   tools: ContextSegment & { count: number };
-  /** input[0] 长期记忆层：技能目录 + **记忆索引** + 早期摘要（压缩会改写它） */
+  /**
+   * input[0] 长期记忆层：技能目录 + 早期摘要（压缩会改写它）。
+   *
+   * **记忆索引不在这里**（v30 起在下面的 `state` 那一段）：她写一笔记忆索引就重建一次，
+   * 放头部会让整段历史从第 1 条起失守。这一段现在只剩"变了就是大事"的两样。
+   */
   memory: ContextSegment;
   /** 事件流渲染出来的历史 items。
    *
@@ -71,9 +76,10 @@ export interface ContextBreakdown {
    */
   history: ContextSegment & { headHash: string; items: number };
   /**
-   * 本轮固定块（B2）：`[当前状态]` + `[关系档案]` + 本轮选中的记忆正文。
+   * 本轮固定块（B2）：`[当前状态]` + `[关系档案]` + 本轮选中的记忆正文 + **记忆索引**（v30）。
    *
    * 它在历史之后、此刻层之前，**一轮之内逐字节不变**——正是"一步之内不必重新编码"的那一段。
+   * 索引（v30 从 `memory` 挪进来的）排在块的最后一段：它变时前缀能一直命到它之前。
    * **可选**：本次改动之前写下的 `budget/consumed` 里没有这一段（那时状态挤在此刻层里），
    * 读旧事件的一方必须按"没有"处理，而不是当成 0 token 的一段。
    */
