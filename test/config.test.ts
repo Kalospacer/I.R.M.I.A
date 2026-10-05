@@ -117,11 +117,11 @@ test('默认配置生成：空目录写出带注释的 config.json，字段齐�
   assert.equal(c.schemaVersion, CONFIG_VERSION);
   assert.equal(c.dataDir, join(dir, 'data'));
   assert.deepEqual(c.budget, {
-    stepTools: 20, turnSteps: 30, taskTokens: 500_000,
-    dailyTokens: 2_000_000, softRatio: 0.8, failStreakMax: 5,
+    stepTools: 20, turnSteps: 30, taskTokens: 500_000_000,
+    dailyTokens: 50_000_000, softRatio: 0.8, failStreakMax: 20,
   });
   assert.deepEqual(c.wake, {
-    heartbeatBaselineMin: 30, idleBackoffMax: 8, heartbeatFloorMin: 10, heartbeatCeilMin: 60,
+    heartbeatFloorMin: 5, heartbeatCeilMin: 60, heartbeatTickMin: 1, heartbeatTargetMeanMin: 30,
     memoryMaintainCron: DEFAULT_MEMORY_MAINTAIN_CRON,
   });
   assert.equal(c.tools.destructiveEnabled, false, 'destructive 必须默认关闭');
@@ -136,6 +136,91 @@ test('默认配置生成：空目录写出带注释的 config.json，字段齐�
   const again = await loadConfig(dir);
   assert.equal(again.createdDefault, false);
   assert.equal(again.configHash, loaded.configHash);
+});
+
+/**
+ * 出厂日额度的**下界**：不许低于"能撑住心跳"的量级（**下界 2e6 是一条不许松的地板**，
+ * 出厂值现在远在它之上：5e7）。
+ *
+ * 这条与上面那条用例是**两个方向**：上面钉"等于多少"（顺手改数字就能过），
+ * 这条钉"**不许低于多少**"——将来有人想把日额度调小，会先在这里被拦住，
+ * 并被要求回头看一眼那笔账。判据不放宽：下界写死在断言里，不是"看着差不多就行"。
+ *
+ * 为什么下界是这个量级（账，不是拍的；**2026-10-05 换口径后按新口径重算**）：
+ * 心跳是**真实唤醒**——每一拍都真发一次 heavy 请求，并且刻意共用同一份冻结前缀去保温
+ * 供方的前缀缓存（design.md §4.12）。于是心跳**自己**就有日开销：按现在这套概率分布
+ * 实测均值约 15 分钟一拍 ⇒ 约 96 拍/天；每拍**非缓存**（`(input − cacheHit) + output`）
+ * ≈ 未命中 0.36 万 + 输出 350 ≈ **0.4 万** ⇒ 一天 ≈ **0.35M**。
+ *（口径、样本量与脚本：`_research/heartbeat-real-wake-audit.mjs`；结论记在 design.md §4.12，
+ * 账记在 §4.6。旧口径那笔账是"176 万~500 万 token/天"，两者差约 25 倍，别混——那笔账判死的是
+ * **旧口径下的 2M**。）
+ *
+ * 下界取心跳日均**上界估算**（0.5M）的 **4 倍 = 2e6**：日额度里心跳至多占 1/4，
+ * 大头留给"心跳之上的真实工作"。**要调小，先来改这条注释里的账与出处，别只改数字。**
+ */
+test('出厂日额度：默认值不许低于能撑住心跳的量级（地板 2e6；出厂值 5e7）', async (t) => {
+  const dir = await freshDir(t);
+  const { config } = await loadConfig(dir);
+
+  // 心跳真实唤醒的日均开销**上界估算**（非缓存口径；出处见上面这段注释）
+  const HEARTBEAT_DAILY_HIGH = 500_000;
+  // 出厂下界**写死 2e6**（= 心跳上界的 4 倍）：出厂额度里心跳只该占个零头（≤ 1/4）。
+  // 写死而不是"由上面那个常量算出来"，是为了让这条判据**没法被顺手放松**：
+  // 想放宽就得同时动下面那条自检，一眼能看见。
+  const FACTORY_FLOOR = 2_000_000;
+  assert.ok(
+    FACTORY_FLOOR >= HEARTBEAT_DAILY_HIGH * 4,
+    '这条用例自己也不许被放松：下界必须 ≥ 心跳日均上界的 4 倍（要改先看上面那笔账）',
+  );
+
+  assert.ok(
+    config.budget.dailyTokens >= FACTORY_FLOOR,
+    `出厂日额度 ${config.budget.dailyTokens} 低于能撑住心跳的量级 ${FACTORY_FLOOR}：`
+      + '心跳是真实唤醒（约 96 拍/天、非缓存约 0.35M/天，见 _research/heartbeat-real-wake-audit.mjs），'
+      + '调这么小会被心跳自己吃掉一大块。账与出处写在 test/config.test.ts 这条用例的注释里与 docs/design.md §4.6/§4.12。',
+  );
+  // 同族自洽（2026-10-05 起的方向）：**日那一层要先响**——它管"一整天"，task 只管"单个任务"。
+  // 所以单任务额度不许比日额度更紧；反过来的话每个 turn 都先撞 task，日额度形同虚设。
+  // （换口径前这条判据是反的：那时 task = daily = 1e8，方向刻意相反；见 config.ts 那两段注释。）
+  assert.ok(
+    config.budget.dailyTokens <= config.budget.taskTokens,
+    '日额度不许高于单任务额度（否则 task 永远先撞线、「日」那一层轮不到）',
+  );
+});
+
+/**
+ * 出厂**单任务**额度的下界（**下界 5e6 是一条不许松的地板**；出厂值现在远在它之上：5e8）。
+ *
+ * 与日额度那条**同一条理由、同一个量级**：心跳每天约 0.35M 非缓存（上界估算 0.5M），
+ * 而 task 那一层是"一个任务的累计消耗"（`tokensTask` 跨 turn 累计、到点把这个 turn 收尾）。
+ * 额度定得比心跳的日均开销还小，等于每次正常任务都先撞它。
+ *
+ * 为什么**不**干脆写成"taskTokens 必须 == dailyTokens"：那是把两层语义焊死（task 撞线 =
+ * 这次任务进待确认，daily 撞线 = 今天拒绝唤醒）。这里钉两件事：不许比心跳量级还小、
+ * 且**比日额度宽**（日先响）。要调的人自己看这笔账。
+ */
+test('出厂单任务额度：不许低于心跳量级的 10 倍，且要比日额度宽（地板 5e6；出厂值 5e8）', async (t) => {
+  const dir = await freshDir(t);
+  const { config } = await loadConfig(dir);
+
+  // 心跳日均非缓存开销的上界估算（与日额度那条同一个常量）
+  const HEARTBEAT_DAILY_HIGH = 500_000;
+  // 出厂下界**写死 5e6**（= 心跳上界的 10 倍，也 = 日额度下界 2e6 的 2.5 倍）
+  const TASK_FLOOR = 5_000_000;
+  assert.ok(
+    TASK_FLOOR >= HEARTBEAT_DAILY_HIGH * 10,
+    '这条用例自己也不许被放松：下界必须 ≥ 心跳日均上界的 10 倍（要改先看上面那笔账）',
+  );
+  assert.ok(
+    config.budget.taskTokens >= TASK_FLOOR,
+    `出厂单任务额度 ${config.budget.taskTokens} 低于能撑住心跳的量级 ${TASK_FLOOR}：`
+      + '旧口径下的 500k 就是这么被判死的（心跳自己就把额度吃掉一大块，task 会先撞线，'
+      + '把每次正常任务都变成"进待确认"）。账与出处见 src/config/config.ts 里 taskTokens 那段注释。',
+  );
+  assert.ok(
+    config.budget.taskTokens >= config.budget.dailyTokens,
+    '单任务额度不许比日额度更紧：新口径下该由「日」那一层先响',
+  );
 });
 
 /**
@@ -206,7 +291,7 @@ test('缺失字段合并默认：段内缺字段补默认，用户写过的值�
 
   assert.equal(config.budget.turnSteps, 5);
   assert.equal(config.budget.stepTools, 20, '同段内缺失字段要补默认');
-  assert.equal(config.budget.dailyTokens, 2_000_000);
+  assert.equal(config.budget.dailyTokens, 50_000_000, '缺 dailyTokens 时补的是**新**出厂默认（单日非缓存 5e7）');
   assert.equal(config.timezone, 'Asia/Shanghai');
 
   assert.equal(config.models.heavy.model, 'custom-heavy');
@@ -220,16 +305,185 @@ test('缺失字段合并默认：段内缺字段补默认，用户写过的值�
   assert.deepEqual(Object.keys(onDisk).sort(), ['budget', 'models', 'timezone']);
 });
 
-test('心跳区间：上下限可配，空拍上限低于下限时兜到下限（不静默变成“更久不露面”）', async (t) => {
+test('心跳区间：上下限可配，上限低于下限时兜到下限（不静默变成“更久不露面”）', async (t) => {
   const dir = await freshDir(t);
   await writeRawConfig(dir, {
-    wake: { heartbeatBaselineMin: 5, heartbeatFloorMin: 10, heartbeatCeilMin: 3 },
+    wake: { heartbeatFloorMin: 10, heartbeatCeilMin: 3 },
     timezone: 'Asia/Shanghai',
   });
 
   const { config } = await loadConfig(dir);
   assert.equal(config.wake.heartbeatFloorMin, 10);
   assert.equal(config.wake.heartbeatCeilMin, 10, '上限写小于下限：取上限 = 下限，因为“静默更久”才是坏方向');
+});
+
+/**
+ * 抽签节奏不许超过下限（2026-10-04 概率模型）。
+ *
+ * 为什么钉这一条：`heartbeatTickMin` 是**抽签间隔**，第一次抽签落在此刻（安静 = tick）。
+ * 它一旦大于下限，第一抽就会落在下限**之后**，下限（"安静不足 5 分钟绝不触发"）就不再是下限——
+ * 更糟的是它还会把整个分布的支撑往下推（5~60 变成 tick~60），均值随之漂走。
+ * 所以解析器直接把 tick 夹到 floor 之内，而不是留给运行期"看着不对再说"。
+ */
+test('抽签节奏：可配，但超过下限时夹到下限（下限必须是真下界）', async (t) => {
+  const dir = await freshDir(t);
+  await writeRawConfig(dir, {
+    wake: { heartbeatFloorMin: 5, heartbeatCeilMin: 60, heartbeatTickMin: 30 },
+    timezone: 'Asia/Shanghai',
+  });
+
+  const { config } = await loadConfig(dir);
+  assert.equal(config.wake.heartbeatTickMin, 5, 'tick 写在 floor 之上：夹到 floor，不把下限推后');
+
+  // 对照：合法范围内原样生效
+  const dir2 = await freshDir(t);
+  await writeRawConfig(dir2, {
+    wake: { heartbeatFloorMin: 5, heartbeatCeilMin: 60, heartbeatTickMin: 2 },
+    timezone: 'Asia/Shanghai',
+  });
+  assert.equal((await loadConfig(dir2)).config.wake.heartbeatTickMin, 2);
+});
+
+/**
+ * 心跳**目标均值**（`wake.heartbeatTargetMeanMin`，2026-02-06 加）：说人话的调频旋钮。
+ *
+ * 为什么钉这几条：这个字段是「心跳频率没有地方可以控制吗？」的答案——它必须
+ * **真的能填、填了真的生效**（解析出来就是那个数，α 由它在启动时反解，见
+ * `test/heartbeat-target-mean.test.ts`），而写错的三种方式必须**当场报配置错**而不是
+ * 静默夹一个值（夹过的旋钮比没有旋钮更坏：人会以为自己调过了）。
+ */
+test('心跳目标均值：默认 30，可配，合法值原样生效', async (t) => {
+  const dir = await freshDir(t);
+  assert.equal((await loadConfig(dir)).config.wake.heartbeatTargetMeanMin, 30, '默认 30 = 平均每半小时露一次面');
+
+  const dir2 = await freshDir(t);
+  await writeRawConfig(dir2, {
+    wake: { heartbeatFloorMin: 5, heartbeatCeilMin: 60, heartbeatTargetMeanMin: 20 },
+    timezone: 'Asia/Shanghai',
+  });
+  assert.equal((await loadConfig(dir2)).config.wake.heartbeatTargetMeanMin, 20, '写 20 就是 20（不夹、不舍）');
+
+  // 边界内的两个极端也要能填：floor+1 与 ceil−1（整数分钟里最靠边的合法值）
+  const dir3 = await freshDir(t);
+  await writeRawConfig(dir3, {
+    wake: { heartbeatFloorMin: 14, heartbeatCeilMin: 16, heartbeatTargetMeanMin: 15 },
+    timezone: 'Asia/Shanghai',
+  });
+  assert.equal((await loadConfig(dir3)).config.wake.heartbeatTargetMeanMin, 15);
+});
+
+test('心跳目标均值 ≤ 下限 / ≥ 上限：报配置错，消息里带两个边界的值', async (t) => {
+  // ① 等于下限（下限以下概率恒为 0，"平均 10 分钟醒一次但 10 分钟内绝不触发"是自相矛盾的）
+  const atFloor = await freshDir(t);
+  await writeRawConfig(atFloor, {
+    wake: { heartbeatFloorMin: 10, heartbeatCeilMin: 60, heartbeatTargetMeanMin: 10 },
+    timezone: 'Asia/Shanghai',
+  });
+  await assert.rejects(
+    () => loadConfig(atFloor),
+    (err: unknown) => {
+      assert.ok(err instanceof ConfigError, `必须是配置错，收到 ${String(err)}`);
+      assert.equal(err.where, 'wake.heartbeatTargetMeanMin');
+      assert.match(err.message, /10/, '消息要说清下限的值');
+      assert.match(err.message, /60/, '以及上限的值');
+      assert.match(err.message, /严格/, '说清是开区间（不能等于边界）');
+      return true;
+    },
+  );
+
+  // ② 等于上限（到点必然触发那一点不是"平均"，是硬边界）
+  //    这里把 ceil 收到 20，让"非默认值的 20"正好落在上限上——用默认值当靶子的话，
+  //    默认值一改这条用例就变成"什么都没测"（而不是失败），那是最坏的一种测试。
+  const atCeil = await freshDir(t);
+  await writeRawConfig(atCeil, {
+    wake: { heartbeatFloorMin: 5, heartbeatCeilMin: 20, heartbeatTargetMeanMin: 20 },
+    timezone: 'Asia/Shanghai',
+  });
+  await assert.rejects(
+    () => loadConfig(atCeil),
+    (err: unknown) => {
+      assert.ok(err instanceof ConfigError);
+      assert.equal(err.where, 'wake.heartbeatTargetMeanMin');
+      assert.match(err.message, /5/);
+      assert.match(err.message, /20/);
+      return true;
+    },
+  );
+
+  // ③ 只把下限调大、没写目标均值：默认 30 与 floor 冲突 ⇒ 也要报错，并说清这个 30 是**代码默认值**
+  const floorOnly = await freshDir(t);
+  await writeRawConfig(floorOnly, {
+    wake: { heartbeatFloorMin: 40, heartbeatCeilMin: 90 },
+    timezone: 'Asia/Shanghai',
+  });
+  await assert.rejects(
+    () => loadConfig(floorOnly),
+    (err: unknown) => {
+      assert.ok(err instanceof ConfigError);
+      assert.match(err.message, /40/, '下限的值');
+      assert.match(err.message, /90/, '上限的值');
+      assert.match(err.message, /代码默认值/, '要说清 30 是从哪来的，否则像是他自己填错了');
+      // "能填的范围"必须是两条约束的**交**：floor<目标<ceil 给 41~89，本字段自身限定 5~60
+      // ⇒ 真正能填的是 41~60。只报 41~89 会给出一个填进去照样报错的范围（实测踩过）。
+      assert.match(err.message, /41~60/, '报出来的范围要取交集（41~89 ∩ 5~60 = 41~60）');
+      assert.doesNotMatch(err.message, /41~89/, '不许报一条越出本字段自身范围的"出路"');
+      return true;
+    },
+  );
+});
+
+test('心跳目标均值：外层合理范围 5~60，越界报错（与边界值无关的那一层）', async (t) => {
+  for (const target of [4, 61]) {
+    const dir = await freshDir(t);
+    await writeRawConfig(dir, {
+      wake: { heartbeatFloorMin: 1, heartbeatCeilMin: 120, heartbeatTargetMeanMin: target },
+      timezone: 'Asia/Shanghai',
+    });
+    await assert.rejects(
+      () => loadConfig(dir),
+      (err: unknown) => {
+        assert.ok(err instanceof ConfigError, `${target} 必须被 5~60 那一层挡住`);
+        assert.equal(err.where, 'wake.heartbeatTargetMeanMin');
+        assert.match(err.message, /5\.\.60/, '报错要说清可填范围');
+        return true;
+      },
+    );
+  }
+});
+
+test('心跳目标均值：上限被夹成下限的退化区间里不做交叉校验（既有夹取语义不改）', async (t) => {
+  // ceil < floor 时解析器按"上限 = 下限"夹取（更快的节律不危险）——那种区间里没有中间地带，
+  // α 与目标均值都无意义，所以出厂默认值不该把一份本来能启动的配置变成起不来。
+  const dir = await freshDir(t);
+  await writeRawConfig(dir, {
+    wake: { heartbeatFloorMin: 30, heartbeatCeilMin: 3 },
+    timezone: 'Asia/Shanghai',
+  });
+  const { config } = await loadConfig(dir);
+  assert.equal(config.wake.heartbeatFloorMin, 30);
+  assert.equal(config.wake.heartbeatCeilMin, 30, '上限仍夹到下限');
+  assert.equal(config.wake.heartbeatTargetMeanMin, 30, '目标均值照旧解析出来（只是这个区间里用不上它）');
+});
+
+/**
+ * 删掉的两个字段**不报错、也不生效**（2026-10-04 概率模型）。
+ *
+ * `heartbeatBaselineMin` / `idleBackoffMax` 是旧确定性排程的参数，已随新模型删除。
+ * 老配置文件里残留下来的这两个键按"逐字段读、不认识的键不进结果"处理：既不抛 ConfigError
+ * （否则老用户升上来直接起不来），也不会假装生效（那比报错更难查）。
+ * 这条用例把"删干净了"钉在案上——将来谁把字段加回来，这里会红。
+ */
+test('已删除的旧心跳字段：残留不报错、也不出现在生效配置里', async (t) => {
+  const dir = await freshDir(t);
+  await writeRawConfig(dir, {
+    wake: { heartbeatBaselineMin: 30, idleBackoffMax: 8, heartbeatFloorMin: 5 },
+    timezone: 'Asia/Shanghai',
+  });
+
+  const { config } = await loadConfig(dir);
+  assert.equal('heartbeatBaselineMin' in config.wake, false, '旧基线字段不该复活');
+  assert.equal('idleBackoffMax' in config.wake, false, '旧退避字段不该复活');
+  assert.equal(config.wake.heartbeatFloorMin, 5, '同段里没被删的字段照常生效');
 });
 
 // ──────────────────────────────── 外部依赖（v30） ────────────────────────────────

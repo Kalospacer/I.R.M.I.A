@@ -547,7 +547,19 @@ test('M3-5 硬停后 topup 恢复：暂停期间拒绝唤醒，加注后原地�
   assert.deepEqual(turns, [1, 2], 'turn 号接着往下走，不重来');
   assert.equal(ofType(events, 'input/claimed').length, 2, '第二条输入由第 2 个 turn 认领');
   assert.equal(harness.projection.pending.length, 0);
-  assert.equal(harness.projection.budget.tokensTask >= tokensAtHalt, true, '已消耗的 token 一个字节都不动');
+  // **进度不丢**的口径（2026-10-05 改口径时一并定的）：
+  //   · 当日累计只增不减——**真花掉的钱一笔都没丢**（它才是账）；
+  //   · `tokensTask` 归零——解除 task 层暂停 = 那次任务结束，新任务从零开始数
+  //     （见 state/fold.ts 的 applyTaskBoundary）。否则这一格"只累加、永不归零"，
+  //     加注解除之后下一步立刻又越线，那就成了"加注也救不回来"。
+  const tokensTodayAfterTopUp = harness.projection.budget.tokensToday;
+  assert.equal(tokensTodayAfterTopUp >= tokensAtHalt, true, '当日已消耗的 token 一个字节都不动');
+  assert.equal(harness.projection.budget.tokensTask < tokensAtHalt, true, '任务账翻了新的一页（归零后重新累计）');
+  assert.equal(
+    harness.projection.budget.tokensTask,
+    tokensTodayAfterTopUp - tokensAtHalt,
+    '新任务那一页 = 加注之后新花的那些（今日累计里减去它之前的那部分）',
+  );
   assert.equal(harness.model.requests.length, 3, '加注后确实接着跑了');
 
   // 恢复通知（M3-7）：故障结束说一次，且与故障告警不是同一条
@@ -1077,11 +1089,43 @@ test('F5b 跨重启恢复配对：故障键与"这条是恢复通知"从 alarm/s
     now: () => harness.clock.now,
     history: events,
   });
-  await second.ok('stall', '水位恢复正常：等待中的输入已被处理。');
+  // 走 `releasePending`（2026-10-05 加）：这条故障是**上一个进程报出去的**，新进程从没见过
+  // 它发生，所以 `ok()` 不给它背书（那条路要"本进程亲眼看见"）；启动补写那条路要求调用方
+  // 先核实"当刻确实不成立"，然后由 `releasePending` 写下这条销账。
+  await second.releasePending('stall', '水位恢复正常：等待中的输入已被处理。');
 
   const alarms = alarmsOf(await harness.events());
   assert.equal(alarms.length, 2, '重启之后仍要发出这一次"已恢复"');
   assert.equal(alarms[1]!.title, '已恢复：stall');
+});
+
+test('F5b 重启之后 ok() 不给"上一个进程报出去的"故障背书（2026-10-05 补）', async (t) => {
+  const harness = await makeHarness(t, {}, []);
+  const emit = (type: string, data: unknown): void => { harness.append(type, data); };
+
+  const first = createNotifier({
+    config: { rateLimitMin: 30 },
+    dataDir: harness.dir,
+    emit,
+    now: () => harness.clock.now,
+  });
+  await first.fail({ category: 'model-failure', level: 'critical', title: '模型连续失败 5 次', body: 'x' });
+
+  const events = await harness.events();
+  const second = createNotifier({
+    config: { rateLimitMin: 30 },
+    dataDir: harness.dir,
+    emit,
+    now: () => harness.clock.now,
+    history: events,
+  });
+  // 新进程的 `healthCheck` 每拍都会因为"当刻没在失败"而调 ok()——但本进程从没见过那串失败，
+  // 写"模型调用已恢复成功"就是编事实（重启不等于那一串失败没发生过）。
+  await second.ok('model-failure', '模型调用已恢复成功：连续失败计数归零。');
+
+  const alarms = alarmsOf(await harness.events());
+  assert.equal(alarms.length, 1, '一个字都不许补：历史事实类的账不该由重启来销');
+  assert.equal(alarms[0]!.level, 'critical');
 });
 // ──────────────────────────────── F5b 结束 ────────────────────────────────
 

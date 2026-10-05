@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../markdown.dart';
 import '../theme.dart';
 import '../ui_kit.dart';
 import 'page_chrome.dart';
@@ -1008,11 +1009,14 @@ class _ChatPageState extends State<ChatPage> {
                 child: FilledButton(
                   style: FilledButton.styleFrom(
                     padding: EdgeInsets.zero,
-                    shape: const CircleBorder(),
-                    backgroundColor: scheme.primary,
+                    // 暗主题下：填充与背景相同（透明）+ 一圈白描边；亮主题下：原来那个
+                    // `const CircleBorder()` + primary 填充。判据与取值都在 theme.dart 的
+                    // IrmiaDarkPair 里，这里不判明暗、也不挑色。
+                    shape: scheme.sendButtonShape,
+                    backgroundColor: scheme.pairFill,
                   ),
                   onPressed: () => unawaited(send()),
-                  child: Icon(Icons.arrow_upward_rounded, size: 20, color: scheme.onPrimary),
+                  child: Icon(Icons.arrow_upward_rounded, size: 20, color: scheme.pairOn),
                 ),
               ),
             ],
@@ -1170,14 +1174,18 @@ class _BubbleRow extends StatelessWidget {
       constraints: const BoxConstraints(maxWidth: 460),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
-        color: isMe ? scheme.primary : scheme.surface,
+        // 用户自己那条气泡：亮主题＝原来那个主色实心；暗主题＝**蓝去掉**，填充与背景相同
+        // （透明）+ 一圈白描边。判据与取值都在 theme.dart 的 IrmiaDarkPair 里。
+        color: isMe ? scheme.pairFill : scheme.surface,
         borderRadius: BorderRadius.only(
           topLeft: const Radius.circular(16),
           topRight: const Radius.circular(16),
           bottomLeft: Radius.circular(isMe ? 16 : 4),
           bottomRight: Radius.circular(isMe ? 4 : 16),
         ),
-        border: isMe ? null : Border.all(color: scheme.outlineVariant),
+        // 她的气泡本来就有 outlineVariant 那一圈，**两模都不动**；只有用户那条在暗主题下
+        // 多这一圈白（亮主题下 `bubbleHairline` 就是 `null`，与动手前逐字节相同）。
+        border: isMe ? scheme.bubbleHairline : Border.all(color: scheme.outlineVariant),
         boxShadow: IrmiaTheme.hairline,
       ),
       child: Column(
@@ -1185,13 +1193,17 @@ class _BubbleRow extends StatelessWidget {
         children: [
           // 这条分支原来挂的是「会话来源：QQ」那句灰字——只有通道消息会用它，而通道消息
           // 现在是靠右的卡片（_ChannelBlock），气泡上不再需要一行来源说明。
-          // 整段直出，可选中复制
-          SelectableText(
+          //
+          // **她的与用户的都走同一套 MD 渲染**（用户 2026-10-05："该实现简单的 MD 渲染了"）：
+          // 字面的 `**粗体**`、反引号在气泡里不该再出现。渲染不改变文本本身——选中复制
+          // 拿到的仍是原文（见 markdown.dart 的三条纪律）。
+          MarkdownText(
             item.text,
-            style: TextStyle(
+            base: TextStyle(
               fontSize: 14.5,
               height: 1.65,
-              color: isMe ? scheme.onPrimary : scheme.onSurface,
+              // 暗主题下气泡底是透明的，字走正常前景（主题的白）；亮主题＝原来的 onPrimary
+              color: isMe ? scheme.pairOn : scheme.onSurface,
             ),
           ),
         ],
@@ -1368,6 +1380,9 @@ class _ToolBlock extends StatelessWidget {
     if (result.isEmpty) {
       return Text(status.label, style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant));
     }
+    // **回退**：出错这一档的底/字曾经被改成主题的 error token（`errorFill/On`），
+    // 用户 2026-10-05 只圈了"发送按钮和气泡"两处、并问"改其他的干嘛"——所以它回到
+    // 原样：正文一律 `onSurface`，没有那块红色的底。别在这里再"优化"配色。
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1619,6 +1634,8 @@ class _NoticeCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final detail = (item.detail ?? '').trim();
+    // **回退**：注入预警那根字曾经被换成主题的 error token，用户没要这一处——
+    // 回到原来那个写死的危险色 `IrmiaTheme.danger`（#E03131）。
     final tone = _isInjection ? IrmiaTheme.danger : scheme.onSurfaceVariant;
     return Container(
       // 三种标签共用一个组件，但定位件保留三个名字：分界那一条的用例按 boundary-card 找、
@@ -1668,7 +1685,13 @@ class _NoticeCard extends StatelessWidget {
                 style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600)),
           ],
           const SizedBox(height: 6),
-          Text(item.text, style: TextStyle(fontSize: 12.5, color: scheme.onSurface)),
+          // 「框架提醒」卡正文与气泡**同一套 MD 渲染**（用户 2026-10-05）：注入预警、
+          // 告警、定时提醒这些现在也是字面的 `**`。同一套渲染器意味着同一份纪律
+          // （不改文本本身 / 规则外原样 / 未闭合退化），不需要第二处判据。
+          MarkdownText(
+            item.text,
+            base: TextStyle(fontSize: 12.5, color: scheme.onSurface),
+          ),
           for (final quote in item.quotes) _InjectionQuote(text: quote),
           if (detail.isNotEmpty) ...[
             const SizedBox(height: 3),
@@ -1906,6 +1929,11 @@ class _ToolStatus {
 }
 
 /// 回执状态 → 颜色 / 图标 / 状态词。null 表示还没回执（正在跑）。
+///
+/// **出错那一档回到写死的 `IrmiaTheme.danger`**（#E03131）：上一轮它被换成了主题的
+/// `errorOn`（深色模浅红），理由是深色底上的对比度；用户 2026-10-05 只圈了气泡与发送键
+/// 两处，并问"改其他的干嘛"——所以这里原样退回。四色在明暗两模下都不随主题漂移
+/// （见 [IrmiaTheme.ok] 那一段的说明），要动它得先问用户。
 _ToolStatus _toolStatus(String? status, ColorScheme scheme) {
   switch (status) {
     case null:

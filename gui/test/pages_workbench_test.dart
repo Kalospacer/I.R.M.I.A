@@ -321,6 +321,11 @@ void main() {
     final post = _lastApi!.posts.single;
     expect(post.path, '/api/commands/config-update');
     expect(post.confirm, 'config-update', reason: '写配置必须带 X-Confirm');
+    // 反向判据：这一笔写的是 `channels.qqOfficial.enabled`，**不是** `trust.mode`，
+    // 所以不许带字段短语 `trust-full-access`——那是"改信任范围"专用的门。
+    // 无脑给所有 config 提交都加，等于把那条门放宽到"随便谁都能声明"，判据就没了。
+    expect(post.confirm, isNot(contains('trust-full-access')),
+        reason: '不带 trust.mode 的提交不该带那个字段短语');
     expect(post.body['fields'], {'channels.qqOfficial.enabled': false});
 
     // 改一个字段：只提交该字段，不带上没动过的项

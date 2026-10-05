@@ -24,7 +24,7 @@ function facts(overrides: Record<string, unknown> = {}) {
       lastSeenAt: '2026-10-04T12:00:00.000Z',
     }],
     contacts: new Map<string, string>([[sid, '测试群聊2']]),
-    aliases: new Map<string, string>(),
+    aliases: new Map<string, { name: string }>(),
     wakeMessage: {
       channel: 'qq-official',
       chatType: 'group-at',

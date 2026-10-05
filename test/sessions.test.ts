@@ -205,9 +205,19 @@ describe('会话簿 · 名字从哪来', () => {
       'qq:c2c:Y =',
       '',
     ].join('\n'));
-    assert.equal(aliases.get('qq:c2c:X'), '用户（OWNER）', '列表写法也认');
-    assert.equal(aliases.get('qq:group-at:G'), '技术群');
+    assert.deepEqual(aliases.get('qq:c2c:X'), { name: '用户', note: 'OWNER' }, '列表写法也认；括号里是备注');
+    assert.deepEqual(aliases.get('qq:group-at:G'), { name: '技术群' });
     assert.equal(aliases.size, 2, '无等号、键不带冒号、名字为空的都跳过');
+  });
+
+  test('别名里的备注：名字只取第一个括号之前，备注整段留着', () => {
+    // 用户实测踩到的那一行（形如 aliases.md 第 10 行）：名字 + 口径一起写在等号右边，
+    // 读取侧原来把整串当名字 → 界面那格窄、光标被顶到末尾，人看到的是备注的尾巴
+    const line = 'qq:group:0AE5 = IRMIA框架测试群（10-04 18:15 用户拉我进来；**群友多是他的网友**——口径：不透露用户的私事，看情况淡着）';
+    assert.deepEqual(parseAliases(line).get('qq:group:0AE5'), {
+      name: 'IRMIA框架测试群',
+      note: '10-04 18:15 用户拉我进来；**群友多是他的网友**——口径：不透露用户的私事，看情况淡着',
+    });
   });
 
   test('空别名表与缺文件同样处理：不报错，退回 openid', () => {

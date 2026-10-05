@@ -327,6 +327,14 @@ class AppState extends ChangeNotifier {
   String dotKind = 'loading';
   String stateText = '正在连接…';
   String subText = '';
+
+  /// **服务端给的状态旁注**（`/api/stats/dashboard.stateNote`，可以为空）。
+  ///
+  /// 目前只有一种内容："预算暂停已解除（turn 层）"——**已经过去的那件事的下文**。
+  /// 它与 [stateText] 分工不同：状态词说当刻在干什么，旁注说昨天那句话后来怎么了。
+  /// 用户 2026-10-05 报的「一直显示预算耗尽」有一半就是这条没有下文（另一半是判据，
+  /// 已收到服务端的 `livePausedLayers` 一处）。
+  String stateNote = '';
   ThemeMode themeMode = ThemeMode.light;
 
   /// **她的名字**：`persona/IDENTITY.md` 里 `名字：` 那一行的值，null = 还没读到/还没写。
@@ -896,7 +904,17 @@ class AppState extends ChangeNotifier {
         final state = stats['state'] as String?;
         final tiles = stats['tiles'];
         needsReview = tiles is Map ? ((tiles['needsReview'] ?? 0) as num).toInt() : 0;
-        stateText = IrmiaTheme.humanState(state, needsReview: needsReview);
+        // 状态词**照抄服务端**（判据一处：`src/web/server.ts` 的 deriveState/livePausedLayers）。
+        // 界面过去自己按 `paused` 那张词表拼"已暂停（预算耗尽）"——而那正是用户 2026-10-05
+        // 看到的假话：她跑了十几个小时，左上角还写着"已暂停"（判据太松，见服务端的注释）。
+        // 界面不再有第二份判断：服务端说 `stateText` 就照它显示；老服务端没这个字段时
+        // 才退回词表（半升级态不至于一片空白）。
+        final served = stats['stateText'];
+        stateText = served is String && served.isNotEmpty
+            ? served
+            : IrmiaTheme.humanState(state, needsReview: needsReview);
+        final note = stats['stateNote'];
+        stateNote = note is String ? note : '';
         dotKind = state ?? 'idle';
         final days = stats['guardedDays'] ?? 0;
         final next = stats['nextWakeAt'];

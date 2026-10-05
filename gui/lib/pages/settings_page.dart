@@ -28,6 +28,9 @@ import 'webhook_secret.dart';
 // 写通道只有两条：
 //   · 配置字段（模型 / 发言节奏 / 系统参数）→ POST /api/commands/config-update
 //     （写 config.json，X-Confirm: config-update，进程重启后接管）
+//     **例外**：有两个字段在服务端 `DANGEROUS_FIELDS` 里登记了**字段短语**，改它们时
+//     `X-Confirm` 要在 `config-update` 之后追加那半截——`trust.mode` → 见 [kTrustConfirm]，
+//     `tools.destructiveEnabled` → `enable-destructive`（那一处就地写着）。其余字段不许跟着加。
 //   · API 密钥 → POST /api/commands/set-key（写 data/.keys.json，X-Confirm: set-key）
 // 密钥只写不读：GET /api/keys 只返回 {configured, mask}，完整值不经过本页面。
 class SettingsPage extends StatefulWidget {
@@ -280,15 +283,22 @@ enum _SysKind {
 
   /// (0,1] 的小数：`pickRatio` 专门拒绝"写成 8 而不是 0.8"这种真实错误
   ratio,
+
+  /// **闭区间内的整数**：区间由字段自己带（[min] / [max]）。
+  ///
+  /// 与 [count] 分开，是因为"这一段数里才有意义"与"至少是 1"是两种判据，硬塞进 [count]
+  /// 会让那五条预算的提示文案跟着变形。当前唯一的一个是心跳平均间隔
+  /// （`wake.heartbeatTargetMeanMin`，6~59，见 [_sysHeartbeatMean]）。
+  range,
 }
 
 /// 系统卡里的一个可编辑字段：点路径 + 标签 + 形状 + 旁注。
 ///
-/// 为什么规格摆成数据而不是九段长得一样的 build 代码：脏判定、保存、回填、渲染四处
+/// 为什么规格摆成数据而不是十段长得一样的 build 代码：脏判定、保存、回填、渲染四处
 /// 都按这一份清单走；抄九遍的下场是某一格"改了却存不进去"或"存了却不显脏"，
 /// 而这两种 bug 都不会报错，只会静静地少写一个字段。
 class _SysField {
-  const _SysField(this.path, this.label, this.kind, {this.note, this.hint});
+  const _SysField(this.path, this.label, this.kind, {this.note, this.hint, this.min, this.max});
 
   /// 写进 config.json 的点路径：既是输入框的 key（测试按它定位），也是提交时的字段名
   final String path;
@@ -301,8 +311,14 @@ class _SysField {
   /// 框里的示例（只在框空着时显示）
   final String? hint;
 
+  /// [kind] 为 range 时的**闭区间**（含两端）。其余形状用不到（它们的边界写死在
+  /// [problem] 里：pickInt 的下限 1、端口的上限 65535、比例的开区间 0~(0,1]）。
+  final int? min;
+  final int? max;
+
   /// 数字字段用等宽（docs/copy-guide.md §6）：20000000 与 500000 要能一眼比出量级
-  bool get numeric => kind == _SysKind.port || kind == _SysKind.count || kind == _SysKind.ratio;
+  bool get numeric =>
+      kind == _SysKind.port || kind == _SysKind.count || kind == _SysKind.ratio || kind == _SysKind.range;
 
   /// 生效值 → 输入框文本。**原样呈现**：20000000 就是 `20000000`，不做 k/M 换算、
   /// 不补百分号——框里必须是 config.json 里那个值本身（用户 ⑪）。
@@ -313,7 +329,7 @@ class _SysField {
     return switch (kind) {
       _SysKind.host || _SysKind.text => value is String ? value : value.toString(),
       _SysKind.ratio => value is num ? _plainDouble(value.toDouble()) : '',
-      _SysKind.port || _SysKind.count => value is num ? value.toInt().toString() : '',
+      _SysKind.port || _SysKind.count || _SysKind.range => value is num ? value.toInt().toString() : '',
     };
   }
 
@@ -321,7 +337,7 @@ class _SysField {
   Object decode(String text) => switch (kind) {
         _SysKind.host || _SysKind.text => text,
         _SysKind.ratio => double.parse(text),
-        _SysKind.port || _SysKind.count => int.parse(text),
+        _SysKind.port || _SysKind.count || _SysKind.range => int.parse(text),
       };
 
   /// 不合规返回那句话（保存前拦下，一个字节都不写盘）；合规返回 null
@@ -343,6 +359,14 @@ class _SysField {
         final value = double.tryParse(text);
         if (value == null) return '$label要填小数（0.8 表示 80%），未保存';
         return (value <= 0 || value > 1) ? '$label是比例，要落在 0~1 之间（不含 0），未保存' : null;
+      case _SysKind.range:
+        final value = int.tryParse(text);
+        if (value == null) return '$label要填整数，未保存';
+        final lo = min;
+        final hi = max;
+        if (lo != null && value < lo) return '$label最小是 $lo，未保存';
+        if (hi != null && value > hi) return '$label最大是 $hi，未保存';
+        return null;
     }
   }
 }
@@ -361,14 +385,49 @@ const _sysStepTools = _SysField('budget.stepTools', '预算 · 步内工具调�
 const _sysTurnSteps = _SysField('budget.turnSteps', '预算 · 单 turn 步数上限', _SysKind.count,
     note: '一个 turn 最多走多少步。', hint: '30');
 const _sysTaskTokens = _SysField('budget.taskTokens', '预算 · 任务 token 上限', _SysKind.count,
-    note: '单个任务累计上限；填原值，20M 这类简写不接受。口径是**未扣缓存**的 token 数'
-        '（含命中缓存的那部分），所以它比账单上的用量大——别拿它当钱数看。', hint: '500000');
+    note: '单个任务累计上限；填原值，20M 这类简写不接受。'
+        '口径是非缓存 token（真花钱的那部分），不是账单上的用量。', hint: '500000');
+/// 提示值 = **出厂默认值**（`src/config/config.ts` 的 `buildDefaults`：`dailyTokens: 100_000_000`）。
+/// 2026-10-04 与出厂值对齐：出厂从 2M 改成 100M 之后，这里还写着 2000000 就是在教人填一个
+/// 会被心跳自己吃穿的值（心跳是真实唤醒，2M 撑不住一天）。只改提示，校验逻辑一个字都没动。
 const _sysDailyTokens = _SysField('budget.dailyTokens', '预算 · 每日 token 上限', _SysKind.count,
-    note: '每日累计上限，按上面的时区切分。口径同上一行：含缓存命中，不等于花销。', hint: '2000000');
+    note: '每日累计上限，按上面的时区切分。口径同上一行：只数没命中缓存的那部分。',
+    hint: '100000000');
 const _sysSoftRatio = _SysField('budget.softRatio', '预算 · 软阈值', _SysKind.ratio,
     note: '0~1 的小数：0.8 就是 80%。到这一线先提示收尾，越过才硬停。', hint: '0.8');
 const _sysFailStreak = _SysField('budget.failStreakMax', '预算 · 连续失败上限', _SysKind.count,
     note: '连续失败这么多次就告警并进入暂停。', hint: '5');
+
+/// 心跳的平均间隔（`wake.heartbeatTargetMeanMin`）——**用户 2026-10-05 要的那个「我能不能控制心跳频率」**。
+///
+/// 落在这一组里的理由：它管的确实是"她多久醒一次"，但它同时也是一条**花销旋钮**
+/// （每醒一次就真跑一个 turn、真花 token），与上面六条预算在使用上是同一类东西——
+/// 想省 token 的人来这一组找，找得到。
+///
+/// 取值 6~59 是**按后端契约的前端提示**（后端才是最终判据；写错了启动就报配置错，
+/// 不会静默夹一个值——见 config.example.json 的 `wake.$comment` 与 docs/operations.md §1.3）：
+/// 那边要求目标均值**严格**落在 `heartbeatFloorMin` 与 `heartbeatCeilMin` 之间，且整体落在 5~60。
+/// 出厂那组边界是 floor 5 / ceil 60，于是当下可填的整数区间正好是 6~59：
+///   · 6  = 比下限 5 大 1：平均值贴着下限不是"平均"，是"每一拍都在最早那一刻"；
+///   · 59 = 比上限 60 小 1：平均值贴着上限同理（每一拍都是最后一拍）。
+/// 用户若把 floor / ceil 改成别的值，这个前端提示会显得保守一格——**这是有意的**：
+/// 界面只拦"明显不可能"的两端，真正判合不合规的是后端，而把 floor/ceil 读进界面来算区间
+/// 会让同一件事有第二份判据（改了配置却不重启时，界面算出来的区间是错的，比保守更糟）。
+///
+/// hint 15 = 出厂默认值（= 实测均值，real-loop 与 docs/design.md §4.12 都写着 15 分钟）。
+///
+/// 旁注**刻意不报具体数字**：那两个边界将来会被用户按自己的 config.json 改（他改了这里也不会跟着变），
+/// 而写了数字的旁注一旦落后就成了假话——所以这里只说"两端各由一条上下限兜住"，数字让人去看 config.json。
+const _sysHeartbeatMean = _SysField(
+  'wake.heartbeatTargetMeanMin',
+  '心跳间隔 · 平均（分钟）',
+  _SysKind.range,
+  min: 6,
+  max: 59,
+  hint: '15',
+  note: '她平均多久自己醒一次——越大越省 token，越小越常醒。'
+      '两端仍由上下限兜住：不因这个数改变，安静不足下限不会醒、到了上限必然会醒。',
+);
 
 /// 系统卡的全部可编辑字段（回填、脏判定与销毁都遍历它）
 const _sysFields = <_SysField>[
@@ -381,6 +440,7 @@ const _sysFields = <_SysField>[
   _sysDailyTokens,
   _sysSoftRatio,
   _sysFailStreak,
+  _sysHeartbeatMean,
 ];
 
 /// 信任范围的两档（`trust.mode`）——**取值与字面量与 `src/config/config.ts` 的
@@ -388,6 +448,18 @@ const _sysFields = <_SysField>[
 /// 也不许把标签当成写入值（标签是给人看的，写进去的永远是这两个 id 之一）。
 const kTrustFull = 'full';
 const kTrustWorkspace = 'workspace';
+
+/// 改 `trust.mode` 时 `X-Confirm` 要带的**命令短语 + 字段短语**。
+///
+/// 为什么是这一串、以及为什么"收紧"也要带：服务端 `DANGEROUS_FIELDS`
+/// （`src/web/server.ts` 的 `'trust.mode': 'trust-full-access'`）**刻意不做方向区分**——
+/// 只给"放宽"加门就得先读盘上现值再判方向，那会变成同一件事的第二处判据，
+/// 而"改这个字段一律要短语"是一句话能核对完的规则。短语值按 `;` 拆、只看包含，多带无害。
+///
+/// 为什么拎成常量：引导卡第五步（`onboarding.dart` 的 `_settleTrust`）写的是**同一个字段**，
+/// 两处各写一份字面量的下场与本文件顶部 `kTrustFull` 那条注释说的一样——服务端换短语时
+/// 只会改一处，另一处静默地吃 400。**这两处必须同时改**，所以它们读同一个名字。
+const kTrustConfirm = 'config-update; trust-full-access';
 
 /// 二选一的**后果话术**（两处共用：设置页与首次引导页）。
 ///
@@ -532,6 +604,9 @@ const _sysRowFields = <String, List<_SysField>>{
   'budget.taskTokens': [_sysTaskTokens],
   'budget.softRatio': [_sysSoftRatio],
   'budget.failStreakMax': [_sysFailStreak],
+  // 心跳平均间隔（用户 2026-10-05）：行 id 与字段路径**同名**——这一行只有一个字段，
+  // 没必要为它另起一个名字（监听地址那种"两字段一行"才需要）。
+  'wake.heartbeatTargetMeanMin': [_sysHeartbeatMean],
 };
 
 class _SettingsPageState extends State<SettingsPage> {
@@ -600,8 +675,8 @@ class _SettingsPageState extends State<SettingsPage> {
   final _speakSpeedCtl = TextEditingController();
   bool _speakSaving = false;
 
-  /// 系统卡的输入框：**key 就是 config.json 的点路径**，一张表管九格。
-  /// 为什么数据驱动而不是九个具名 controller：脏判定、保存、回填三处都遍历同一张表，
+  /// 系统卡的输入框：**key 就是 config.json 的点路径**，一张表管十格。
+  /// 为什么数据驱动而不是十个具名 controller：脏判定、保存、回填三处都遍历同一张表，
   /// 少写一处就是"改了存不进去"或"存了却不显脏"。
   late final Map<String, TextEditingController> _sysCtls = {
     for (final field in _sysFields) field.path: TextEditingController(),
@@ -1107,12 +1182,12 @@ class _SettingsPageState extends State<SettingsPage> {
         if (keysError != null)
           _footnote('密钥状态读取失败（$keysError）。密钥徽章不可用，模型名与 Base URL 仍可保存。'),
         if (savedSource == 'memory')
-          _footnote('读不到 config.json，这一页显示的是当前**生效**的那份（保存仍会写进文件）。'),
+          _footnote('读不到 config.json，这一页显示的是当前生效的那份（保存仍会写进文件）。'),
         if (pendingRestart.any((path) => path.startsWith('models.')))
-          _footnote('上面有改动**还没生效**：模型名与端点是启动参数，要重启进程才接管——'
+          _footnote('上面有改动还没生效：模型名与端点是启动参数，要重启进程才接管——'
               '在那之前跑的还是启动时那份。保存本身是成功的，框里显示的就是盘上那份。'),
-        _footnote('密钥只写不读：本页显示的始终是掩码，完整值仅在建立连接时读取一次。保存写入 config.json 与 data/.keys.json，'
-            '进程重启后接管，且环境变量优先于文件。'),
+        _footnote('密钥只写不读：本页显示的始终是掩码，完整值仅在建立连接时读取一次。'
+            '保存写入 config.json 与 data/.keys.json，进程重启后接管（环境变量优先于文件）。'),
       ]),
       const SizedBox(height: 18),
       _sectionBlock('ui', [_uiCard()]),
@@ -2608,7 +2683,7 @@ class _SettingsPageState extends State<SettingsPage> {
       trailing: summary == null ? null : _badge(summary, configured ? IrmiaTheme.ok : IrmiaTheme.warn),
       children: [
         if (webhookError != null) ...[
-          _footnote('凭据状态读取失败（$webhookError）。状态看不见时**先别按"重新生成"**：'
+          _footnote('凭据状态读取失败（$webhookError）。状态看不见时先别按"重新生成"：'
               '轮换不可逆（旧的那份当场失效），而此刻你并不知道有没有人在用它。'),
           Align(
             alignment: Alignment.centerLeft,
@@ -2667,7 +2742,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           child: SelectableText(_webhookCurl(), style: _mono(11.5, scheme.onSurface)),
         ),
-        _footnote('/webhook/* **不认界面凭据**（也不认迁移期那份 data/.ui-token）：这条通道只认'
+        _footnote('/webhook/* 不认界面凭据（也不认迁移期那份 data/.ui-token）：这条通道只认'
             '上面那份专用凭据。它是给外部系统的——投得进来，读不到 /api/* 上的任何东西。'),
         _footnote('凭据文件：${_secretText('file').isEmpty ? 'data/.webhook-secret.json' : _secretText('file')}'
             '（盘上只有它的 sha256：原文只在你按下按钮那一次出现在屏幕上，之后再没人读得回来）。'),
@@ -2789,9 +2864,7 @@ class _SettingsPageState extends State<SettingsPage> {
               onChanged: _memorySaving ? null : (next) => unawaited(_saveMemoryEnabled(next)),
             ),
           ),
-          note: '开着：框架生成 MEMORIES/INDEX.md（一份指针表）、每轮把索引注入固定块、'
-              '按 wake.memoryMaintainCron 每日整理一次（过期流水账并进 facts.md、写一篇 diary/），'
-              'facts.md 的 !pinned 分区与条目 TTL 也由框架维护。',
+          note: '开着：框架生成并维护 MEMORIES/INDEX.md，每轮把索引注入固定块，并每日整理一次。',
         ),
         // 关掉时才出现的代价行：与卡头的说明分开，是因为它只在关掉这一种状态下成立
         if (!enabled) ...[
@@ -2805,12 +2878,18 @@ class _SettingsPageState extends State<SettingsPage> {
           restart: true,
         ),
         _footnote('不受这个开关影响的两条路：MEMORIES/aliases.md 参与「会话认人 / 关注名单」'
-            '属于**通道侧**；STATE.md（她当前状态）是**独立的一层**。'),
+            '属于通道侧；STATE.md（她当前状态）是独立的一层。'),
         _footnote('这一项是进程启动时读的：保存写进 config.json，重启后接管。'
-            '关掉不会删任何文件，也不会阻止她自己动那些文件。'),
-        Text(
-          '为什么留这个开关：给"只想让 agent 自己管记忆"的人一条干净的路。',
-          style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+            '关掉不会删任何文件。'),
+        DetailFold(
+          child: Text(
+            '关掉之后框架不生成、不注入、不整理，但她照旧能自己读写那些文件。'
+            '为什么留这个开关：给只想让 agent 自己管记忆的人一条干净的路。'
+            '每日整理的时间点由 wake.memoryMaintainCron 定（默认每日一次）：'
+            '过期的流水账并进 facts.md，另写一篇 diary/。'
+            'facts.md 的 !pinned 分区与条目 TTL 也归框架维护。',
+            style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+          ),
         ),
       ],
     );
@@ -2916,9 +2995,7 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ],
           ),
-          note: '两档各自管什么写在选项里，改哪一档就按哪一档的后果算。'
-              '这一条**同时**管 fs 工具族（safe_read / safe_write / edit_file / list_dir / '
-              'rg_search 等）与 pwsh：前者经同一条路径判定，后者的 workdir 与命令行里的路径一起受管。',
+          note: '两档各自管什么写在选项里，改哪一档就按哪一档的后果算。',
         ),
         const SizedBox(height: 12),
         // 只读的「当前生效」行：与「记忆」卡同形（服务端说了要重启就摆"需重启"，
@@ -2931,17 +3008,23 @@ class _SettingsPageState extends State<SettingsPage> {
           restart: true,
         ),
         if (pending)
-          _footnote('上面选的那一档**还没生效**：盘上已经写下了，但正跑着的这个进程用的仍是'
+          _footnote('上面选的那一档还没生效：盘上已经写下了，但正跑着的这个进程用的仍是'
               '启动时读到的那份——重启后接管。在那之前，她照旧按当前生效的那一档活动。'),
         _footnote('工作目录由服务端算出来（默认 <配置目录>/workspace），界面上不手填：'
             '同一条边界写两个值，就一定会出现"配置说 A、实际拦在 B"。'),
-        _footnote('它是**边界，不是提醒**：越界的读写与命令一律被拒绝。'
-            '它与 destructive 开关、pwsh 命令黑名单是各自独立的三道门——这一条管的是"范围"，'
-            '不代替那两道。'),
-        Text(
-          '为什么默认完全信任：她是一台无人值守的常驻 agent，"能自己去找、去修、去装"本来'
-          '就是她存在的方式；默认把她关进一个空目录，等于出厂就让她大多数本事用不出来。',
-          style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+        _footnote('它是边界，不是提醒：越界的读写与命令一律被拒绝。'),
+        DetailFold(
+          // 定位件：设置页上「详情」不止一处，用例要的是"信任范围卡里这一处"
+          key: const ValueKey('trust-rules-fold'),
+          child: Text(
+            '它管 fs 工具族（safe_read / safe_write / edit_file / list_dir / rg_search 等）与 pwsh：'
+            '前者经同一条路径判定，后者的 workdir 与命令行里的路径一起受管。'
+            '它与 destructive 开关、pwsh 命令黑名单是各自独立的三道门——这一条管的是范围，'
+            '不代替那两道。\n'
+            '为什么默认完全信任：她是一台无人值守的常驻 agent，"能自己去找、去修、去装"本来'
+            '就是她存在的方式；默认把她关进一个空目录，等于出厂就让她大多数本事用不出来。',
+            style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+          ),
         ),
       ],
     );
@@ -2997,7 +3080,9 @@ class _SettingsPageState extends State<SettingsPage> {
         {
           'fields': {'trust.mode': mode},
         },
-        confirm: 'config-update',
+        // 字段级危险短语（服务端 DANGEROUS_FIELDS）：**两档都要**，不是只给"放宽"那一档。
+        // 少了它这次写入会被服务端挡成 400 confirm-required。
+        confirm: kTrustConfirm,
       );
       // 写完立刻按**盘上那份**回读（本页其余字段同一条纪律）：服务端可能拒了、也可能归一化过，
       // "我以为写下去的"不作数
@@ -3015,16 +3100,17 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  // ── 分区十：系统（逐行就地编辑：监听地址 / 时区 / 六条预算） ──
+  // ── 分区十：系统（逐行就地编辑：监听地址 / 时区 / 六条预算 / 心跳平均间隔） ──
 
   /// 系统卡（用户 ⑪ 起可改，⑭ 起改成**逐行**就地编辑）。
   ///
   /// 为什么回到"紧凑表 + 每行一枚胶囊"：⑪ 第二版把整张表摊成常驻输入框，用户看了说
   /// "就像原来这样，后面有个胶囊按钮，点击就可以编辑对应行行不行吗"——**表是读的地方，
-  /// 改是偶发动作**。常驻九个框，把"扫一眼参数"变成了"面对一张表单"。
+  /// 改是偶发动作**。常驻十个框，把"扫一眼参数"变成了"面对一张表单"。
   ///
   /// 为什么仍然要一个「保存」而不是像开关那样点一下就写：数字框边打字边落盘会把
-  /// 20000000 打成 2（与发言卡的速度框同一条理由），而这八行都是**进程启动参数**
+  /// 20000000 打成 2（与发言卡的速度框同一条理由），而这九行都是**进程启动参数**
+  /// （`HOT_RELOAD_FIELDS` 是空的：没有哪个字段能热更，包括心跳）
   /// ——它们的共同点恰恰是"改到一半的状态谁都不该用"。现在这个"保存"是**行内**的，
   /// 所以卡头不再有「有未保存的更改」，也不再有卡片底部的总保存键：
   /// 逐行自包自足，没有"整张卡脏了"这个概念了。
@@ -3035,11 +3121,16 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget _systemCard() {
     return _SectionCard(
       title: '系统',
-      // 卡头原来挂「只读」，脚注写着"修改请编辑 config.json"——⑪ 之后这两句都会变成假话
-      note: '监听地址、时区与六条预算是这个进程的启动参数：在这里改，保存写进 config.json，'
-          '重启后生效。',
+      // 卡头原来挂「只读」，脚注写着"修改请编辑 config.json"——⑪ 之后这两句都会变成假话。
+      //
+      // 这句话**同时也是这一页测试的定位锚**（`inSystemCard` 按它找卡——`find.textContaining`
+      // 只取第一个 Container 祖先，所以这句必须**只出现一次**）。2026-10-05 加"心跳"两个字时
+      // 顺手把它写成了"监听地址、时区、六条预算与心跳的平均间隔"——那正好把「监听地址」那一行的
+      // 标签也变成了候选，锚点于是指到了行上，五条系统卡用例一起红。**别再往这句里塞行标签**。
+      note: '监听地址、时区、六条预算与心跳都是这个进程的启动参数：'
+          '在这里改，保存写进 config.json，重启后生效。',
       children: [
-        // 默认露前 4 行（最常看/最常调的先摆），其余 6 行收在「查看全部」后面
+        // 默认露前 4 行（最常看/最常调的先摆），其余 7 行收在「查看全部」后面
         // （用户 ⑭："平时可能只暴露几项，可以全部展开"）。展开/收起由 CappedChildren 自带。
         CappedChildren(
           cap: 4,
@@ -3061,6 +3152,11 @@ class _SettingsPageState extends State<SettingsPage> {
             _sysEditRow('budget.taskTokens'),
             _sysEditRow('budget.softRatio'),
             _sysEditRow('budget.failStreakMax'),
+            // 心跳平均间隔（用户 2026-10-05："心跳频率我没有地方可以控制吗？"）：
+            // 摆在预算那一组的**末尾**——它与上面几条是同一类旋钮（都决定"她花多少 token"），
+            // 而它是这一组里唯一"直接决定她多久醒一次"的一条。放在 destructive 那行之前，
+            // 因为 destructive 管的是"能碰什么"，不是"跑多勤"。
+            _sysEditRow('wake.heartbeatTargetMeanMin'),
             _destructiveRow(),
           ],
         ),

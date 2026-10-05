@@ -17,7 +17,7 @@
  * 计数进返回值（`ops`），同时写一条 `memory/maintained`（internal）事件留痕。
  *
  * 记账口径：本任务自己做的两次 light 调用各写一条 `budget/consumed{lane:'light'}`，
- * 与 necessity-gate 的门账同一份口径（失败也记账，否则 light 通道坏了 failStreak 永远为 0）。
+ * 与 injection-judge 的判定账同一份口径（失败也记账，否则 light 通道坏了 failStreak 永远为 0）。
  *
  * 刻意没做的部分（不编造来源）：访问强化（"近期召回命中的条目往前提"）——它需要召回命中数据，
  * 本模块没有这条输入；`MEMORIES/aliases.md` 的别名维护同理，由 agent 用文件工具自主写。
@@ -72,9 +72,20 @@ const SECTION_TITLES: Record<AnySection, string> = {
 const ALIASES_SEED = `# 身份别名
 
 平台给的身份标识对不上人时，在这里给他起个名字。一行一条：\`<sid> = <名字>\`。
+备注可以写在名字后的括号里，会作为备注显示、不计入名字。
 
 sid 就在你每轮上下文里那份「外部会话」清单上（形如 \`qq:c2c:<openid>\`）。
 写了名字，下次他来就用这个名字显示——**QQ 不提供昵称**，认人只能靠你自己记。
+
+# 群成员（openid，不是 sid；只在认人时用）
+
+群里的人不是会话（他可能从没私聊过你），所以单起一段：\`<openid> = <名字>\`——**键是裸 openid**，
+不带 \`qq:c2c:\` 那种前缀（\`#\` 开头那一行是段标题，不是条目）。这一段的用途是**在群里 @ 人**：
+你在 \`speak\` / \`report\` 的正文里写 \`[@名字]\`，框架就照这一段把名字换成官方 @ 形态
+（\`<qqbot-at-user id="…" />\`）再发出去。三条边界：
+括号里是备注、**不算名字**；同名对应两个 openid 时框架**拒绝**（重名不猜），那种情况直接写 \`<@<openid>>\`；
+名字认不出来时**那一条不会发出去**，并把这一段现有的名字回给你——照它改一个字再发。
+openid **按群隔离**（只有你在同一个群里见过的那个才管用），别把别处抄来的 id 填在这儿。
 
 `;
 
@@ -419,7 +430,7 @@ function textFromOutputs(response: DsResponse): string {
   return text;
 }
 
-/** 容错取 JSON：模型偶尔会用 ``` 围栏包一层（与 necessity-gate 同口径的宽松解析） */
+/** 容错取 JSON：模型偶尔会用 ``` 围栏包一层（与 injection-judge 同口径的宽松解析） */
 function extractJson(text: string): unknown {
   const trimmed = text.trim();
   const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(trimmed);
@@ -658,7 +669,7 @@ function archiveEpisode(memDir: string, name: string): string {
   return basename(target);
 }
 
-/** light 调用的账（lane=light，与 necessity-gate 的门账同口径） */
+/** light 调用的账（lane=light，与 injection-judge 的判定账同口径） */
 interface LightAccount {
   log: EventLog | null;
   projection: Projection | null;

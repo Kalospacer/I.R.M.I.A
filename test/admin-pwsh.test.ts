@@ -21,7 +21,7 @@ import {
   MAX_TODO_ITEMS,
   ONDEMAND_WARN_BYTES,
   PERSONA_PROTECTED_FILES,
-  SPEAK_SEGMENT_MAX,
+  SPEAK_TEXT_MAX,
   SPEAK_TEXT_REMIND_MAX,
   SPEAK_TEXT_SUGGESTED_MAX,
   createAdminTools,
@@ -48,6 +48,12 @@ import {
   truncateOutput,
   type PwshToolDefinition,
 } from '../src/tools/pwsh.ts';
+// 群里 @ 人那几条用例走**真的**通道（真适配器 + 真回投接线，只有网络出口是夹具）：
+// 出问题的那一跳正是"工具 → 回投 → 出站体"中间这一段，打桩到中间就等于把它测掉了
+import {
+  QQ_CHANNEL_NAME, QqOfficialChannel, createChannelReplyPoster,
+  type HttpJsonFn, type HttpJsonResponse,
+} from '../src/channel/qq-official.ts';
 import type { ToolContext } from '../src/tools/types.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
 
@@ -604,8 +610,8 @@ describe('speak：告警出口与三路投递', () => {
     setSleepForTest(async () => {});
     t.after(() => { setSleepForTest(null); });
 
-    // 45 字以内才按标点分段（`SPEAK_SEGMENT_MAX`）：这条夹具只有 15 字，稳在分段区内。
-    // 边界那两侧（正好 45 仍分段 / 46 起整条发出）在「分段上限」那条用例里钉着。
+    // 分段是门内的投递形态：这条夹具 15 字，稳在硬门（`SPEAK_TEXT_MAX`）以内、也切成两条。
+    // 门的两侧（40 通过 / 41 被拒）在「硬门」那条用例里钉着，分段本身在「分段回来了」那条里钉着。
     const spoken = '长任务跑完了，共 42 个文件';
     const result = await toolkit.byName('speak').handler({ text: spoken }, ctx);
     assert.equal(result.isError, undefined, result.content);
@@ -961,9 +967,10 @@ describe('speak：告警出口与三路投递', () => {
     const recorder = makeRecorder();
     let epoch = 0;
     // 六个逗号 → 六条气泡；第三条落库之后人插话。
-    // **整段必须压在 45 字以内**（`SPEAK_SEGMENT_MAX`）：46 字起 speak 就不分段了（整条一次发出），
-    // 那时候这个夹具只会发出一条、插话落在它后面，这条用例锁的"第 4 条起没出去"整个失效。
-    const text = '第一句在这里，第二句在这里，第三句在这里，第四句在这里，第五句在这里，第六句在这里。';
+    // **整段必须压在硬门（`SPEAK_TEXT_MAX`）以内**：超门的话 speak 直接拒绝、一个字都不发，
+    // 这条用例锁的"第 4 条起没出去"就整个失效（连第一条都不会有）。这一份正好 40 字（贴线）。
+    const text = '第一句话在这里，第二句也在这，三句在这里了，四句在这呢，五句在这里呀，六句在这吧';
+    assert.equal(charCount(text), SPEAK_TEXT_MAX, '夹具必须正好压在硬门上（41 就会整段被拒）');
     const toolkit = createAdminTools({
       timers: new TimerStore(null),
       emit: (type, data) => {
@@ -983,14 +990,14 @@ describe('speak：告警出口与三路投递', () => {
     const lines = result.content.split('\n');
     assert.equal(lines.length, 4, `回执就四行（多了就是把同一段话抄两遍）：\n${result.content}`);
     assert.match(lines[0]!, /发言被打断：他刚说「和我的私聊是私有的，没关系」。/);
-    assert.match(lines[1]!, /^- 已经发出去的（收不回来了）：3 条——第一句在这里／第二句在这里／第三句在这里$/);
+    assert.match(lines[1]!, /^- 已经发出去的（收不回来了）：3 条——第一句话在这里／第二句也在这／三句在这里了$/);
     assert.match(
       lines[2]!,
-      /^- 没来得及发的（3 条）：1\. 第四句在这里／2\. 第五句在这里／3\. 第六句在这里$/,
+      /^- 没来得及发的（3 条）：1\. 四句在这呢／2\. 五句在这里呀／3\. 六句在这吧$/,
       '未发的必须逐条编号点名——她据此才看得出"第 4 条起没出去"',
     );
     // 第三行不重复已发的内容（重复 = 同一段话在上下文里出现两次，且容易让她把已发的重讲一遍）
-    assert.ok(!lines[2]!.includes('第一句'), `未发那行不许夹带已发的内容：${lines[2]}`);
+    assert.ok(!lines[2]!.includes('第一句话'), `未发那行不许夹带已发的内容：${lines[2]}`);
     assert.match(lines[3]!, /重新组织语言/);
     assert.match(lines[3]!, /^别把剩下这半截硬接上去/);
   });
@@ -1121,7 +1128,7 @@ describe('speak：告警出口与三路投递', () => {
     assert.doesNotMatch(result.content, /report|改道|别再说一遍/, '不该给建议');
   });
 
-  // ── speak 的长度口径：描述与判据同源；翻回 25 是用户定的风格；45 是分段上限 ──
+  // ── speak 的长度口径：25 = 目标 / 40 = 硬门（拒绝）/ 分段 = 门内的投递形态 ──
 
   test('描述里的字数上限由常量拼出来（描述与判据不许两处真相）', async () => {
     const ws = await workspace('speak-desc');
@@ -1153,6 +1160,33 @@ describe('speak：告警出口与三路投递', () => {
     // 这一条钉的就是"不许再照着实测分布把它放宽"，以及"最多两个逗号"这条风格没丢。
     assert.equal(SPEAK_TEXT_SUGGESTED_MAX, 25, '25 是用户定的说话风格目标，不许按实测分布放宽');
     assert.match(description, /最多两个逗号/u, '「最多两个逗号」是用户风格口径的一部分');
+
+    // 硬门的那个数**同样由常量拼进描述**（两处各写一个数就是两处真相），并且要与常量本身相等。
+    assert.match(
+      description,
+      new RegExp(`超 ${SPEAK_TEXT_MAX} 字直接退回`, 'u'),
+      `描述里的硬门必须来自 SPEAK_TEXT_MAX：${description}`,
+    );
+    const onGate = /超 (\d+) 字/u.exec(description);
+    assert.notEqual(onGate, null, `描述里没有「超 N 字」这个硬门口径：${description}`);
+    assert.equal(
+      Number(onGate![1]),
+      SPEAK_TEXT_MAX,
+      `描述里手写了硬门的数（${onGate![1]}），必须与 SPEAK_TEXT_MAX 同源`,
+    );
+
+    // **"这是聊天用的、可以不成句"必须写在描述里**（用户 2026-10-05 特意点的那句）：
+    // 她原来可能把 speak 当成"写正式短句"的地方。细节（残缺/倒装/省略那一串）在 `text` 参数里，
+    // 参数不进 <60 那份预算——但"聊天用"这半句得留在总描述里，她读的第一句就是它。
+    assert.match(description, /聊天用/u, '描述要说清这是聊天用的，不是写正式句子');
+    const textParam = (toolkit.byName('speak').parameters['properties'] as Record<string, { description: string }>)['text']!;
+    for (const word of ['口语', '残缺', '倒装', '省略']) {
+      assert.match(
+        textParam.description,
+        new RegExp(word, 'u'),
+        `text 参数描述要明说允许口语化（缺「${word}」）：${textParam.description}`,
+      );
+    }
   });
 
   test('超限提醒只在越过提醒线时发：25 字不提醒、26 字（刚过线）要提醒', async () => {
@@ -1189,51 +1223,317 @@ describe('speak：告警出口与三路投递', () => {
     assert.match(wayOver.content, /report/u, '要给出路，不能只说"太长了"');
   });
 
-  test('分段上限：正好 45 字仍按标点分段，46 字起整条一次发出', async () => {
+  test('硬门：41 字直接拒绝（不截断、不照发），拒绝文案给全三条出路', async () => {
+    const ws = await workspace('speak-gate');
+    const recorder = makeRecorder();
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: recorder.emit,
+      personaRoot: join(ws, 'persona'),
+      // 关掉打字节奏：这一条锁的是"门"，不锁等多久
+      speakTyping: { typingEffect: false, charsPerMinute: 90 },
+      // 目标故意给一个：门必须在**解析目标之前**就拦下（一句话超了门，就没有"发给谁"的问题了）
+      replyTargetOf: () => ({ url: 'qq:group:G1', idempotencyKey: 'turn-gate' }),
+    });
+    const tool = toolkit.byName('speak');
+
+    // ① **正好 40 字：通过**（判据是「超过」，压线不算超）。
+    const onGate = '甲'.repeat(SPEAK_TEXT_MAX);
+    assert.equal(onGate.length, SPEAK_TEXT_MAX, '夹具必须正好压在门上');
+    const allowed = await tool.handler({ text: onGate }, makeCtx(ws));
+    assert.equal(allowed.isError, undefined, `正好 ${SPEAK_TEXT_MAX} 字必须放行：${allowed.content}`);
+    assert.doesNotMatch(allowed.content, /超过 speak 的上限/u, '压线不该被拒');
+    assert.equal(recorder.count('message/assistant'), 1, '放行的那条正常落库');
+
+    // ② **41 字（刚过门）：直接拒绝**——不是截断、不是"提醒之后照发"。
+    const overGate = '甲'.repeat(SPEAK_TEXT_MAX + 1);
+    const bubblesBefore = recorder.count('message/assistant');
+    const sentBefore = recorder.count('speak/sent');
+    const rejected = await tool.handler({ text: overGate }, makeCtx(ws));
+    assert.equal(rejected.isError, true, `超过 ${SPEAK_TEXT_MAX} 字必须被拒：${rejected.content}`);
+    assert.match(rejected.content, new RegExp(`${SPEAK_TEXT_MAX} 字`, 'u'), '要说清门是多少字');
+    assert.match(rejected.content, new RegExp(`这段 ${SPEAK_TEXT_MAX + 1} 字`, 'u'), '要如实报出收到了多少字');
+    // 三条出路一条都不许少（用户原话：重新组织语言 / 多次调用 / report）
+    assert.match(rejected.content, /重新组织/u, '出路①：重新组织成更短的一句');
+    assert.match(rejected.content, /拆成几次调用/u, '出路②：拆成几次调用');
+    assert.match(rejected.content, /report/u, '出路③：内容本来就长 → report');
+    // "一个字都没发出去"必须是**事实**，不是一句话：任何一路都不许多出一条
+    assert.equal(recorder.count('message/assistant'), bubblesBefore, '被拒时一个字都不许落进对话流');
+    assert.equal(recorder.count('speak/sent'), sentBefore, '被拒时不许新增任何 speak/sent 回执（三路都不许动）');
+    assert.equal(
+      recorder.events.some((event) => event.type === 'message/assistant'
+        && (event.data as { text: string }).text === overGate),
+      false,
+      '被拒的原文一个字都不许出现在对话流里（截断或照发都会留下痕迹）',
+    );
+  });
+
+  test('分段回来了：40 字以内的多逗号文本照旧切成多条发出', async () => {
+    // 用户 2026-10-05 取消了"超过 45 字不分段"那条口径 → 分段对所有进门内的文本照旧生效。
+    // 夹具用 `test/speak-interrupt-web.test.ts` 那一份（4 段、共 33 字）：它同时证明
+    // "门内的长句仍然被切"，而不是整条发出。
     const ws = await workspace('speak-segment');
     const recorder = makeRecorder();
     const toolkit = createAdminTools({
       timers: new TimerStore(null),
       emit: recorder.emit,
       personaRoot: join(ws, 'persona'),
-      // 关掉打字节奏：这一条只锁"切没切"，不锁等多久（节奏有自己的用例）
       speakTyping: { typingEffect: false, charsPerMinute: 90 },
     });
     const tool = toolkit.byName('speak');
 
-    // ① **正好 45 字仍分段**：逗号在 20 字处 → 两条。
-    const atMax = `${'甲'.repeat(20)}，${'乙'.repeat(24)}`;
-    assert.equal(charCount(atMax), SPEAK_SEGMENT_MAX, '夹具必须正好压在 45 上');
-    const segmented = await tool.handler({ text: atMax }, makeCtx(ws));
-    assert.equal(segmented.isError, undefined, segmented.content);
-    assert.match(segmented.content, /按聊天节奏发成 2 条/u, '45 字仍走标点分段（"像人打字"的节奏还在）');
+    const herSpeech = '第一句摆在这里，第二句放在那边，第三句换个地方说，第四句再说一句吧';
+    assert.ok(
+      charCount(herSpeech) <= SPEAK_TEXT_MAX,
+      `夹具 ${charCount(herSpeech)} 字必须落在硬门（${SPEAK_TEXT_MAX}）以内`,
+    );
+    const result = await tool.handler({ text: herSpeech }, makeCtx(ws));
+    assert.equal(result.isError, undefined, result.content);
+    assert.match(result.content, /按聊天节奏发成 4 条/u, '门内的多段文本照旧分段（那条 45 字口径已取消）');
     assert.deepEqual(
       recorder.events
         .filter((event) => event.type === 'message/assistant')
         .map((event) => (event.data as { text: string }).text),
-      ['甲'.repeat(20), '乙'.repeat(24)],
-      '45 字：逗号处断、标点摘掉',
+      ['第一句摆在这里', '第二句放在那边', '第三句换个地方说', '第四句再说一句吧'],
+      '逗号处断开、标点摘掉，逐条发出去',
+    );
+  });
+
+  // ──────────── 出站正文里的 @：一个字都不动（2026-10-05 用户决定移除形态改写） ────────────
+  //
+  // 这里原来有一层便利：她从 `speak` / `report` 的正文里写 `[@名字]`，框架读她的
+  // `MEMORIES/aliases.md` 群成员段查出 openid，再改写成官方那一串
+  // `<qqbot-at-user id="…" />`；名字认不出来时**一个字都不发**。用户 2026-10-05 决定移除
+  // （原话「我觉得没必要存在」）：① **她本人就会写官方形态**，id 就在她自己的 aliases.md
+  // 群成员段里（docs/design.md §4.20.1）；② 那一层因为一个读表路径错误把她**整条消息卡住过**。
+  //
+  // 所以现在这一组用例从 speak 工具一路走到 HTTP 请求体，钉的是"**一个字节都不改、也不拦**"。
+
+  /**
+   * 她的群成员表：`MEMORIES/aliases.md` 的成员段，键是**裸 openid**（不是 sid）。
+   *
+   * 夹具里故意把它写得齐齐整整——那层解析已经移除了，框架**不该再读它**：正文里写什么就发什么。
+   * 留着它正是为了当反证（表在，也不查）。
+   */
+  async function writeMemberAliases(ws: string, lines: string[]): Promise<void> {
+    await mkdir(join(ws, 'MEMORIES'), { recursive: true });
+    await writeFile(join(ws, 'MEMORIES', 'aliases.md'), [
+      '# 身份别名',
+      '',
+      'qq:group:GROUP1 = 测试群聊1（口径：少说话）',
+      '# 群成员（openid，不是 sid；只在认人时用）',
+      ...lines,
+      '',
+    ].join('\n'), 'utf8');
+  }
+
+  const MEMBER1_OPENID = 'B01F025D72D3B2075F49EFB08297D105';
+
+  /** 真 QQ 通道 + 夹具网络出口：记下每一个真正发出去的请求体 */
+  function qqRigWith(http: (input: { url: string; jsonBody: unknown }) => HttpJsonResponse): {
+    toolkit: (emit: AdminEventEmitter) => ReturnType<typeof createAdminTools>;
+    sentBodies: Array<Record<string, unknown>>;
+  } {
+    const sentBodies: Array<Record<string, unknown>> = [];
+    const fn = async (input: { url: string; method: string; jsonBody?: unknown }): Promise<HttpJsonResponse> => {
+      if (input.url.includes('/messages')) sentBodies.push(input.jsonBody as Record<string, unknown>);
+      return http({ url: input.url, jsonBody: input.jsonBody });
+    };
+    return {
+      sentBodies,
+      toolkit: (emit) => {
+        const channel = new QqOfficialChannel({
+          appId: 'APP',
+          clientSecret: 'SECRET',
+          http: fn as unknown as HttpJsonFn,
+          useMarkdown: true,
+        });
+        const poster = createChannelReplyPoster(new Map([[QQ_CHANNEL_NAME, channel]]));
+        return createAdminTools({
+          timers: new TimerStore(null),
+          emit,
+          personaRoot: 'persona',
+          replyTargetOf: (ctx) => ({ url: 'qq:group:GROUP1', idempotencyKey: `turn-${ctx.turn}` }),
+          replyPoster: poster,
+        });
+      },
+    };
+  }
+
+  /** 一律答"成功"的出口口径：token 请求与发消息请求分开答 */
+  const okHttp = (id: string) => (input: { url: string }): HttpJsonResponse =>
+    (input.url.includes('getAppAccessToken')
+      ? { status: 200, text: '', body: { access_token: 'T', expires_in: '7200' } }
+      : { status: 200, text: JSON.stringify({ id }), body: { id } });
+
+  test('分段照旧：@ 串不给切分**加任何规则**，而且没有一段是框架改过的字', async (t) => {
+    const ws = await workspace('speak-mention-official');
+    await writeMemberAliases(ws, [`${MEMBER1_OPENID} = **1 号**（群昵称「伊尔弥亚」，昵称不作数）`]);
+    const recorder = makeRecorder();
+    const rig = qqRigWith(okHttp('M-AT'));
+    setSleepForTest(async () => {});
+    t.after(() => { setSleepForTest(null); });
+
+    // 夹具用短 id：真实 openid（32 位）的官方串连 `speak` 的 40 字硬门都进不去（见下面那条注释）。
+    const tag = '<qqbot-at-user id="X9" />';
+    const text = `${tag} 一号在不在，收到回个话`;
+    assert.ok(text.length <= 40, `夹具 ${text.length} 字必须落在 speak 的硬门（40）以内`);
+    const result = await rig.toolkit(recorder.emit)
+      .byName('speak').handler({ text }, makeCtx(ws));
+    assert.equal(result.isError, undefined, result.content);
+
+    const sent = rig.sentBodies.map((body) => (body['markdown'] as { content: string }).content);
+    // ① 逗号照旧断开（分段规则一个字没改）
+    assert.equal(sent.at(-1), '收到回个话', '逗号处断开、标点摘掉');
+    assert.equal(rig.sentBodies[0]?.['msg_type'], 2, 'markdown 开着照旧走 markdown（@ 不改这条口径）');
+    // ② **框架没有在中间插字或改字**：每一段都是原文里按顺序截下来的一段。
+    //    切点在哪儿由 `chat-split` 一个人说了算（包括长过 `SPLIT_MAX_CHARS`=20 时补的那一刀）——
+    //    这一层移除之后就再也没有"为了 @ 而先切后渲染"这回事了。
+    let cursor = 0;
+    for (const segment of sent) {
+      const at = text.indexOf(segment, cursor);
+      assert.ok(at >= 0, `每一段都必须是原文里按顺序的一段，且没被改写：${segment}`);
+      cursor = at + segment.length;
+    }
+    assert.deepEqual(
+      recorder.events.filter((event) => event.type === 'message/assistant')
+        .map((event) => (event.data as { text: string }).text),
+      sent,
+      '本地那份记录与发出去的是同一份字节',
     );
 
-    // ② **46 字（刚过线）不分段**：只发一条，且是整段原文——长话再按标点切是刷屏，
-    //    而且切点越来越随意。逗号还在里面，说明这一条锁的确实是"没切"。
-    const overMax = `${'甲'.repeat(21)}，${'乙'.repeat(24)}`;
-    assert.equal(charCount(overMax), SPEAK_SEGMENT_MAX + 1, '夹具必须正好是 46（45 的下一侧）');
-    const whole = await tool.handler({ text: overMax }, makeCtx(ws));
-    assert.equal(whole.isError, undefined, whole.content);
-    assert.match(whole.content, /按聊天节奏发成 1 条/u, '46 字起整条一次发出');
+    // 如实记下（2026-10-05，给下一个人的话）：`SPLIT_MAX_CHARS`=20，而官方串本身 25 字节起，
+    // 所以 `speak` 这条路上它**一定**长过 20，于是会在自己的空格处被再切一刀
+    // （`<qqbot-at-user` | `id="…" />…`）——那一刀会把 @ 切成两半。这不是这层移除带来的，
+    // 但移除之后它成了 @ 的唯一路径问题：**要 @ 人的正文请走 `report`**（不切分、不限长，
+    // 真 openid 的整串在下面那条用例里钉着）。要不要给 `chat-split` 加一条"标记内不许下刀"
+    // 的规则，由用户定——那是分段器的口径，不是这一层的。
+    assert.match(result.content, /已发往|投递：已送达/u);
+  });
+
+  test('`report` 里写**真实 openid** 的官方串：整段逐字节进请求体，不切分也不改写', async (t) => {
+    // speak 那条 40 字硬门装不下真实 openid（32 位）+ 一句话，所以"@ 人的长正文"实际走 report。
+    const ws = await workspace('report-mention-official');
+    await writeMemberAliases(ws, [`${MEMBER1_OPENID} = **1 号**（群昵称「伊尔弥亚」，昵称不作数）`]);
+    const recorder = makeRecorder();
+    const rig = qqRigWith(okHttp('M-REPORT'));
+    const result = await rig.toolkit(recorder.emit).byName('report').handler({
+      text: `<qqbot-at-user id="${MEMBER1_OPENID}" /> 一号，用户让我把这条报告发给你：跑完了，42 个文件。`,
+    }, makeCtx(ws));
+    assert.equal(result.isError, undefined, result.content);
+    assert.equal(rig.sentBodies.length, 1, '整段一条，不切分');
     assert.equal(
-      recorder.count('message/assistant'),
-      3,
-      '只多出一条发言记录（①的两条 + ②的一条）——②没有被切成多条',
+      (rig.sentBodies[0]?.['markdown'] as { content: string }).content,
+      `<qqbot-at-user id="${MEMBER1_OPENID}" /> 一号，用户让我把这条报告发给你：跑完了，42 个文件。`,
+      '官方那一串（含真实 openid）逐字节原样',
+    );
+    assert.match(result.content, /已发往|投递：已送达/u);
+  });
+
+  test('`[@名字]` 原样出站而且**照发**：不再有"认不出就一个字都不发"那道门', async (t) => {
+    // 移除的核心就是这一条：正文里写 `[@1 号]`——框架不改写它（不查 aliases.md），
+    // 更**不拒发**。它到了群里是普通文字，那是她的写法问题，轮不到框架替她拦。
+    const ws = await workspace('speak-mention-bracket');
+    await writeMemberAliases(ws, [
+      '9C39B782C8B6F3124178E33561C4B4D7 = 甲',
+      `${MEMBER1_OPENID} = **1 号**（群昵称「伊尔弥亚」，昵称不作数）`,
+    ]);
+    const recorder = makeRecorder();
+    const rig = qqRigWith(okHttp('M-BRACKET'));
+    setSleepForTest(async () => {});
+    t.after(() => { setSleepForTest(null); });
+
+    const text = '[@1 号] 在不在';
+    const result = await rig.toolkit(recorder.emit)
+      .byName('speak').handler({ text }, makeCtx(ws));
+    assert.equal(result.isError, undefined, `不拒发：${result.content}`);
+
+    assert.equal(rig.sentBodies.length, 1, 'HTTP 请求照发（反向断言：不拒发）');
+    assert.equal(
+      (rig.sentBodies[0]?.['markdown'] as { content: string }).content,
+      text,
+      '就是这个字节串——既没被查表换成官方那一串，也没被拦下',
+    );
+    assert.equal(
+      JSON.stringify(rig.sentBodies[0]?.['markdown']).includes('qqbot-at-user'),
+      false,
+      '框架不再替她把名字翻成 openid（aliases.md 里那个 `1 号` 与它无关）',
     );
     assert.deepEqual(
-      recorder.events
-        .filter((event) => event.type === 'message/assistant')
-        .map((event) => (event.data as { text: string }).text)
-        .at(-1),
-      overMax,
-      '46 字整条发出、一个字节不改（连逗号也还在）',
+      recorder.events.filter((event) => event.type === 'message/assistant')
+        .map((event) => (event.data as { text: string }).text),
+      [text],
+    );
+  });
+
+  test('出站体逐字节照旧（回归）：一个字都不改、msg_seq 也不动', async (t) => {
+    const ws = await workspace('speak-mention-plain');
+    await writeMemberAliases(ws, [`${MEMBER1_OPENID} = 1 号`]);
+    const rig = qqRigWith(okHttp('M-PLAIN'));
+    setSleepForTest(async () => {});
+    t.after(() => { setSleepForTest(null); });
+
+    const result = await rig.toolkit(makeRecorder().emit)
+      .byName('speak').handler({ text: '跑完了，42 个文件' }, makeCtx(ws));
+    assert.equal(result.isError, undefined, result.content);
+    // 与"加 @ 支持之前"逐字节一样：msg_type=2 + markdown.content + msg_seq=1（没有 msg_id 就是主动消息）。
+    // 9 字不足分段下限（`SPLIT_MIN_CHARS`=12），所以整句一条发出去。
+    assert.deepEqual(rig.sentBodies, [
+      { msg_type: 2, markdown: { content: '跑完了，42 个文件' }, msg_seq: 1 },
+    ], '出站体一个字节都不许变');
+  });
+
+  test('非 QQ 目标：正文连"改写"这个念头都不该有（`[@名字]` 一字不动）', async (t) => {
+    const ws = await workspace('speak-mention-onebot');
+    await writeMemberAliases(ws, [`${MEMBER1_OPENID} = 1 号`]);
+    const posted: string[] = [];
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: makeRecorder().emit,
+      personaRoot: join(ws, 'persona'),
+      replyTargetOf: (ctx) => ({ url: 'onebot:c2c:12345', idempotencyKey: `turn-${ctx.turn}` }),
+      replyPoster: { async post(_target, text) { posted.push(text); return { ok: true, status: 200 }; } },
+    });
+    setSleepForTest(async () => {});
+    t.after(() => { setSleepForTest(null); });
+
+    const result = await toolkit.byName('speak').handler({ text: '[@1 号] 在不在' }, makeCtx(ws));
+    assert.equal(result.isError, undefined, result.content);
+    assert.deepEqual(posted, ['[@1 号] 在不在'], '所有通道一个待遇：正文原样，谁也不替谁猜协议');
+  });
+
+  test('没有 markdown 权限时**回执如实**：降级事实进回执（形态变了就得说清）', async (t) => {
+    const ws = await workspace('speak-mention-degraded');
+    await writeMemberAliases(ws, [`${MEMBER1_OPENID} = 1 号`]);
+    const recorder = makeRecorder();
+    let call = 0;
+    const rig = qqRigWith((input) => {
+      if (input.url.includes('getAppAccessToken')) {
+        return { status: 200, text: '', body: { access_token: 'T', expires_in: '7200' } };
+      }
+      call += 1;
+      // 第一条（markdown）被拒 → 通道降级纯文本重发；第二条（纯文本）成功
+      return call === 1
+        ? { status: 200, text: '', body: { code: 40034127, message: '无markdown模板权限' } }
+        : { status: 200, text: '', body: { id: 'M-FALLBACK' } };
+    });
+    setSleepForTest(async () => {});
+    t.after(() => { setSleepForTest(null); });
+
+    const text = '在不在';
+    const result = await rig.toolkit(recorder.emit).byName('speak').handler({ text }, makeCtx(ws));
+    assert.equal(result.isError, undefined, result.content);
+    // 形态如实：markdown 被拒 → 纯文本，而**正文照旧是同一份字节**（降级不改话）
+    assert.equal(rig.sentBodies.length, 2, '一次失败 + 一次降级重发');
+    assert.equal(rig.sentBodies[0]?.['msg_type'], 2);
+    assert.equal(rig.sentBodies[1]?.['msg_type'], 0);
+    assert.equal(rig.sentBodies[1]?.['content'], text);
+    // 回执如实：不许只说"已送达"——"形态变了"必须一起说清（`SendOutcome.degraded` 那一项）
+    assert.match(result.content, /40034127/u);
+    assert.match(
+      result.content,
+      /原生 markdown 模板权限/u,
+      '顺带给出去路：让用户去开权限（这句是**通道**带回来的降级事实）',
     );
   });
 });

@@ -21,7 +21,7 @@
  * 而且要随实现演进（通道能力、输出出口变了，她就该知道）。人格可改，装置只读。
  */
 
-import { CHANNEL_LABELS, CHAT_TYPE_LABELS, applyAliases, readableSessionName, resolveNameForSid, resolveSessionName, sessionLabelOf, sidOf, type SessionEntry } from '../channel/sessions.ts';
+import { CHANNEL_LABELS, CHAT_TYPE_LABELS, applyAliases, readableSessionName, resolveNameForSid, resolveSessionName, sessionLabelOf, sidOf, type AliasTable, type SessionEntry } from '../channel/sessions.ts';
 import { INJECTION_WARN_WINDOW_MS, type InjectionWarnFacts } from '../channel/injection.ts';
 
 /** 装置自述（静态）。十段各管一件事：
@@ -136,8 +136,11 @@ export interface ContactFacts {
    *
    * 为什么需要：QQ 不提供单聊/群聊用户的昵称，`person` 就是一串 openid。
    * 别名是她（或人）自己认人之后记下的名字——框架只负责读进来、显示出去。
+   *
+   * 值是 {@link AliasTable}：她写在名字后面括号里的**备注**不进这里的任何一句话——
+   * 那是给界面看的（"她在这个群里怎么说话"的口径），不是喂回她上下文的东西。
    */
-  aliases?: ReadonlyMap<string, string>;
+  aliases?: AliasTable;
   /**
    * 框架维护的联系人表（`config.persona.contacts`：sid → 名字）。
    *

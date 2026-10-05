@@ -18,12 +18,20 @@ import { join } from 'node:path';
 
 import type { TimerStore } from '../wake/timer-store.js';
 import type { JobManager } from '../runtime/job-manager.js';
+import type { EventLog } from '../log/event-log.js';
+import type { AppEvent, Projection } from '../log/types.js';
 import type { WakeChannel, MemoryRead } from '../log/types.js';
 import type { DepsManager } from '../deps/manager.js';
+import type { DsClient } from '../model/ds-client.js';
 import type { MediaPoster, AdminEventEmitter, ChannelNameResolver, ChannelReader, ChannelSpokenReader, Notifier, PersonaUpdatedPayload, ReplyPoster } from './admin.js';
 import type { ToolDefinition } from './types.js';
-import type { ToolModelSpec } from './registry.js';
+import type { ListForModelOptions, ToolModelSpec } from './registry.js';
+import type { IsolationConfig, ToolPlanGate } from './executor.js';
+import type { HookRunner } from '../hook/hooks.js';
 import type { VisionModelClient } from './vision.js';
+import type { AgentLoopPersona } from '../runtime/agent-loop.js';
+import type { TaskBudgetGuard, TaskToolDeps } from '../runtime/subagent.js';
+import { createTaskTool, TASK_TOOL_NAME } from '../runtime/subagent.ts';
 import { createAdminTools } from './admin.ts';
 import { createNetTools } from './net.ts';
 import { createPwshTool } from './pwsh.ts';
@@ -60,6 +68,32 @@ export interface ToolCatalogOptions {
   onPersonaUpdated?: (payload: PersonaUpdatedPayload) => void;
   /** pwsh 的破坏性命令开关，默认 false（安全默认，与 design.md §4.10 第三级门一致） */
   destructiveEnabled?: boolean;
+  /**
+   * `task`（隔离子代理工具，design §4.21）注不注册。**默认 false = 不注册**。
+   *
+   * 为什么默认不开（理由与 `rg_search` / `es_search` 那两件**不一样**）：那两件是"本机装了才
+   * 存在"，判据在机器上；这一件的判据在**代价**上——工具清单是请求**冻结前缀**的一部分
+   * （docs/schema.md §13：模型请求的全部内容可由 model 事件 + 人格资产重建），
+   * 多一件 = 每次请求都多付一份 schema（常驻 token），而且**清单变化的那个 turn 必然是一次
+   * 缓存 miss**（前缀变了，服务端缓存整段失效）。它是一件"加了就再也拿不掉"的常驻开销，
+   * 所以要人显式要，而不是默认替所有人付。
+   *
+   * 打开之后会发生什么（实测数见 docs/operations.md §1.2）：清单 24 → 25 件、`tools` 段
+   * +172 token（它自己那一件：name 1 + desc 76 + params 95）、她多一件能"整块外包"的工具
+   * （子代理独立上下文、预算从父扣、默认不能再下派）。
+   */
+  taskEnabled?: boolean;
+  /**
+   * `task` 的运行期依赖（装配期给**取值器**，调用期才解析）。
+   *
+   * 为什么必须惰性：装配顺序上"建注册表"在"建 RealLoop / 拿到投影与人格"之前，而子代理要的
+   * registry / projection / persona 三样都在循环那一侧。取值器让装配点不必提前持有循环对象，
+   * 也让 `task` 在被调用那一刻拿到**当时**的账（不是装配那一刻的快照）。
+   *
+   * 不传 = `task` 即使被要求打开也造不出来（那时 `onNote` 里会如实说明），
+   * 因为一个没有运行期的 `task` 只会把"未接线"当成工具结果回给她。
+   */
+  taskRuntime?: TaskToolRuntimeResolver;
   /**
    * 外部依赖管理器（`src/deps/`，v30）。**探测只做一次**的来源：
    *   · `buildFsTools` 用它决定 rg_search / es_search 注不注册（没装就不注册）；
@@ -164,6 +198,56 @@ export interface ToolCatalogOptions {
    */
   askHumanTimeoutMs?: number;
 }
+
+/**
+ * `task` 的运行期素材（装配点逐格给；缺任何一格就读不到"当时"）。
+ *
+ * 一个字段都不在这里**推导**：工具层不读配置、不读循环——registry / projection / persona /
+ * guard / planGate 各自的主都在别处（注册表在 buildCatalogRegistry、投影与人格在 main.ts、
+ * 判定器与计划门在 RealLoop）。这里只是把它们递到调用那一刻。
+ */
+export interface TaskToolRuntimeDeps {
+  /** 父注册表（`buildCatalogRegistry` 造的那一个：MCP 上线的新工具也在里面） */
+  registry: ToolRegistry;
+  /** 父投影（`recovery.projection`）：预算基线与记账回流都走它 */
+  projection: Projection;
+  /** 人格常驻层（与主循环**同一个对象**，main.ts 的 onPersonaUpdated 就地在它身上改字段） */
+  persona: AgentLoopPersona;
+  /** 事件日志（子代理链的写入经它） */
+  log: EventLog;
+  /** 模型客户端（与主循环同一个；子代理换车道靠 `lane` 参数，不换客户端） */
+  ds: DsClient;
+  /** 时钟注入；缺省 = 工具内置兜底（本机时钟的 ISO 串） */
+  now?: (() => string) | undefined;
+  /** 本机时区（与 read_channel 那条同源：config.timezone） */
+  timezone?: string | undefined;
+  /** 父循环那一份刹车判定器（有效上限含人工加注）。不传 = 用工具内置兜底上限 */
+  guard?: TaskBudgetGuard | undefined;
+  /** 进模型清单的口径，与父一致（real-loop 给的是 `{includeDestructive: config.tools.destructiveEnabled}`） */
+  modelVisibility?: ListForModelOptions | undefined;
+  /** 计划模式门（与父共用同一个实例，见 subagent.ts 的 TaskRuntime.planGate） */
+  planGate?: ToolPlanGate | undefined;
+  hooks?: HookRunner | undefined;
+  isolation?: IsolationConfig | undefined;
+  skillCatalog?: string | null | undefined;
+}
+
+/**
+ * 运行期素材里**只有循环才知道**的那一半（`RealLoopDeps.taskRuntime` 的形状）：
+ * 刹车判定器、计划门、执行点钩子、隔离配置、技能索引、时钟。
+ *
+ * 它**与宿主那半格子合并后**才是一份完整素材：装配点给 log / ds / registry / projection /
+ * persona / modelVisibility（那些在装配期或者稍后就有），循环给这一半。两半用同一个键名，
+ * 合并规则是"循环的覆盖装配点的"（见 real-loop 的 agentDeps）——因为循环给的都是**活**的东西
+ * （判定器实例会被加注换掉），谁都不可能比它更知道"现在"。
+ */
+export type TaskLoopRuntimeDeps = Partial<TaskToolRuntimeDeps>;
+
+/**
+ * 运行期取值器。返回 `null` = 这一刻没有运行期（假循环分支、CLI 只读路径）：`task` 会如实
+ * 报"未接线"，而不是拿一份空投影去跑（那会把子代理的账记在一个不存在的父上）。
+ */
+export type TaskToolRuntimeResolver = () => TaskToolRuntimeDeps | null;
 
 /** 未接线的模型通道：把"CLI 里调不动 vision"变成一条可读的错误，而不是一个静默的空实现 */
 export function unwiredVisionClient(): VisionModelClient {
@@ -271,9 +355,71 @@ export async function buildToolCatalog(options: ToolCatalogOptions): Promise<Too
         ? {}
         : { onAccess: (data) => options.memoryReadRecorder!(data) }),
     }),
+    ...buildTaskTools(options),
     ...adminKit.tools,
     ...buildShellTools(options),
   ];
+}
+
+/**
+ * `task` 工具族：**条件注册**，默认一件都不注册（见 [ToolCatalogOptions.taskEnabled]）。
+ *
+ * 为什么不做成"永远注册、只是默认不进模型清单"：登记在注册表里的东西**会被别处看见**——
+ * 界面的工具开关（`GET /api/tools` 列的是已注册清单）会多出一件"存在但关着"的 `task`，
+ * 而 destructive 的总开关一开，它就会从"注册了但没列"变成"列出来了"（`listForModel` 的
+ * 判据是 sideEffect）。那条路上 `tools.destructiveEnabled: true` 会**顺带**把子代理能力
+ * 打开——"加一件能力"从来不该是另一个开关的副作用。所以判据只有一处：用户显式写了
+ * `tools.taskEnabled: true`。
+ *
+ * 不注册时**必须说话**：条件注册的工具不出现不能无声无息（与 rg_search / es_search 同一
+ * 条纪律，用户的原话"没有时如实告知"）。它缺省就不在，所以只在"用户要了却没接上"时出声。
+ */
+function buildTaskTools(options: ToolCatalogOptions): ToolDefinition[] {
+  if (options.taskEnabled !== true) return [];
+
+  const runtime = options.taskRuntime;
+  if (runtime === undefined) {
+    // 用户要了、装配点却没给取值器：那是接线不全（编程错误），不是"机器上没装"。
+    // 照旧把工具造出来并让它如实报"未接线"——她至少能知道这条路为什么走不通，
+    // 而不是反复重试一件永远不存在的东西。启动日志里同步说明白。
+    options.onNote?.('[工具] task 已按配置打开，但宿主没有提供运行期依赖：本进程里它一调就会报「未接线」');
+  } else {
+    options.onNote?.('[工具] task 已注册（隔离子代理；每次请求多付一份 schema 的常驻 token）');
+  }
+
+  // 五格静态形状（registry / projection / persona / log / ds）**刻意一个都不传**：
+  // 装配期确实拿不到它们（循环还没建、投影还在折叠、日志句柄在 main.ts 手里），
+  // 传进来只会是假的。实际读的全是下面这条运行期取值器——`runtimeOf` 给了它就原样返回。
+  //
+  // `resolve` 那一跳只为让类型收窄：取值器在闭包里被调用，而"上面已经判过 undefined"
+  // 这件事 TypeScript 不会替闭包记住。
+  const resolve = runtime;
+  const deps: TaskToolDeps = {
+    runtime: resolve === undefined
+      ? () => null
+      : () => {
+        const rt = resolve();
+        if (rt === null) return null;
+        return {
+          log: rt.log,
+          ds: rt.ds,
+          registry: rt.registry,
+          projection: rt.projection,
+          persona: rt.persona,
+          now: rt.now ?? (() => new Date().toISOString()),
+          // 时区缺省跟装配点那条（config.timezone）：它与父循环读的是同一个值
+          timezone: rt.timezone ?? options.timezone ?? 'UTC',
+          ...(rt.guard === undefined ? {} : { guard: rt.guard }),
+          ...(rt.modelVisibility === undefined ? {} : { modelVisibility: rt.modelVisibility }),
+          ...(rt.planGate === undefined ? {} : { planGate: rt.planGate }),
+          ...(rt.hooks === undefined ? {} : { hooks: rt.hooks }),
+          ...(rt.isolation === undefined ? {} : { isolation: rt.isolation }),
+          ...(rt.skillCatalog === undefined ? {} : { skillCatalog: rt.skillCatalog }),
+        };
+      },
+  };
+
+  return [createTaskTool(deps)];
 }
 
 /**

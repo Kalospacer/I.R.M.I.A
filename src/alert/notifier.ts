@@ -20,6 +20,8 @@
  *   恢复（连续失败后首次成功）时发一条"已恢复"再清除登记——同一串故障不重复告警，
  *   也不会在故障期间刷屏。恢复通知的指纹与故障本身不同（`…:recovered`），
  *   所以不会被故障那 30 分钟窗口连坐。没有登记时不发（不制造"恢复了什么"的假事实）。
+ *   限流只节流**人看的通道**：恢复通知自己被限流时，那条 `alarm/sent{recovered:true}`
+ *   照旧写（销账不能缺，见 `deliver` 里那段说明）。
  *
  * 两种对外形状（同一份实现，双方接口都保留）：
  *   - `new Notifier({ alertDir, rateLimitMin, now, history, record, webhookUrl })`
@@ -129,6 +131,11 @@ export interface AlertNotifier extends AdminNotifier {
   alert(input: AlertInput): Promise<NotifyOutcome>;
   fail(input: AlertInput): Promise<NotifyOutcome>;
   ok(category: string, body?: string | undefined): Promise<NotifyOutcome>;
+  /**
+   * 启动补写的销账口：给**上一个进程留下的**故障写一条"已恢复"（调用方负责核实它当刻
+   * 确实不成立）。与 `ok()` 的分工见实现处的说明。
+   */
+  releasePending(category: string, body: string): Promise<NotifyOutcome>;
   /** 恢复入口：把历史 alarm/sent 折进限流窗口（M3-10 跨重启限流） */
   restore(events: Iterable<AppEvent>): void;
   /** 当前限流窗口快照：指纹 → 最近一次发送时刻（毫秒） */
@@ -304,6 +311,7 @@ export function createNotifier(options: CreateNotifierOptions): AlertNotifier {
     alert: (input) => core.alert(input),
     fail: (input) => core.fail(input),
     ok: (category, body) => core.ok(category, body),
+    releasePending: (category, body) => core.releasePending(category, body),
     restore: (events) => {
       core.restore(events);
     },
@@ -342,6 +350,23 @@ export class Notifier {
   private readonly windowsMap = new Map<string, number>();
   /** 处于故障中的故障键 → 连续失败窗口 */
   private readonly stalling = new Map<string, StallRecord>();
+  /**
+   * 这些故障键是**上一个进程留下的**（由 `restore()` 折进来的），本进程从没见过它发生。
+   *
+   * 为什么要分开记（2026-10-05）：`restore()` 把历史故障重建回来，于是 `healthCheck` 的
+   * `ok()` 在**重启后的第一拍**就会替它写一条"已恢复"——而本进程从头到尾没观察到一次失败，
+   * 那句话说出口就是**编事实**（"连续失败已恢复成功"）。原来的 `record` 只喂 `deliver` 的
+   * 成功分支，而恢复通知被限流时不落事件，所以这个洞一直没露出来；把销账补进限流分支之后
+   * 它立刻现形了。
+   *
+   * 两条出路：
+   *   · **新进程真的又失败过**（`fail()` 被调过，那条告警送没送达都算，见 `noteFault`）
+   *     ⇒ `noteFault` 把它从这一集里摘掉，此后自然恢复照旧写（那是本进程亲眼看见的故障）；
+   *   · **由进程状态决定、重启后重新评估**的那几类（预算耗尽、水位停滞）⇒ 走
+   *     `alert/startup.ts` 的启动补写：那边要求"当刻确实不成立"才写，写完从这一集里摘掉。
+   * 剩下的（"已经发生过的历史事实"）**永远等不到自动的"已恢复"**——那条账不该由重启来销。
+   */
+  private readonly carriedOver = new Set<string>();
   private readonly counters: AlertStats = { sent: 0, suppressed: 0, failed: 0 };
   /** 目录只创建一次；创建失败不拦发送（appendFile 会再报一次，行为一致） */
   private dirReady = false;
@@ -441,11 +466,18 @@ export class Notifier {
 
   /**
    * 恢复上报：处于 stall 时发一条"已恢复"并清除登记；不在 stall（或那次故障没送达）时什么都不做。
+   *
+   * 两条**不许写**的情形（都写在这一个地方，调用方不必自己判）：
+   *   · 那次故障没送达（`announced` 为假）——人从来没被告知出过事，恢复通知就是假事实；
+   *   · 这个故障键是 `restore()` 从上一个进程折进来的（见 `carriedOver`）——本进程没有
+   *     "恢复成功"那一刻可写。要销这类账，走启动补写（`alert/startup.ts`），
+   *     那条路要求"当刻确实不成立"才算数。
    */
   async ok(category: string, body?: string | undefined): Promise<NotifyOutcome> {
     const key = `category:${category}`;
     const stall = this.stalling.get(key);
     if (stall === undefined) return { ok: true };
+    if (this.carriedOver.has(key)) return { ok: true };
     this.stalling.delete(key);
     if (!stall.announced) return { ok: true };
     const seconds = Math.max(0, Math.round((this.now().getTime() - stall.since) / 1000));
@@ -466,6 +498,9 @@ export class Notifier {
   /**
    * 恢复入口：把历史 `alarm/sent` 折进两份状态——限流窗口（M3-10 跨重启限流）与
    * **尚未恢复的故障登记**（`foldStalls`）。后者让"已恢复"在重启之后仍然配得上它的报警。
+   *
+   * 折进来的故障同时记进 `carriedOver`（本进程没见过它发生）：于是 `ok()` 不会替它
+   * 写一条本进程没资格写的"已恢复"，要销账得走 `releasePending()`（启动补写那条路）。
    */
   restore(events: Iterable<AppEvent>): void {
     const list = [...events];
@@ -475,8 +510,42 @@ export class Notifier {
     }
     for (const [key, record] of foldStalls(list)) {
       // 只补空缺：本进程已经登记的故障（更新、更准）不被历史覆盖
-      if (!this.stalling.has(key)) this.stalling.set(key, record);
+      if (this.stalling.has(key)) continue;
+      this.stalling.set(key, record);
+      this.carriedOver.add(key);
     }
+  }
+
+  /**
+   * 启动补写的销账入口：`category:<类别>` 这个历史故障**当刻确实不成立**时，写一条"已恢复"。
+   *
+   * 与 `ok()` 的分工是一条线：`ok()` 写"本进程看见的恢复"，本方法写"**上一个进程留下的、
+   * 当刻已经核实过不成立**的恢复"。调用方（`runtime/real-loop.ts` 的启动路径）负责核实，
+   * 核实不了就别调——这里不做二次判定，判据只有一份（见 `alert/startup.ts`）。
+   *
+   * 幂等：写下去之后登记与"上一个进程留下的"标记都被摘掉，同一进程内再调是空操作；
+   * 下一次启动 `foldStalls` 见到那条 `recovered:true` 也不会再把这个键折回来。
+   */
+  async releasePending(category: string, body: string): Promise<NotifyOutcome> {
+    const key = `category:${category}`;
+    const stall = this.stalling.get(key);
+    if (stall === undefined) return { ok: true };
+    this.stalling.delete(key);
+    this.carriedOver.delete(key);
+    if (!stall.announced) return { ok: true };
+    const seconds = Math.max(0, Math.round((this.now().getTime() - stall.since) / 1000));
+    const input: AlertInput = {
+      category: `${category}:recovered`,
+      level: 'info',
+      title: `已恢复：${category}`,
+      body: `${body}（这条故障是上一个进程报出去的，持续 ${seconds} 秒）`,
+      params: { category },
+    };
+    return toOutcome(await this.deliver(
+      input,
+      fingerprintOf(input.category, input.params),
+      { key, recovered: true },
+    ));
   }
 
   windows(): Map<string, number> {
@@ -504,6 +573,28 @@ export class Notifier {
       // 有意丢弃：不是失败，是限流。故障仍在持续，stall 登记照旧推进（只是没送达）
       this.counters.suppressed += 1;
       this.noteFault(fault, fingerprint, false);
+      // **恢复通知的销账不许被限流吞掉**（2026-10-05 修的现场）。
+      //
+      // 限流是**人看的通道**的节流（文件档 + webhook）：一天里解了两次同一个故障，
+      // 人不需要收两条推送。但"这个故障已经解除"是**账**——前端读的是 `alarm/sent` 事件
+      // （见 web/server.ts 的 frameworkNotesView），账缺一条，卡上就永远红着。
+      //
+      // 现场（实测：真实日志 30159 条，见 _research/alarm-probe.txt）：09:33:55 解 daily 层
+      // 写下了恢复通知（fp=856b390081a0cb84），14 分钟后 09:47:28 解 task 层时同一个指纹
+      // 还在 30 分钟窗口内 ⇒ 这一条被限流丢弃 ⇒ **`budget/resumed` 落了库、恢复通知没落库**，
+      // 运行情况页那条「预算耗尽（任务 token）」一直红着，而它早就解除了。
+      //
+      // 所以这里只补一件事：recovered 记录照旧交给宿主落 `alarm/sent`（日志只增不改，
+      // 同一次故障的配对账必须完整）。对外**照实**返回被限流——这一条没有推送出去。
+      if (fault?.recovered === true) {
+        this.record?.({
+          fingerprint,
+          level: input.level,
+          title: input.title,
+          key: fault.key,
+          recovered: true,
+        });
+      }
       return { sent: false, fingerprint, file, reason: RATE_LIMITED };
     }
 
@@ -604,10 +695,24 @@ export class Notifier {
   /**
    * 故障登记的推进：普通故障（`fault.recovered !== true`）落账；恢复通知自己只是销账完成，
    * 不再重新登记——否则一次恢复就会把刚清掉的故障键又立起来。
+   *
+   * 走到这里就等于**本进程又见过它发生了一次**（`fail()` 是"这个故障此刻成立"的唯一入口；
+   * 普通告警与恢复通知带的 `fault` 分别是 null / `recovered:true`，都在上面挡掉了），
+   * 所以"上一个进程留下的"标记要在这里摘掉：此后它是一条本进程看着的活故障，
+   * 自然恢复当然该写「已恢复」。
+   *
+   * 判据是**见过它发生**，不是**这一条告警送达了**（2026-10-05 修的真 bug）：限流节流的是
+   * 给人看的通道，它挡不住"故障又发生了一次"这个事实——何况这个故障账早在前一个进程就
+   * 报出去过（`foldStalls` 只折已送达的键，折回来的 `announced` 必为真）。若在这里再要求
+   * 一次送达，被限流压住的那次观察就不算数，于是本进程后面**真的**看着它解除时也写不出
+   * 销账，运行情况页那张卡就一直红着——`model-failure` 更惨：它不在启动补写的判据表里
+   * （历史事实类，见 `alert/startup.ts` 的 `NEVER_BACKFILLED`），重启那条路也不救它。
+   * 那正是这一整段要修的病，所以要在这里挡住它。
    */
   private noteFault(fault: FaultRef | null, fingerprint: string, archived: boolean): void {
     if (fault === null || fault.recovered === true) return;
     this.markStall(fault.key, fingerprint, archived);
+    this.carriedOver.delete(fault.key);
   }
 
   /** 告警日志按 UTC 日期分片（与 budget/rollover 的"今日"口径一致） */

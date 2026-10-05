@@ -69,11 +69,10 @@ String _short(Object? hash) {
   return text.length <= 8 ? text : text.substring(0, 8);
 }
 
-String _num(int value) {
-  if (value >= 1000000) return '${(value / 1000000).toStringAsFixed(1)}M';
-  if (value >= 1000) return '${(value / 1000).toStringAsFixed(1)}k';
-  return '$value';
-}
+// 千分位那个与 k/M/G 那个都搬去了 `../format.dart`
+//（2026-10-05：单位格式只能有一处实现，见 `logs_format.dart` 的文件头）。
+// 这一页剩下的"人话"（归因等式、解除那句话）印的是**精确整数**——那是给人逐位核对的，
+// 不是读量级的，所以它们走 `formatExact`（同一个函数，同一份千分位规则）。
 
 String _p2(int value) => value.toString().padLeft(2, '0');
 
@@ -98,17 +97,9 @@ TextStyle _mono(double size, Color color) => TextStyle(
 
 // ─── 两条"事实类"事件的人话（唯一实现：行摘要与详情面板共用，界面不写第二份措辞） ───
 
-/// 精确整数（千分位）。与 TS 侧 `context-audit.ts` 的 `exact()` 同一口径：
-/// 归因那一行是给人**核对**的，两千和三千不能都印成"0.2万"。
-String _exact(int value) {
-  final text = (value < 0 ? 0 : value).toString();
-  final out = StringBuffer();
-  for (var i = 0; i < text.length; i += 1) {
-    if (i > 0 && (text.length - i) % 3 == 0) out.write(',');
-    out.write(text[i]);
-  }
-  return out.toString();
-}
+// 千分位那份实现在 `../format.dart` 的 `formatExact`（本地那份与它逐字相同，已合并）：
+// 与 TS 侧 `context-audit.ts` 的 `exact()` 同一口径——归因那一行是给人**核对**的，
+// 两千和三千不能都印成"0.2万"。
 
 int _segTokens(Map<String, dynamic> segment) => _int(segment['tokens']);
 
@@ -135,20 +126,20 @@ String? _contextLine(Map<String, dynamic> data) {
   final tools = _map(ctx['tools']);
   final input = _map(ctx['input']);
   final history = _map(ctx['history']);
-  final segments = <String>['记忆 ${_exact(_segTokens(_map(ctx['memory'])))}'];
+  final segments = <String>['记忆 ${formatExact(_segTokens(_map(ctx['memory'])))}'];
   final state = ctx['state'];
   if (state is Map) {
-    segments.add('固定块 ${_exact(_segTokens(state.cast<String, dynamic>()))}');
+    segments.add('固定块 ${formatExact(_segTokens(state.cast<String, dynamic>()))}');
   }
   segments
-    ..add('历史 ${_exact(_segTokens(history))}（${_int(history['items'])} 条）')
-    ..add('此刻层 ${_exact(_segTokens(_map(ctx['now'])))}');
+    ..add('历史 ${formatExact(_segTokens(history))}（${_int(history['items'])} 条）')
+    ..add('此刻层 ${formatExact(_segTokens(_map(ctx['now'])))}');
   // 这两段为 0 时不印：它们不是"当时是空的"，而是"那一步没有这一格"
-  if (_segTokens(_map(ctx['wake'])) > 0) segments.add('本轮输入 ${_exact(_segTokens(_map(ctx['wake'])))}');
-  if (_segTokens(_map(ctx['hint'])) > 0) segments.add('尾部插播 ${_exact(_segTokens(_map(ctx['hint'])))}');
-  return '整条 ${_exact(_contextWhole(data) ?? 0)} = 指令 ${_exact(_segTokens(instructions))}'
-      ' + 工具 ${_exact(_segTokens(tools))}（${_int(tools['count'])} 件）'
-      ' + input 段 ${_exact(_segTokens(input))}（${segments.join(' · ')}）';
+  if (_segTokens(_map(ctx['wake'])) > 0) segments.add('本轮输入 ${formatExact(_segTokens(_map(ctx['wake'])))}');
+  if (_segTokens(_map(ctx['hint'])) > 0) segments.add('尾部插播 ${formatExact(_segTokens(_map(ctx['hint'])))}');
+  return '整条 ${formatExact(_contextWhole(data) ?? 0)} = 指令 ${formatExact(_segTokens(instructions))}'
+      ' + 工具 ${formatExact(_segTokens(tools))}（${_int(tools['count'])} 件）'
+      ' + input 段 ${formatExact(_segTokens(input))}（${segments.join(' · ')}）';
 }
 
 /// `budget/resumed` → 一行人话：哪一层、谁解的、凭什么解的、解除那一刻两个数是多少。
@@ -157,8 +148,8 @@ String? _contextLine(Map<String, dynamic> data) {
 /// 当时撞线的那个数不在这里，它在解除之前那条 `budget/exhausted` 里（见 src/log/types.ts）。
 String _resumedLine(Map<String, dynamic> data) {
   final why = _str(data['reason']) == 'limit-raised' ? '配置里的上限被调大' : '累计加注把上限抬高了';
-  return '${_str(data['layer'])} 层暂停已解除：已用 ${_exact(_int(data['actual']))}'
-      ' / 有效上限 ${_exact(_int(data['limit']))}（$why）';
+  return '${_str(data['layer'])} 层暂停已解除：已用 ${formatExact(_int(data['actual']))}'
+      ' / 有效上限 ${formatExact(_int(data['limit']))}（$why）';
 }
 
 /// 详情面板顶上那段"读法"：有归因给归因等式，`budget/resumed` 给解除那句话，其余返回 null

@@ -84,7 +84,8 @@ extension _LogsPanels on _LogsPageState {
               if (tokenSeries.length < 2)
                 Text('暂无序列数据', style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant))
               else ...[
-                Text('token 用量 · 峰值 ${_num(peak)}',
+                // 峰值与卡片、页脚同源（`logsPeakLine` → format.dart）：这个数也是非缓存口径
+                Text(logsPeakLine(peak),
                     style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
                 const SizedBox(height: 4),
                 _Spark(values: tokenSeries, color: scheme.primary),
@@ -130,10 +131,11 @@ extension _LogsPanels on _LogsPageState {
                 // 默认 8 行，其余收进「查看全部」（§3.4）
                 CappedChildren(children: [for (final t in turns) _turnRow(context, t)]),
               const Divider(height: 18),
+              // 页脚与两张 lane 卡说的是同一件事（都是非缓存口径的 token 累计），
+              // 数字走 `logsMonthLine` → `format.dart`：同一个数在这里和运行情况页长得一样
               Text(
-                '月累计 ${_num(_int(month['tokens']))} token · turn 数 ${_int(month['turns'])}'
-                ' · 单次均价 ${_num(_int(month['avgPerTurn']))}',
-                style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+                logsMonthLine(_int(month['tokens']), _int(month['turns']), _int(month['avgPerTurn'])),
+                style: TextStyle(fontSize: 12, height: 1.6, color: scheme.onSurfaceVariant),
               ),
             ],
           ),
@@ -173,11 +175,11 @@ extension _LogsPanels on _LogsPageState {
           ),
           SizedBox(
             width: 76,
-            child: Text(_num(_int(t['input'])), textAlign: TextAlign.right, style: _mono(12.5, scheme.onSurface)),
+            child: Text(logsCompactTokens(_int(t['input'])), textAlign: TextAlign.right, style: _mono(12.5, scheme.onSurface)),
           ),
           SizedBox(
             width: 76,
-            child: Text(_num(_int(t['output'])), textAlign: TextAlign.right, style: _mono(12.5, scheme.onSurface)),
+            child: Text(logsCompactTokens(_int(t['output'])), textAlign: TextAlign.right, style: _mono(12.5, scheme.onSurface)),
           ),
           SizedBox(
             width: 68,

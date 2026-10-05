@@ -11,8 +11,8 @@ String _summary(Map<String, dynamic> ev) {
     case 'budget/consumed':
       // 归因（`context`）是这条事件上的一个字段：有它就缀一句"整条多大"（点开有整条等式），
       // 没有（旧日志、或这条不是模型记账）就照旧只报这笔用量
-      return '+${_num(_int(d['inputTokens']))}↑ +${_num(_int(d['outputTokens']))}↓ (hit ${_num(_int(d['cacheHitTokens']))}) ${d['lane'] ?? ''}'
-          '${_contextWhole(d) == null ? '' : ' · 归因 ${_num(_contextWhole(d)!)}'}';
+      return '+${logsCompactTokens(_int(d['inputTokens']))}↑ +${logsCompactTokens(_int(d['outputTokens']))}↓ (hit ${logsCompactTokens(_int(d['cacheHitTokens']))}) ${d['lane'] ?? ''}'
+          '${_contextWhole(d) == null ? '' : ' · 归因 ${logsCompactTokens(_contextWhole(d)!)}'}';
     case 'budget/resumed':
       return _resumedLine(d);
     case 'turn/end':
@@ -89,15 +89,24 @@ class _LaneCard extends StatelessWidget {
           Row(
             children: [
               Text(label, style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+              const SizedBox(width: 6),
+              // 口径词摆在卡头：这张卡上的数**计入预算**，而非缓存口径是它唯一的语义
+              //（2026-10-05 换的口径：`(input − cacheHit) + output`，见 state/fold.ts）
+              Text('· $kBudgetMetricLabel',
+                  style: TextStyle(fontSize: 10.5, color: scheme.onSurfaceVariant.withValues(alpha: 0.85))),
               const Spacer(),
               Text(total > 0 ? '占今日 ${(tokens / total * 100).round()}%' : '—',
                   style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
             ],
           ),
           const SizedBox(height: 6),
-          Text(_num(tokens),
-              style: const TextStyle(
-                  fontSize: 26, fontWeight: FontWeight.w600, fontFeatures: [FontFeature.tabularFigures()])),
+          // 卡面印紧凑写法（2.7M），悬停给真数（2,705,946）——两者由同一个函数给
+          Tooltip(
+            message: logsTokensTooltip(tokens),
+            child: Text(logsCompactTokens(tokens),
+                style: const TextStyle(
+                    fontSize: 26, fontWeight: FontWeight.w600, fontFeatures: [FontFeature.tabularFigures()])),
+          ),
           const SizedBox(height: 10),
           SizedBox(
             height: 6,
@@ -119,9 +128,11 @@ class _LaneCard extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 6),
+          // 这一行是"预算卡有没有跟着设置一起变"最直接的读法：硬上限与软线都印出来。
+          // 三个数走 `logsLimitLine`（同一处格式化），口径词一行说一次。
           Text(
-            hardLimit > 0 ? '距预算上限 ${_num(tokens)} / ${_num(hardLimit)}（软线 ${_num(soft)}）' : '未设置日上限，进度条不可用',
-            style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant),
+            logsLimitLine(tokens, hardLimit, soft),
+            style: TextStyle(fontSize: 11.5, height: 1.5, color: scheme.onSurfaceVariant),
           ),
         ],
       ),

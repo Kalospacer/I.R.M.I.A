@@ -1,5 +1,6 @@
 /**
  * Irmia Agent — 启动异常退出告警（docs/design.md §4.9 触发点清单首条、docs/milestones.md M4 交付物 5）
+ * 与**启动时补写"已恢复"**（2026-10-05，见下半篇）。
  *
  * 判据只有一个：**恢复流程的补偿清单里出现了「上一次运行异常退出」**。
  * 这条事实由 runtime/recover.ts 第四步（settleOpenTurn）产生——它发现上一个进程留下未闭合的
@@ -16,6 +17,7 @@
 
 import type { NotifyOutcome } from '../tools/admin.js';
 import type { AlertInput, AlertNotifier } from './notifier.js';
+import type { AppEvent, BudgetLayer } from '../log/types.js';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
@@ -86,4 +88,193 @@ export async function notifyStartupRecovery(
   const alert = buildStartupRecoveryAlert(input);
   if (alert === null) return null;
   return notifier.alert(alert);
+}
+
+// ══════════════════════════════ 启动时补写「已恢复」 ══════════════════════════════
+
+/**
+ * 为什么需要这一段（2026-10-05 用户报的现场）：
+ *
+ * 一条"已恢复"（`alarm/sent{recovered:true}`，标题「已恢复：budget-exhausted」）**只在同一个
+ * 进程里条件自然解除时才写**（`notifier.ok` ← `real-loop` 的 `releaseLiftedPauses` / 加注 /
+ * healthCheck）。而用户恢复预算走的是**重启 + 改额度**那条路：重启之后上一次那条
+ * `budget/exhausted` 由日志重放回来，可那个进程里**再没有任何一刻**会判"它解除了"——
+ * 于是运行情况页那张卡上，一条早就解除的"预算耗尽"永远红着。
+ *
+ * 这一段补的就是那一笔账，判据一条都不新造：
+ *   · **哪些故障还没解除**：`foldStalls(events)`（notifier.ts 的既有口径，与 `restore()` 同源）；
+ *   · **怎么写"已恢复"**：`notifier.ok(category, 理由)`（与运行期那条路是同一个方法，
+ *     `recovered:true` + 故障键配对 + 指纹都照旧）；
+ *   · **为什么可以写**：调用方给出"当刻确实不成立"的判据，本模块不放行谎报（见下）。
+ */
+
+/**
+ * **不许补写的类别**——"已经发生过的历史事实"。
+ *
+ * 这条线是这一段最重要的分寸：**重启不等于那件事没发生过**。
+ *   · `model-failure`（模型连续失败）：投影里的 `failStreak` 是**持久**计数，重启不清零
+ *     （见 `state/fold.ts`）。冷启动时它可能是 0，但那是"这个进程还没失败过"，不是
+ *     "上一次那串连续失败已经好了"——那串失败真的发生过，给它补一条"已恢复"就是造假事实。
+ *   · 其余"外部世界已经改变"的告警（webhook 挂了、通道断了）同理：进程重启不改外部世界。
+ *
+ * 反过来说，**可以**补写的是「由**进程状态**决定、重启后会重新评估」的那几类：
+ * 它们的成立与否只取决于当刻的框架状态（预算有没有越线、队列里有没有人在等），
+ * 重启后重新评估一次，评估结论就是真相。判据表见 {@link STARTUP_BACKFILL}。
+ */
+export const NEVER_BACKFILLED = new Set<string>([
+  'model-failure',
+  'startup-recovery',
+]);
+
+/**
+ * 允许在启动时补写「已恢复」的类别及其**当刻是否仍成立**的判据（唯一一份判定表）。
+ *
+ * 每条判据都必须是"当刻状态"，且**真实不成立时才返回 true**：
+ *   · `budget-exhausted`：日志里没有任何一层还停在"撞线且未解除"的暂停态
+ *     （判据是 `pausedLayers` 为空，见 {@link pausedLayers}）；
+ *   · `stall`：队列里没有"等了超过阈值还没被处理"的输入（`budget-guard.ts` 的 `stallOf`，
+ *     运行期用的是同一个函数）。
+ *
+ * 判据由调用方注入，本模块不自己再实现一遍——第二份判定必然与运行期分岔。
+ */
+export const STARTUP_BACKFILL: Record<
+  string,
+  (evidence: StartupBackfillEvidence) => boolean
+> = {
+  'budget-exhausted': (evidence) => evidence.pausedLayers.length === 0,
+  stall: (evidence) => !evidence.stallNow,
+};
+
+/** 启动补写要向调用方问的两件"当刻状态"（都是运行期已有的判定，不新造） */
+export interface StartupBackfillEvidence {
+  /** 当刻还停在"撞线且未解除"的暂停态的预算层（空 = 那一档当刻没有暂停） */
+  pausedLayers: readonly BudgetLayer[];
+  /** 当刻是否真有水位停滞（有输入等着没人处理） */
+  stallNow: boolean;
+}
+
+/**
+ * 判据的工具：**当刻还停在"撞线且未解除"的预算层**。
+ *
+ * 判据与 `BudgetGuard.isPaused` 是同一条（`lastExhausted` 里还有没有这一层的记录），
+ * 只是它要一份投影而已：
+ *   · 记录还在 ⇒ 这一层还停着（**不管它的上限是不是已经被抬高了**——抬高的那一半由
+ *     {@link raisedLayers} 说清，两件事分开看，合成一句"不暂停"就说不清是谁解的）；
+ *   · 记录没了、而同一条撞线事实还在日志里 ⇒ 后来被 `budget/resumed` 或加注解开了。
+ */
+export function pausedLayers(projection: {
+  lastExhausted: Partial<Record<BudgetLayer, unknown>>;
+}): BudgetLayer[] {
+  return (Object.keys(projection.lastExhausted) as BudgetLayer[]).sort();
+}
+
+/**
+ * 判据的工具：**哪些预算层的暂停是被"抬上限"解掉的**——日志里说得出凭据的那种。
+ *
+ * 与 {@link pausedLayers} 是一对：投影里已经没有这一层的暂停记录，而日志里那条
+ * `budget/exhausted` 之后**没有** `budget/topped-up` / `budget/resumed`
+ * （`state/fold.ts` 的销账口径，这里逐字复用）——那它只可能是"上限被抬高了"解开的，
+ * 要满足"有效上限 > 撞线时那个上限"（`liftedPauses` 判据③的同一个比较）。
+ *
+ * **认不出的形状一律不认**（宁可漏一句话，也不编）：读不出 layer 的 `budget/exhausted`、
+ * 记录里没有上限，都不算。
+ */
+export function raisedLayers(
+  events: Iterable<AppEvent>,
+  effectiveLimit: (layer: BudgetLayer) => number,
+): BudgetLayer[] {
+  const open = new Map<BudgetLayer, number>();
+  for (const event of events) {
+    if (event.type === 'budget/exhausted') {
+      const layer = event.data.layer;
+      const limit = event.data.limit;
+      if (typeof limit !== 'number' || !Number.isFinite(limit)) continue;
+      open.set(layer, limit);
+      continue;
+    }
+    if (event.type === 'budget/topped-up' || event.type === 'budget/resumed') {
+      open.delete(event.data.layer);
+    }
+  }
+
+  const raised: BudgetLayer[] = [];
+  for (const [layer, archivedLimit] of open) {
+    if (effectiveLimit(layer) > archivedLimit) raised.push(layer);
+  }
+  return raised.sort();
+}
+
+/**
+ * 仍未解除的故障类别（`category:xxx` 键 → `xxx`），按类别去重。
+ *
+ * 口径与 `notifier.ts` 的 `foldStalls` **同一份**：一个故障键有 `alarm/sent` 而其后没有
+ * `recovered:true` 的那条，就算"还没销账"。这里只把键名换成类别名，方便按类别查判据表。
+ */
+export function unresolvedCategories(events: Iterable<AppEvent>): string[] {
+  const open = new Set<string>();
+  for (const event of events) {
+    if (event.type !== 'alarm/sent') continue;
+    const key = event.data.key;
+    if (key === undefined || key === '') continue;
+    const category = categoryOfKey(key);
+    if (category === null) continue;
+    if (event.data.recovered === true) open.delete(category);
+    else open.add(category);
+  }
+  return [...open].sort();
+}
+
+/** 故障键 → 类别：只认运行期 `fail()`/`ok()` 写下的 `category:<类别>` 形状 */
+export function categoryOfKey(key: string): string | null {
+  const prefix = 'category:';
+  if (!key.startsWith(prefix)) return null;
+  const category = key.slice(prefix.length);
+  return category === '' ? null : category;
+}
+
+/**
+ * 挑出**这次启动该补写「已恢复」**的类别。
+ *
+ * 三条同时成立才挑：① 该类别有未解除的告警；② 不在 {@link NEVER_BACKFILLED} 里
+ * （历史事实类，重启不为它背书）；③ 它在 {@link STARTUP_BACKFILL} 里有判据，且判据说
+ * **当刻确实不成立**。任一条不成立就一个字都不写——**不许为了好看而谎报恢复**。
+ */
+export function backfillCandidates(
+  events: Iterable<AppEvent>,
+  evidence: StartupBackfillEvidence,
+): string[] {
+  return unresolvedCategories(events).filter((category) => {
+    if (NEVER_BACKFILLED.has(category)) return false;
+    const resolvable = STARTUP_BACKFILL[category];
+    if (resolvable === undefined) return false; // 没有判据的类别：不动它（保守）
+    return resolvable(evidence);
+  });
+}
+
+/**
+ * 补写「已恢复」，返回**真的写下去了**的类别。
+ *
+ * 走的是 `releasePending`（不是 `ok`）：这一条账的语义是"**上一个进程留下的**故障，
+ * 当刻已经核实过不成立"——`ok()` 只管本进程亲眼看见的恢复，不给历史故障背书
+ * （见 notifier.ts 的 `carriedOver`）。
+ *
+ * 幂等有两层，都不靠内存记账：
+ *   · 写下去的那条 `recovered:true` 进日志，`foldStalls` 下一次启动就把这个键销掉
+ *     ⇒ 下一次启动 `backfillCandidates` 根本挑不出它，**重复启动不会堆积重复记录**；
+ *   · `releasePending` 自己写完之后登记就没了，同一次启动再调是空操作。
+ *
+ * `reason` 说明这笔账是谁补的——读日志的人要能一眼看出"这不是运行期自然恢复"。
+ * 内容由调用方给（它才知道当刻的数），本函数不编数字。
+ */
+export async function backfillResolvedAlarms(
+  notifier: AlertNotifier,
+  categories: readonly string[],
+  reason: (category: string) => string,
+): Promise<string[]> {
+  const written: string[] = [];
+  for (const category of categories) {
+    await notifier.releasePending(category, reason(category));
+    written.push(category);
+  }
+  return written;
 }

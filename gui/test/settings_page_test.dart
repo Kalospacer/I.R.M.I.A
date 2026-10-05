@@ -22,6 +22,8 @@ import 'package:irmia_gui/ui_state.dart';
 ///
 /// ⑭ 起系统卡是**逐行就地编辑**（紧凑表 + 每行一枚「编辑」胶囊）：只动这一行、只写这一行、
 /// 取消就丢、默认只露 4 行能展开收起、两条只读行没有胶囊——这七条锁在文件末尾。
+/// 心跳频率那一行（`wake.heartbeatTargetMeanMin`，2026-10-05 加）三条锁在系统卡那组之后：
+/// 渲染盘上那份的值、只发一条 config-update、`X-Confirm` **不带** `trust-full-access`。
 /// 「记忆」卡（`persona.memoryEnabled`）三条锁在最后：开关读盘上那份、点一下走 config-update、
 /// **关掉时那句代价必须在**（它是一句"什么都不会报错、代价过几天才显形"的话）。
 void main() {
@@ -137,6 +139,11 @@ void main() {
     },
     'tools': {'destructiveEnabled': false},
     'speak': {'typingEffect': true, 'charsPerMinute': 90},
+    // 心跳平均间隔（`wake.heartbeatTargetMeanMin`）：用户 2026-10-05 点名要的那个旋钮——
+    // "心跳频率我没有地方可以控制吗？"。假配置给的是**与出厂默认相同**的 15，
+    // 所以这一条不能证明"读的是配置"（写死 15 也过）——那件事由下面 `heartbeatMean`
+    // 那条用例用另一个值（40）单独锁住。
+    'wake': {'heartbeatFloorMin': 5, 'heartbeatCeilMin': 60, 'heartbeatTargetMeanMin': 15},
     // persona.memoryEnabled 是记忆卡的读源；$pending 是服务端给"盘上已改、进程还没接管"的元信息
     'persona': {'memoryEnabled': true, 'contacts': <String, dynamic>{}},
     r'$pending': {'source': 'saved', 'restartRequired': <String>[]},
@@ -206,6 +213,7 @@ void main() {
       },
       'tools': {'destructiveEnabled': false},
       'speak': {'typingEffect': true, 'charsPerMinute': 90},
+      'wake': {'heartbeatFloorMin': 5, 'heartbeatCeilMin': 60, 'heartbeatTargetMeanMin': 15},
       'persona': {'memoryEnabled': true, 'contacts': <String, dynamic>{}},
       r'$pending': {'source': 'saved', 'restartRequired': <String>[]},
     };
@@ -373,9 +381,14 @@ void main() {
   Finder inDepsCard(Finder target) => inCard('建议安装的外部依赖', target);
   /// 「协议端（可选）」卡内部（锚句随 2026-10-02 的副标题更正换过一次）
   Finder inProtocolCard(Finder target) => inCard('各是一条独立的入站通道', target);
-  /// 「系统」卡内部（⑪ 之后它不再只读，卡头说明句是这一页上唯一的那句）
+  /// 「系统」卡内部（⑪ 之后它不再只读，卡头说明句是这一页上唯一的那句）。
+  ///
+  /// 2026-10-05 心跳那行加进来时，卡头说明句跟着改了（"六条预算" → "六条预算与心跳"），
+  /// 这里的锚句**必须同步改**——它是一段 `textContaining`，锚句对不上就是"找不到卡"，
+  /// 而 `find.ancestor(...).first` 找不到时不会报"锚句过期"，只会让**五条系统卡用例一起红**
+  /// （现象是"某个控件在卡里找不到"，看上去像控件坏了）。卡头说明句与这一行是**配对**的。
   Finder inSystemCard(Finder target) =>
-      inCard('监听地址、时区与六条预算是这个进程的启动参数', target);
+      inCard('监听地址、时区、六条预算与心跳都是这个进程的启动参数', target);
 
   /// 系统卡某一格**编辑态**输入框里的文本：按点路径取，不按"页面上第几个框"取——
   /// 这一页的输入框已经多到按序号取必然出错（⑪ 之前那条 `.last` 就是被这件事绊倒的）。
@@ -1160,21 +1173,25 @@ void main() {
     expect(sysValue(tester, 'budget.dailyTokens'), '2000000');
     expect(inSystemCard(find.text('D:/irmia/data')), findsOneWidget, reason: '第 4 行是数据目录');
 
-    // 其余 6 行连渲染都还没发生（不是"藏起来"，是根本没挂上去）
+    // 其余 7 行连渲染都还没发生（不是"藏起来"，是根本没挂上去）
     expect(find.byKey(const ValueKey('sys-value-budget.stepTools')), findsNothing);
     expect(inSystemCard(find.text('预算 · 软阈值')), findsNothing);
     expect(inSystemCard(find.text('destructive 工具策略')), findsNothing);
+    // 心跳平均间隔（2026-10-05 加的那一行）也收在里面：它落在预算那一组的末尾
+    expect(inSystemCard(find.text('心跳间隔 · 平均（分钟）')), findsNothing);
+    expect(find.byKey(const ValueKey('sys-value-wake.heartbeatTargetMeanMin')), findsNothing);
 
-    // CappedChildren 报的是**总行数**（10 = 8 个可编辑 + 2 个只读），标签在展开后切成「收起」
-    await tapInCard(tester, inSystemCard(find.text('查看全部（10 行）')));
+    // CappedChildren 报的是**总行数**（11 = 9 个可编辑 + 2 个只读），标签在展开后切成「收起」
+    await tapInCard(tester, inSystemCard(find.text('查看全部（11 行）')));
     expect(inSystemCard(find.text('预算 · 软阈值')), findsOneWidget);
     expect(inSystemCard(find.text('destructive 工具策略')), findsOneWidget);
-    expect(inSystemCard(find.text('查看全部（10 行）')), findsNothing);
+    expect(inSystemCard(find.text('心跳间隔 · 平均（分钟）')), findsOneWidget);
+    expect(inSystemCard(find.text('查看全部（11 行）')), findsNothing);
     expect(inSystemCard(find.text('收起')), findsOneWidget);
 
     await tapInCard(tester, inSystemCard(find.text('收起')));
     expect(inSystemCard(find.text('预算 · 软阈值')), findsNothing, reason: '展开后要能再收起');
-    expect(inSystemCard(find.text('查看全部（10 行）')), findsOneWidget);
+    expect(inSystemCard(find.text('查看全部（11 行）')), findsOneWidget);
     expect(tester.takeException(), isNull);
     await drain(tester);
   });
@@ -1233,10 +1250,37 @@ void main() {
     await drain(tester);
   });
 
+  testWidgets('系统卡：六个示例值（hint）逐个钉住——每日 token 上限与出厂默认 100M 对齐', (tester) async {
+    // 判据：提示值 = **出厂默认值**（`src/config/config.ts` 的 `buildDefaults`）。出厂从 2M 改成
+    // 100M 之后，这里若还写着 2000000，就是在教人填一个会被心跳自己吃穿的值。这条测试同时钉住
+    // "只动了日额度那一个"——其余五个提示**没有**跟着改（防"顺手一起改"）。
+    await pumpSettings(tester, size: const Size(1350, 3400));
+    await tapInCard(tester, inSystemCard(find.text('查看全部（11 行）')));
+
+    /// 点开某一行的编辑态，读那一格输入框的 hint，再用「取消」把这行收回去
+    /// （不收的话下一行要点的「编辑」胶囊不在——这正是逐行交互的样子）。
+    Future<String?> hintOf(String id, String path) async {
+      await tapInCard(tester, sysEdit(id));
+      final box = tester.widget<TextField>(find.byKey(ValueKey('sys-field-$path')));
+      final hint = box.decoration?.hintText;
+      await tapInCard(tester, sysCancelBtn(id));
+      return hint;
+    }
+
+    expect(await hintOf('budget.dailyTokens', 'budget.dailyTokens'), '100000000',
+        reason: '每日 token 上限的提示要跟出厂默认（100_000_000）逐字一致，不是随手一个示例');
+    expect(await hintOf('budget.stepTools', 'budget.stepTools'), '20');
+    expect(await hintOf('budget.turnSteps', 'budget.turnSteps'), '30');
+    expect(await hintOf('budget.taskTokens', 'budget.taskTokens'), '500000');
+    expect(await hintOf('budget.softRatio', 'budget.softRatio'), '0.8');
+    expect(await hintOf('budget.failStreakMax', 'budget.failStreakMax'), '5');
+    await drain(tester);
+  });
+
   testWidgets('系统卡：非法值当场拦下，一个字节都不写盘（六种取值逐个试）', (tester) async {
     await pumpSettings(tester, size: const Size(1350, 3400));
     // 六次里有两次落在默认收起的那几行上（软阈值 / 步内工具调用上限），先把整张表展开
-    await tapInCard(tester, inSystemCard(find.text('查看全部（10 行）')));
+    await tapInCard(tester, inSystemCard(find.text('查看全部（11 行）')));
 
     // 逐条按解析器的规则来（src/config/config.ts）。每一格试完用「取消」把这一行收掉：
     // 不然那一行还开着输入框，下一行要点的「编辑」胶囊根本不在（这正是逐行交互的样子）。
@@ -1293,7 +1337,7 @@ void main() {
 
   testWidgets('系统卡：数据目录只读，destructive 策略这一行是唯一能改它的地方', (tester) async {
     await pumpSettings(tester, size: const Size(1350, 3400));
-    await tapInCard(tester, inSystemCard(find.text('查看全部（10 行）')));
+    await tapInCard(tester, inSystemCard(find.text('查看全部（11 行）')));
 
     // 两条只读行没有胶囊，也没有输入框（键就是点路径/行 id，找不到即证明它不可编辑）
     expect(find.byKey(const ValueKey('sys-edit-dataDir')), findsNothing);
@@ -1342,8 +1386,8 @@ void main() {
     expect(lastPost?['fields'], {'tools.destructiveEnabled': true});
     expect(lastConfirm, 'update-config; enable-destructive');
 
-    // 「需重启」只挂在能改的那 8 行上：改不了的行喊重启没意义（⑭ 的原话）
-    expect(inSystemCard(find.text('需重启')), findsNWidgets(8));
+    // 「需重启」只挂在能改的那 9 行上：改不了的行喊重启没意义（⑭ 的原话）
+    expect(inSystemCard(find.text('需重启')), findsNWidgets(9));
     await drain(tester);
   });
 
@@ -1366,6 +1410,113 @@ void main() {
     expect(postCount, 1);
     expect(lastPost?['fields'], {'web.host': '0.0.0.0', 'web.port': 8899});
     expect(lastConfirm, 'config-update');
+    await drain(tester);
+  });
+
+  // ── 心跳频率：系统卡里那一行 `wake.heartbeatTargetMeanMin`（用户 2026-10-05） ──
+  //
+  // 用户原话："心跳频率我没有地方可以控制吗？" —— 结论是只能手改 config.json，界面上没有入口。
+  // 这三条锁的就是"入口补上了、而且补对了"：
+  //   ① 这一行**渲染盘上那份的值**（不是写死的 15，也不是空框）；
+  //   ② 改动只走既有的 config-update，body 里就是这一个字段、值就是框里那个数；
+  //   ③ 它的 `X-Confirm` **不带**字段短语 —— `trust-full-access` 只给带 `trust.mode` 的请求
+  //      （见 settings_page.dart 顶部的写通道说明与 [kTrustConfirm]）。无脑跟一份短语，
+  //      轻则没意义，重则把"每次改心跳都要带危险短语"变成习惯，那句话本身就不值钱了。
+
+  testWidgets('系统卡 · 心跳频率：这一行渲染盘上那份的值（15），标签与说明是人话', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+    // 它在默认收起的那几行里：先展开整张表（与上面几条系统卡用例同一条路）
+    await tapInCard(tester, inSystemCard(find.text('查看全部（11 行）')));
+
+    // ① 读态摆的就是配置里那个数（示例配置 = 出厂默认 15）
+    expect(sysValue(tester, 'wake.heartbeatTargetMeanMin'), '15',
+        reason: '这一行要摆盘上那份的值，不是空着让人猜');
+    // ② 标签是人话（点路径不上屏）：用户要能一眼看懂"我改的是哪个数"
+    expect(inSystemCard(find.text('心跳间隔 · 平均（分钟）')), findsOneWidget);
+    expect(inSystemCard(find.textContaining('wake.heartbeatTargetMeanMin')), findsNothing,
+        reason: '字段路径是给实现者看的，不该出现在界面上');
+
+    // ③ 点开编辑态：框里预填当前值，旁注把"越大越省、两端有兜底"如实说清
+    await tapInCard(tester, sysEdit('wake.heartbeatTargetMeanMin'));
+    expect(sysText(tester, 'wake.heartbeatTargetMeanMin'), '15', reason: '编辑态先摆当前值，不是空框');
+    // 文案规则（用户 2026-10-05）：说明 = 一行要点，**不带 markdown 记号**
+    //（界面 chrome 不做渲染，渲染器只服务正文）。所以这里既钉内容、也钉"没有 **"。
+    expect(
+      find.text('她平均多久自己醒一次——越大越省 token，越小越常醒。'
+          '两端仍由上下限兜住：不因这个数改变，安静不足下限不会醒、到了上限必然会醒。'),
+      findsOneWidget,
+      reason: '这句说明是这一行的一半价值：没有它，人不知道自己填的数会怎样影响她',
+    );
+    expect(find.textContaining('**'), findsNothing, reason: '界面提示里不许再留 markdown 记号');
+    await tapInCard(tester, sysCancelBtn('wake.heartbeatTargetMeanMin'));
+    await drain(tester);
+  });
+
+  testWidgets('系统卡 · 心跳频率：读数跟着配置走（40 也照实渲染，不是写死的 15）', (tester) async {
+    // 上一条用的是 15（= 出厂默认），所以它证明不了"读的是配置"——写死 15 也能过。
+    // 这一条把盘上那份改成 40：读数必须跟着变，而那正是用户按这个框时看到的起始值。
+    config['wake'] = {'heartbeatFloorMin': 5, 'heartbeatCeilMin': 60, 'heartbeatTargetMeanMin': 40};
+    await pumpSettings(tester, size: const Size(1350, 3400));
+    await tapInCard(tester, inSystemCard(find.text('查看全部（11 行）')));
+
+    expect(sysValue(tester, 'wake.heartbeatTargetMeanMin'), '40',
+        reason: '框里必须是配置里那个值本身，不是一个写死的默认值');
+    await tapInCard(tester, sysEdit('wake.heartbeatTargetMeanMin'));
+    expect(sysText(tester, 'wake.heartbeatTargetMeanMin'), '40', reason: '点开编辑态也摆同一个值');
+    await tapInCard(tester, sysCancelBtn('wake.heartbeatTargetMeanMin'));
+    await drain(tester);
+  });
+
+  testWidgets('系统卡 · 心跳频率：改值保存走 config-update，fields 就是这一个字段、X-Confirm 不带字段短语', (tester) async {    await pumpSettings(tester, size: const Size(1350, 3400));
+    await tapInCard(tester, inSystemCard(find.text('查看全部（11 行）')));
+
+    await tapInCard(tester, sysEdit('wake.heartbeatTargetMeanMin'));
+    await tester.enterText(find.byKey(const ValueKey('sys-field-wake.heartbeatTargetMeanMin')), '45');
+    await tester.pump();
+    await tapInCard(tester, sysSaveBtn('wake.heartbeatTargetMeanMin'));
+    await pumpUntil(tester, find.text('已保存，重启后生效'));
+
+    // 一条请求、一个字段、值是框里那个数（不是字符串 '45'，也不是别人的字段）
+    expect(postCount, 1, reason: '逐行保存就是一条请求');
+    expect(lastPost?['fields'], {'wake.heartbeatTargetMeanMin': 45});
+    // X-Confirm：命令短语要有；字段短语**一个都不许跟**
+    expect(lastConfirm, contains('config-update'), reason: '写配置必须带命令短语');
+    expect(lastConfirm, isNot(contains('trust-full-access')),
+        reason: '这一项不在服务端 DANGEROUS_FIELDS 里，不许无脑带上 trust 的字段短语');
+    expect(lastConfirm, 'config-update', reason: '逐字相等才算证明：多带的那半截就是从这里溜进去的');
+
+    // 保存成功后退出编辑态、按盘上那份回填（假服务端没改配置，所以回到 15）
+    expect(find.byKey(const ValueKey('sys-field-wake.heartbeatTargetMeanMin')), findsNothing);
+    expect(sysEdit('wake.heartbeatTargetMeanMin'), findsOneWidget);
+    await drain(tester);
+  });
+
+  testWidgets('系统卡 · 心跳频率：越界的值当场拦下（一个字节都不写盘）', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 3400));
+    await tapInCard(tester, inSystemCard(find.text('查看全部（11 行）')));
+
+    // 逐条按这一行的边界试（6~59）。文案由 _SysField.problem 生成，与别的数值行同一套口径。
+    Future<void> check(String bad, String message) async {
+      await tapInCard(tester, sysEdit('wake.heartbeatTargetMeanMin'));
+      await tester.enterText(
+          find.byKey(const ValueKey('sys-field-wake.heartbeatTargetMeanMin')), bad);
+      await tester.pump();
+      await tapInCard(tester, sysSaveBtn('wake.heartbeatTargetMeanMin'));
+      await pumpUntil(tester, find.text(message));
+      expect(postCount, 0, reason: 'wake.heartbeatTargetMeanMin = $bad 不该写进配置');
+      // 拦下之后留在编辑态：人就在那个框上，改完再按一次就行
+      expect(find.byKey(const ValueKey('sys-field-wake.heartbeatTargetMeanMin')), findsOneWidget);
+      await tapInCard(tester, sysCancelBtn('wake.heartbeatTargetMeanMin'));
+    }
+
+    // 5 = 现存的下限本身：平均值贴着下限不是"平均"，是"每一拍都在最早那一刻"
+    await check('5', '心跳间隔 · 平均（分钟）最小是 6，未保存');
+    // 60 = 现存的上限本身：同理（这三个数就是边界，不是随手挑的）
+    await check('60', '心跳间隔 · 平均（分钟）最大是 59，未保存');
+    // 非整数照样拦（与其余数值行同一句文案）
+    await check('7.5', '心跳间隔 · 平均（分钟）要填整数，未保存');
+
+    expect(postCount, 0);
     await drain(tester);
   });
 
@@ -1461,8 +1612,19 @@ void main() {
     expect(find.text(r'她只能在 C:\path\to\workspace 里活动；越界的读写与命令会被拒绝。'), findsOneWidget);
     // 只读的「当前生效」行说清现在按哪一档跑
     expect(find.text(r'只限工作目录 · C:\path\to\workspace'), findsOneWidget);
-    // 这一条的定性要在卡上（它是边界，不是提醒）
-    expect(find.textContaining('它是**边界，不是提醒**'), findsOneWidget);
+    // 这一条的定性要在卡上（它是边界，不是提醒）——按文案规则（用户 2026-10-05）
+    // 长解释收进了「详情」折叠：所以先断言折叠在，再展开断言那句话在。
+    // 展开点按**这一条自己那枚**折叠头找（设置页上「详情」不止一处，所以按 key）。
+    expect(find.text('它是边界，不是提醒：越界的读写与命令一律被拒绝。'), findsOneWidget);
+    await tapInCard(
+      tester,
+      find.descendant(
+        of: find.byKey(const ValueKey('trust-rules-fold')),
+        matching: find.textContaining('详情'),
+      ),
+    );
+    expect(find.textContaining('它管 fs 工具族'), findsOneWidget,
+        reason: '折叠里要有那道边界的完整口径');
 
     // ③ 点「完全信任」= 放宽边界：先出确认框，取消就一个请求都不发
     await tapInCard(tester, trustRow('full'));
@@ -1484,7 +1646,12 @@ void main() {
     await pumpUntil(tester, find.textContaining('已改为完全信任'));
     expect(postCount, 1);
     expect(lastPost?['fields'], {'trust.mode': 'full'});
-    expect(lastConfirm, 'config-update', reason: '写配置必须带 X-Confirm');
+    // 字段短语：改 `trust.mode` 时 `X-Confirm` 必须**同时**含命令短语与 `trust-full-access`。
+    // 服务端 `DANGEROUS_FIELDS`（src/web/server.ts）对这一个字段两个方向都要——
+    // 少了它，界面点"改成完全信任"会吃 400 confirm-required（配对改动只落一半的老事故）。
+    expect(lastConfirm, kTrustConfirm, reason: '改信任范围要带字段短语 trust-full-access');
+    expect(lastConfirm, contains('config-update'), reason: '命令短语也得在');
+    expect(lastConfirm, contains('trust-full-access'), reason: '字段短语也得在');
     await drain(tester);
   });
 
@@ -1511,7 +1678,9 @@ void main() {
     await pumpUntil(tester, find.textContaining('已改为只限工作目录'));
     expect(postCount, 1);
     expect(lastPost?['fields'], {'trust.mode': 'workspace'});
-    expect(lastConfirm, 'config-update');
+    // **收紧也要带**：服务端刻意不做方向区分（只给放宽加门就得先读盘上现值判方向，
+    // 那是同一件事的第二处判据）。所以"只限工作目录"这一档同样要带字段短语。
+    expect(lastConfirm, kTrustConfirm, reason: '收紧那一档同样要带 trust-full-access');
     await drain(tester);
   });
 
@@ -1529,7 +1698,7 @@ void main() {
     // 界面只显示服务端算出来的结论：徽章是「尚未生效」（= 盘上与生效**真的**不同），
     // 而不是笼统的「需重启」（那只是"这类字段改完要重启"的常态说明）
     expect(find.text('尚未生效'), findsOneWidget);
-    expect(find.textContaining('上面选的那一档**还没生效**'), findsOneWidget);
+    expect(find.textContaining('上面选的那一档还没生效'), findsOneWidget);
     expect(find.textContaining('重启后接管'), findsWidgets);
     // 那一档本身照旧摆在卡上（选中的仍是盘上那份：将来跑的就是它）
     expect(trustRowSelected(tester, 'workspace'), isTrue);

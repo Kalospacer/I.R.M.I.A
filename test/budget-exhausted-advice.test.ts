@@ -216,10 +216,12 @@ function assertAdvice(input: AlertInput, layer: 'step' | 'turn' | 'task' | 'dail
   assert.match(text, /budget\/resumed/u, `${layer}：解除的凭据（那条事件）要点名，人才查得到是谁解的`);
   // ⑤ 不许计价
   assert.equal(PRICING.test(text), false, `${layer}：这句话里不许出现价格/货币字样`);
-  // token 那两档要带上既有口径（未扣缓存、不等于花销）；次数那两档如实说数的是次数
+  // token 那两档要带上**新口径**（2026-10-05 换的：只算"真花钱的那部分"= 输入里没命中缓存的 + 输出，
+  // 缓存命中的那一大截不算）；次数那两档如实说数的是次数。判据不放宽：三个要点逐条钉住。
   if (layer === 'task' || layer === 'daily') {
-    assert.match(text, /未扣缓存/u, `${layer}：token 档的口径必须带上`);
-    assert.match(text, /不等于花销/u);
+    assert.match(text, /真花钱的那部分/u, `${layer}：token 档的口径必须带上`);
+    assert.match(text, /没命中缓存的/u);
+    assert.match(text, /缓存命中的那一大截不算/u);
   } else {
     assert.match(text, /不是 token/u, `${layer}：次数档不该硬套 token 口径`);
   }

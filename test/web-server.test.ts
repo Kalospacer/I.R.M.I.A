@@ -46,7 +46,8 @@ import { TimerStore } from '../src/wake/timer-store.ts';
 import { AUTH_FILE_NAME, SCRYPT_PARAMS, UI_TOKEN_FILE, readLegacyToken } from '../src/web/auth.ts';
 import { WebhookSecretStore } from '../src/web/webhook-secret.ts';
 import {
-  DASHBOARD_EVENT_WINDOW, buildPersonaFiles, instanceIdOf, startWebServer, type WebServer,
+  DASHBOARD_EVENT_WINDOW, buildPersonaFiles, instanceIdOf, restartCommandLine, restartNote, startWebServer,
+  type WebServer,
 } from '../src/web/server.ts';
 
 // ──────────────────────────────── 脚手架 ────────────────────────────────
@@ -461,10 +462,11 @@ test('GET /api/stats/dashboard：六态状态机与磁贴（有待确认时进 n
   };
   assert.equal(body.state, 'needs-review', '待确认优先于其它状态');
   assert.equal(body.tiles['needsReview'], 1);
-  assert.equal(body.tiles['tokensToday'], 120);
+  // 非缓存口径（2026-10-05）：(100 − 60) + 20 = 60（旧口径是 120）。命中率照旧 hit/(hit+miss)
+  assert.equal(body.tiles['tokensToday'], 60);
   assert.equal(body.tiles['cacheHitRate'], 0.6);
   assert.equal(body.hourly.length, 24, '24 小时序列（总览趋势线与预算弹层同一口径）');
-  assert.equal(body.budget['heavy'], 120);
+  assert.equal(body.budget['heavy'], 60);
   assert.equal(body.empty, false);
   assert.equal(typeof body.personaProposals, 'number');
 
@@ -484,45 +486,57 @@ test('GET /api/stats/dashboard：六态状态机与磁贴（有待确认时进 n
 
 test('GET /api/budget：today 与 7d 两条时间口径', async (t) => {
   const fx = await setup(t);
-  const consumed = (tokens: number, ts?: string): void => {
+  /**
+   * 追加一条消耗。`hit` 用来造**命中**的样本——两条事件故意一条全未命中、一条大部分命中，
+   * 于是"卡片/趋势线/按天分桶/页脚是不是同一个口径"这几条断言才有判别力：
+   * 旧口径下它们会得到 150，非缓存口径下是 110。
+   */
+  const consumed = (tokens: number, ts?: string, hit = 0): void => {
     const event = fx.append('budget/consumed', {
       turn: 1, step: 1, lane: 'heavy', model: 'deepseek-chat',
-      inputTokens: tokens, outputTokens: 0, cacheHitTokens: 0, cacheMissTokens: tokens,
+      inputTokens: tokens, outputTokens: 0, cacheHitTokens: hit, cacheMissTokens: tokens - hit,
       durationMs: 1, retryCount: 0, finishReason: 'completed', tokensTodayAccum: tokens,
     });
     if (ts !== undefined) (event as { ts: string }).ts = ts;
   };
   consumed(100);
-  consumed(50);
+  consumed(50, undefined, 40); // 50 里命中 40 ⇒ 非缓存口径只算 10
 
   const today = await call(fx, '/api/budget?range=today');
   assert.equal(today.status, 200);
   const todayBody = today.body as {
     today: { tokens: number };
-    daily: unknown[];
-    hourly: Array<{ input: number; output: number; tokens: number }>;
+    daily: Array<{ tokens: number; hit: number; miss: number }>;
+    hourly: Array<{ input: number; output: number; hit: number; tokens: number }>;
     limits: { dailyTokens: number; softRatio: number };
     turns: Array<{ turn: number; input: number; output: number }>;
     month: { tokens: number; turns: number; avgPerTurn: number };
     layers: Array<{ layer: string }>;
     metricNote: string;
   };
-  // 口径那一句话必须跟着数字一起给（2026-10-04）：上限数的是**未扣缓存**的 token，
-  // 不写清楚，第一次看到"今日用量 34599.9k"的人只会以为框架在乱算
-  assert.match(todayBody.metricNote, /未扣缓存/u);
+  // 口径那一句话必须跟着数字一起给（2026-10-04 加，2026-10-05 换成非缓存口径）：
+  // 不写清楚，人只会拿"今日用量"当全部 token（那是旧口径）去对账
+  assert.match(todayBody.metricNote, /非缓存/u);
+  assert.match(todayBody.metricNote, /没命中缓存的那部分/u);
   assert.match(todayBody.metricNote, /不是同一个数/u);
-  assert.equal(todayBody.today.tokens, 150);
+  assert.equal(todayBody.today.tokens, 110, '卡片：100 + (50 − 40) = 110（旧口径 150）');
   assert.equal(todayBody.daily.length, 1, 'today 只看今天一天');
+  assert.equal(todayBody.daily[0]!.tokens, 110, '7d 的按天分桶与卡片同口径（同一条判据）');
+  assert.equal(todayBody.daily[0]!.hit, 40, '原始分量照旧给（命中率要它）');
+  assert.equal(todayBody.daily[0]!.miss, 110);
   assert.equal(todayBody.hourly.length, 24, '弹层里的“24 小时”图与总览同源');
-  assert.equal(todayBody.hourly.reduce((sum, point) => sum + point.tokens, 0), 150);
-  assert.equal(todayBody.hourly[0]!.input + todayBody.hourly[0]!.output, todayBody.hourly[0]!.tokens);
+  assert.equal(todayBody.hourly.reduce((sum, point) => sum + point.tokens, 0), 110, '24 小时序列也走非缓存口径');
+  assert.equal(
+    todayBody.hourly[0]!.input - todayBody.hourly[0]!.hit + todayBody.hourly[0]!.output,
+    todayBody.hourly[0]!.tokens,
+  );
   assert.deepEqual(todayBody.limits.dailyTokens, fx.config.budget.dailyTokens);
   assert.equal(todayBody.limits.softRatio, 0.8);
   assert.deepEqual(todayBody.layers.map((layer) => layer.layer), ['step', 'turn', 'task', 'daily']);
   assert.equal(todayBody.turns.length, 1);
-  assert.equal(todayBody.turns[0]!.input, 150);
-  assert.equal(todayBody.month.tokens, 150);
-  assert.equal(todayBody.month.avgPerTurn, 150);
+  assert.equal(todayBody.turns[0]!.input, 150, 'turn 明细给的是**原始**输入（in/out 照原样，不折算）');
+  assert.equal(todayBody.month.tokens, 110, '页脚本月估算与卡片同口径');
+  assert.equal(todayBody.month.avgPerTurn, 110);
 
   const week = await call(fx, '/api/budget?range=7d');
   assert.equal((week.body as { daily: unknown[] }).daily.length, 7);
@@ -838,6 +852,76 @@ test('POST /api/commands/requeue：死信重新入队（认领计数归零）', 
   assert.equal(errorOf(missing).code, 'dead-letter-not-found');
 });
 
+test('POST /api/commands/discard：丢弃死信只留痕、幂等、不存在即 404', async (t) => {
+  const fx = await setup(t);
+  fx.append('wake/manual', { note: '这条一直失败' });
+  fx.append('input/dead-letter', { inputSeq: 1, claimCount: 3, lastError: '总是超时' });
+  assert.equal(fx.projection.deadLetters.length, 1);
+
+  // 丢弃不是危险操作（frontend.md §4 的确认短语只给改能力边界的操作），不带 X-Confirm 也应成功
+  const res = await call(fx, '/api/commands/discard', {
+    method: 'POST',
+    body: { inputSeq: 1, reason: '内容已经过期，不再重投' },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(fx.projection.deadLetters.length, 0, '丢弃后它离开死信队列（现在是什么）');
+
+  const last = (await fx.readAll()).at(-1)!;
+  assert.equal(last.type, 'input/discarded');
+  assert.equal(last.visibility, 'internal', '丢信是簿记，不进她的上下文');
+  assert.deepEqual(last.data, {
+    inputSeq: 1,
+    claimCount: 3,
+    reason: '内容已经过期，不再重投',
+    by: 'human',
+  });
+
+  // **日志只增不改**：那条 input/dead-letter 一个字都不许动（它是已经发生过的事实）
+  const deadLetters = (await fx.readAll()).filter((e) => e.type === 'input/dead-letter');
+  assert.equal(deadLetters.length, 1, '死信记录不被删除、不被改写');
+
+  // 幂等：同一个 seq 再丢一次 = 它已经不在死信队列里了 ⇒ 404，不产生第二条 input/discarded
+  const again = await call(fx, '/api/commands/discard', {
+    method: 'POST',
+    body: { inputSeq: 1, reason: '再丢一次' },
+  });
+  assert.equal(again.status, 404);
+  assert.equal(errorOf(again).code, 'dead-letter-not-found');
+  assert.equal(
+    (await fx.readAll()).filter((e) => e.type === 'input/discarded').length,
+    1,
+    '同一个 seq 只可能有一次终局：重复调用不产生第二条处理记录',
+  );
+
+  // 不存在的 seq：与 requeue 同一个 notFound 风格
+  const missing = await call(fx, '/api/commands/discard', {
+    method: 'POST',
+    body: { inputSeq: 99 },
+  });
+  assert.equal(missing.status, 404);
+  assert.equal(errorOf(missing).code, 'dead-letter-not-found');
+
+  // 载荷形状错误：与 requeue 同一条校验
+  const bad = await call(fx, '/api/commands/discard', {
+    method: 'POST',
+    body: { inputSeq: 0 },
+  });
+  assert.equal(bad.status, 400);
+});
+
+test('POST /api/commands/discard：省略理由时留一句默认的（留痕不为空）', async (t) => {
+  const fx = await setup(t);
+  fx.append('wake/manual', { note: '失败三次' });
+  fx.append('input/dead-letter', { inputSeq: 1, claimCount: 3 });
+
+  const res = await call(fx, '/api/commands/discard', { method: 'POST', body: { inputSeq: 1 } });
+  assert.equal(res.status, 200);
+  const last = (await fx.readAll()).at(-1)!;
+  assert.equal(last.type, 'input/discarded');
+  assert.equal(last.data.reason, '人工丢弃：不再重投');
+  assert.equal(fx.projection.deadLetters.length, 0);
+});
+
 test('POST /api/commands/timer-cancel：落 timer/cancelled 并移出投影', async (t) => {
   const fx = await setup(t);
   fx.append('timer/set', {
@@ -1015,6 +1099,75 @@ test('POST /api/commands/config-update：写回配置、保注释、非法值回
   assert.equal(errorOf(unknown).code, 'unknown-command');
 });
 
+/**
+ * `trust.mode` 的字段级短语（2026-10-05 加）。
+ *
+ * 为什么它够格进 `DANGEROUS_FIELDS`（见 server.ts 那张表自己的注释："改这些字段等于改它能碰什么"）：
+ * `full` ↔ `workspace` 之间换一档，改变的是**她能在哪台机器上动手**——`workspace` 档下越界的读写与
+ * 命令是**被拒绝**的（`config.ts` 的 TrustConfig），而写回 `full` 就是把边界放开到整台电脑。
+ * 最该防的那一下（"改回完全信任"）正是这条短语要挡的误触。
+ *
+ * 两个方向**都**要短语（这里刻意不做方向区分）：只给"放宽"加门就得在服务端读盘上现值、判方向，
+ * 那是同一件事的第二处判据；"改这个字段一律要短语"是一句话能核对完的规则。
+ */
+test('POST /api/commands/config-update：trust.mode 要字段短语（两个方向都要），不带就拒绝', async (t) => {
+  const fx = await setup(t);
+  const disk = (): { trust?: { mode?: string } } =>
+    JSON.parse(readFileSync(fx.configPath, 'utf8')) as { trust?: { mode?: string } };
+  // 夹具那份 config.json 里**没有** trust 这一节（只有 $comment / schemaVersion / budget），
+  // 所以"被拒的请求什么都没写"的判据是"盘上压根没有 trust"，比"值不等于 full"更硬。
+  assert.equal(disk().trust, undefined, '前提：夹具盘上没有 trust 这一节');
+
+  // ① 不带短语：拒绝，且理由说明白"是哪个字段 + 要带什么短语"
+  const refused = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { 'trust.mode': 'full' } },
+  });
+  assert.equal(refused.status, 400);
+  assert.equal(errorOf(refused).code, 'confirm-required');
+  assert.match(errorOf(refused).message, /trust\.mode/u, '拒绝理由要点名是哪个字段');
+  assert.match(errorOf(refused).message, /trust-full-access/u, '并且给出要带的那条短语');
+  assert.equal(disk().trust, undefined, '被拒的请求一个字节都不该写进盘上那份');
+
+  // ② 只带命令级短语：不够（字段级短语是**追加**要求）
+  const commandOnly = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { 'trust.mode': 'full' } },
+    headers: { 'x-confirm': 'update-config' },
+  });
+  assert.equal(commandOnly.status, 400);
+  assert.equal(errorOf(commandOnly).code, 'confirm-required');
+  assert.equal(disk().trust, undefined);
+
+  // ③ 收紧方向（full → workspace）**同样**要短语：不做方向区分（见上面那段注释）
+  const tighten = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { 'trust.mode': 'workspace' } },
+  });
+  assert.equal(tighten.status, 400, '收紧也要短语：判据只有"改没改这个字段"，没有第二个方向判据');
+  assert.equal(errorOf(tighten).code, 'confirm-required');
+
+  // ④ 带全短语：放行，落到盘上（生效那一段仍是旧值——热更白名单为空，需重启，口径同 config-update）
+  const confirmed = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { trust: { mode: 'workspace' } } },
+    headers: { 'x-confirm': 'update-config; trust-full-access' },
+  });
+  assert.equal(confirmed.status, 200);
+  assert.deepEqual((confirmed.body as { fields: string[] }).fields, ['trust.mode']);
+  assert.equal(disk().trust?.mode, 'workspace', '短语到位就照写：门挡的是误触，不是人');
+  assert.equal(fx.config.trust.mode, 'full', '盘上改了不等于生效了（要重启进程才接管）');
+
+  // ⑤ 回到 full（最该防的那一下）也走同一条门：带上短语照旧放行
+  const back = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { 'trust.mode': 'full' } },
+    headers: { 'x-confirm': 'trust-full-access' },
+  });
+  assert.equal(back.status, 200);
+  assert.equal(disk().trust?.mode, 'full');
+});
+
 test('POST /api/commands/webhook-test：走同一个告警出口，失败如实报告', async (t) => {
   const fx = await setup(t);
 
@@ -1034,12 +1187,15 @@ test('POST /api/commands/webhook-test：走同一个告警出口，失败如实�
 
 test('未实现的命令：501 + 可操作原因（不伪造事件）', async (t) => {
   const fx = await setup(t);
-  const res = await call(fx, '/api/commands/dead-discard', { method: 'POST', body: { inputSeq: 1 } });
+  // `dead-discard` 原来就挂在这里（501："schema 里还没有对应事件类型"）。2026-10-05 那条
+  // 事件类型（`input/discarded`）落地了，它转成了真命令 `discard`（见上面那条用例）——
+  // 所以这里换一条仍然没接的动作来钉"501 的形状"。
+  const res = await call(fx, '/api/commands/archive-now', { method: 'POST', body: {} });
   assert.equal(res.status, 501);
   assert.equal(errorOf(res).code, 'not-implemented');
-  assert.match(errorOf(res).message, /input\/discarded/u, '说明缺的是哪条事件类型');
+  assert.match(errorOf(res).message, /运维模块/u, '说明缺的是哪一块');
 
-  const wrongMethod = await call(fx, '/api/commands/dead-discard');
+  const wrongMethod = await call(fx, '/api/commands/archive-now');
   assert.equal(wrongMethod.status, 405, '写命令只接受 POST');
 });
 
@@ -1513,6 +1669,127 @@ function consumedData(): Record<string, unknown> {
   };
 }
 
+test('GET /api/framework-notes：配到「已恢复」的旧告警不再按当前严重渲染（配对看 key，不是推断）', async (t) => {
+  const fx = await setup(t);
+  // 现场复刻（2026-10-05 用户报的那条）：17:33 的「预算耗尽（任务 token）」以严重挂在最上面，
+  // 而它 14 分钟后就被 budget/resumed 解除了——解除那件事在日志里是**一条同 key 的恢复通知**。
+  const alarm = fx.append('alarm/sent', {
+    fingerprint: 'fp-task-budget',
+    level: 'critical',
+    title: '预算耗尽（任务 token）：已用 178734979 / 上限 57000000',
+    key: 'category:budget-exhausted',
+  });
+  const recovered = fx.append('alarm/sent', {
+    fingerprint: 'fp-budget-recovered',
+    level: 'info',
+    title: '已恢复：budget-exhausted',
+    key: 'category:budget-exhausted',
+    recovered: true,
+  });
+
+  const body = (await call(fx, '/api/framework-notes')).body as { notes: Array<Record<string, unknown>> };
+  const original = body.notes.find((note) => note['seq'] === alarm.seq)!;
+  assert.equal(original['recovered'], true, '配对结果由服务端给出：界面照抄，不自己比指纹、也比不出');
+  assert.equal(original['historical'], true, '它是历史——渲染成"已恢复 · 历史"，不是当前问题');
+  assert.equal(original['level'], 'critical', '等级字段照旧原样给（不许改事实），降级与否是渲染的事');
+  assert.match(String(original['reason']), /已恢复/u, '卡上要说得清它是被哪一条恢复通知销掉的');
+  assert.match(String(original['reason']), new RegExp(`seq ${recovered.seq}`, 'u'));
+});
+
+test('GET /api/framework-notes：没配到「已恢复」的告警照旧留着（别把还没好的事说成好了）', async (t) => {
+  const fx = await setup(t);
+  // 同一个 key 上报两次、只恢复一次 ⇒ 仍然有一条没销账（与 foldStalls 的 count 语义一致）
+  const first = fx.append('alarm/sent', {
+    fingerprint: 'fp-daily', level: 'critical', title: '预算耗尽（每日 token）', key: 'category:budget-exhausted',
+  });
+  const second = fx.append('alarm/sent', {
+    fingerprint: 'fp-task', level: 'critical', title: '预算耗尽（任务 token）', key: 'category:budget-exhausted',
+  });
+  fx.append('alarm/sent', {
+    fingerprint: 'fp-recovered', level: 'info', title: '已恢复：budget-exhausted',
+    key: 'category:budget-exhausted', recovered: true,
+  });
+  // 另一种情形：恢复通知**在前**（时间倒挂的坏日志）不算配对
+  const orphanRecovery = fx.append('alarm/sent', {
+    fingerprint: 'fp-r2', level: 'info', title: '已恢复：model-failure', key: 'category:model-failure', recovered: true,
+  });
+  const later = fx.append('alarm/sent', {
+    fingerprint: 'fp-fail', level: 'critical', title: '模型连续失败 6 次', key: 'category:model-failure',
+  });
+
+  const body = (await call(fx, '/api/framework-notes')).body as { notes: Array<Record<string, unknown>> };
+  const bySeq = new Map(body.notes.map((note) => [note['seq'], note]));
+  assert.equal(bySeq.get(first.seq)?.['recovered'], true, '一次恢复只销最早那条没销的');
+  assert.equal(bySeq.get(second.seq)?.['recovered'], undefined, '报两次、好一次 ⇒ 还剩一条是当前问题');
+  assert.equal(bySeq.get(later.seq)?.['recovered'], undefined, '恢复通知在前的坏日志不算配对：它仍按当前严重渲染');
+  assert.equal(
+    bySeq.get(orphanRecovery.seq)?.['recovered'], undefined,
+    '恢复通知自己走它本来就有的那个字段（`recovered:true` 由 notifier 写在事件上），配对表不碰它',
+  );
+  assert.equal(bySeq.get(orphanRecovery.seq)?.['level'], 'info', '恢复通知的等级照旧是 info');
+});
+
+test('POST /api/commands/restart：带了盘上不存在的界面路径 ⇒ 当场拒绝，且事件里留下这次请求的值', async (t) => {
+  const fx = await setup(t);
+  // 用户 2026-10-05：「点了按钮没有任何日志痕迹，无法判断请求有没有带界面路径」。
+  // 现在这条拒绝也是**有痕**的：事件里带着 guiExe 的值与"盘上不存在"这个事实。
+  const bad = join(fx.dir, 'no-such-gui.exe');
+  const res = await call(fx, '/api/commands/restart', {
+    method: 'POST', body: { guiExe: bad }, headers: { 'x-confirm': 'restart' },
+  });
+  assert.equal(res.status, 400);
+  assert.equal((res.body as { error: { code: string } }).error.code, 'restart-bad-gui-exe');
+
+  const events = await fx.readAll();
+  const rejected = events.filter(
+    (event) => event.type === 'config/changed'
+      && (event.data as { configHash?: string }).configHash === 'restart-rejected-bad-gui-exe',
+  );
+  assert.equal(rejected.length, 1, '拒绝也要留痕：不然"这次请求带没带路径"事后仍然无法回答');
+  const data = rejected[0]!.data as { guiExe?: string; guiExeExists?: boolean };
+  assert.equal(data.guiExe, bad, '把请求里那个值原样记下来');
+  assert.equal(data.guiExeExists, false, '以及它在盘上到底存不存在');
+  assert.equal(
+    events.some((event) => (event.data as { configHash?: string }).configHash?.startsWith('restart-failed')),
+    false,
+    '一个进程都没动：拒绝路径不该走到 WMI',
+  );
+});
+
+test('重启回执：三种结局三句话（"只重启了后端"必须与"连界面一起"说得不一样）', () => {
+  // 用户 2026-10-05：按了按钮没有反馈，而且"所谓的'重启前后端'也没有重启前端"。
+  // 文案只有这一处（`restartNote`），服务端的 note 与界面的 toast 说的是同一件事。
+  const notStarted = restartNote({ gui: true, scriptStarted: false });
+  assert.match(notStarted, /没能确认/u);
+  assert.equal(/正在重启/u.test(notStarted), false, '没读回执就绝不能说"正在重启"——那是过去那种假话');
+
+  const backendOnly = restartNote({ gui: false, scriptStarted: true });
+  assert.match(backendOnly, /界面不在本次动作范围内/u, '只重启了后端就要如实说，别让人以为界面也重启了');
+  assert.match(backendOnly, /主进程/u);
+
+  const both = restartNote({ gui: true, scriptStarted: true });
+  assert.match(both, /主进程与界面/u);
+  assert.notEqual(both, backendOnly, '两种结果的文案必须不同');
+});
+
+test('重启命令行：界面路径逐字进命令行（带空格的路径不许被拆成两截）', () => {
+  // 用户 2026-10-05：「带了路径的请求**必须有留痕**」——留痕里最要紧的那一列就是这条
+  // 命令行（WMI 建的进程没有 stdout，脚本的输出无处可去，只有它证明"参数确实送到了"）。
+  const spaced = String.raw`C:\Program Files\Irmia\irmia_gui.exe`;
+  const shell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+  const command = restartCommandLine({
+    shellExe: shell,
+    argv: [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '"D:\\repo\\tools\\restart-agent.ps1"',
+      '-Repo', '"D:\\repo"', '-GuiExe', `"${spaced}"`, '-TraceLog', '"D:\\repo\\data\\restart-trace.log"',
+    ],
+  });
+  assert.ok(command.startsWith(`"${shell}" `), `第一个 token 是那个 shell 的绝对路径（WMI 里没有 PATH）：${command}`);
+  assert.ok(command.includes(`-GuiExe "${spaced}"`), `界面路径必须原样带引号出现在命令行里：${command}`);
+  assert.ok(command.includes('-TraceLog '), '留痕文件路径也在命令行里（脚本与服务端约定同一个文件）');
+  assert.equal(command.includes('--%'), false, '实测 --% 会把带引号的 -File 路径当字面量：不许用');
+});
+
 test('GET /api/framework-notes：一条提示都没有时给空数组（不是 404、不是 null）', async (t) => {
   const fx = await setup(t);
   const res = await call(fx, '/api/framework-notes');
@@ -1684,6 +1961,75 @@ test('GET /api/framework-notes：上下文审计两类也在这张卡里（缓�
 
   // 告警照旧拿到完整的 limit：它的额度与归因无关
   assert.equal(body.notes.find((note) => note['kind'] === 'alarm')!['seq'], alarm.seq);
+});
+
+test('GET /api/framework-notes：**预期内**的缓存失守不进这张卡，只有"无法归因"的进', async (t) => {
+  const fx = await setup(t);
+
+  // ① 重启造成的失守（归因 restart）：事件照旧在日志里，但**不占告警区**
+  fx.append('budget/consumed', {
+    ...consumedData(),
+    turn: 1,
+    cacheBreak: {
+      class: 'tools',
+      classes: ['tools'],
+      cause: 'restart',
+      causes: [{ class: 'tools', cause: 'restart' }],
+      silent: true,
+      reason: '缓存前缀失守（tools）：工具清单变了……原因是接管/重启（预期内，不告警）。',
+      gapMs: 60_000,
+    },
+  });
+  // ② 她自己改 STATE 造成的失守（归因 asset）：同样不进卡
+  fx.append('budget/consumed', {
+    ...consumedData(),
+    turn: 2,
+    cacheBreak: {
+      class: 'state',
+      classes: ['state'],
+      cause: 'asset',
+      causes: [{ class: 'state', cause: 'asset' }],
+      silent: true,
+      reason: '缓存前缀失守（state）：本轮固定块被改写……原因是她自己刚改了资产（预期内，不告警）。',
+      gapMs: 60_000,
+    },
+  });
+  // ③ 无故变化（归因 unattributable）：**只有它仍然告警**
+  const unexplained = fx.append('budget/consumed', {
+    ...consumedData(),
+    turn: 3,
+    cacheBreak: {
+      class: 'persona',
+      classes: ['persona'],
+      cause: 'unattributable',
+      causes: [{ class: 'persona', cause: 'unattributable' }],
+      silent: false,
+      reason: '缓存前缀失守（persona）：人格文件被改写……原因不明（**归因不明 ⇒ 仍然告警**）。',
+      gapMs: 60_000,
+    },
+  });
+  // ④ 老日志（没有 silent 字段）：按"要告警"处理——历史条目一条不丢
+  fx.append('budget/consumed', {
+    ...consumedData(),
+    turn: 4,
+    cacheBreak: {
+      class: 'memory',
+      classes: ['memory'],
+      reason: '缓存前缀失守（memory）：长期记忆层被改写……',
+      gapMs: 60_000,
+    },
+  });
+
+  const body = (await call(fx, '/api/framework-notes')).body as { notes: Array<Record<string, unknown>> };
+  const breaks = body.notes.filter((note) => note['kind'] === 'cache-break');
+  assert.equal(breaks.length, 2, '降级的那些不进卡（2026-10-05 用户批准的口径）');
+  const titles = breaks.map((note) => note['title']);
+  assert.ok(titles.includes('缓存前缀失守：人格文件变更（无法归因）'), `标题要带归因：${titles.join(' / ')}`);
+  assert.ok(titles.includes('缓存前缀失守：长期记忆层改写'), '老日志没有 cause 时不硬塞归因，照旧告警');
+  assert.equal(
+    breaks.some((note) => note['seq'] === unexplained.seq), true,
+    '说不清为什么的那一条必须在卡上',
+  );
 });
 
 test('GET /api/framework-notes：只有归因、没有真事时这张卡是空的', async (t) => {

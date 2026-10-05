@@ -54,6 +54,7 @@ import { foldTopUps, writeTopUpRequest, type TopUpRequest, type TopUpTotals } fr
 import { answerHuman, type AnswerOutcome } from './runtime/plan-mode.ts';
 import { isCacheValid, loadProjectionCacheResult, PROJECTION_CACHE_FILE } from './state/projection-cache.ts';
 import { fold } from './state/fold.ts';
+import { formatWithExact } from './format/units.ts';
 import { WAKE_FILE_PREFIX, WAKE_WATCH_DIR_NAME } from './wake/sources.ts';
 
 // 只读扫描的唯一实现在 log/read-only.ts：CLI 与 doctor 共用，避免"两套解析各说各话"
@@ -98,13 +99,20 @@ const DEFAULT_TAIL_LIMIT = 20;
 /** 摘要单行上限：超出截断，保证一条事件恒占一行 */
 const SUMMARY_MAX_CHARS = 100;
 
-/** 层序（越靠前越"紧"）与中文标签，与 budget-guard.ts 同口径 */
+/**
+ * 层序（越靠前越"紧"）与中文标签，与 budget-guard.ts 同口径。
+ */
 const BUDGET_LAYERS: readonly BudgetLayer[] = ['step', 'turn', 'task', 'daily'];
 const LAYER_LABEL: Record<BudgetLayer, string> = {
   step: '单步', turn: '单轮', task: '单任务', daily: '每日',
 };
+/**
+ * 四层的单位。`step`/`turn` 数的是**次数**，`task`/`daily` 数的是 token——后两档必须写清是
+ * **非缓存** token（`state/fold.ts` 的 `budgetTokensOf` 是唯一口径定义）：CLI 是给人读的，
+ * 数与单位必须一起说清——只写 `token` 会让人以为那是全部 token（换口径前它确实是）。
+ */
 const LAYER_UNIT: Record<BudgetLayer, string> = {
-  step: '次工具调用', turn: '步', task: 'token', daily: 'token',
+  step: '次工具调用', turn: '步', task: '非缓存 token', daily: '非缓存 token',
 };
 
 // ──────────────────────────────── 对外类型 ────────────────────────────────
@@ -217,6 +225,12 @@ export interface BudgetLayerReport {
 
 export interface BudgetReport {
   dataDir: string;
+  /**
+   * 今日累计：**非缓存口径**（2026-10-05 用户换的：`(input − cacheHit) + output`，
+   * "真花钱的那部分"；唯一一处定义在 `state/fold.ts` 的 `budgetTokensOf`）。
+   * `heavy` / `light` 是同一个口径按 lane 分列；`cacheHit` / `cacheMiss` 是**原始分量**
+   *（照事件原样折，喂"缓存命中率"那条观测），别拿它们去和 `tokens` 对账——`tokens` 不含命中那部分。
+   */
   today: {
     tokens: number;
     heavy: number;
@@ -226,6 +240,7 @@ export interface BudgetReport {
     /** 命中率 = hit/(hit+miss)；两者都是 0 时为 null——"没有样本"与"0% 命中"是两件事 */
     hitRate: number | null;
   };
+  /** 单任务累计（非缓存口径，同上） */
   taskTokens: number;
   topUps: TopUpTotals;
   layers: BudgetLayerReport[];
@@ -390,7 +405,7 @@ export function formatStatus(report: StatusReport): string[] {
     `状态 · 数据目录 ${report.dataDir}`,
     `事件日志: 最大 seq ${report.events.maxSeq} / 分片 ${report.events.shards} 个 / 坏行 ${report.events.badLines}`,
     `投影缓存: ${cache}`,
-    `今日消耗: ${report.budget.tokensToday} tok（hit ${report.budget.cacheHitToday} / miss ${report.budget.cacheMissToday}；heavy ${report.budget.tokensTodayHeavy} / light ${report.budget.tokensTodayLight}）`,
+    `今日非缓存消耗: ${tokenCell(report.budget.tokensToday)}（hit ${formatWithExact(report.budget.cacheHitToday)} / miss ${formatWithExact(report.budget.cacheMissToday)}；heavy ${formatWithExact(report.budget.tokensTodayHeavy)} / light ${formatWithExact(report.budget.tokensTodayLight)}）`,
     `水位: ${report.watermark} · 待办 ${report.pending.total}${dist === '' ? '' : `（${dist}）`} · 待确认 ${report.needsReview} · 死信 ${report.deadLetters}`,
     `openTurn: ${report.openTurn === null ? '空闲' : `#${report.openTurn.turn}（step ${report.openTurn.step}）`}`,
     `定时器: ${report.timers.total} 个${report.timers.nextAt === null ? '' : ` · 最近到期 ${report.timers.nextAt}`}`,
@@ -510,6 +525,10 @@ export function summarizeEvent(event: AppEvent): string {
     case 'input/claimed': return `turn ${event.data.turn} 认领 ${event.data.wakeSeqs.length} 条`;
     case 'input/requeued': return `退回 ${event.data.wakeSeqs.length} 条（${event.data.reason}）`;
     case 'input/dead-letter': return `seq ${event.data.inputSeq} 认领 ${event.data.claimCount} 次 · 转死信`;
+    // 丢弃是死信的**终局**（不再重投）：这句话要能回答"谁丢的、凭什么丢的、它试过几次"
+    case 'input/discarded':
+      return `seq ${event.data.inputSeq} 已丢弃（认领 ${event.data.claimCount} 次 · by ${event.data.by}`
+        + `）：${clip(event.data.reason, 60)}`;
     case 'alarm/sent':
       return `[${event.data.level}] ${event.data.title}（fp ${event.data.fingerprint}）`;
     case 'review/resolved':
@@ -923,8 +942,19 @@ export function buildBudgetReport(input: {
   };
 }
 
-function formatCount(value: number): string {
-  return Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/gu, ',');
+// 千分位那个函数（formatCount）随本次"单位格式只有一处"合并进 format/units.ts 的
+// formatExact —— 保留第二份实现正是"同一个数两种写法"的来源。
+
+
+/**
+ * token 数的当行读法：紧凑写法 + 口径词 + **原始精确值**。
+ *
+ * `2.7M 非缓存 token（2,705,946）`——紧凑写法让量级一眼可读，括号里的真数让人能对账。
+ * 与界面同一条纪律（用户的原话："别让人看不到真实数"），单位格式走
+ * `format/units.ts` 的唯一实现（CLI 与 web/server.ts 引同一份，界面那侧是它的 Dart 镜像）。
+ */
+function tokenCell(value: number): string {
+  return `${formatWithExact(value)} 非缓存 token`;
 }
 
 function formatRatio(ratio: number): string {
@@ -937,28 +967,28 @@ export function formatBudget(report: BudgetReport, options: { today: boolean }):
     lines.push('（没读到 config.json，硬上限用内置默认值——与主进程生效的配置可能不同）');
   }
   lines.push(
-    `今日消耗: ${formatCount(report.today.tokens)} token`
-    + `（heavy ${formatCount(report.today.heavy)} · light ${formatCount(report.today.light)}）`,
+    `今日非缓存消耗: ${tokenCell(report.today.tokens)}`
+    + `（heavy ${formatWithExact(report.today.heavy)} · light ${formatWithExact(report.today.light)}）`,
   );
   const hit = report.today.hitRate === null ? '无样本' : formatRatio(report.today.hitRate);
   lines.push(
-    `缓存: 命中 ${formatCount(report.today.cacheHit)} / 未命中 ${formatCount(report.today.cacheMiss)}`
+    `缓存: 命中 ${formatWithExact(report.today.cacheHit)} / 未命中 ${formatWithExact(report.today.cacheMiss)}`
     + ` · 命中率 ${hit}`,
   );
-  lines.push(`单任务累计: ${formatCount(report.taskTokens)} token`);
+  lines.push(`单任务非缓存累计: ${tokenCell(report.taskTokens)}`);
 
   const topped = BUDGET_LAYERS.filter((layer) => report.topUps[layer] > 0)
-    .map((layer) => `${layer} +${formatCount(report.topUps[layer])}`);
+    .map((layer) => `${layer} +${formatWithExact(report.topUps[layer])}`);
   lines.push(`人工加注: ${topped.length === 0 ? '无' : topped.join('、')}`);
 
   const shown = options.today ? report.layers.filter((layer) => layer.layer === 'daily') : report.layers;
-  lines.push(options.today ? '今日口径（仅每日层）:' : '四层阈值（软阈值 = 硬上限 × softRatio）:');
+  lines.push(options.today ? '今日非缓存口径（仅每日层）:' : '四层阈值（软阈值 = 硬上限 × softRatio）:');
   for (const layer of shown) {
     const flag = layer.over ? ' · 已越线' : layer.soft ? ' · 已达软阈值' : '';
     lines.push(
-      `  ${LAYER_LABEL[layer.layer]}(${layer.layer}): 已用 ${formatCount(layer.used)} / 硬上限 `
-      + `${formatCount(layer.limit)} ${LAYER_UNIT[layer.layer]}（${formatRatio(layer.hardRatio)}）`
-      + ` · 软阈值 ${formatCount(layer.softLimit)}（${formatRatio(layer.softRatio)}）${flag}`,
+      `  ${LAYER_LABEL[layer.layer]}(${layer.layer}): 已用 ${formatWithExact(layer.used)} / 硬上限 `
+      + `${formatWithExact(layer.limit)} ${LAYER_UNIT[layer.layer]}（${formatRatio(layer.hardRatio)}）`
+      + ` · 软阈值 ${formatWithExact(layer.softLimit)}（${formatRatio(layer.softRatio)}）${flag}`,
     );
   }
   return lines;

@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:irmia_gui/api.dart';
 import 'package:irmia_gui/app.dart';
+import 'package:irmia_gui/markdown.dart';
 import 'package:irmia_gui/pages/chat_page.dart';
 import 'package:irmia_gui/theme.dart';
 import 'package:irmia_gui/ui_state.dart';
@@ -155,6 +156,7 @@ void main() {
     List<Map<String, dynamic>>? history,
     Map<String, dynamic>? contacts,
     bool sessionsFail = false,
+    ThemeData? theme,
   }) async {
     tester.view.physicalSize = const Size(1200, 900);
     tester.view.devicePixelRatio = 1.0;
@@ -165,7 +167,8 @@ void main() {
     );
     final state = AppState(api: api);
     await tester.pumpWidget(MaterialApp(
-      theme: IrmiaTheme.light(),
+      // 默认亮主题；暗主题那两处白描边的用例显式传 IrmiaTheme.dark()
+      theme: theme ?? IrmiaTheme.light(),
       home: Scaffold(body: ChatPage(state: state)),
     ));
     await tester.pump();
@@ -586,6 +589,9 @@ void main() {
     ]);
 
     // 徽章那枚字用危险色，且页面里不再有第二枚同样文字的徽章（它是这一列里唯一一件"框架替她留意到的事"）
+    //
+    // **回退**（用户 2026-10-05）：上一轮这里改成了主题的 `errorOn`，用户圈的范围只有
+    // 气泡与发送键两处白描边——注入预警不在此列，回到写死的 `IrmiaTheme.danger`。
     final badge = tester.widget<Text>(find.text('注入预警'));
     expect(badge.style?.color, IrmiaTheme.danger, reason: '危险色：一眼看得出这张卡不一样');
   });
@@ -704,5 +710,127 @@ void main() {
     expect(find.text('rg_search'), findsOneWidget);
     expect(find.text('tool'), findsNothing);
     expect(find.text('命中 3 处'), findsOneWidget, reason: '回执还在同一个块里');
+  });
+
+  // ───── 暗主题的两处白描边 + 没被圈到的两处回退（用户 2026-10-05 原话） ─────
+  //
+  //   「暗主题时。发送按钮和气泡改成白色描边不就行了。改其他的干嘛？」
+  //   「怎么把亮主题时的蓝色改掉了。我不是让你改暗主题的吗？」
+  //
+  // 判据（token 与侧栏选中项）在 test/theme_tokens_test.dart；这里量**屏幕上**那三个控件。
+
+  /// 一条消息气泡的装饰：按"填色 = 预期底色"从这条文字的祖先里认出来。
+  BoxDecoration bubbleDecoration(WidgetTester tester, String text, Color fill) {
+    final found = tester
+        .widgetList<Container>(find.ancestor(of: find.text(text), matching: find.byType(Container)))
+        .map((c) => c.decoration)
+        .whereType<BoxDecoration>()
+        .where((d) => d.color == fill)
+        .toList();
+    expect(found, hasLength(1), reason: '"$text" 那条气泡要能被认出来（填色 $fill）');
+    return found.single;
+  }
+
+  /// 发送键那层 Material：形状是圆的那个（描边就长在形状上）。
+  Material sendButton(WidgetTester tester) {
+    final button = find.ancestor(
+        of: find.byIcon(Icons.arrow_upward_rounded), matching: find.byType(FilledButton));
+    expect(button, findsOneWidget, reason: '输入框右边那个圆形按钮');
+    final circles = tester
+        .widgetList<Material>(find.descendant(of: button, matching: find.byType(Material)))
+        .where((m) => m.shape is CircleBorder)
+        .toList();
+    expect(circles, hasLength(1), reason: '发送键那层 Material 的形状是圆的');
+    return circles.single;
+  }
+
+  testWidgets('亮主题：气泡与发送键仍是原来的蓝、一个描边都不加（回归）', (tester) async {
+    final scheme = IrmiaTheme.light().colorScheme;
+    await pumpChat(tester, history: [
+      evt(1, 'wake/manual', {'note': '你去看看日志'}),
+      evt(2, 'message/assistant', {'text': '这就去。', 'toolCalls': <dynamic>[]}),
+    ]);
+
+    // 用户自己那条气泡：原来就是主色实心、没有描边
+    final mine = bubbleDecoration(tester, '你去看看日志', scheme.primary);
+    expect(mine.color, scheme.primary, reason: '亮主题照旧：还是原来那个蓝');
+    expect(mine.border, isNull, reason: '亮主题下用户的气泡不许出现任何描边');
+
+    // 发送键：原来就是 primary 底 + const CircleBorder()（side 本来就是 none）
+    final send = sendButton(tester);
+    expect(send.color, scheme.primary, reason: '亮主题照旧：主色实心');
+    expect((send.shape! as CircleBorder).side, BorderSide.none,
+        reason: '亮主题下发送键一圈边都没有');
+    expect(tester.widget<Icon>(find.byIcon(Icons.arrow_upward_rounded)).color, scheme.onPrimary,
+        reason: '图标色也没动');
+  });
+
+  testWidgets('暗主题：气泡与发送键只有白描边——蓝去掉、底色 = 背景', (tester) async {
+    final scheme = IrmiaTheme.dark().colorScheme;
+    await pumpChat(tester, theme: IrmiaTheme.dark(), history: [
+      evt(1, 'wake/manual', {'note': '你去看看日志'}),
+      evt(2, 'message/assistant', {'text': '这就去。', 'toolCalls': <dynamic>[]}),
+    ]);
+
+    // 用户那条气泡：**蓝填充整个去掉** ⇒ 透明（＝露出背景那层 dawn 渐变）+ 一圈 1px 白描边
+    final mine = bubbleDecoration(tester, '你去看看日志', Colors.transparent);
+    expect(mine.color, Colors.transparent, reason: '用户："底色和背景相同即可"');
+    expect(mine.color, isNot(scheme.primary), reason: '**蓝色全部去掉**');
+    final border = mine.border;
+    expect(border, isA<Border>(), reason: '暗主题下气泡要有那圈白描边');
+    final b = border! as Border;
+    for (final side in <BorderSide>[b.top, b.right, b.bottom, b.left]) {
+      expect(side.color, scheme.onSurface, reason: '描边是主题里最接近白的那一档');
+      expect(side.width, IrmiaTheme.hairlineWidth);
+      expect(side.width, 1.0, reason: '用户要的是"细"');
+    }
+    final mineText = tester
+        .widgetList<MarkdownText>(find.byType(MarkdownText))
+        .firstWhere((m) => m.source == '你去看看日志');
+    expect(mineText.base?.color, scheme.onSurface, reason: '字走正常前景（主题的白）');
+    expect(mineText.base?.color, isNot(scheme.onPrimary),
+        reason: '不再是"蓝底配的那个深藏青"');
+
+    // 发送键：同一形态——透明底 + 白图标 + 白描边
+    final send = sendButton(tester);
+    expect(send.color, Colors.transparent, reason: '填充与背景相同');
+    expect(send.color, isNot(scheme.primary), reason: '**蓝色全部去掉**');
+    final side = (send.shape! as CircleBorder).side;
+    expect(side.color, scheme.onSurface);
+    expect(side.width, 1.0);
+    expect(tester.widget<Icon>(find.byIcon(Icons.arrow_upward_rounded)).color, scheme.onSurface,
+        reason: '图标走正常前景，别再是蓝底白字那种');
+
+    // 她的那条气泡不在用户的名单里：填充与那圈 outlineVariant 描边都照旧
+    final hers = bubbleDecoration(tester, '这就去。', scheme.surface);
+    expect((hers.border! as Border).top.color, scheme.outlineVariant,
+        reason: '只动两处——她那条气泡的描边不许跟着变白');
+    expect(hers.color, scheme.surface, reason: '她的气泡填充也没动');
+  });
+
+  Future<void> expectErrorTone(WidgetTester tester, ThemeData theme) async {
+    await pumpChat(tester, theme: theme, history: [
+      evt(1, 'tool/call', {
+        'turn': 1, 'step': 0, 'callId': 'c1', 'name': 'read_file',
+        'arguments': '{"file_path":"main.log"}', 'sideEffect': 'none',
+      }),
+      evt(2, 'tool/result', {
+        'turn': 1, 'step': 0, 'callId': 'c1', 'callSeq': 1, 'status': 'error',
+        'content': '炸了', 'durationMs': 12,
+      }),
+    ]);
+    final label = tester.widget<Text>(find.text('出错'));
+    expect(label.style?.color, IrmiaTheme.danger,
+        reason: '工具行「出错」回到写死的危险色；上一轮的 errorOn 已退回（用户："改其他的干嘛"）');
+    expect(label.style?.color, isNot(theme.colorScheme.onErrorContainer),
+        reason: '不许再取主题的 errorContainer 一族');
+  }
+
+  testWidgets('工具行「出错」亮模：写死的 IrmiaTheme.danger', (tester) async {
+    await expectErrorTone(tester, IrmiaTheme.light());
+  });
+
+  testWidgets('工具行「出错」暗模：同一个红，没被换成 errorOn', (tester) async {
+    await expectErrorTone(tester, IrmiaTheme.dark());
   });
 }

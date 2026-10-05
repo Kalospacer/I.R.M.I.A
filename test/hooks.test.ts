@@ -652,32 +652,29 @@ test('钩子附加上下文经 agent-loop 的尾部 developer 通道注入后续
   assert.match(second, /POST-CTX/);
 });
 
-test('Wake 钩子：注入文本既进必要性门，也进本 turn 的尾部 developer 通道', async (t) => {
+test('Wake 钩子：注入文本进本 turn 的尾部 developer 通道（钩子只跑一次）', async (t) => {
+  // 2026-10-05：必要性门拆了，这条用例原来验的是"门也看得到钩子注入的那段文本"。
+  // 现在改成验**钩子的两件事实**：它真的跑了一次（计数 spawner），且它的注入落了地（进请求尾部）。
+  // 判据没放宽——"紧急信息由钩子带进来"这条用法靠的就是后半句。
   const box = sandbox(t, 'loop-wake');
   const harness = await makeLoopHarness(t, box.dir);
+  const counter = countingSpawner(JSON.stringify({ additionalContext: 'WAKE-CTX 今天有两件事等她' }), 0);
   const hooks = new HookRunner({
-    entries: [entry('Wake', box.command('wake'), { matcher: 'manual' })],
+    entries: [entry('Wake', 'wake', { matcher: 'manual' })],
+    spawn: counter.spawn,
     now: () => new Date(NOW),
   });
 
   const wake = harness.append('wake/manual', { note: '看一眼' });
   const model = fakeModel([{ text: '知道了。' }]);
-  const seenByGate: string[] = [];
 
-  const reason = await runTurn(harness.depsOf(model.ds, {
-    hooks,
-    necessityGate: (wakeText) => {
-      seenByGate.push(wakeText);
-      return Promise.resolve(true);
-    },
-  }), [wake]);
+  const reason = await runTurn(harness.depsOf(model.ds, { hooks }), [wake]);
 
   assert.deepEqual(reason, { kind: 'completed' });
-  assert.equal(seenByGate.length, 1);
-  assert.match(seenByGate[0]!, /WAKE-CTX/, '门要能看到钩子注入的内容，否则"紧急信息由钩子带进来"就没意义');
+  assert.equal(counter.tasks.length, 1, 'Wake 钩子恰好跑一次');
   const hint = trailingDeveloper(model.requests[0]!);
-  assert.ok(hint !== null);
-  assert.match(hint, /WAKE-CTX/);
+  assert.ok(hint !== null, '钩子的注入必须落进本 turn 的请求里');
+  assert.match(hint, /WAKE-CTX/, '否则"紧急信息由钩子带进来"这条用法就废了');
 });
 
 test('Wake 钩子只匹配来源：matcher 不命中时零进程开销且无注入', async (t) => {

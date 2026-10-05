@@ -94,8 +94,9 @@ Flutter 的 Windows 工具链会失败，这是工具链的限制，不是本项
 cp config.example.json config.json   # Windows: copy config.example.json config.json
 ```
 
-`config.example.json` 里每个字段都有注释，说明含义、单位与默认值。相对路径（`dataDir`、
-`paths.workspaceAllowlist`）以配置文件所在目录为基准解析。
+`config.example.json` 里带着注释（含义、单位与默认值），按分段解释；**代码默认值以
+`src/config/config.ts` 为准**（那份是唯一默认值源，出厂文件是照它生成的）。相对路径（`dataDir`）
+以配置文件所在目录为基准解析。
 
 - **`config.json` 不进版本库**（已在 `.gitignore` 里）：它含本机的 owner 标识、联系人表与机器
   路径。仓库里给的是 `config.example.json`。
@@ -111,7 +112,7 @@ cp config.example.json config.json   # Windows: copy config.example.json config.
 | `gui/` | Windows 桌面界面（Flutter），唯一的界面 |
 | `test/` | 后端测试；`gui/test/` 是界面测试 |
 | `tools/` `scripts/` | 运行期工具与启停脚本 |
-| `skills/` | 技能包（目前只有第三方的 `anysearch`，见下方许可证一节） |
+| `skills/` | 技能包（框架自带的 `image-dialogue`、`sd-selfie`，以及第三方的 `anysearch`——见下方许可证一节） |
 | `brand/` | 项目标识的矢量母版与各尺寸导出，说明见 [`brand/README.md`](brand/README.md) |
 
 ## 测试

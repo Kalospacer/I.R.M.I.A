@@ -193,4 +193,37 @@ describe('关系档案 · 会话级回退（她自己维护的"群"这一层）'
       null,
     );
   });
+
+  test('QQ 单聊：openid 经 aliases 解析成人名后**命中人名档案**（2026-10-05 修的真 bug）', () => {
+    // 现场形状：档案文件名是人名（`RELATIONSHIPS/OWNER.md`），而唤醒里的 person 是 openid。
+    // 不做身份归一 ⇒ 拿 openid 找文件必然落空 ⇒ 他在 QQ 单聊里说话没有档案、在 GUI 里说话却有。
+    const dir = fixture({ OWNER: '他是我用户。' });
+    const mem = join(dir, 'workspace', 'MEMORIES');
+    mkdirSync(mem, { recursive: true });
+    writeFileSync(
+      join(mem, 'aliases.md'),
+      '# 别名\nqq:c2c:OPENID1 = OWNER（用户）\n',
+      'utf8',
+    );
+    const note = relationshipForWake(
+      wake('wake/channel', {
+        channel: 'qq-official', chatType: 'c2c', person: 'OPENID1', chatId: 'OPENID1',
+      }),
+      dir,
+    );
+    assert.equal(note?.who, 'OWNER', '解析出来的人名要用于寻址');
+    assert.equal(note?.content, '他是我用户。');
+  });
+
+  test('没有 aliases 表时行为与从前一致：不猜、不报错（群/成员档案仍按 sid 命中）', () => {
+    const dir = fixture({ OPENID1: '按 openid 命名的档案' });
+    // 故意不写 aliases.md：解析不到额外线索，应当回到 person/chatId 两步
+    const note = relationshipForWake(
+      wake('wake/channel', {
+        channel: 'qq-official', chatType: 'c2c', person: 'OPENID1', chatId: 'OPENID1',
+      }),
+      dir,
+    );
+    assert.equal(note?.who, 'OPENID1', '没有表就照旧按原样寻址');
+  });
 });

@@ -19,7 +19,7 @@ import { runCli, type CliContext, type CliIO } from '../src/cli.ts';
 import type { AppEvent } from '../src/log/types.js';
 import { sha256Hex } from '../src/persona/versions.ts';
 import { runDoctor } from '../src/runtime/doctor.ts';
-import { PROJECTION_CACHE_FILE } from '../src/state/projection-cache.ts';
+import { PROJECTION_CACHE_FILE, PROJECTION_CACHE_VERSION } from '../src/state/projection-cache.ts';
 import { fold } from '../src/state/fold.ts';
 
 const T0 = '2026-05-01T00:00:00.000Z';
@@ -130,6 +130,13 @@ test('doctor ①：合规日志上 11 条不变量全绿，退出码 0', async (
   assert.equal(await runCli(['doctor'], cli.io, { dataDir: fx.dir }), 0);
   assert.match(cli.lines.join('\n'), /结论：全部通过/);
   assert.match(cli.lines.join('\n'), /✓ I9/);
+
+  // I7 的换口径锁（2026-10-05）：这条夹具的调用**命中 80 / 未命中 20**——旧口径下 I7 自己
+  // 也算一遍 `input + output`，换口径之后会把一份正确的投影报成"投影与事件累计不符"（假故障）。
+  // 现在 I7 引 `fold.ts` 的 `budgetTokensOf`：(100 − 80) + 20 = 40。判据不放宽，只钉住"不假报"。
+  const i7 = report.checks.find((check) => check.id === 'I7');
+  assert.equal(i7?.status, 'ok', `I7 不许假报（换口径后的判据）：${i7?.detail}`);
+  assert.match(i7?.detail ?? '', /今日非缓存 40 tok/, '读数要按非缓存口径给，别报旧口径的 120');
 });
 
 // ──────────────────────────────── ② 逐条破坏 ────────────────────────────────
@@ -297,9 +304,18 @@ test('doctor ③：--json 输出可被机器消费（含 failures 与逐条结�
 
 // ──────────────────────────────── ④ 投影缓存（OPS-projection） ────────────────────────────────
 
-/** 把一份投影写成缓存文件（信封 lastSeq 与 state.lastSeq 必须一致，否则先被加载层拒掉） */
+/**
+ * 把一份投影写成缓存文件。形状**逐字对齐生产**（`state/projection-cache.ts` 的
+ * `saveProjectionCache`）：信封 `{ version, lastSeq, state }`，`state.budget.budgetVersion`
+ * 由 fold 盖章。少任何一格都不是"这份缓存坏了"，而是"这份缓存不是生产写出来的"——
+ * doctor 那条判据要验的是**内容对不对**，所以夹具不能先被加载层拒掉。
+ */
 function writeCache(fx: Fixture, state: unknown, lastSeq: number): void {
-  writeFileSync(join(fx.dir, PROJECTION_CACHE_FILE), JSON.stringify({ lastSeq, state }), 'utf8');
+  writeFileSync(
+    join(fx.dir, PROJECTION_CACHE_FILE),
+    JSON.stringify({ version: PROJECTION_CACHE_VERSION, lastSeq, state }),
+    'utf8',
+  );
 }
 
 test('doctor ④：缓存里的 watermark 是运行期游标，与折叠不一致不算损坏', async (t) => {

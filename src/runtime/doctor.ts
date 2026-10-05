@@ -25,7 +25,7 @@ import { readEventsReadOnly, type LogScan } from '../log/read-only.ts';
 import { inputContentText, render } from '../model/render.ts';
 import { sha256Hex } from '../persona/versions.ts';
 import { BLOB_ID_PATTERN, blobDirOf, blobIdOf, blobPathOf } from '../state/blob-store.ts';
-import { applyEvent, finalizePressure, fold } from '../state/fold.ts';
+import { applyEvent, budgetTokensOf, finalizePressure, fold } from '../state/fold.ts';
 import { basicProjectionShape, isCacheValid, loadProjectionCacheResult } from '../state/projection-cache.ts';
 import { EVENT_LOG_DIR_NAME, TIMER_FILE_NAME } from './recover.ts';
 import { LOCK_FILE_NAME } from './instance-lock.ts';
@@ -289,9 +289,25 @@ function checkUnknownInNeedsReview(events: readonly AppEvent[], projection: Proj
 
 // ──────────────────────────────── I7 ────────────────────────────────
 
-/** I7：预算累计 = 所有 budget/consumed 的折叠结果（tokensToday 只算最近 rollover 之后） */
+/**
+ * I7：预算累计 = 所有 budget/consumed 的折叠结果（tokensToday 只算最近 rollover 之后）
+ *
+ * ⚠️ **两个累计量、两条式子，别混**（2026-10-05 换预算口径时改的这一处）：
+ *
+ *   · **投影那三格**（`tokensToday` / `Heavy` / `Light`）按**预算口径**折：**引**
+ *     `state/fold.ts` 的 `budgetTokensOf`，**不在这里重写公式**。这一处原来自己写了一遍
+ *     `inputTokens + outputTokens`——换口径之后它就是"第二份判据"，实跑会把一份**正确**的投影
+ *     报成 `投影 tokensToday=X，事件累计 Y`（假故障）。判据只做一处，这里只做搬运。
+ *   · **事件自带的 `tokensTodayAccum`** 按**写入方**的式子核：新增之前的累计 + 本条
+ *     `input + output`（写入方是 `agent-loop.accountStep`，另外几处内部调用同式）。
+ *     它是 `docs/schema.md` §6 里的**观测字段**（"便于直接查询"），**不等于**预算口径——
+ *     换口径没有动它，拿预算口径去核它会把一条写对了的事实报成坏的。
+ */
 function checkBudgetFold(events: readonly AppEvent[], projection: Projection): DoctorCheck {
+  /** 事件自带 `tokensTodayAccum` 的累计（写入方口径：in + out） */
   let accum = 0;
+  /** 预算口径的累计（`budgetTokensOf`：未命中 + 输出） */
+  let billable = 0;
   let heavy = 0;
   let light = 0;
   let consumed = 0;
@@ -299,6 +315,7 @@ function checkBudgetFold(events: readonly AppEvent[], projection: Projection): D
   for (const event of events) {
     if (event.type === 'budget/rollover') {
       accum = 0;
+      billable = 0;
       heavy = 0;
       light = 0;
       continue;
@@ -312,21 +329,24 @@ function checkBudgetFold(events: readonly AppEvent[], projection: Projection): D
       broken.push(`seq ${event.seq} 的 tokensTodayAccum=${event.data.tokensTodayAccum}，折叠应为 ${expected}`);
     }
     accum = expected;
-    if (event.data.lane === 'heavy') heavy += delta;
-    else light += delta;
+    // 投影那一侧走预算口径（唯一一处定义在 fold.ts；这里不重算 token 算式）
+    const cost = budgetTokensOf(event.data);
+    billable += cost;
+    if (event.data.lane === 'heavy') heavy += cost;
+    else light += cost;
   }
 
   const b = projection.budget;
-  if (b.tokensToday !== accum) broken.push(`投影 tokensToday=${b.tokensToday}，事件累计 ${accum}`);
-  if (b.tokensTodayHeavy !== heavy) broken.push(`投影 heavy=${b.tokensTodayHeavy}，事件累计 ${heavy}`);
-  if (b.tokensTodayLight !== light) broken.push(`投影 light=${b.tokensTodayLight}，事件累计 ${light}`);
+  if (b.tokensToday !== billable) broken.push(`投影 tokensToday=${b.tokensToday}，按非缓存口径折出 ${billable}`);
+  if (b.tokensTodayHeavy !== heavy) broken.push(`投影 heavy=${b.tokensTodayHeavy}，按非缓存口径折出 ${heavy}`);
+  if (b.tokensTodayLight !== light) broken.push(`投影 light=${b.tokensTodayLight}，按非缓存口径折出 ${light}`);
 
   return {
     id: 'I7',
     title: '预算累计与 budget/consumed 折叠一致',
     status: broken.length === 0 ? 'ok' : 'fail',
     detail: broken.length === 0
-      ? `${consumed} 条消耗事件、今日 ${b.tokensToday} tok（heavy ${heavy} / light ${light}）`
+      ? `${consumed} 条消耗事件、今日非缓存 ${b.tokensToday} tok（heavy ${heavy} / light ${light}）`
       : broken.slice(0, 5).join('；'),
   };
 }

@@ -30,7 +30,12 @@ import 'ui_state.dart';
 ///                 + `POST /api/commands/set-key`（`X-Confirm: set-key`）
 ///        · 通道 → `POST /api/commands/config-update`（`X-Confirm: config-update`）
 ///        · 人格 → `POST /api/commands/persona-edit`（危险表里是 null，不带确认短语）
-///        · 信任范围 → `POST /api/commands/config-update`（`X-Confirm: config-update`）
+///        · 信任范围 → `POST /api/commands/config-update`
+///                     （`X-Confirm: config-update; trust-full-access`——多出来的那半是**字段短语**，
+///                       见 [kTrustConfirm]；写 `trust.mode` 少了它服务端回 400）
+///
+///      （前三步都写 `X-Confirm: config-update`；`config-update` 这条命令在服务端的
+///        `CONFIRM_PHRASES` 里是 **null**，所以那半截短语是声明性的，真正被校验的是字段短语。）
 ///
 /// **为什么信任范围这一步排在最后**（2026-10-05 加）：前四步填的是"她是谁、怎么说话"，
 /// 这一步定的是"她能碰多远"。放最后是因为它是**一次边界声明**——前四步没有一步会问她
@@ -781,9 +786,8 @@ class _OnboardingCardState extends State<_OnboardingCard> {
           onChanged: (_) => setState(() => problem = null),
           decoration: InputDecoration(hintText: mentionKeywordsHint(_knownName)),
         ),
-        _note('写进通道配置 channels.mentionKeywords：正文里出现这几个词就当作"在叫她"'
-            '（与平台的 @ 走同一条路）。用逗号或顿号隔开；上面填了名字这里会自动跟着填一份，'
-            '你可以改宽或改窄；**清空 = 只认平台的 @**。', scheme),
+        _note('正文里出现这几个词就当"在叫她"（与平台的 @ 同一条路）。'
+            '逗号或顿号隔开；填了名字这里会自动跟一份。清空 = 只认平台的 @。', scheme),
       ],
     );
   }
@@ -987,8 +991,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
           }),
         ),
         _note(
-          '这是**边界，不是提醒**：选「只限工作目录」之后，越界的读写与命令会被拒绝。'
-          '它同时管 fs 工具族（safe_read / safe_write / edit_file / list_dir 等）与 pwsh。'
+          '这是边界，不是提醒：越界的读写与命令会被拒绝（fs 工具族与 pwsh 都管）。'
           '${trustMode == widget.signals.trustMode ? '与现在盘上那份一致，这一屏不会写任何东西。' : '与现在盘上那份不同：点「完成」时写进 config.json，重启进程后接管。'}'
           '之后在设置页「信任范围」里随时能改。',
           scheme,
@@ -1261,7 +1264,11 @@ class _OnboardingCardState extends State<_OnboardingCard> {
     return null;
   }
 
-  /// 第五步 → `POST /api/commands/config-update`（短语 config-update），只提交 `trust.mode`。
+  /// 第五步 → `POST /api/commands/config-update`，只提交 `trust.mode`。
+  ///
+  /// `X-Confirm` 要带**字段短语** `trust-full-access`（服务端 `DANGEROUS_FIELDS` 对
+  /// `trust.mode` 两个方向都要），所以这一处读设置页那个共享常量 [kTrustConfirm]，
+  /// 与本文件顶部 import 里的 `kTrustFull` 同一条理由：同一个字段的写法只许有一份。
   ///
   /// **与盘上那份一致就一个字节都不写**：引导页的默认高亮就是配置默认值（[defaultTrustMode]），
   /// 也就是说绝大多数人这一屏根本不会改任何东西——那时还硬写一次 config.json，换来的是
@@ -1276,7 +1283,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
         {
           'fields': {'trust.mode': trustMode},
         },
-        confirm: 'config-update',
+        confirm: kTrustConfirm,
       );
     } catch (err) {
       return '信任范围没写进去：$err';

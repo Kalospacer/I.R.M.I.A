@@ -161,7 +161,7 @@ function buildMixedLog(): AppEvent[] {
   const wi = evt<WakeIntention>('wake/intention', { intentionId: 'i1', content: '检查备份' });
   const wj = evt<WakeJob>('wake/job', { jobId: 'job1' });
   push(wf, wt, ww, wm, wi, wj);
-  push(evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 900, idleTicks: 2, pressure: 0.2 }));
+  push(evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 900, idleTicks: 2, pressure: 0.2, probability: 0.4, roll: 0.2 }));
   push(evt<InputClaimed>('input/claimed', { turn: 1, wakeSeqs: [wf.seq, wt.seq], claimCounts: [0, 0] }));
   push(evt<InputRequeued>('input/requeued', {
     wakeSeqs: [wf.seq], claimCounts: [1], sources: ['file'], reason: 'turn-interrupted',
@@ -371,7 +371,7 @@ test('wake 一律进 pending 并带来源（含 heartbeat），heartbeat 额外�
   const manual = evt<WakeManual>('wake/manual', { note: 'poke' });
   const intention = evt<WakeIntention>('wake/intention', { intentionId: 'i', content: 'check' });
   const job = evt<WakeJob>('wake/job', { jobId: 'j' });
-  const hb = evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 600, idleTicks: 7, pressure: 0.4 });
+  const hb = evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 600, idleTicks: 7, pressure: 0.4, probability: 0.4, roll: 0.2 });
 
   const p = fold([file, timer, webhook, manual, intention, job, hb]);
   assert.deepEqual(
@@ -543,9 +543,10 @@ test('dedupe 窗口：容量 1000，第 1001 个键淘汰最旧的键', () => {
 
 // ──────────────────────────────── 预算 ────────────────────────────────
 
-test('budget/consumed 分 lane 与 hit/miss 累计，tokensToday 等于分 lane 之和', () => {
+test('budget/consumed 分 lane 与 hit/miss 累计：预算只加"没命中缓存的那部分 + 输出"', () => {
   resetFactory();
   const p = emptyProjection();
+  // heavy：input 100 = 命中 30 + 未命中 70，输出 20 ⇒ 计入预算 = 70 + 20 = 90（旧口径是 120）
   const heavy = evt<BudgetConsumed>('budget/consumed', {
     turn: 1, step: 0, lane: 'heavy', model: 'm',
     inputTokens: 100, outputTokens: 20, cacheHitTokens: 30, cacheMissTokens: 70,
@@ -555,27 +556,31 @@ test('budget/consumed 分 lane 与 hit/miss 累计，tokensToday 等于分 lane 
 
   assert.deepEqual(p.budget, {
     date: null,
-    tokensToday: 120, tokensTodayHeavy: 120, tokensTodayLight: 0,
+    // 口径版本随累计量一起盖章（换口径时恢复层靠它判"这份累计能不能续用"，见 log/types.ts）
+    budgetVersion: 2,
+    tokensToday: 90, tokensTodayHeavy: 90, tokensTodayLight: 0,
+    // 命中/未命中照事件原样折（喂命中率那条观测），与计入预算的 90 不是一回事
     cacheHitToday: 30, cacheMissToday: 70,
-    tokensTask: 120, stepsThisTurn: 0, toolCallsThisStep: 0,
+    tokensTask: 90, stepsThisTurn: 0, toolCallsThisStep: 0,
   });
   assert.equal(p.failStreak, 0);
   assert.equal(p.lastModelSuccessAt, heavy.ts);
 
+  // light：input 40 = 命中 5 + 未命中 35，输出 10 ⇒ 计入预算 = 35 + 10 = 45（旧口径是 50）
   const light = evt<BudgetConsumed>('budget/consumed', {
     turn: 1, step: 1, lane: 'light', model: 'm2',
-    inputTokens: 40, outputTokens: 10, cacheHitTokens: 5, cacheMissTokens: 45,
+    inputTokens: 40, outputTokens: 10, cacheHitTokens: 5, cacheMissTokens: 35,
     durationMs: 3, retryCount: 2, finishReason: 'completed', tokensTodayAccum: 0,
   });
   applyOne(p, light);
 
-  assert.equal(p.budget.tokensToday, 170, '只按 input+output 累计，信任事件自带的 tokensTodayAccum');
-  assert.equal(p.budget.tokensTodayHeavy, 120);
-  assert.equal(p.budget.tokensTodayLight, 50);
+  assert.equal(p.budget.tokensToday, 135, '只按 (input − cacheHit) + output 累计，不信事件自带的 tokensTodayAccum');
+  assert.equal(p.budget.tokensTodayHeavy, 90);
+  assert.equal(p.budget.tokensTodayLight, 45);
   assert.equal(p.budget.tokensToday, p.budget.tokensTodayHeavy + p.budget.tokensTodayLight);
   assert.equal(p.budget.cacheHitToday, 35);
-  assert.equal(p.budget.cacheMissToday, 115);
-  assert.equal(p.budget.tokensTask, 170);
+  assert.equal(p.budget.cacheMissToday, 105);
+  assert.equal(p.budget.tokensTask, 135);
 });
 
 test('failStreak 只在 failed 上递增，其余 finishReason 清零并推进 lastModelSuccessAt', () => {
@@ -615,9 +620,10 @@ test('failStreak 只在 failed 上递增，其余 finishReason 清零并推进 l
 test('budget/rollover 只清 today 系，tokensTask 与 failStreak 跨日保留', () => {
   resetFactory();
   const p = emptyProjection();
+  // input 500 = 命中 50 + 未命中 450，输出 100 ⇒ 非缓存口径计入 550（旧口径 600）
   applyOne(p, evt<BudgetConsumed>('budget/consumed', {
     turn: 1, step: 0, lane: 'heavy', model: 'm',
-    inputTokens: 500, outputTokens: 100, cacheHitTokens: 50, cacheMissTokens: 550,
+    inputTokens: 500, outputTokens: 100, cacheHitTokens: 50, cacheMissTokens: 450,
     durationMs: 2, retryCount: 0, finishReason: 'failed', tokensTodayAccum: 0,
   }));
   applyOne(p, evt<BudgetRollover>('budget/rollover', { date: '2020-06-02' }));
@@ -627,7 +633,7 @@ test('budget/rollover 只清 today 系，tokensTask 与 failStreak 跨日保留'
   assert.equal(p.budget.tokensTodayLight, 0);
   assert.equal(p.budget.cacheHitToday, 0);
   assert.equal(p.budget.cacheMissToday, 0);
-  assert.equal(p.budget.tokensTask, 600, '任务内累计不随日界清零');
+  assert.equal(p.budget.tokensTask, 550, '任务内累计不随日界清零（非缓存口径：450 + 100）');
   assert.equal(p.failStreak, 1, '日界不清失败链');
   assert.equal(p.lastModelSuccessAt, null, '本次没有成功调用，成功时刻保持 null');
 });
@@ -650,17 +656,20 @@ test('投影记住记账日期：它是"今天记过没有"的唯一凭据（重
   assert.equal(p.budget.date, '2026-10-01', '记账日期必须折进投影（旧实现里它根本没这个字段）');
 
   // 跨天之后又用了一些：这个数不该再被任何"重启"清掉——运行时看到 date 是今天就不会写 rollover
+  // input 300 = 命中 200 + 未命中 100，输出 50 ⇒ 非缓存口径计入 150（旧口径 350）
   applyOne(p, evt<BudgetConsumed>('budget/consumed', {
     turn: 2, step: 0, lane: 'light', model: 'm',
-    inputTokens: 300, outputTokens: 50, cacheHitTokens: 200, cacheMissTokens: 150,
+    inputTokens: 300, outputTokens: 50, cacheHitTokens: 200, cacheMissTokens: 100,
     durationMs: 2, retryCount: 0, finishReason: 'completed', tokensTodayAccum: 0,
   }));
-  assert.equal(p.budget.tokensToday, 350, '当日量照常累计');
+  assert.equal(p.budget.tokensToday, 150, '当日量照常累计（非缓存口径：100 + 50）');
   assert.equal(p.budget.date, '2026-10-01', '累计不改记账日期');
 });
 
 test('§12-7 预算不变量：tokensToday 等于最近一次 rollover 之后所有 consumed 之和', () => {
   resetFactory();
+  // 第 i 条：input = 100 + i（其中命中 i）⇒ 未命中恒为 100，输出 10 + i
+  //   ⇒ **非缓存口径**每条计入 100 + (10 + i) = 110 + i（旧口径是 110 + 2i）
   const events: AppEvent[] = [];
   const mk = (i: number): BudgetConsumed => evt<BudgetConsumed>('budget/consumed', {
     turn: 1, step: i, lane: i % 2 === 0 ? 'heavy' : 'light', model: 'm',
@@ -672,12 +681,12 @@ test('§12-7 预算不变量：tokensToday 等于最近一次 rollover 之后所
   let afterRollover = 0;
   for (let i = 0; i < 5; i++) {
     events.push(mk(i));
-    beforeRollover += 110 + 2 * i;
+    beforeRollover += 110 + i;
   }
   events.push(evt<BudgetRollover>('budget/rollover', { date: '2020-06-02' }));
   for (let i = 5; i < 11; i++) {
     events.push(mk(i));
-    afterRollover += 110 + 2 * i;
+    afterRollover += 110 + i;
   }
 
   const p = fold(events);
@@ -843,7 +852,7 @@ test('压力四项加权：needsReview / pending / 到期意图 / 距发言超 2
   // 距上次发言超 2h：+0.2；恰好 2h 不算
   const t1 = tsAfter(200);
   const said = evt<AssistantMessage>('message/assistant', { text: '我在', toolCalls: [] }, { ts: t1 });
-  const hb = evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 7200, idleTicks: 1, pressure: 0.1 }, { ts: t1 });
+  const hb = evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 7200, idleTicks: 1, pressure: 0.1, probability: 1, roll: 0.5 }, { ts: t1 });
   assert.equal(
     pressureOf([said, hb], new Date(Date.parse(t1) + 2 * HOUR_MS).toISOString()),
     BASE_PRESSURE,
@@ -867,7 +876,7 @@ test('压力四项加权：needsReview / pending / 到期意图 / 距发言超 2
 
 test('压力参照时刻优先级：referenceTs > lastWake > lastModelSuccessAt > lastAssistantAt > firstEventAt', () => {
   resetFactory();
-  const hb = evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 10, idleTicks: 0, pressure: 0 }, { ts: tsAfter(200) });
+  const hb = evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 10, idleTicks: 0, pressure: 0, probability: 0, roll: 0.5 }, { ts: tsAfter(200) });
   const success = evt<BudgetConsumed>('budget/consumed', {
     turn: 1, step: 0, lane: 'heavy', model: 'm',
     inputTokens: 1, outputTokens: 1, cacheHitTokens: 0, cacheMissTokens: 2,
@@ -898,7 +907,7 @@ test('压力参照时刻优先级：referenceTs > lastWake > lastModelSuccessAt 
 
 test('压力不读环境时钟：把 Date.now 打桩到 1979 年，结论仍按日志内 ts 计算', () => {
   resetFactory();
-  const hb = evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 10, idleTicks: 0, pressure: 0 }, { ts: tsAfter(600) });
+  const hb = evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 10, idleTicks: 0, pressure: 0, probability: 0, roll: 0.5 }, { ts: tsAfter(600) });
   const due = evt<IntentionRaised>('intention/raised', { intentionId: 'i', content: 'x', triggerAt: tsAfter(590) });
 
   const realNow = Date.now;

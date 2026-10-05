@@ -674,7 +674,11 @@ void main() {
       expect(postFor('/api/commands/config-update')['body'], {
         'fields': {'trust.mode': 'workspace'},
       });
-      expect(postFor('/api/commands/config-update')['confirm'], 'config-update');
+      // 改 `trust.mode` 的 `X-Confirm` 必须**同时**含两个短语：命令短语（声明性）+
+      // 字段短语 `trust-full-access`（服务端 DANGEROUS_FIELDS 真的在校验它，两个方向都要）。
+      // 少了那半截，这一步会吃 400——引导走不到底，而人只会看到一句"信任范围没写进去"。
+      expect(postFor('/api/commands/config-update')['confirm'], kTrustConfirm);
+      expect(postFor('/api/commands/config-update')['confirm'], contains('trust-full-access'));
       expect(find.text(kOnboardingTitle), findsNothing, reason: '完成之后卡片应关掉');
       await closeOut(tester);
     });

@@ -133,6 +133,8 @@ void main() {
     expect(tester.takeException(), isNull);
 
     // 二级项选中时「更多」也要高亮：组标题颜色跟随选中态变为 primary
+    // （上一轮把选中态收进了主题 token，用户 2026-10-05 退回了没被圈到的两处之一：
+    //  选中项的底与字回到 surfaceContainerHighest + primary。见 test/theme_tokens_test.dart）
     final scheme = IrmiaTheme.light().colorScheme;
     final moreText = tester.widget<Text>(find.text('更多'));
     expect(moreText.style?.color, scheme.primary, reason: '「更多」未跟随二级选中态高亮');

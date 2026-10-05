@@ -255,15 +255,17 @@ test('cli review：list 打印待确认明细，resolve 写 review/resolved 后�
 
 test('cli budget：heavy/light 分列、缓存命中率、距软/硬阈值比例与加注后的有效上限', async (t) => {
   const fx = await setup(t);
+  // heavy：input 1000 = 命中 800 + 未命中 200，输出 400 ⇒ 非缓存口径计入 200 + 400 = 600
   fx.append('budget/consumed', {
     turn: 1, step: 1, lane: 'heavy', model: 'fake-heavy',
-    inputTokens: 600, outputTokens: 400, cacheHitTokens: 800, cacheMissTokens: 200,
-    durationMs: 5, retryCount: 0, finishReason: 'completed', tokensTodayAccum: 1000,
+    inputTokens: 1000, outputTokens: 400, cacheHitTokens: 800, cacheMissTokens: 200,
+    durationMs: 5, retryCount: 0, finishReason: 'completed', tokensTodayAccum: 1400,
   });
+  // light：命中 0 ⇒ 两种口径同值（100 + 0）
   fx.append('budget/consumed', {
     turn: 1, step: 2, lane: 'light', model: 'fake-light',
     inputTokens: 100, outputTokens: 0, cacheHitTokens: 0, cacheMissTokens: 100,
-    durationMs: 3, retryCount: 0, finishReason: 'completed', tokensTodayAccum: 1100,
+    durationMs: 3, retryCount: 0, finishReason: 'completed', tokensTodayAccum: 1500,
   });
   fx.append('budget/topped-up', { layer: 'daily', addedTokens: 1000, by: 'cli-tester' });
   fx.close();
@@ -276,19 +278,33 @@ test('cli budget：heavy/light 分列、缓存命中率、距软/硬阈值比例
   const out = collector();
   assert.equal(await runCli(['budget'], out.io, ctx), 0);
   const text = out.lines.join('\n');
-  assert.match(text, /今日消耗: 1,100 token（heavy 1,000 · light 100）/);
+  // 单位与口径（2026-10-05 用户报"同一个数两种写法"之后统一）：紧凑写法在前、真数在括号里，
+  // 数字旁边的单位一律写"非缓存 token"。**同一个数在运行情况页、日志页、CLI 必须是同一串字符**
+  // （那条回归立案在 test/format-units.test.ts）。
+  assert.match(text, /今日非缓存消耗: 700 非缓存 token（heavy 600 · light 100）/);
   assert.match(text, /缓存: 命中 800 \/ 未命中 300 · 命中率 72\.7%/);
-  assert.match(text, /单任务累计: 1,100 token/);
-  assert.match(text, /人工加注: daily \+1,000/);
-  // 有效硬上限 = 配置 2000 + 加注 1000 = 3000；已用 1100 → 36.7%；软阈值 2400 → 45.8%
-  assert.match(text, /每日\(daily\): 已用 1,100 \/ 硬上限 3,000 token（36\.7%） · 软阈值 2,400（45\.8%）/);
-  // task 层：1100 / 500 已越线，软阈值 400
-  assert.match(text, /单任务\(task\): 已用 1,100 \/ 硬上限 500 token（220\.0%） · 软阈值 400（275\.0%） · 已越线/);
+  assert.match(text, /单任务非缓存累计: 700 非缓存 token/);
+  assert.match(text, /人工加注: daily \+1\.0k（1,000）/, '加注量也换档，真数在括号里');
+  // 有效硬上限 = 配置 2000 + 加注 1000 = 3000；已用 700 → 23.3%；软阈值 2400 → 29.2%
+  assert.match(text, /每日\(daily\): 已用 700 \/ 硬上限 3\.0k（3,000） 非缓存 token（23\.3%） · 软阈值 2\.4k（2,400）（29\.2%）/);
+  // task 层：700 / 500 已越线，软阈值 400
+  assert.match(text, /单任务\(task\): 已用 700 \/ 硬上限 500 非缓存 token（140\.0%） · 软阈值 400（175\.0%） · 已越线/);
+  // 同一个数在 CLI 与界面必须是同一个写法：这条与 test/format-units.test.ts 的那一条同源，
+  // 这里钉的是"CLI 那一侧确实走了它"（而不是自己又算了一遍）
+  const big = collector();
+  assert.equal(await runCli(['budget'], big.io, {
+    ...ctx, budget: { ...ctx.budget!, dailyTokens: 5_000_000 },
+  }), 0);
+  assert.match(
+    big.lines.join('\n'),
+    /每日\(daily\): 已用 700 \/ 硬上限 5\.0M（5,001,000） 非缓存 token/,
+    '百万级印 M、真数在括号里，单位词与非缓存口径一起给',
+  );
 
   const today = collector();
   assert.equal(await runCli(['budget', '--today'], today.io, ctx), 0);
   const todayText = today.lines.join('\n');
-  assert.match(todayText, /今日口径（仅每日层）:/);
+  assert.match(todayText, /今日非缓存口径（仅每日层）:/);
   assert.ok(!todayText.includes('单步(step)'), todayText);
 
   const bad = collector();

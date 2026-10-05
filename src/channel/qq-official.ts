@@ -22,6 +22,14 @@
  *   • 事件体     C2C：`{id, author.user_openid, content, timestamp}`；
  *                群：`{id, author.member_openid, group_openid, content, timestamp}`；
  *                `content` 已去除 @ 前缀（群消息）；attachment 的字段是 `url` / `filename`。
+ *   • **群里 @ 人**（2026-10-05 查官方文档确证）：正文里嵌
+ *                **`<qqbot-at-user id="<openid>" />`**，客户端渲染成蓝色 @；旧协议 `<@userid>`
+ *                官方标注"即将弃用"。它**不需要 markdown**——官方原话"群聊…支持含有文本文字的
+ *                消息类型，如：文本消息、图文消息、markdown 消息"，所以 `msg_type:0` 与 `2` 都行。
+ *                同一个群成员的 openid **按群隔离**（`member_openid`），跨群抄来的 id @ 不到人。
+ *                **那一串由她自己写在正文里**（框架不做名字 → openid 那一跳，见文件末尾那段
+ *                注释与 docs/design.md §4.20.1）——本文件只负责把正文原样发出去。
+ *                出处《文本交互》：https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/trans/text-chain.html
  *   • 发送消息   POST `/v2/users/{user_openid}/messages` 与 `/v2/groups/{group_openid}/messages`，
  *                体 `{content, msg_type:0, msg_id?, msg_seq?}`。
  *                **被动回复窗口**：单聊 60 分钟且同一条消息最多 4 次；群聊 5 分钟且最多 5 次。
@@ -115,6 +123,31 @@ function isMarkdownRejected(response: HttpJsonResponse): boolean {
   const code = readNumber(payload, 'code');
   if (code !== null && QQ_MARKDOWN_REJECT_CODES.includes(code)) return true;
   return readString(payload, 'message').includes('不允许发送原生 markdown');
+}
+
+/**
+ * 各码的人话含义。用途只有一个：**回执里如实说清是哪一种**。
+ *
+ * 为什么要把它们分开：`40034127`（没有 markdown 模板权限）与 `40034011`（内容不合规）在
+ * 处理上是两条路——前者要人去开放平台开权限、或干脆关掉 `useMarkdown`；后者是她那段正文
+ * 自己要改。混成一句"发送失败"，她会一遍遍换措辞（这正是她现场卡住的那种循环）。
+ */
+const MARKDOWN_REJECT_WHY: Readonly<Record<number, string>> = {
+  22006: '消息类型与内容不匹配',
+  40034011: 'markdown 内容不被接受',
+  40034124: 'markdown 参数不合法',
+  40034127: '本 Bot 没有原生 markdown 模板权限',
+};
+
+/** 被拒的一句话理由（认得出的码给人话，认不出照抄服务端原话——不编） */
+function markdownRejectReason(response: HttpJsonResponse): string {
+  const payload = asRecord(response.body);
+  const code = readNumber(payload, 'code');
+  const message = readString(payload, 'message');
+  const why = code === null ? '' : MARKDOWN_REJECT_WHY[code];
+  if (why !== undefined) return `code=${code} ${why}`;
+  const detail = [code === null ? '' : `code=${code}`, message].filter((part) => part !== '').join(' ');
+  return detail === '' ? `HTTP ${response.status}` : detail;
 }
 
 const QQ_PROPERTIES = {
@@ -482,6 +515,10 @@ export function mapDispatchToWakeChannel(
  * 形状：`[引用 @…9F56 原话]` + 正文。**只在 103 上做**：普通消息的 `msg_elements` 里也有
  * 自己的正文，不认这个标记就会把消息本身当成"被引用的那句"（张冠李戴）。
  * 被引原话截到 80 字（她要的是"在说哪件事"，不是逐字转录；全文她自己有办法去看）。
+ *
+ * **这个前缀不是"发信人自己的话"**：被引的常常就是她刚说的那句（用户回复她时）。所以注入
+ * 判定与引文把它整个排除在外——消费者是 `channel/injection.ts` 的 `speakerWordsOf`，改这里的
+ * 形状要同时改那里（同一条约定的两端，见那个函数的注释：用她自己的话给她定罪是"框架在骗她"）。
  */
 function quotedPrefix(payload: Record<string, unknown>): string {
   if (Number(payload['message_type']) !== 103) return '';
@@ -951,6 +988,27 @@ export class QqGateway {
   }
 }
 
+// ──────────────────────────── 出站正文：一个字都不动（2026-10-05） ────────────────────────────
+
+/*
+ * **出站正文一律逐字节发出去**，@ 的写法也不例外。
+ *
+ * 这里原来有一层便利（`renderOutboundMentions`）：把 `[@名字]` / `<@id>` 查成 openid、再改写成
+ * 官方形态 `<qqbot-at-user id="…" />`；名字认不出来时**一个字都不发**（怕"她说 @ 了人、其实谁
+ * 都没亮"的静默失败）。2026-10-05 用户决定移除，原话：**「我觉得没必要存在。搞完告知她已经移除了就行」**。
+ * 两条理由都是事实，不是取舍：
+ *   ① **她本人就会写官方形态**：那一串（连同 **我们这一侧**看到的 openid）就记在她自己的
+ *      `MEMORIES/aliases.md` 群成员段里——形态与 id 都在她手上。框架替她做这一步，等于把她的
+ *      资产搬进框架，中间还多一跳会出错的地方；
+ *   ② 它**真的卡过她**：那层判据因为一个读表路径错误，把她整条消息拦下、一个字都没发出去。
+ *
+ * 所以现在只有一条判据：**正文原样出站**（分段照旧由 `chat-split` 决定）。
+ * `[@1 号]`、`<@D37C…>` 都只是普通文字，照发；这里**不认**任何标记，**也不拒发**。
+ *
+ * 官方形态与"openid 按群隔离"这两条协议知识仍然有效——入站方向仍在剥它（见上面「正文里的
+ * 机器话」那段与 `readableContent`）；写给她看的口径在 docs/design.md §4.20.1。
+ */
+
 // ──────────────────────────────── 发送（REST） ────────────────────────────────
 
 /**
@@ -971,7 +1029,20 @@ export interface SendTextOptions {
 }
 
 export type SendOutcome =
-  | { ok: true; messageId: string; passive: boolean; msgSeq: number }
+  | {
+    ok: true;
+    messageId: string;
+    passive: boolean;
+    msgSeq: number;
+    /**
+     * **如实回报的降级**：这条本来是 markdown、被服务端拒了，最后按纯文本发出去的。
+     *
+     * 为什么要把它带回来（2026-10-05）：`ok: true` 只说明"话发出去了"，可"这条 @ 有没有生效"
+     * 是另一件事——机器人没有 markdown 权限时，出站形态与她的预期不同，回执里必须说清楚，
+     * 否则就是"以为发出去了、其实没 @ 到"的静默失败。消费它是 `tools/admin.ts` 的回执那一行。
+     */
+    degraded?: string;
+  }
   | { ok: false; reason: string; passive: boolean };
 
 /** 官方发送接口的单条路径（chatType → URL 模板） */
@@ -1148,22 +1219,34 @@ export class QqMessageSender {
     const msgId = options.msgId ?? '';
     const passive = msgId !== '';
     const msgSeq = options.msgSeq ?? (passive ? this.nextSeqFn(msgId) : 1);
+    /** `degraded` 只在真发生过时出现：三个成功出口共用一个映射（免得漏掉一条出口） */
+    const done = (
+      result: { messageId: string; msgSeq: number },
+      wasPassive: boolean,
+      note: string | null,
+    ): SendOutcome => ({
+      ok: true,
+      messageId: result.messageId,
+      passive: wasPassive,
+      msgSeq: result.msgSeq,
+      ...(note === null ? {} : { degraded: note }),
+    });
     const first = await this.post(chatType, chatId, text, passive ? { msgId, msgSeq } : { msgSeq });
-    if (first.ok) return first;
+    if (first.ok) return done(first, passive, first.degraded);
     // **去重撞车**：换一个新序号再发一次（平台只认 msg_id+msg_seq 这一对是不是新的）。
     // 成因见 QQ_DEDUPE_CODES 那段注释：计数器活在内存里，重启后会与旧进程用过的号撞上。
     if (passive && isDedupeRejected(first.reason)) {
       const retrySeq = freshSeq(msgSeq);
       this.log.warn(`[QQ] 被动回复撞上去重（${first.reason}），换 msg_seq=${retrySeq} 重发一次`);
       const deduped = await this.post(chatType, chatId, text, { msgId, msgSeq: retrySeq });
-      if (deduped.ok) return deduped;
+      if (deduped.ok) return done(deduped, passive, deduped.degraded);
       return { ok: false, reason: deduped.reason, passive };
     }
     if (!passive || !first.retryable) return { ok: false, reason: first.reason, passive };
     this.log.warn(`[QQ] 被动回复被拒（${first.reason}），降级为主动消息重发一次`);
     const second = await this.post(chatType, chatId, text, { msgSeq: 1 });
     return second.ok
-      ? { ok: true, messageId: second.messageId, passive: false, msgSeq: 1 }
+      ? done(second, false, second.degraded)
       : { ok: false, reason: second.reason, passive: false };
   }
 
@@ -1561,7 +1644,7 @@ export class QqMessageSender {
     chatId: string,
     text: string,
     extra: { msgId?: string; msgSeq: number },
-  ): Promise<{ ok: true; messageId: string; passive: boolean; msgSeq: number }
+  ): Promise<{ ok: true; messageId: string; passive: boolean; msgSeq: number; degraded: string | null }
     | { ok: false; reason: string; retryable: boolean }> {
     let token: string;
     try {
@@ -1594,6 +1677,8 @@ export class QqMessageSender {
 
     const wantMarkdown = this.options.useMarkdown === true;
     let response: HttpJsonResponse;
+    // 降级事实（原样带回给调用方，见 SendOutcome.degraded）：null = 这条本来就是按预期形态发的
+    let degraded: string | null = null;
     try {
       response = await send(wantMarkdown);
     } catch (err) {
@@ -1601,7 +1686,9 @@ export class QqMessageSender {
     }
     // 降级：机器人没有原生 markdown 权限时改发纯文本重试一次（绝不因为格式不被支持就丢话）
     if (wantMarkdown && isMarkdownRejected(response)) {
-      this.log.warn('[QQ] 原生 markdown 被拒（无权限或内容不合规），降级为纯文本重发一次');
+      const why = markdownRejectReason(response);
+      this.log.warn(`[QQ] 原生 markdown 被拒（${why}），降级为纯文本重发一次`);
+      degraded = `markdown 被拒（${why}），这条按纯文本发出`;
       try {
         response = await send(false);
       } catch (err) {
@@ -1626,7 +1713,7 @@ export class QqMessageSender {
         retryable: response.status >= 500,
       };
     }
-    return { ok: true, messageId, passive: extra.msgId !== undefined, msgSeq: extra.msgSeq };
+    return { ok: true, messageId, passive: extra.msgId !== undefined, msgSeq: extra.msgSeq, degraded };
   }
 }
 
@@ -1901,7 +1988,7 @@ export function createChannelMediaPoster(
 export function createChannelReplyPoster(
   channels: ReadonlyMap<string, ChannelAdapter>,
   options: { timeoutMs?: number } = {},
-): { post(target: { url: string; idempotencyKey: string; msgId?: string }, text: string): Promise<{ ok: true; status: number } | { ok: false; reason: string }> } {
+): { post(target: { url: string; idempotencyKey: string; msgId?: string }, text: string): Promise<{ ok: true; status: number; note?: string } | { ok: false; reason: string }> } {
   const timeoutMs = options.timeoutMs ?? 15_000;
   return {
     // 返回"带 post 的对象"而不是裸函数：admin 的 ReplyPoster 是接口（post 方法），
@@ -1925,7 +2012,14 @@ export function createChannelReplyPoster(
             timerRef.handle = setTimeout(() => { reject(new Error(`回投超时（${timeoutMs}ms）`)); }, timeoutMs);
           }),
         ]);
-        if (outcome.ok) return { ok: true, status: 200 };
+        if (outcome.ok) {
+          // 降级事实**原样带上**（`degraded` → `note`）：`ok: true` 只说"话发出去了"，
+          // 而"这条的形态与她以为的不一样（例如 markdown 被拒、按纯文本发的）"是回执里
+          // 必须说清的另一件事——不然就是"以为发出去了、其实没 @ 到"的静默失败。
+          return outcome.degraded === undefined
+            ? { ok: true, status: 200 }
+            : { ok: true, status: 200, note: outcome.degraded };
+        }
         return { ok: false, reason: outcome.reason };
       } catch (err) {
         return { ok: false, reason: messageOf(err) };

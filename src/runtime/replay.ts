@@ -30,7 +30,7 @@ import type { InputItem, RenderPersona, RenderedRequest } from '../model/render.
 import { NOW_LAYER_BANNER, RENDER_VERSION, clipTaskTitle, inputContentText, wakeTitle } from '../model/render.ts';
 import type { ContactFacts } from '../model/self-brief.ts';
 import type { TurnBlockFacts } from '../model/render.js';
-import { collectSessions, parseAliases } from '../channel/sessions.ts';
+import { collectSessions, parseAliases, type SessionAlias } from '../channel/sessions.ts';
 import { WarnExemptBook, type WarnExemptJudge } from '../channel/warn-exempt.ts';
 import { CONFIG_FILE_NAME, loadConfig, systemTimezone } from '../config/config.ts';
 import { readEventsReadOnly } from '../log/read-only.ts';
@@ -213,7 +213,7 @@ export function contactFactsForReplay(input: {
   onebot: boolean;
   alertWebhook: boolean;
   contacts?: ReadonlyMap<string, string>;
-  aliases?: ReadonlyMap<string, string>;
+  aliases?: ReadonlyMap<string, SessionAlias>;
 }): ContactFacts {
   const sessions = collectSessions(input.events);
   const topics = new Map<string, string>();
@@ -249,7 +249,7 @@ export function contactFactsForReplay(input: {
 }
 
 /** `MEMORIES/aliases.md` 里的别名（重建用；读不到就是空表——她还没认过人） */
-function readAliasesForReplay(dataDir: string): ReadonlyMap<string, string> {
+function readAliasesForReplay(dataDir: string): ReadonlyMap<string, SessionAlias> {
   try {
     return parseAliases(readFileSync(join(dataDir, 'workspace', 'MEMORIES', 'aliases.md'), 'utf8'));
   } catch {
@@ -293,7 +293,7 @@ export interface RebuildOptions {
     onebot: boolean;
     alertWebhook: boolean;
     contacts?: ReadonlyMap<string, string>;
-    aliases?: ReadonlyMap<string, string>;
+    aliases?: ReadonlyMap<string, SessionAlias>;
   };
   /**
    * 数据目录（v29/B2）：重建"本轮固定块"里那段**选中的记忆正文**时要从盘上按 `path:line` 现取。

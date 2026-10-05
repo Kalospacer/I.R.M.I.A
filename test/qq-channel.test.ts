@@ -24,7 +24,8 @@ import type { WakeChannel } from '../src/log/types.js';
 import {
   QQ_CHANNEL_NAME, QQ_INTENTS_GROUP_AND_C2C, QQ_OP, QqAccessToken, QqGateway, QqMessageSender,
   QqOfficialChannel, createChannelReplyPoster, defaultHttpJson, mapDispatchToWakeChannel,
-  messagesPathOf, parseReplyUrl, reconnectDelayMs, replyUrlOf, type HttpJsonFn, type HttpJsonResponse,
+  messagesPathOf, parseReplyUrl, reconnectDelayMs, replyUrlOf,
+  type HttpJsonFn, type HttpJsonResponse,
 } from '../src/channel/qq-official.ts';
 import {
   OPCODE, acceptKeyOf, connect as wsConnect, encodeFrame, parseFrame, parseWsUrl, unmask,
@@ -1074,6 +1075,82 @@ test('关掉 useMarkdown：直接纯文本，不多花一次失败请求', async
   const body = http.requests[0]?.jsonBody as Record<string, unknown>;
   assert.equal(body['msg_type'], 0);
   assert.equal(body['content'], '你好');
+});
+
+// ──────────── 出站正文里的 @：一个字都不动（2026-10-05 用户决定移除形态改写） ────────────
+//
+// 这里原来有一层便利：`[@名字]` / `<@id>` → 查她的 `aliases.md` → 官方那一串
+// `<qqbot-at-user id="…" />`，名字认不出来时**一个字都不发**。用户 2026-10-05 决定移除
+// （原话「我觉得没必要存在」）：**她本人就会写官方形态**、id 就在她 aliases.md 的群成员段里，
+// 而那一层因为一个读表路径错误把她整条消息卡住过。
+//
+// 于是通道层的判据只剩一条：**正文逐字节发出去**。官方那一串是普通字符（平台认它），
+// `[@名字]` 也是普通字符（平台不认它——但**轮不到框架拒发**）。
+
+test('正文里的官方 at 串逐字节原样出站：markdown 与纯文本两种 msg_type 都不动它', async () => {
+  // 官方文档《文本交互》：嵌入文本用 `<qqbot-at-user id="" />`（旧协议 `<@userid>` 即将弃用），
+  // 且**文本消息与 markdown 消息都支持它**——所以"这一串"与 `msg_type` 是两件事，谁都不许动谁。
+  const raw = '<qqbot-at-user id="B01F025D72D3B2075F49EFB08297D105" /> 一号，收到回个话';
+
+  const mdHttp = makeFakeHttp(() => ({ status: 200, text: JSON.stringify({ id: 'M-AT' }), body: { id: 'M-AT' } }));
+  const mdSender = new QqMessageSender({
+    token: () => Promise.resolve('ACCESS'), http: mdHttp.fn, useMarkdown: true,
+  });
+  const mdOutcome = await mdSender.sendText('group', 'G1', raw, { msgId: 'MSG-1' });
+  assert.equal(mdOutcome.ok, true);
+  const mdBody = mdHttp.requests[0]?.jsonBody as Record<string, unknown>;
+  assert.equal(mdBody['msg_type'], 2, 'markdown 开着就走 markdown（@ 不改这条口径）');
+  assert.equal((mdBody['markdown'] as { content: string }).content, raw, '官方串逐字节原样');
+  assert.equal('content' in mdBody, false, 'content 与 markdown 互斥（官方口径）');
+
+  // 关掉 markdown（没有模板权限的机器人）：同一段正文走纯文本，**那一串照旧逐字节在**
+  const plainHttp = makeFakeHttp(() => ({ status: 200, text: JSON.stringify({ id: 'M-AT2' }), body: { id: 'M-AT2' } }));
+  const plainSender = new QqMessageSender({
+    token: () => Promise.resolve('ACCESS'), http: plainHttp.fn, useMarkdown: false,
+  });
+  await plainSender.sendText('group', 'G1', raw, { msgId: 'MSG-1' });
+  const plainBody = plainHttp.requests[0]?.jsonBody as Record<string, unknown>;
+  assert.equal(plainBody['msg_type'], 0);
+  assert.equal(plainBody['content'], raw, '纯文本那一路同样一个字都不动');
+});
+
+test('`[@名字]` 就是普通文字：原样发出去，通道层不改写也不拦', async () => {
+  const http = makeFakeHttp(() => ({ status: 200, text: JSON.stringify({ id: 'M-NAME' }), body: { id: 'M-NAME' } }));
+  const sender = new QqMessageSender({
+    token: () => Promise.resolve('ACCESS'), http: http.fn, useMarkdown: false,
+  });
+  const raw = '[@1 号] 一号在不在';
+  const outcome = await sender.sendText('group', 'G1', raw, { msgId: 'MSG-1' });
+  assert.equal(outcome.ok, true, '照发——"认不出名字就一个字都不发"那道门已经不在这一层了');
+  assert.equal(http.requests.length, 1, 'HTTP 请求照发（反向断言：不拒发）');
+  assert.equal((http.requests[0]?.jsonBody as Record<string, unknown>)['content'], raw);
+});
+
+test('原生 markdown 被拒：回执要带上**降级事实**（没权限 ≠ 假装没事）', async () => {
+  // 这条钉的是 SendOutcome.degraded：`ok: true` 只说"话发出去了"，可这一条的**形态变了**
+  // ——正文里的官方 at 串到底还在不在，全看它。不带回去，上游就只能报一句"已送达"。
+  let call = 0;
+  const http = makeFakeHttp(() => {
+    call += 1;
+    return call === 1
+      ? { status: 200, text: '', body: { code: 40034127, message: '无markdown模板权限' } }
+      : { status: 200, text: JSON.stringify({ id: 'M4' }), body: { id: 'M4' } };
+  });
+  const sender = new QqMessageSender({
+    token: () => Promise.resolve('ACCESS'), http: http.fn, useMarkdown: true,
+  });
+  const outcome = await sender.sendText('group', 'G1', '<qqbot-at-user id="X9" /> 在吗');
+  assert.equal(outcome.ok, true, '降级后话照样发出去');
+  const degraded = outcome.ok ? (outcome.degraded ?? '') : '';
+  assert.match(degraded, /40034127/u, '码要如实带上');
+  assert.match(degraded, /没有原生 markdown 模板权限/u, '人话理由：这一条要人去开权限');
+  assert.match(degraded, /纯文本/u);
+  // 没降级的那条不许有这一项（免得每条发言都缀一句"形态正常"）
+  const clean = makeFakeHttp(() => ({ status: 200, text: JSON.stringify({ id: 'M5' }), body: { id: 'M5' } }));
+  const cleanOutcome = await new QqMessageSender({
+    token: () => Promise.resolve('ACCESS'), http: clean.fn, useMarkdown: true,
+  }).sendText('group', 'G1', '你好');
+  assert.equal(cleanOutcome.ok && cleanOutcome.degraded, undefined);
 });
 
 test('富媒体：上传换 file_info → msg_type=7 发送（一条一个 media，与文本共用被动窗口）', async () => {

@@ -521,6 +521,13 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     const visionClient = {
       generate: async (request: unknown) => ds.generate(request as Parameters<DsClient['generate']>[0]),
     };
+    /**
+     * 注册表的**惰性取值点**：`task`（子代理）要的是"父注册表"本身，而它现在正在被造
+     * ——`buildCatalogRegistry` 先把工具清单造出来，再逐件注册。所以给一个先空后填的格子：
+     * 取值发生在 `task` 被调用的那一刻，那时它早就填好了。MCP 之后上线的新工具也在里面
+     * （子代理的工具集是父的子集，就该照着调用那一刻的注册表现算）。
+     */
+    const registryRef: { registry: ToolRegistry | null } = { registry: null };
     const catalog = await buildCatalogRegistry({
       dataDir,
       timers,
@@ -559,6 +566,20 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       // destructive 工具的装配开关（§4.10 第三级门）：决定 http_post / http_download 这类
       // 「配置里显式开启才注册」的工具造不造出来，也决定 pwsh 的危险模式放不放行
       destructiveEnabled: destructiveTools,
+      // `task`（隔离子代理，design §4.21）的注册开关：**默认 false = 不注册**。
+      // 判据是用户显式写的 `tools.taskEnabled`，与 destructiveEnabled 刻意**不共用**：
+      // 后者是"允许她做不可自动重试的事"，前者是"多一件常驻工具"——两件事，两个开关
+      //（共用会让"把 destructive 打开"顺带把子代理能力也打开，那是加能力的副作用，不是决定）。
+      taskEnabled: config.tools.taskEnabled,
+      // 运行期素材**惰性取**：注册表这一句还在造（此刻 catalog.registry 尚不存在），
+      // 投影与人格也还没交到循环手里。取值发生在 `task` 被调用的那一刻，那时三样都在。
+      // `guard` / `planGate` 由 RealLoop 每轮补上（它才有判定器与计划门）。
+      taskRuntime: () => {
+        const live = registryRef.registry;
+        // 没填上 = 装配没走完（理论上到不了这里）：判 null，`task` 会如实报"未接线"
+        if (live === null) return null;
+        return { log, ds, registry: live, projection: recovery.projection, persona };
+      },
       // 后台任务管理器惰性取值：装配顺序上 catalog 先于 jobManager 的其它消费方就位
       jobs: () => jobManager,
       // 记忆访问账（design §4.17 第 2 条"访问强化"）：`memory_read` 每读成功一条就记一笔，
@@ -586,6 +607,8 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     });
     const registry = catalog.registry;
     toolRegistry = registry;
+    // 填上那个惰性格子（见上面 registryRef 的注释）：`task` 的取值器从这一刻起拿得到父注册表
+    registryRef.registry = registry;
     // 工具开关（设置界面的禁用名单）：从配置装载到内存注册表。关掉的工具不进模型请求，
     // 界面仍列得出来（显示为关闭态）——名单外的名字由 setDisabled 自己忽略
     registry.setDisabled(config.tools.disabled);
@@ -617,6 +640,12 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       timers,
       // 她问人之后的等待线（§6.1）：与上面 catalog 传的是同一个配置值
       askHumanTimeoutMs: config.tools.askHumanTimeoutMin * 60_000,
+      // `task` 子代理的运行期素材（design §4.21）：**只在用户真的打开了它时才给**。
+      // 这里补的是只有循环才知道的三样——刹车判定器（活取，加注会换实例）、计划门、
+      // 执行点钩子；其余四样（log / ds / registry / projection / persona）由 catalog 那侧
+      // 的取值器给（装配点就有）。没打开时这一格不传：于是"没开"在运行期也是真的，
+      // 而不只是"没注册"。
+      ...(config.tools.taskEnabled ? { taskRuntime: {} } : {}),
     });
     write(`[模型] 已配置 ${config.models.heavy.model}（key 来自环境变量 ${config.models.heavy.apiKeyEnv} 或本地密钥文件），`
       + `工具 ${registry.listForModel({ includeDestructive: config.tools.destructiveEnabled }).length} 件可用`

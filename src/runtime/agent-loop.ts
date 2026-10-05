@@ -139,14 +139,6 @@ export interface AgentLoopDeps {
   timezone: string;
   /** 刹车钩子；不传即无刹车（M2 的默认口径） */
   budget?: AgentLoopBudget;
-  /**
-   * 回复必要性门（§4.11 沉默是正常动作）。返回 false 则沉默收尾，不发起模型调用。
-   *
-   * 第二个参数是**本批唤醒事件**：门需要它来分类（只有心跳批次才值得过门，真实事件
-   * 不该被规则层替她闭嘴）。它是一个**可选形参**，所以只声明一个形参的门实现
-   * （nullary / unary）照常相容，历史装配点不需要改动。
-   */
-  necessityGate?: (wakeText: string, wakeEvents?: readonly AppEvent[]) => Promise<boolean>;
   /** 主循环 lane（§4.12 任务-模型两级路由），默认 heavy */
   lane?: ModelLane;
   /** 文件类工具的路径白名单根；默认 process.cwd() */
@@ -632,21 +624,19 @@ class TurnRunner {
     // 没有输入可认领：无事可做。仍写 turn/start + turn/end，让"空拍"在日志里有据可查
     if (claimed.wakeSeqs.length === 0) return this.endTurn({ kind: 'completed' });
 
-    // 回复必要性门（§4.11 沉默是正常动作）。认领已完成，故本批输入不会被重复评估。
-    // 静默路径的事件序列与 agent-loop 的其他收尾完全一致：
-    //   turn/start → input/claimed → turn/end{completed, spoke:false}，零模型调用（M5-4）。
-    const gate = this.deps.necessityGate ?? (() => Promise.resolve(true));
-    // Wake 钩子（design §4.19）：唤醒时注入附加输入。它跟门看的是同一份文本——
-    // 钩子说的东西也算「这次唤醒说了什么」，否则「紧急信息由钩子带进来」这条用法就废了。
+    // Wake 钩子（design §4.19）：唤醒时注入附加输入，排进本 turn 的尾部 developer 通道。
+    //
+    // 2026-10-05 起这里**没有回复必要性门了**：那道门（`runtime/necessity-gate.ts`）已拆——它
+    // 做的唯一一件事是"在调模型之前替她决定闭嘴"，而"闭嘴"在旧口径里等于**一个请求都不发**。
+    // 用户把心跳改成**真实唤醒**（唤醒一次的花费远少于缓存前缀被供方回收的花费；心跳这一拍
+    // 就是去保温供方那份 KV 前缀的），那条口径被整体否掉。**"开不开口"仍由她自己定**
+    // （`speak` / `turn/end.spoke`），但"调模型"照做。理由、实测与警告见
+    // docs/design.md 的「试过并废掉的口径：回复必要性门」。
     const wakeText = this.wakeText();
     const injected = await this.runWakeHooks(wakeText);
-    const gateText = injected === null ? wakeText : `${wakeText}\n${injected}`;
-    if (!(await gate(gateText, this.wakeEvents))) return this.endTurn({ kind: 'completed' });
-    // 过了门才把注入文本排进尾部 developer 通道：要沉默就一并沉默，不留孤儿上下文
     if (injected !== null) this.hookContext.push(injected);
 
-    // 记忆选材（B2）：**过了门才写**——门判沉默时这一轮不会有任何 step，写一条没人用的选材账
-    // 只会让日志里多出"选了却没用"的噪音。写在第一个 step/start 之前（轮首），所以
+    // 记忆选材（B2）：写在第一个 step/start 之前（轮首），所以
     // `deriveRequest`/重放按 `seq < step/start.seq` 取得到它。
     this.selectMemoryForTurn();
 
@@ -958,6 +948,10 @@ class TurnRunner {
    * 同一条事件上还挂两笔**上下文事实**（2026-10-03；不新增事件类型，见 context-audit.ts）：
    *   · `context`：这次请求的上下文构成（渲染层的副产物，段边界只有它知道）；
    *   · `cacheBreak`：与**上一次被审计的调用**做前缀比对的结论，只在真失守时出现。
+   *     2026-10-05 起它多带一份**归因**（`cause` / `causes` / `silent`，判据见
+   *     `context-audit.ts` 的 `segmentCause`）：预期内的失守（重启、她改资产、工具清单、
+   *     压缩、渲染换代、空闲）降级成普通记录，只有"无法归因"仍然告警——用户那次的原话是
+   *     「预期内的代价和真正的异常混在同一条告警里 ⇒ 告警常态化 ⇒ 人就不看了」。
    * 两次比对之间没有额外的请求，所以"一步一条"既是归因的粒度，也是哨兵的粒度。
    */
   private accountStep(
@@ -978,8 +972,13 @@ class TurnRunner {
       ts,
       cacheHitTokens: cacheHit,
       cacheMissTokens: Math.max(0, inputTokens - cacheHit),
+      // 轮号只服务固定块的"形状差异"判据（块只在每轮第 1 步发，跨轮的块哈希本就不可比）
+      turn: this.turn,
     };
-    const cacheBreak = detectCacheBreak(previous, audit, this.deps.cacheBreakThresholds);
+    // 第 4 个参数是**事件序列**：归因要用"两次调用之间发生了什么"（重启 / 她改了资产 / 工具清单 /
+    // 压缩）来解释每一段指纹为什么变，判据只在 `context-audit.ts` 一处（见 `segmentCause`）。
+    // 这里传的是同一份日志快照——重放走同一条路，所以归因也是可复算的，不是运行期才有的观测。
+    const cacheBreak = detectCacheBreak(previous, audit, this.deps.cacheBreakThresholds, this.events);
     const data: Record<string, unknown> = {
       turn: this.turn,
       step,
@@ -1158,10 +1157,10 @@ class TurnRunner {
     }, { sync: true });
   }
 
-  /** 唤醒文本（必要性门与任务卡标题共用同一渲染口径） */
+  /** 唤醒文本（Wake 钩子的输入与任务卡标题共用同一渲染口径） */
   private wakeText(): string {
     const payloads = this.timerPayloads();
-    // 提及那一轮：门与请求体看到的必须是**同一份文本**（否则"紧急信息由钩子带进来"这类判断
+    // 提及那一轮：钩子与请求体看到的必须是**同一份文本**（否则"紧急信息由钩子带进来"这类判断
     // 会按着一段她已经看不到的话来做）。所以这里也换成那句通知。
     const notice = mentionNoticeOf(this.deps.contact ?? null, this.wakeEvents[0] ?? null);
     return this.wakeEvents

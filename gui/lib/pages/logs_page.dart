@@ -4,9 +4,11 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../format.dart';
 import '../theme.dart';
 import 'page_chrome.dart';
 
+part 'logs_format.dart';
 part 'logs_ops.dart';
 part 'logs_panels.dart';
 part 'logs_rows.dart';

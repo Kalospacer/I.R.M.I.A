@@ -138,14 +138,80 @@ describe('read_channel · 她自己点开信箱', () => {
   test('读完写 channel/read，upToSeq = 取回的那批里最大的 msgSeq', async () => {
     const rec = recorder();
     const tk = toolkitWith(async (sid) => [
-      message({ chatId: 'G1', chatType: 'group', msgSeq: 7, sid }),
-      message({ chatId: 'G1', chatType: 'group', msgSeq: 12, sid }),
+      message({ chatId: 'G1', chatType: 'group', msgSeq: 7, seq: 700, sid }),
+      message({ chatId: 'G1', chatType: 'group', msgSeq: 12, seq: 705, sid }),
     ], rec);
 
     await tk.byName('read_channel').handler({ sid: 'qq:group:G1' }, CTX);
     const read = rec.last('channel/read');
     assert.deepEqual(read, { sid: 'qq:group:G1', upToSeq: 12 }, '已读位置推到这一批的最后一条');
     assert.equal(rec.count('channel/read'), 1);
+  });
+
+  test('回执上那个数写的是**事件 seq**（不是平台序号）：两个口径不许混用', async () => {
+    // 这一条钉的是"文案里的数别把人绕进去"：平台序号 1（单聊恒为 1）与事件 seq 300 分得很开，
+    // 所以"回执上出现的是哪个数"一眼可判。她自己（与事后读日志的人）都靠这句话判断"读到哪了"。
+    const rec = recorder();
+    const tk = toolkitWith(async () => [
+      message({ chatId: 'U1', chatType: 'c2c', text: '在吗', msgSeq: 1, seq: 300 }),
+    ], rec);
+    const result = await tk.byName('read_channel').handler({ sid: 'qq:c2c:U1' }, CTX);
+    assert.match(result.content, /已标记读过 seq=300/u, `回执写的是事件 seq：${result.content.split('\n')[0]}`);
+    assert.equal(/upToSeq=/u.test(result.content), false, '旧口径的名字不该再出现在给她看的话里');
+  });
+
+  test('单聊（msgSeq 恒为 1）：同进程里第二次读，中间来的**新消息必须看得见**', async () => {
+    // 2026-10-05 修的真缺陷（`docs/unread-and-inbox-check.md` §3 末尾那条，这次落地）：
+    // 官方入站事件体里**没有**会话内序号（`msgSeq` 在官方协议里是出站字段），所以 c2c 的消息
+    // 一律 `msgSeq: 1`。早退判据原来拿它比大小 ⇒ 第一次读完之后 `max(msgSeq)(1) <= upToSeq(1)`
+    // 恒真 ⇒ **同一个进程里读第二次必答"没有新消息"，哪怕用户这中间刚发了十条**。
+    // 现在判的是**事件 seq**（单调、重放稳定、哪个平台都拿得到）：新消息落库必得更大的 seq。
+    const rec = recorder();
+    let messages = [
+      message({ chatId: 'U1', chatType: 'c2c', person: '用户', text: '第一句', msgSeq: 1, seq: 300 }),
+    ];
+    const tk = toolkitWith(async (sid, limit) => messages.slice(-limit), rec);
+    const tool = tk.byName('read_channel');
+
+    const first = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
+    assert.ok(first.content.includes('第一句'), '第一次照给');
+
+    // 他在这中间又发了十条（同一个进程、同一个 readState）
+    messages = [
+      ...messages,
+      ...Array.from({ length: 10 }, (_, i) =>
+        message({ chatId: 'U1', chatType: 'c2c', person: '用户', text: `第十一句的后半 ${i}`, msgSeq: 1, seq: 301 + i })),
+    ];
+    const second = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
+    assert.equal(second.content.includes('没有新消息'), false,
+      `新消息必须看得见（这正是修之前必错的场景）：${second.content}`);
+    assert.ok(second.content.includes('第十一句的后半 9'), '十条新消息都在这一屏里');
+    assert.equal(rec.count('channel/read'), 2, '真有新消息 → 照常记一笔已读');
+  });
+
+  test('单聊：真没有新消息时照旧回"没有新消息"（反向用例，别把这条闸整体放开）', async () => {
+    // 上面那条修的是"判据用错了数"，不是"取消去重"：平台序号恒 1 的会话**没有新东西**时，
+    // 第二、第三次读仍然必须是"没有新消息"——否则一次修 bug 会顺手把 2026-10-02 那个
+    // "一轮连读五遍、白花四个 step"的教训放回来。
+    const rec = recorder();
+    const same = [
+      message({ chatId: 'U1', chatType: 'c2c', person: '用户', text: '就这一句', msgSeq: 1, seq: 300 }),
+    ];
+    const tk = toolkitWith(async (sid, limit) => same.slice(-limit), rec);
+    const tool = tk.byName('read_channel');
+
+    const first = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
+    assert.ok(first.content.includes('就这一句'));
+
+    const same1 = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
+    assert.match(same1.content, /没有新消息/u, '同一批、窗口没放宽 → 照旧去重');
+    const same2 = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
+    assert.match(same2.content, /还是\s*没有新消息/u, '第三次把话说得更直白');
+    assert.equal(rec.count('channel/read'), 1, '没有新东西就不该再记一笔已读');
+
+    // 窗口放宽 = 她要往前翻，那是合法的（这条例外没被上面那条修复波及）
+    const wider = await tool.handler({ sid: 'qq:c2c:U1', limit: 40 }, CTX);
+    assert.ok(wider.content.includes('就这一句'), 'limit 比上次大 → 照给');
   });
 
   test('limit 缺省 20、上限 100（超上限夹住而不是报错）', async () => {

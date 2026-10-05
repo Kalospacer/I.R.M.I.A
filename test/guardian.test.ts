@@ -447,8 +447,10 @@ test('M4-7 status 五要素：水位 / 待办数 / 今日消耗 / 待确认数 /
   assert.ok(lines.some((line) => line.includes('水位: 0')), `缺水位\n${text}`);
   assert.equal(report.pending.total, 1);
   assert.ok(lines.some((line) => line.includes('待办 1')), `缺待办数\n${text}`);
-  assert.equal(report.budget.tokensToday, 150, '今日消耗 = 最近一条 rollover 之后的 consumed 之和');
-  assert.ok(lines.some((line) => line.includes('今日消耗: 150 tok')), `缺今日消耗\n${text}`);
+  assert.equal(report.budget.tokensToday, 70, '今日消耗 = 最近一条 rollover 之后的 consumed 之和（非缓存口径：(100 − 80) + 50）');
+  // 单位与口径统一（2026-10-05）：数字后面的单位词只有一处给（`format/units.ts` 的口径由
+  // 调用点补），CLI status 与 budget 两行必须写同一个说法
+  assert.ok(lines.some((line) => line.includes('今日非缓存消耗: 70 非缓存 token')), `缺今日消耗\n${text}`);
   assert.equal(report.needsReview, 1, 'unknown 的工具调用必须进待确认');
   assert.ok(lines.some((line) => line.includes('待确认 1')), `缺待确认数\n${text}`);
   assert.equal(report.lock.present, true);
@@ -457,9 +459,10 @@ test('M4-7 status 五要素：水位 / 待办数 / 今日消耗 / 待确认数 /
   assert.ok(lines.some((line) => line.includes(`锁: 持有者 pid ${process.pid}`)), `缺锁信息\n${text}`);
 
   // 分列口径（operations.md §6：今日消耗要 hit/miss 分列）
+  // tokensToday* 走**非缓存口径**（2026-10-05）：(100 − 80) + 50 = 70；hit/miss 是原始分量，照旧
   assert.deepEqual(report.budget, {
-    tokensToday: 150,
-    tokensTodayHeavy: 150,
+    tokensToday: 70,
+    tokensTodayHeavy: 70,
     tokensTodayLight: 0,
     cacheHitToday: 80,
     cacheMissToday: 20,
@@ -477,7 +480,7 @@ test('M4-7 status 五要素：水位 / 待办数 / 今日消耗 / 待确认数 /
   };
   assert.equal(parsed.watermark, 0);
   assert.equal(parsed.pending.total, 1);
-  assert.equal(parsed.budget.tokensToday, 150);
+  assert.equal(parsed.budget.tokensToday, 70);
   assert.equal(parsed.budget.cacheHitToday, 80);
   assert.equal(parsed.budget.cacheMissToday, 20);
   assert.equal(parsed.needsReview, 1);

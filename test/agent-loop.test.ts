@@ -221,21 +221,38 @@ test('M2-1 无工具调用：turn 以 completed 结束，spoke=true 表示说过
   assert.equal(model.requests.length, 1);
 });
 
-test('M2-1 必要性门为假：沉默收尾，不发起模型调用（spoke=false）', async (t) => {
+test('M2-1 沉默是正常动作（turn 内部）：她走完一拍而不开口，spoke=false 且输入不悬空', async (t) => {
+  // 2026-10-05：回复必要性门拆了，这条用例从"门为假 → 零调用"改成验 **turn 内部的行为**——
+  // "沉默"不再等于"一个请求都不发"（用户把心跳改成真实唤醒：唤醒一次远比缓存前缀被回收便宜），
+  // 而是"她看完之后决定不说话"。判据一条没放宽：结局、spoke、认领、账，全都在。
   const harness = await makeHarness(t);
   const wake = wakeManual(harness, '心跳：看一眼');
-  const model = fakeModel([]);
+  const model = fakeModel([{ text: '', toolCalls: [] }]);
 
-  const reason = await runTurn(harness.depsOf(model.ds, { necessityGate: async () => false }), [wake]);
+  const reason = await runTurn(harness.depsOf(model.ds), [wake]);
 
   assert.deepEqual(reason, { kind: 'completed' });
-  assert.equal(model.requests.length, 0);
+  assert.equal(model.requests.length, 1, '这一拍照常调模型（"看一眼"必须真的发生）');
   const events = await harness.readAll();
-  assert.equal(events.filter(event => event.type === 'step/start').length, 0);
+  assert.equal(events.filter(event => event.type === 'step/start').length, 1);
   const end = ofType<TurnEnd>(events, 'turn/end')[0]!;
-  assert.equal(end.data.spoke, false);
+  assert.equal(end.data.spoke, false, '她没开口');
   // 沉默也要认领：否则这条输入会永远留在队列里被反复评估
   assert.equal(events.filter(event => event.type === 'input/claimed').length, 1);
+});
+
+test('M2-1 没有输入可认领时才是零模型调用：空拍照样留 turn/start + turn/end', async (t) => {
+  const harness = await makeHarness(t);
+  const model = fakeModel([]);
+
+  const reason = await runTurn(harness.depsOf(model.ds), []);
+
+  assert.deepEqual(reason, { kind: 'completed' });
+  assert.equal(model.requests.length, 0, '没有谁在跟她说话：这一拍一个请求都不发');
+  const events = await harness.readAll();
+  assert.equal(events.filter(event => event.type === 'step/start').length, 0);
+  assert.equal(events.filter(event => event.type === 'input/claimed').length, 0);
+  assert.equal(ofType<TurnEnd>(events, 'turn/end')[0]!.data.spoke, false);
 });
 
 // ──────────────────────────────── ② 工具调用全链路 ────────────────────────────────

@@ -172,30 +172,31 @@ export const SPEAK_TEXT_SUGGESTED_MAX = 25;
  */
 export const SPEAK_TEXT_REMIND_MAX = 25;
 /**
- * **超过它就不再按标点自动分段**：整段一次发出去。
+ * speak 的**硬门**：超过它**直接拒绝**（`errorResult`）——不截断、不"提醒之后照发"。
  *
- * 分段本身是"像人打字"的节奏（按 `charCount` 在每个逗号与句号处断开，逐条发），
- * 但那个节奏只对短话成立：45 字以上再按标点切，读起来是**刷屏**，而且切点会越来越随意
- * （话越长，标点越不像意群边界——同一口气被切碎）。长话整条发出，形状反而接近
- * "他发来一条很长的消息"，而不是"她连发七八条"。
+ * 用户 2026-10-05 的原话：「超多少字不截断取消。而是超过 40 字直接拒绝。返回要求重新组织语言，
+ * 或是多次调用，或是 report」。所以这一条与上面两条**性质不同**：
  *
- * **45 的来历**：用户 2026-10-05 定"超过 45 就不自动分段了"。阈值取在**分段的最大收益点**上——
- * 45 字以内的短话切出来是自然的意群（一句话本来就该一口气说完）；46 字起才切，切出来的段
- * 已经长于"一次说一件事"的量，剩下的只是机械地按标点数数。所以这条线是**分段形态**的分界，
- * 不是说话风格的分界。
+ *   • **25**（`SPEAK_TEXT_SUGGESTED_MAX`）= **目标**——她该往哪儿说（越短越好，像打字聊天）；
+ *   • **40（本常量）= 硬门**——过了就退回，一个字不发（`text` 那条路根本走不到）；
+ *   • **提醒线**（`SPEAK_TEXT_REMIND_MAX`）= **纠偏的密度**——多久追她一句（不阻止发送）。
+ *   • **分段**（`chat-split.ts`）= **40 以内的投递形态**——切成几条、按打字节奏一条条发。
  *
- * **它与 25 / 提醒线不是一个概念，别混成一个**：
- *   • 25（`SPEAK_TEXT_SUGGESTED_MAX`）= **目标**——她该往哪儿说（越短越好，像打字聊天）；
- *   • 45（本常量）= **分段的上限**——切与不切的那一刀，与"该说多长"无关；
- *   • 提醒线（`SPEAK_TEXT_REMIND_MAX`）= **纠偏的密度**——多久追她一句。
- * 两者会同时出现在一段 30~45 字的文本上：**切照切、提醒照发**（分段是形态，提醒是引导），
- * 所以"提醒了还分段"不是矛盾，也不需要谁让谁。
+ * 三层的分工可以一句话说完：**25 是目标，40 是门，分段是门里的走路方式**。40 以内照旧分段
+ * （那是"像人打字"的语义，没有"超过多少就不分段"这回事了——那条 45 字的口径已被用户取消）。
  *
- * 判据用 `charCount`（中文计字口径：emoji 算一个字）而不是 `text.length`：后者会把 emoji
- * 数成两个，于是同一段话在带表情时提前越过 45。**边界是精确的**：正好 45 字仍分段，
- * 46 字起不分段——测试 `test/admin-pwsh.test.ts` 钉住了这两侧。
+ * **为什么 40 是"拒绝"而不是"截断"**：截断过的话照样发出去，人读到的就不是她想说的那句了
+ * （回执与日志还会记着一段被砍过的文本）——那是替她说了半句。拒绝则把决定权还给她：
+ * 重说、拆几次、还是改用 `report`，由她判断。拒绝文案必须给出这三条路（她照着就能改）。
+ *
+ * 判据用 `charCount`（中文计字口径：emoji / 增补平面字符算一个字），与分段、`maxLength`
+ * 同一把尺子——用 `text.length` 会把 emoji 数成两个，同一句话带不带表情会落在门的两侧。
+ * **边界是精确的**：正好 40 字通过，41 字起拒绝（测试 `test/admin-pwsh.test.ts` 钉住两侧）。
+ *
+ * `SPEAK_TEXT_HARD_MAX` 仍在、仍是 `requiredString` 的 `maxLength`：那是"别把整篇报告塞进来"
+ * 的兜底（schema 层），400 > 40，所以真正会先拦下来的是这一条。
  */
-export const SPEAK_SEGMENT_MAX = 45;
+export const SPEAK_TEXT_MAX = 40;
 /** 硬上限：只是防它把整篇报告塞进来；稍微超过不拒，只在结果里提醒（那条提醒见 SPEAK_TEXT_REMIND_MAX） */
 const SPEAK_TEXT_HARD_MAX = 400;
 /** report 的上限：正式内容允许长，与 speak 差三个量级 */
@@ -461,7 +462,20 @@ export interface ReplyTarget {
   msgId?: string;
 }
 
-export type ReplyOutcome = { ok: true; status: number } | { ok: false; status?: number; reason: string };
+export type ReplyOutcome =
+  | {
+    ok: true;
+    status: number;
+    /**
+     * **话发出去了，但形态与她以为的不一样**（原样来自通道层，`SendOutcome.degraded`）。
+     *
+     * 首例：机器人没有原生 markdown 权限 → 服务端拒了 markdown → 通道按纯文本重发成功。
+     * 这条不是失败，但它**必须进回执**：`ok: true` 只说"到了"，而"这一条的形态变了"关系到
+     * 「@ 到底亮没亮」。不说，就是留一个"以为发出去了、其实没 @ 到"的静默失败。
+     */
+    note?: string;
+  }
+  | { ok: false; status?: number; reason: string };
 export interface ReplyPoster {
   post(target: ReplyTarget, text: string): Promise<ReplyOutcome>;
 }
@@ -646,6 +660,18 @@ export interface ChannelMessageView {
   text: string;
   messageId: string;
   msgSeq: number;
+  /**
+   * 这条消息**落进日志时的 seq**（`EventLog.nextSeq` 分配，严格单调；宿主不会填别的数）。
+   *
+   * 为什么视图里需要它、而不是用上面的 `msgSeq`："这个会话自上次读到之后**又来没来过**新消息"
+   * 只有它答得对。`msgSeq` 是**平台**的会话内序号，而平台常常给不出（见 `channel/inbox.ts` 的
+   * `inboxMsgSeqOf`），官方单聊干脆**恒为 1**——拿它比大小，同一个进程里第二次读单聊必然得出
+   * "没有新消息"，哪怕用户刚发了十条（2026-10-05 报的真缺陷）。
+   *
+   * `msgSeq` 仍然是**未读**的判据（那是"会话里第几条"的语义，见 `channel/sessions.ts`）；
+   * 两个数各答各的问题，**别互相顶替**：这里答"新不新"，它答"读到第几条"。
+   */
+  seq?: number;
   ts: string;
   attachments?: Array<{ type: string; url?: string; name?: string }>;
 }
@@ -681,6 +707,20 @@ export type ReadChannelItem = ChannelMessageView | ChannelSpoken;
  */
 export function isChannelSpoken(item: ReadChannelItem): item is ChannelSpoken {
   return (item as ChannelMessageView).msgSeq === undefined;
+}
+
+/**
+ * 这一行**落进日志时的 seq**（两种来源都有；宿主填不出时退回 0）。
+ *
+ * 两种用途，同一份判据：
+ *   ① 排序的最后一个键——官方单聊的 `msgSeq` **恒为 1**，一批单聊消息在主键与次序键上全部相等，
+ *      少了它，同毫秒的顺序就"由实现决定"，而她读到的因果不该随实现变；
+ *   ② `read_channel` 判"这个会话有没有新东西"（见 handler 里那句 `fresh`）：
+ *      只有事件 seq 答得对这个问题，平台序号答不出（平台常常不给，单聊恒为 1）。
+ */
+export function eventSeqOf(item: ReadChannelItem): number {
+  const raw = isChannelSpoken(item) ? item.seq : (item as ChannelMessageView).seq;
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
 }
 
 /**
@@ -734,9 +774,9 @@ export function mergeChannelSpeech(
     const ka = orderKeyOf(a);
     const kb = orderKeyOf(b);
     if (ka !== kb) return ka - kb;
-    const sa = isChannelSpoken(a) ? a.seq : (a as ChannelMessageView).msgSeq;
-    const sb = isChannelSpoken(b) ? b.seq : (b as ChannelMessageView).msgSeq;
-    return (Number.isFinite(sa) ? sa : 0) - (Number.isFinite(sb) ? sb : 0);
+    // 第三个键（事件 seq，见 eventSeqOf 的注释）：平台序号相同的一批——官方单聊恒为 1——
+    // 靠它才有确定的先后，否则这一屏的顺序就交给实现了
+    return eventSeqOf(a) - eventSeqOf(b);
   });
   return merged.slice(-limit);
 }
@@ -999,9 +1039,18 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
     };
   };
 
+  /**
+   * 降级事实那一行（回执用）：`ok: true` 且通道带回了 `note` 时才追加。
+   *
+   * 说的是**通道自己的形态变化**（例如 markdown 被拒、按纯文本发的），不改投递结果。
+   * 正文里的 @ 写法不在这里解释——2026-10-05 起出站正文**一个字都不动**，@ 由她自己按官方
+   * 形态写在正文里（docs/design.md §4.20.1），框架没有什么可替她保证的。
+   */
+  const degradeLineOf = (note: string | undefined): string | null =>
+    note === undefined ? null : `提醒：这条的形态被降级了——${note}。`;
+
   const personaRootOf = (ctx: ToolContext): string =>
     options.personaRoot ?? resolve(ctx.workspaceRoot, 'persona');
-
   // ── write_persona ──
 
   const writePersona: ToolDefinition = {
@@ -1317,21 +1366,33 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
   const speak: ToolDefinition = {
     name: 'speak',
     description:
-      `跟人说话用这个（日常闲聊）——一次说一件事、${SPEAK_TEXT_SUGGESTED_MAX} 字内、最多两个逗号，一轮一次就够：`
+      `跟人说话用这个（**聊天用，不是写正式句子**）——一次说一件事、${SPEAK_TEXT_SUGGESTED_MAX} 字内、最多两个逗号；`
       + '整段交给它，按打字节奏自动断句发出去。'
-      + '别反复调它堆话，长内容用 report；不调它，人听不到你。',
+      + `超 ${SPEAK_TEXT_MAX} 字直接退回，别调它堆话；长内容用 report。`,
     // 描述不许写长：它进 tools 那一段（请求的缓存前缀），且 `tool-catalog` 有一条
     // **<60 token** 的硬线（本轮口径，与另外六件一起算）。所以分段的细则
     // （顿号不断、成对符号里不断、不足 12 字整段一条）**只写在 `chat-split.ts` 里**，
     // 不往这里塞——那些是她写标点时自然就会写对的规则，不需要她背。
     //
-    // 那个字数上限**由 SPEAK_TEXT_SUGGESTED_MAX 拼进来**，不许在描述里手写：描述与判据
-    // 必须同源。它同时是**说话风格目标**（用户定的 25 字、短句、像打字聊天），不是从实测
-    // 分布里挑的分位数——别照着日志里的 p90 把它放宽（那一版被纠过，见该常量的注释）。
+    // **"口语化、允许残缺/倒装/省略"那一句放在 `text` 参数的描述里**（参数不进那份 <60 预算，
+    // 这是既有先例）：那句话要说清"这是聊天消息、可以不成句"，两三句才够，塞进总描述会顶破线。
+    // 但"**聊天用、不是写正式句子**"这半句必须留在总描述里——她读的第一句就是它。
+    //
+    // **两个数都由常量拼进来**（`SPEAK_TEXT_SUGGESTED_MAX` 与 `SPEAK_TEXT_MAX`），不许在描述里
+    // 手写：描述与判据必须同源。建议线同时是**说话风格目标**（用户定的 25 字、短句、像打字聊天），
+    // 不是从实测分布里挑的分位数——别照着日志里的 p90 把它放宽（那一版被纠过，见该常量的注释）。
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: '要说的完整内容（会被自动拆成几条，不必自己拆）' },
+        text: {
+          type: 'string',
+          description:
+            '要说的内容，**一句话**（会被自动断成几条，不必自己拆）。'
+            + '**这是聊天消息，不是正式发言**：短、口语，允许句子残缺、倒装、省略、表达奇怪'
+            + '——按你平时随口回一句的样子写就行，不必先组织成完整句。'
+            + `超过 ${SPEAK_TEXT_MAX} 字会被**直接退回**（不截断、也不照发）：改成更短的一句、`
+            + '拆成几次调用，或内容本来就长时改用 report。',
+        },
         to: {
           type: 'string',
           description:
@@ -1356,6 +1417,26 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
       try {
         const args = argsRecord(rawArgs, 'speak');
         const text = requiredString(args, 'text', { maxLength: SPEAK_TEXT_HARD_MAX });
+        // **硬门（`SPEAK_TEXT_MAX` 40）：超过就退回，一个字不发。** 用户 2026-10-05 的口径。
+        //
+        // 拒绝而不是截断：截断过的那半句照样发出去，人读到的就不是她想说的那句了；把它退回去，
+        // "重说 / 拆几次 / 改用 report"这三个决定仍在她手里。所以文案给全三条路，并把**收到多少字**
+        // 如实报出来（她据此才知道要砍掉多少）——这是"拒绝必须给模型明确的下一步"那条纪律
+        // （design.md §4.10）在这一处的落点。
+        //
+        // 位置刻意在**解析目标之前**：一句话超了门就没有"该不该发、发给谁"的问题了，先判它
+        // 才不会白算一轮；也保证被拒时日志里一个字都没落（截断或提醒后照发都做不到这一点）。
+        if (charCount(text) > SPEAK_TEXT_MAX) {
+          return errorResult(
+            `这段 ${charCount(text)} 字，超过 speak 的上限（一次至多 ${SPEAK_TEXT_MAX} 字）——`
+            + 'speak 是聊天用的，一个字都没发出去。三条路挑一条：\n'
+            + `- 重新组织成更短的一句：聊天不必是完整句子，口语、残缺、倒装、省略都行`
+            + `（往 ${SPEAK_TEXT_SUGGESTED_MAX} 字左右收）；\n`
+            + '- 拆成几次调用：一次说一件事，说几轮都行；\n'
+            + '- 内容本来就长：改用 report（正式内容允许长，Markdown 原样保留、不按标点切）。',
+            TOOL_ERROR_CODES.invalidArgs,
+          );
+        }
         // 提醒：越过提醒线就追那一句。**它是纠偏，不是判错**——那句话只该把话头引回
         // "一次说一件事、像打字聊天"的目标，不该说成"你超了上限"（更不该说成"你做不到"）。
         // 提醒线与建议线**脱钩**（2026-10-05 用户定：两条都是 25），所以改提醒的密度
@@ -1392,11 +1473,19 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         //
         // 说话期间人又开口了（`ctx.interrupt`）就立刻停：已经发出去的收不回来，没发的
         // 一段都不发，并在回执里如实告诉她——那条回执是给她重新组织语言的依据。
-        // 分段与不分段的分界（`SPEAK_SEGMENT_MAX`，用户 2026-10-05 定的口径）：
-        // **45 字以内才按标点切**（切出来是自然的意群，逐条发就是"她在打字"）；
-        // **46 字起整条一次发出**——长话再切是刷屏，而且切点越来越随意。
-        // 只有这一处判定，别在下面再写一套：分段规则全在 `chat-split.ts` 里。
-        const segments = charCount(text) > SPEAK_SEGMENT_MAX ? [text] : splitForChat(text);
+        // **分段照旧**：一次发言切成几条、按打字节奏一条条发（`chat-split.ts` 认逗号与句号，
+        // 成对符号与代码块有保护、不足 12 字整段一条——细则全在那个模块里，这里不重写一套）。
+        // 已经没有"超过多少字就不分段"这回事了：用户 2026-10-05 取消了那条 45 字的口径，
+        // 超长改由上面的硬门（`SPEAK_TEXT_MAX` 40）直接拒绝——**门在进 speak 之前**，
+        // 走到这里的文本一定在门内，于是"切不切"只剩"该怎么切"。
+        const segments = splitForChat(text);
+        // **正文原样出站**：一个字都不改、一段都不拦（2026-10-05 用户决定移除"名字 → openid →
+        // 官方 @ 串"那一层，原话「我觉得没必要存在」，理由见 `channel/qq-official.ts` 文末那段
+        // 注释与 docs/design.md §4.20.1）。`[@1 号]` 这种写法就是普通文字：**照发**——那层便利
+        // 曾经因为一个读表路径错误把她整条消息卡住过，一个字都没出去。
+        //
+        // 本地那份记录也是她的原话（`message/assistant` 与 `speak/sent` 都不动）：
+        // 现在连投递走的都是同一份字节，`read_channel` 读回来的与群里看到的一字不差。
         const typing = options.speakTyping ?? DEFAULT_SPEAK_TYPING;
         const perCharMs = typing.typingEffect ? 60_000 / typing.charsPerMinute : 0;
         /** 这一条投递回执的归并键：`read_channel` 按它把一次 speak 归成一行（见 SpeakSentPayload） */
@@ -1410,6 +1499,8 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         let interrupted = false;
         /** IM 那一路的失败原因（null = 没失败）；一旦失败就不再试后面的段，但日志照落 */
         let imFailure: string | null = null;
+        /** IM 那一路带回来的降级提醒（形态变了，但话发出去了）：要进回执 */
+        let imNote: string | null = null;
         /** 一段都没开始发之前不许取消——见循环开头那段说明 */
         let started = false;
         for (let index = 0; index < segments.length; index += 1) {
@@ -1442,11 +1533,15 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
           emit('speak/sent', { channel: 'log', chars: segment.length } satisfies SpeakSentPayload);
           emitted += 1;
           started = true;
-          // IM 紧跟同一段：本地先落（那一跳永远可用），再发出去（那一跳可能失败）
+          // IM 紧跟同一段：本地先落（那一跳永远可用），再发出去（那一跳可能失败）。
+          // 发出去的就是这一段本身——逐字节原样，与上面那条日志同一份字节。
           if (target !== null && imFailure === null) {
             const outcome = await replyPoster.post(target, segment);
-            if (outcome.ok) sent += 1;
-            else imFailure = outcome.reason;
+            if (outcome.ok) {
+              sent += 1;
+              // 降级事实（例如 markdown 没权限、按纯文本发的）只在回执里说，不改投递结果
+              imNote = degradeLineOf(outcome.note) ?? imNote;
+            } else imFailure = outcome.reason;
           }
         }
 
@@ -1478,6 +1573,7 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
             spoke === null ? '发言被打断：他刚发来新消息。' : `发言被打断：他刚说「${spoke.text}」。`,
             `- 已经发出去的（收不回来了）：${emitted === 0 ? '一条都没发' : `${emitted} 条——${said}`}`,
             `- 没来得及发的（${unreleased.length} 条）：${numberedUnreleased(unreleased)}`,
+            ...(imNote === null ? [] : [`- ${imNote}`]),
             '别把剩下这半截硬接上去。先看他新说的是什么，重新组织语言再开口。',
           ].join('\n'));
         }
@@ -1530,6 +1626,10 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
             ? `投递：已送达 ${target.url}（${sent} 条）`
             : `已发往 ${targetLabel}（sid ${target.url}）：${sent} 条`);
         }
+        // 降级提醒单独一行，且**排在投递结论之后**：先答"发没发出去"，再答"发成什么样"。
+        // 它只在通道明确带回降级事实时出现（例如 markdown 被拒、按纯文本发的）——
+        // 没发生就一个字都不写，免得每一条发言都缀一句"形态正常"的噪音。
+        if (imNote !== null) lines.push(imNote);
         return okResult(`发言已处理：\n${lines.map((line) => `- ${line}`).join('\n')}`
           + (overRemindLine
             // 措辞是**纠偏**，不是判错：说"这段偏长、往回收"，不说"你超了上限"（更不说"做不到"）。
@@ -1601,6 +1701,8 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
           return errorResult(resolved.error, TOOL_ERROR_CODES.invalidArgs);
         }
         const target = resolved.target;
+        // 正文原样出站（与 speak 同一条判据）：报告里写 `[@1 号]` 也好、写官方那一串
+        // `<qqbot-at-user id="…" />` 也好，都只是正文的一部分——框架不改写、也不拒发。
         if (target === null) {
           lines.push('投递：本轮没有 IM 会话可发（跳过）；报告已经在对话流里了，人在界面能看见');
         } else {
@@ -1610,6 +1712,8 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
             lines.push(resolved.label === ''
               ? `投递：已送达 ${target.url}（HTTP ${outcome.status}）`
               : `已发往 ${resolved.label}（sid ${target.url}）`);
+            const note = degradeLineOf(outcome.note);
+            if (note !== null) lines.push(note);
           } else {
             lines.push(`${resolved.label === '' ? '投递' : `发往 ${resolved.label}`}：失败——${outcome.reason}`);
           }
@@ -1762,10 +1866,13 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
   /**
    * 每个会话"上次读到哪、上次要了多宽的窗口"——**只用来判"这次有没有新东西"**。
    *
+   * `seq` 是**事件 seq**（不是平台序号）：判据只有一份，见 handler 里那句 `fresh`
+   * ——平台序号答不了"新不新"（官方单聊恒为 1）。
+   *
    * 它是缓存，不是账：账在日志的 `channel/read` 里。进程重启后是空的，于是第一次调用照旧
    * 正常返回消息（宁可多给一次，也不能因为"我记不清"就什么都不给）。
    */
-  const readState = new Map<string, { upToSeq: number; limit: number }>();
+  const readState = new Map<string, { seq: number; limit: number }>();
   /**
    * 同一轮里同一个会话被读了几次：`${turn}\u0000${sid}` → 次数。
    *
@@ -1903,31 +2010,48 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         // **它不扩窗**：下面按时间轴插进去之后再压回 limit，所以这一屏最多还是 limit 行
         //（她的发言也占行——见 mergeChannelSpeech 的取舍说明）。
         const spoken = channelSpokenReader === null ? [] : await channelSpokenReader(sid);
-        const latest = messages.reduce((max, m) => Math.max(max, m.msgSeq), 0);
+        // 未读的判据（写进 `channel/read`）：平台序号，"这条是这个会话里的第几条"。
+        // 平台给不出时宿主填的就是事件 seq（`channel/inbox.ts` 的 `inboxMsgSeqOf`）。
+        const upToSeq = messages.reduce((max, m) => Math.max(max, m.msgSeq), 0);
+        // **"有没有新东西"的判据（唯一一处）：事件 seq**。它是这次取回的这批里最大的一条的落库 seq
+        // ——严格单调、重放稳定，且**无论哪个平台都拿得到**。
+        //
+        // 为什么不能用上面那个 `upToSeq` 判新（2026-10-05 修的真缺陷）：官方**单聊的 msgSeq 恒为 1**
+        // （平台不给会话内序号，见 `channel/qq-official.ts` 的实证结论）。同一个进程里第二次读单聊，
+        // "这批最大的 msgSeq"还是 1 ⇒ `1 <= prev.upToSeq(=1)` ⇒ 回一句"没有新消息"，
+        // 哪怕用户这中间刚发了十条。事件 seq 没有这个毛病：新消息落库必得更大的 seq。
+        const latestSeq = messages.reduce((max, m) => Math.max(max, eventSeqOf(m)), 0);
         const prev = readState.get(sid);
-        // 没有新消息、也没要更宽的窗口 → 直接说"没有新消息"，不把同一段再摆一遍。
-        // 三个例外都留着：① 她要看**更早**的（limit 比上次大）——那是有新内容的请求；
-        // ② 本进程还没读过这个会话（重启后的第一次）——宁可多给一次，也别让她两手空空；
-        // ③ **这一轮就是这个会话在叫她**（提及/@）——那种情况下"没有新消息"是假的：叫她的那条是
-        //   `wake/channel`，不计入未读，可能正好压在已读位之内，而 v28 之后她手里**只有通知、
-        //   没有正文**。此时必须照给，否则她永远看不到那句原话（2026-10-02 用户从截图上抓到的）。
+        // 没有新东西、也没要更宽的窗口 → 直接说"没有新消息"，不把同一段再摆一遍。三个例外都留着：
+        //   ① 她要看**更早**的（limit 比上次大）——那是有新内容的请求，不是重复调用；
+        //   ② 本进程还没读过这个会话（重启后的第一次）——宁可多给一次，也别让她两手空空；
+        //   ③ **这一轮就是这个会话在叫她**（提及/@）——那种情况下"没有新消息"是假的：叫她的那条是
+        //      `wake/channel`，不计入未读、可能正好压在已读位之内，而 v28 之后她手里**只有通知、
+        //      没有正文**。此时必须照给，否则她永远看不到那句原话（2026-10-02 用户从截图上抓到的）。
+        //
+        // 2026-10-05 的修复**没有动这三个例外**：① ② 判的都不是"新不新"（它们判"要不要更宽的窗口 /
+        // 是不是重启后第一次"），③ 判的是"这一轮谁在叫她"——那是**另一件事**，不是"尾巴新不新"的
+        // 第二处判据。改掉的是那个**数**：`latest`（平台序号）→ `latestSeq`（事件 seq）。
         const caller = mentionMessage?.() ?? null;
         const calledThisTurn = caller !== null && caller.sid === sid;
-        if (!calledThisTurn && prev !== undefined && latest <= prev.upToSeq && limit <= prev.limit) {
+        if (!calledThisTurn && prev !== undefined && latestSeq <= prev.seq && limit <= prev.limit) {
           const times = bumpReadRepeat(ctx?.turn ?? 0, sid);
           const head = times <= 1
-            ? `${sid} 没有新消息：你已经读到最新了（停在 upToSeq=${prev.upToSeq}）。`
+            ? `${sid} 没有新消息：你已经读到最新了（停在 seq=${prev.seq}）。`
               + '不必再翻一遍——想接着说就直接 speak，回不回、说什么都由你。'
             : `${sid} 还是没有新消息：这一轮你已经读过它 ${times} 次，再读返回的还是同一段`
-              + `（停在 upToSeq=${prev.upToSeq}）。想说话直接 speak 就行；真要往前翻，`
+              + `（停在 seq=${prev.seq}）。想说话直接 speak 就行；真要往前翻，`
               + `把 limit 调到比 ${prev.limit} 大（默认 ${READ_CHANNEL_DEFAULT_LIMIT}、上限 ${READ_CHANNEL_MAX_LIMIT}）。`;
           return okResult(head);
         }
         // 读完就记账：未读归零。**先取消息、后写已读**——反过来会出现"标了已读但一条没看到"，
         // 那种状态没有任何办法自查（她自己以为看过了，日志也说看过了，只有她知道是空的）。
-        const upToSeq = latest;
+        //
+        // 两笔账各记各的：`channel/read` 里那个是**会话簿的位置**（未读按它算，口径不变）；
+        // readState 记的是**这批尾巴的事件 seq**（上面那条闸的判据）。同一个名字（upToSeq）不
+        // 同时担两件事——它们是两个不同的数，混用一个必然至少错一个。
         emit('channel/read', { sid, upToSeq } satisfies ChannelReadPayload);
-        readState.set(sid, { upToSeq, limit });
+        readState.set(sid, { seq: latestSeq, limit });
         bumpReadRepeat(ctx?.turn ?? 0, sid);
 
         const entry = sessionEntryOf(messages[0]!);
@@ -1938,7 +2062,7 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         // 头一行把两件事都说清：这一屏几行、其中她自己的几行——她据此决定要不要把 limit 调大
         //（不报的话，"我说过的话怎么不见了"在下一次读更窄的窗口时会变成一次误判）。
         const composition = mine === 0 ? '' : `，其中你自己的发言 ${mine} 行`;
-        const head = `${sid} 最近 ${batch.length} 条${composition}（本机时间，正序；已标记读过 upToSeq=${upToSeq}）· ${where}`;
+        const head = `${sid} 最近 ${batch.length} 条${composition}（本机时间，正序；已标记读过 seq=${latestSeq}）· ${where}`;
         return okResult(`${head}\n${renderReadBatch(batch, entry, messages[0]!).join('\n')}`);
       } catch (err) {
         return errorResultFromThrown(err, TOOL_ERROR_CODES.invalidArgs);

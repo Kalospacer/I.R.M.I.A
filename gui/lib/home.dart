@@ -55,6 +55,10 @@ class HomeShell extends StatelessWidget {
                     children: [
                       for (final page in navPages)
                         _NavItem(
+                          // 定位件：侧栏那一项自己的名字。页面上同名的文字不止一处
+                          // （一级导航项 + 页头标题），用例要的是"侧栏里那一项"——
+                          // 按 key 找，不按文字猜。
+                          key: ValueKey('nav-${page.id}'),
                           icon: page.icon,
                           activeIcon: page.activeIcon,
                           label: page.label,
@@ -268,6 +272,7 @@ class _MoreGroupState extends State<_MoreGroup> {
 
 class _NavItem extends StatelessWidget {
   const _NavItem({
+    super.key,
     required this.icon,
     required this.activeIcon,
     required this.label,
@@ -292,10 +297,17 @@ class _NavItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    // **回退**：选中态曾经被换成主题 token（`navSelectedFill/On` = secondaryContainer 一族），
+    // 亮主题下原来是 primary 蓝的字也跟着变了。用户 2026-10-05 圈的范围只有气泡与发送键
+    // （"改其他的干嘛"），所以这里回到原样：底 surfaceContainerHighest、字与图标 primary。
+    // 暗主题下唯一新加的东西是气泡与发送键那两圈白描边，见 theme.dart 的 IrmiaDarkPair。
+    final fill = selected ? scheme.surfaceContainerHighest : Colors.transparent;
+    final tone = selected ? scheme.primary : scheme.onSurface;
+    final iconTone = selected ? scheme.primary : scheme.onSurfaceVariant;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Material(
-        color: selected ? scheme.surfaceContainerHighest : Colors.transparent,
+        color: fill,
         borderRadius: BorderRadius.circular(8),
         child: InkWell(
           borderRadius: BorderRadius.circular(8),
@@ -312,7 +324,7 @@ class _NavItem extends StatelessWidget {
                 Icon(
                   selected ? activeIcon : icon,
                   size: indented ? 17 : 19,
-                  color: selected ? scheme.primary : scheme.onSurfaceVariant,
+                  color: iconTone,
                 ),
                 const SizedBox(width: 10),
                 Expanded(
@@ -320,7 +332,7 @@ class _NavItem extends StatelessWidget {
                     label,
                     style: TextStyle(
                       fontSize: indented ? 12.8 : 13.5,
-                      color: selected ? scheme.primary : scheme.onSurface,
+                      color: tone,
                       fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
                     ),
                   ),

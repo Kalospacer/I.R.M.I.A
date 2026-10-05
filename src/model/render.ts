@@ -26,6 +26,15 @@ import { estimateTokens } from '../tools/registry.ts';
 /**
  * 渲染模板版本：任何模板变更必须递增并接受一次缓存全 miss。
  *
+ * v33（`用度：` 那一行按新预算口径说话，2026-10-05 用户的口径）：
+ *      预算换成"**只算没命中缓存的那部分**"（原话逐字抄在 `state/fold.ts` 的 `budgetTokensOf` 里）。
+ *      这一行的数字一直是 `budget.tokensToday`（跟着 fold 自动变），**变的是它旁边那个词**：
+ *      原来是 `今日 51,003,320 tok`——同一个数在没有口径说明时会被读成"全部 token"，
+ *      而它现在数的是"真花钱的那部分"。改成 `今日非缓存 … tok`，与设置页那一档的标签
+ *      （「预算 · 每日 token 上限」的口径说明）、与软提示里那句"非缓存额度"用**同一个词**。
+ *      改一个词 = 此刻层的字节变了，所以照规矩递增并接受一次缓存全 miss。
+ *      数字（`tokensToday` / `dailyLimit`）的口径与判据同源：唯一一处定义在 `fold.ts`。
+ *
  * v32（STATE 预算提醒进此刻层，2026-10-05 用户的口径）：用户说
  *      「STATE 如果超预算的话，就加个提醒 `[STATE.md]预算超限，记得维护，将过时内容移入记忆文件或删除`」，
  *      并明确选了**只提醒、不截断**（框架不动她的文件，她看到提醒自己去维护）。
@@ -218,7 +227,7 @@ import { estimateTokens } from '../tools/registry.ts';
  *
  * v2：`instructions` 尾部（人格三层之后、任务卡之前）插入装置自述（self-brief.ts 的 SELF_BRIEF）。
  */
-export const RENDER_VERSION = '32';
+export const RENDER_VERSION = '33';
 
 /**
  * 哪次工具调用没有回执时，补给它（也补给她）的那句话。
@@ -290,9 +299,14 @@ export interface MachineFacts {
  *
  * 三件事都是"她要不要收着点"的依据：今日花了多少（还有多少额度）、常驻前缀有没有在命中、
  * 模型侧是不是连着坏（连续失败到上限就会暂停唤醒——她得知道那不是自己坏了）。
+ *
+ * ⚠️ **`tokensToday` 与 `dailyLimit` 是同一个口径**（2026-10-05 起 = **非缓存 token**：
+ * `(input − cacheHit) + output`，唯一一处定义在 `state/fold.ts` 的 `budgetTokensOf`）。
+ * 比例 `tokensToday / dailyLimit` 因此是有意义的；两个数**不许**一个换口径一个不换——
+ * 那会算出"今天用了 4%"这种自相矛盾的百分比。
  */
 export interface UsageFacts {
-  /** 今日累计 token（投影 `budget.tokensToday`，按 config.timezone 的"今日"切分） */
+  /** 今日累计 **非缓存** token（投影 `budget.tokensToday`，按 config.timezone 的"今日"切分） */
   tokensToday: number;
   /** 生效日上限（含人工加注；`BudgetGuard.limitOf('daily')` 的结论）；null = 不知道，只报用量 */
   dailyLimit?: number | null;
@@ -1152,12 +1166,18 @@ function machineLine(facts: MachineFacts | null): string {
 }
 
 /**
- * `用度：` 的值：今日用量（+ 占日预算的比例）· 缓存命中率 · 连续失败数。
+ * `用度：` 的值：今日**非缓存**用量（+ 占日预算的比例）· 缓存命中率 · 连续失败数。
  *
- * 三个数各有各的用处：**今日用量**是"还能说多久"（日额度烧完就拒绝唤醒）；**缓存命中率**是
+ * 三个数各有各的用处：**今日非缓存用量**是"还能说多久"（非缓存日额度烧完就拒绝唤醒；
+ * 它数的是"真花钱的那部分"，口径唯一一处定义在 `state/fold.ts` 的 `budgetTokensOf`）；
+ * **缓存命中率**是
  * 常驻前缀有没有在命中（掉下来意味着每轮都在为整段上下文付全价）；**连续失败数**是模型侧
  * 是不是在坏（到上限就暂停唤醒——她得知晓那不是自己坏了）。
  * 没有样本时写"无样本"而不是 0%（0% 会被读成"缓存全 miss"），不知道上限就只报用量。
+ *
+ * **为什么把"非缓存"三个字写进这一行（v33）**：口径换了而词没换，同一串数字会被读成
+ * "全部 token"（换口径前它确实就是全部 token）——同一个词指向两个数，比不写更糟。
+ * 设置页「预算 · 每日 token 上限」那一档的说明、软提示里那句"非缓存额度"，用的是同一个词。
  *
  * **它只在告警时被调用**（见 `usageAlert`）：默认那一行整个不出现。
  */
@@ -1171,8 +1191,8 @@ function usageLine(facts: UsageFacts | null): string {
   if (Number.isFinite(facts.tokensToday)) {
     const tokens = Math.max(0, Math.round(facts.tokensToday));
     parts.push(limit === null
-      ? `今日 ${groupDigits(tokens)} tok`
-      : `今日 ${groupDigits(tokens)} tok（占每日预算 ${groupDigits(limit)} 的 ${((tokens / limit) * 100).toFixed(1)}%）`);
+      ? `今日非缓存 ${groupDigits(tokens)} tok`
+      : `今日非缓存 ${groupDigits(tokens)} tok（占每日预算 ${groupDigits(limit)} 的 ${((tokens / limit) * 100).toFixed(1)}%）`);
   }
 
   const hit = Number.isFinite(facts.cacheHitTokens) ? Math.max(0, facts.cacheHitTokens) : 0;
@@ -1220,6 +1240,8 @@ function cacheHitIsLow(facts: UsageFacts): boolean {
  *      `softRatio` 就是预算层真正用的那个刹车比例（`BudgetGuard`，配置默认 0.8、兜底
  *      `DEFAULT_SOFT_RATIO`，且配置非法时退兜底）。取它是因为**越过它就会有一条软提示、
  *      越过上限就拒绝唤醒**——她该在同一拍里知道"快到头了"。这里不写死数字，读配置给的值。
+ *      两个数同口径（**非缓存 token**，`state/fold.ts` 的 `budgetTokensOf`）：换口径只换一边
+ *      会算出"今天用了 4%"这种自相矛盾的百分比。
  *   ② **连续失败已达上限**（`failStreak ≥ failStreakMax`）。
  *      到上限就进入可恢复暂停（design §4.6 失败刹车）。这里**不在中途报**：第一次失败就报一次
  *      等于把正常的重试也变成告警；到了上限才是她真的动不了的那一刻。

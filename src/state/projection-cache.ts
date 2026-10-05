@@ -16,12 +16,31 @@ import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import type { Projection } from '../log/types.js';
+// 预算口径版本：累计量跨不了口径，载入时必须校验它（值导入写 .ts，见 fold.ts 的约定）
+import { BUDGET_ACCOUNTING_VERSION } from '../log/types.ts';
 
 /** 缓存文件名，固定，不随配置变化 */
 export const PROJECTION_CACHE_FILE = 'projection.json';
 
-/** 缓存信封格式版本；只在信封形状变化时递增，旧版本缓存按「不认识」丢弃重算 */
-export const PROJECTION_CACHE_VERSION = 1;
+/**
+ * 缓存信封格式版本。两条递增理由，任一成立就必须 +1（旧版本一律按「不认识」丢弃重算）：
+ *   ① **信封形状**变化（`ProjectionCache` 增删字段）；
+ *   ② **预算口径**变化——即 `state/fold.ts` 的 `budgetTokensOf` 的算式变了。
+ *
+ * ② 是 2026-10-05 那次实测事故的直接对策：投影里的 `tokensToday` / `tokensTask` 是**累计量**，
+ * 一半来自旧算式、一半来自新算式就没法再对账（现场：磁盘缓存里冻结着旧口径的
+ * `tokensToday=29,951,973`，而同一份日志按新口径折出来只有 `2,052,965`——
+ * 进程照旧拿前者判刹车，于是她一开始 turn 就被 `budget/exhausted{layer:'task'}` 拒掉）。
+ * 累计量**不能跨口径续用**，只能整份丢弃、从事件重放。
+ *
+ * 与之配对的是 `state/snapshot.ts` 的 `SNAPSHOT_VERSION`：两条恢复路径（缓存 / 快照）
+ * **必须一起 +1**，否则旧快照仍会把旧口径的累计喂回新进程（现场正是走的快照那条路）。
+ * `test/budget-snapshot-rebuild.test.ts` 钉住这条配对关系。
+ *
+ * 记账：v1 = 未扣缓存口径（`input + output`，含 cacheHit）；v2 = 非缓存口径
+ * （`(input − cacheHit) + output`，见 `state/fold.ts` 的 `budgetTokensOf`）。
+ */
+export const PROJECTION_CACHE_VERSION = 2;
 
 /** 磁盘上的缓存外形（lastSeq 冗余一份，便于不反序列化 state 就判定新鲜度） */
 export interface ProjectionCache {
@@ -115,7 +134,12 @@ const NULLABLE_OBJECT_KEYS = ['openTurn', 'waitingHuman', 'degraded', 'lastWake'
  * 只钉「能否安全参与折叠」，不深入数组元素：漏一个字段会让后续调度读到 undefined，
  * 而过度校验会在事件类型演进时误丢仍然可用的缓存——元素级坏数据由读到具体项的使用方处理。
  *
- * 导出供 state/snapshot.ts 复用：快照与缓存校验的是同一份投影形状，两处各写一套必然漂移。
+ * 一条**语义**校验（不是形状）：`budget.budgetVersion` 必须等于当前口径版本
+ * （`BUDGET_ACCOUNTING_VERSION`，由 fold 盖章）。累计量跨不了口径，缺这一格或版本不符
+ * 就整份丢弃、从事件重放——这正是 2026-10-05「旧账压新账」那次事故的判据。
+ *
+ * 导出供 state/snapshot.ts 复用：快照与缓存校验的是同一份投影形状，
+ * 两处各写一套必然漂移（那次事故就是"快照那条路没校验"造成的）。
  */
 export function basicProjectionShape(value: unknown): value is Projection {
   if (!isRecord(value)) return false;
@@ -139,6 +163,8 @@ export function basicProjectionShape(value: unknown): value is Projection {
   for (const key of ['budget', 'jobs', 'claimedByTurn', 'lastExhausted'] as const) {
     if (!isRecord(value[key])) return false;
   }
+  const budget = value['budget'] as Record<string, unknown>;
+  if (budget['budgetVersion'] !== BUDGET_ACCOUNTING_VERSION) return false;
   return true;
 }
 
@@ -224,10 +250,11 @@ export async function loadProjectionCacheResult(
     return { ok: false, reason: `${path} 的 lastSeq 非法：${String(lastSeq)}` };
   }
 
-  // 版本缺失按当前版本接受（历史/手写缓存）；版本不认识一律丢弃，不猜未知字段语义
+  // 版本缺失一律丢弃：这一格只可能来自"换口径之前那一版代码"（累计量的口径不明就不能续算）。
+  // 版本不认识同样丢弃，不猜未知字段语义。
   const rawVersion = parsed['version'];
-  if (rawVersion !== undefined && rawVersion !== PROJECTION_CACHE_VERSION) {
-    return { ok: false, reason: `${path} 的版本 ${String(rawVersion)} 不认识` };
+  if (rawVersion !== PROJECTION_CACHE_VERSION) {
+    return { ok: false, reason: `${path} 的版本 ${String(rawVersion)} 不认识（缺失或过期）` };
   }
 
   const state = parsed['state'];

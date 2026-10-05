@@ -193,8 +193,24 @@ export interface WakeManual extends EventEnvelope<'wake/manual', {
   via?: 'dream';
 }> {}
 
+/**
+ * 心跳触发（概率模型，2026-10-04 起；模型与标定见 `src/wake/heartbeat.ts` 文件头）。
+ *
+ * **为什么 `probability` / `roll` 是必填而不是可选**：用户的口径是"越久没触发概率越高"，
+ * 事后要能回答"这一拍为什么现在响"。只有 `quietSeconds` 答不了——同一个安静时长在旧模型里
+ * 对应一个固定间隔，在新模型里对应一次抽签。留下当时用的概率与抽到的数，
+ * 判据就能被复算：`roll < probability` 才响，而 `probability = q^α` 由安静时长唯一确定。
+ * 写成必填还顺带把"忘了带审计字段"变成编译期错误（`HeartbeatSink.emitHeartbeat` 收的是本类型）。
+ *
+ * `idleTicks` / `pressure` 保留但**不再参与节律**：它们是既有诊断（GUI 状态、压力溯源）的输入，
+ * 删掉要动投影缓存与界面，与本次改动无关；这里只把语义钉清楚——节律只由安静时长决定。
+ */
 export interface WakeHeartbeat extends EventEnvelope<'wake/heartbeat', {
   quietSeconds: number; idleTicks: number; pressure: number;
+  /** 触发时安静时长对应的命中概率（`q^α`，q=(安静−下限)/(上限−下限)） */
+  probability: number;
+  /** 这一次抽到的随机数（[0,1)）：`roll < probability` 才触发 */
+  roll: number;
 }> {}
 
 export interface WakeIntention extends EventEnvelope<'wake/intention', {
@@ -431,6 +447,12 @@ export interface BudgetConsumed extends EventEnvelope<'budget/consumed', {
    *
    * 没有这个字段 = 这次与上次的冻结前缀一致（不是"没查"）。只在真破坏时出现，
    * 所以它能直接当"框架提示"卡上的一条告警看。
+   *
+   * 2026-10-05 起它还带**归因与分级**（`cause` / `causes` / `silent`，判据在
+   * `model/context-audit.ts` 的 `segmentCause`）：预期内的失守（重启、她自己改资产、
+   * 工具清单变更、压缩、渲染换代、空闲）只落成普通记录，`silent === true`；
+   * **只有归因不明的（`cause: 'unattributable'`）仍然进告警区**。
+   * 字段是可选的：老日志没有 `silent` ⇒ 读的一方按"要告警"处理，历史条目一条不丢。
    */
   cacheBreak?: CacheBreak;
 }> {}
@@ -502,6 +524,29 @@ export interface InputClaimed extends EventEnvelope<'input/claimed', {
 
 export interface InputDeadLetter extends EventEnvelope<'input/dead-letter', {
   inputSeq: number; claimCount: number; lastError?: string;
+}> {}
+
+/**
+ * 人把一条死信**丢弃**（不再重投）：`input/dead-letter` 的终局之一（internal）。
+ *
+ * 为什么是一种自己的事件，而不是"删掉那条死信记录"（2026-10-05 定）：
+ * 事件日志是唯一真相源、**只增不改**。一条输入被认领三次仍然失败是**已经发生过的事实**，
+ * 抹掉它等于篡改日志；人能做的事只是**决定不再重投**——那是另一件事，就该有另一条事实。
+ * 于是投影里它离开死信队列（"现在是什么"变了），日志里那条 `input/dead-letter` 一个字不动。
+ *
+ * 与 `input/requeued` 的区别只在**结局**：那条是"再给一次机会"（回到 pending），
+ * 这条是"到此为止"（输入被有意作废，它的内容不再进入她的上下文）。
+ * 两条都销掉同一条死信，所以对同一个 inputSeq 只能有一条真正生效——API 层据此报 404。
+ */
+export interface InputDiscarded extends EventEnvelope<'input/discarded', {
+  /** 被丢弃的那条输入（`input/dead-letter` 里的 inputSeq） */
+  inputSeq: number;
+  /** 死信形成时的认领次数：留痕用，便于人回看"它到底试了几次" */
+  claimCount: number;
+  /** 丢弃理由（自由文本；人写的原话进日志，不加工） */
+  reason: string;
+  /** 谁丢的。今天只有人这条路（API/CLI），字段留出来是为了将来框架自动清场时说得清 */
+  by: string;
 }> {}
 
 /** 输入退回队列：interrupted turn 认领过的输入重新入队（internal） */
@@ -966,7 +1011,7 @@ export type AppEvent =
   | TimerSet | TimerFired | TimerCancelled
   | BudgetConsumed | BudgetRollover | BudgetExhausted | BudgetToppedUp | BudgetResumed
   | PolicyDenied | AuthzDenied | LogRepaired | InstanceTakeover
-  | InputClaimed | InputDeadLetter | InputRequeued | ToolZombie
+  | InputClaimed | InputDeadLetter | InputRequeued | InputDiscarded | ToolZombie
   | SlashHandled
   | AlarmSent | ReviewResolved | SnapshotCheckpoint | CompactionSummary
   | PersonaUpdated | ConfigChanged | MemoryMaintained | MemorySelected | MemoryRead
@@ -1151,6 +1196,24 @@ export interface TimerEntry {
   payload: unknown;
 }
 
+/**
+ * 预算口径的版本号——**累计量与它必须同源**（`Projection.budget.budgetVersion` 存的就是它）。
+ *
+ * 换口径时**必须 +1**，并同时抬 `state/projection-cache.ts` 的 `PROJECTION_CACHE_VERSION`
+ * 与 `state/snapshot.ts` 的 `SNAPSHOT_VERSION`：前者让投影缓存被丢弃，后者让折叠快照被丢弃，
+ * 两者缺一，旧口径的累计量就会从另一条恢复路径喂回新进程（现场那次事故走的正是快照那条路）。
+ *
+ * 记账：
+ *   · v1 = **未扣缓存**口径（`inputTokens + outputTokens`，含 cacheHit）；
+ *   · v2 = **非缓存**口径（`(inputTokens − cacheHitTokens) + outputTokens`，只算真花钱的那部分）
+ *     —— 唯一一处算式在 `state/fold.ts` 的 `budgetTokensOf`。
+ *
+ * 为什么版本号放在这里而不是 fold.ts：它描述的是**投影的形状**（哪一版累计量），
+ * 而投影形状的家是 log/types.ts；fold.ts 只是盖这个章的人（并把它转出去给恢复层读）。
+ * `test/budget-snapshot-rebuild.test.ts` 钉住"算式 ↔ 版本号"的配对关系。
+ */
+export const BUDGET_ACCOUNTING_VERSION = 2;
+
 export interface Projection {
   lastSeq: number;
   /** 投递水位：连续已处理到的位置。推进时跳过空洞 */
@@ -1172,6 +1235,25 @@ export interface Projection {
   /** 已批准但尚未落地的执行许可（指纹匹配，tool/call 落库即消费） */
   planApproved: PlanApproval[];
   budget: {
+    /**
+     * 这一份累计是按**哪一版预算口径**折出来的。
+     *
+     * 存在的理由是一次实测事故（2026-10-05）：投影里的 `tokensToday` / `tokensTask` 是**累计量**，
+     * 它们被写进 `data/projection.json` 与 `data/snapshots/*.json` 跨进程复用。口径一换
+     * （未扣缓存 → 非缓存），旧账的一半按旧算式、新账的一半按新算式 ⇒ 两套数都不可信，
+     * 而刹车照旧拿它判：现场磁盘上冻结着 `tokensToday=29,951,973`，同一份日志按新算式
+     * 折出来只有 `2,052,965`，进程却拿前者判"日额度用尽"，她一开始 turn 就被拒。
+     *
+     * 所以累计量必须**带着口径版本**一起走：`state/projection-cache.ts` 与 `state/snapshot.ts`
+     * 校验它，不一致就把整份派生状态丢掉、从事件重放（真相源永远是事件日志）。
+     *
+     * 它由 `fold` 盖（`emptyProjection()` 就带上），不在别处赋值——累计量与它的口径标签
+     * 必须同源，两处各写一遍迟早会对不上。当前值见 {@link BUDGET_ACCOUNTING_VERSION}。
+     *
+     * 可选是为了让**旧日志/旧缓存**仍然读得进来（老文件里没有这一格）：缺这一格 = 不认识，
+     * 载入层按"不可用"处理（重建），而不是猜它是哪一版。
+     */
+    budgetVersion?: number;
     /**
      * 最近一次 `budget/rollover` 记的是哪一天（`YYYY-MM-DD`，没有则 null）。
      *
@@ -1242,7 +1324,7 @@ export interface Projection {
   failStreak: number;
   /** 模型降级链状态：非 null 表示正在降级运行 */
   degraded: { lane: ModelLane; since: string; reason: string } | null;
-  /** 心跳连续空拍数 */
+  /** 心跳连续空拍数（连续没有外部事件的拍数；**只用于诊断**——节律由概率模型决定，它不再参与排期） */
   idleTicks: number;
   /** 最近一次唤醒 */
   lastWake: { source: WakeSource; at: string } | null;
@@ -1254,7 +1336,10 @@ export interface Projection {
   deadLetters: Array<{ inputSeq: number; claimCount: number; at: string }>;
   /** 最近一次日志归档/备份时刻 */
   lastArchiveAt: string | null;
-  /** 压力值（0-1）：心跳退避调制 */
+  /**
+   * 压力值（0-1）：由"欠着的事"（待审、挂起输入、到期意图、很久没说话）累加。
+   * **不调制心跳节律**（概率模型只看安静时长）；它服务必要性门与诊断。
+   */
   pressure: number;
 }
 
@@ -1269,6 +1354,7 @@ export function emptyProjection(): Projection {
     planPending: [],
     planApproved: [],
     budget: {
+      budgetVersion: BUDGET_ACCOUNTING_VERSION,
       tokensToday: 0, tokensTodayHeavy: 0, tokensTodayLight: 0,
     date: null,
       cacheHitToday: 0, cacheMissToday: 0,

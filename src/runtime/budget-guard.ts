@@ -3,12 +3,23 @@
  *
  * 职责：没人看着，必须有硬上限。四层，全部从投影读、全部跨重启累计。
  *
- * | 层    | 限制            | 判定                | 动作                                |
- * |-------|-----------------|---------------------|-------------------------------------|
- * | step  | 单步工具调用数  | `> stepTools`       | 多余调用记 over-limit，本 step 收束  |
- * | turn  | 单轮步数        | `>= turnSteps`      | 结束本 turn，reason budget-exhausted |
- * | task  | 单任务累计 token| `>= taskTokens`     | 结束本 turn，进入待确认              |
- * | daily | 每日累计 token  | `>= dailyTokens`    | 拒绝唤醒（唤醒层读 dailyBreach）     |
+ * | 层    | 限制                    | 判定                | 动作                                |
+ * |-------|-------------------------|---------------------|-------------------------------------|
+ * | step  | 单步工具调用数          | `> stepTools`       | 多余调用记 over-limit，本 step 收束  |
+ * | turn  | 单轮步数                | `>= turnSteps`      | 结束本 turn，reason budget-exhausted |
+ * | task  | 单任务累计 token        | `>= taskTokens`     | 结束本 turn，进入待确认              |
+ * | daily | 每日累计 token          | `>= dailyTokens`    | 拒绝唤醒（唤醒层读 dailyBreach）     |
+ *
+ * ⚠️ **token 那两档数的是"非缓存"的 token**（2026-10-05 用户换的口径，原话逐字抄在
+ * `state/fold.ts` 的 `budgetTokensOf` 里）：
+ *
+ *     计入预算的 token = (inputTokens − cacheHitTokens) + outputTokens
+ *
+ * 也就是"输入里没命中缓存的那部分 + 输出"——**只盯真花钱的那部分**。定义**只有一处**
+ *（`fold.ts` 的 `budgetTokensOf`），本模块只读投影里折出来的那个数（`tokensTask` /
+ * `tokensToday`），自己不重算：判据分两处写，早晚会分岔，而分岔的那天刹车会在错误的时刻停。
+ * 换口径之前是"未扣缓存"（含 cacheHit），在真实唤醒的心跳（约 97% 命中）之下计数器飞快见顶。
+ * step / turn 两档数的是**次数**（工具调用数 / 步数），与 token 口径无关。
  *
  * 三条不可让步的语义：
  * 1. **消耗从投影读，不在内存里累加**（§4.6「成本必须跨重启累计」）。投影是日志的折叠结果，
@@ -54,8 +65,17 @@ export const TOPUP_FILE_PREFIX = 'topup-';
 const MAX_NAME_ATTEMPTS = 1000;
 
 /**
- * 配置非法时的兜底上限。数值与 config.ts 的内置默认值同义；
- * 这里只做「配置字段缺失也不能让刹车消失」的兜底，正常路径永远读 config.budget。
+ * 配置非法时的兜底上限——**只是一条"刹车不许消失"的最后一道**，正常路径永远读 `config.budget`
+ * （`main.ts` 装配时把生效配置里的六个数交进来）。
+ *
+ * ⚠️ **它不等于 `config.ts` 的内置默认值**（别按"两边同义"读）：出厂默认现在是
+ * `taskTokens: 500000000` / `dailyTokens: 50000000`（见 config.ts 那两段注释里那笔账），
+ * 而这里的兜底值刻意**不跟**——它要回答的问题是"配置整个读不出来时也得有个数能停手"，
+ * 而不是"厂值是多少"。两边的值今天在哪一档上都不相等（daily 那一档曾经恰好都是 2M，
+ * 那是**巧合，不是同义**，出厂值一改这层巧合就没了）：
+ * 拿这里的 500k 当"出厂单任务额度"复述就会得出**错**结论。
+ *
+ * 行为一个字都没动（那几个数还是老样子）；改的只是这段注释里已经失真的那几句。
  */
 const FALLBACK_LIMITS = {
   stepTools: 20,
@@ -75,12 +95,19 @@ const LAYER_LABEL: Record<BudgetLayer, string> = {
   daily: '每日',
 };
 
-/** 软提示文本：说给模型听的一句话，尾部插播 */
+/**
+ * 软提示文本：说给模型听的一句话，尾部插播。
+ *
+ * token 那两档跟着预算口径说话（**"非缓存"**，与此刻层 `用度：` 那一行、与设置页标签同一个词）：
+ * 口径换了而提示还按旧口径描述，她就会把"真花钱的那部分"读成"全部 token"——同一个数两个说法，
+ * 比不说更糟。措辞用大白话（"非缓存额度"而不是"非缓存口径"）：这句话是说给她听的动作提示，
+ * 不是账本术语。
+ */
 const HINT_TEXT: Record<BudgetLayer, string> = {
   step: '这一步的工具调用快满了，能合并的合并，剩下的拆到后面的步骤',
   turn: '这一轮已经连续行动很多步，手上的事做完就收尾',
-  task: '这次任务的累计消耗快到上限了，先把手上的阶段收尾并交代还剩什么',
-  daily: '今天的额度快用完了，收尾并交代清楚明天从哪接着干',
+  task: '这次任务的非缓存消耗快到上限了，先把手上的阶段收尾并交代还剩什么',
+  daily: '今天的非缓存额度快用完了，收尾并交代清楚明天从哪接着干',
 };
 
 // ──────────────────────────────── 对外类型 ────────────────────────────────
@@ -212,10 +239,29 @@ export interface BudgetGuardDeps {
 /** 一层的瞬时状态（观测与软阈值共用同一份计算，避免两处口径漂移） */
 export interface BudgetLayerStatus {
   layer: BudgetLayer;
-  /** 已消耗（投影派生：跨重启累计） */
+  /**
+   * 已消耗（投影派生：跨重启累计）。单位随层走：
+   * step / turn 是**次数**（工具调用数 / 步数），task / daily 是**非缓存 token**
+   *（`(input − cacheHit) + output`，唯一一处定义在 `state/fold.ts` 的 `budgetTokensOf`）。
+   */
   used: number;
   /** 有效上限 = 基础上限 + 累计人工加注 */
   limit: number;
+  /**
+   * 有效上限的**构成**：`base` 来自 `config.budget`，`topUp` 来自累计人工加注
+   * （`budget/topped-up` 的折叠结果）。两者相加 == {@link limit}。
+   *
+   * 为什么必须把它算出来、而不是让人拿配置去对：2026-10-05 现场那张告警是
+   * 「已用 178734979 / 上限 57000000」，而 `config.json` 里写的是 `taskTokens: 5000000`
+   * ——数字对不上不是 bug，是**上限里混着 52M 历史加注**。不把构成摊开，
+   * 下一次还是"配置写了 5M、它按 57M 判"这种把人绕晕的账（用户原话：**不许不协调**）。
+   */
+  composition: {
+    /** 配置里那一档（`config.budget.*`，随"改配置 + 重启"变） */
+    base: number;
+    /** 累计人工加注（`irmia topup` 与跨天 rollover 的 0 加注都折在这里） */
+    topUp: number;
+  };
   /** used / limit */
   ratio: number;
   /** 已越过硬上限 */
@@ -315,11 +361,24 @@ export function writeTopUpRequest(dataDir: string, request: TopUpRequest, now: D
 // ──────────────────────────────── 实现 ────────────────────────────────
 
 export class BudgetGuard {
-  private readonly limits: BudgetGuardConfig;
+  /**
+   * 生效的六个上限。**每次判定前从 {@link rawLimits} 重解一次**（见 `configure`），
+   * 所以调用方把配置改了就立刻按新值判——判据不许留一份"开户时那份配置"的副本。
+   */
+  private limits: BudgetGuardConfig;
+  /**
+   * 上限的**原始来源**（`config.budget` 或 `BudgetGuardConfig`）。
+   *
+   * 为什么留一整份而不是留解析好的 `limits`：口径是"限额实时取自 config"。
+   * 主进程重启后本来就会重新装配判定器（配置是启动参数），但**判定器自己**也不许把上限
+   * 焊死在构造那一刻——现场那次"配置写了 5M、它按 57M 判"里，57M 有一半就是历史加注，
+   * 另一半随时可能被改配置换掉。留原件 + 每次重解，是把这条口径钉在判定层内部。
+   */
+  private rawLimits: Partial<BudgetGuardConfig>;
   private readonly projection: Projection | null;
   private readonly emit: BudgetEmitter | null;
   private readonly now: () => Date;
-  private readonly softRatioValue: number;
+  private softRatioValue: number;
   private readonly stallMsValue: number;
   /** 累计人工加注（从事件折叠；setTopUps 载入，addTopUp 增量） */
   private topUps: TopUpTotals = emptyTopUps();
@@ -336,21 +395,37 @@ export class BudgetGuard {
   constructor(config: BudgetGuardConfig, options?: BudgetGuardOptions);
   constructor(a: BudgetGuardDeps | BudgetGuardConfig, b?: BudgetGuardOptions) {
     const asDeps = 'projection' in a;
-    const config = asDeps ? (a.config as Partial<BudgetGuardConfig>) : a;
-    this.limits = {
-      stepTools: pickLimit(config.stepTools, FALLBACK_LIMITS.stepTools),
-      turnSteps: pickLimit(config.turnSteps, FALLBACK_LIMITS.turnSteps),
-      taskTokens: pickLimit(config.taskTokens, FALLBACK_LIMITS.taskTokens),
-      dailyTokens: pickLimit(config.dailyTokens, FALLBACK_LIMITS.dailyTokens),
-      softRatio: pickSoftRatio(config.softRatio),
-      failStreakMax: pickLimit(config.failStreakMax, FALLBACK_LIMITS.failStreakMax),
-    };
+    this.rawLimits = (asDeps ? a.config : a) as Partial<BudgetGuardConfig>;
+    this.limits = deriveLimits(this.rawLimits);
     this.projection = asDeps ? a.projection : null;
     this.emit = asDeps ? a.emit : null;
     this.now = asDeps ? a.now : (() => new Date());
-    this.softRatioValue = pickSoftRatio(asDeps ? (a.softRatio ?? a.config?.softRatio) : this.limits.softRatio);
+    this.softRatioValue = asDeps
+      ? pickSoftRatio(a.softRatio ?? a.config?.softRatio)
+      : pickSoftRatio(this.limits.softRatio);
     const stallOverride = asDeps ? a.stallMs : b?.stallMs;
     this.stallMsValue = pickLimit(stallOverride, DEFAULT_STALL_MS);
+  }
+
+  /**
+   * 换一份配置（**限额实时取自 config** 的入口）。
+   *
+   * 调用场景两条，都在宿主那一侧：
+   *   · 进程重启后重新装配判定器（`real-loop.makeGuard`）——那时 `rawLimits` 就是新配置；
+   *   · 将来 `budget.*` 真的进了热更白名单（今天它不在，见 `config/watcher.ts` 的
+   *     `HOT_RELOAD_FIELDS`），宿主在 `config/changed` 回调里调它一次即可。
+   *
+   * 已经判出去的账**一律不改写**：撞刹车留下的 `budget/exhausted` 是历史事实，
+   * 配置改了它也不会变——"暂停解不解"由 `liftedPauses` 拿新的上限与当刻的已用量现判。
+   */
+  configure(config: Partial<BudgetGuardConfig>): void {
+    this.rawLimits = config;
+    this.limits = deriveLimits(config);
+    this.softRatioValue = pickSoftRatio(config.softRatio);
+    // 上限变了就重新武装"本进程已写过"的标记：新上限下这一层可能还要再撞一次，
+    // 不重新武装就等于"改完配置之后这一层再也不会报警"
+    this.exhaustedWritten.clear();
+    this.hinted.clear();
   }
 
   // ── 判定：单点事实来源（宿主据此写事件与告警，判定层不替它写） ──
@@ -436,13 +511,18 @@ export class BudgetGuard {
   statuses(p?: Projection): BudgetLayerStatus[] {
     const proj = this.project(p);
     return LAYER_ORDER.map((layer) => {
-      const limit = this.limitOf(layer);
+      const base = this.limitOfConfig(layer);
+      const topUp = this.topUps[layer];
+      const limit = base + topUp;
       const used = usedOf(layer, proj);
       const ratio = limit > 0 ? used / limit : 0;
       // step 层是"多余调用"语义：恰好用满 20 次不算越线，第 21 次才越线；
       // 其余三层是"额度用尽"语义：到达上限即停。
       const over = layer === 'step' ? used > limit : used >= limit;
-      return { layer, used, limit, ratio, over, soft: ratio >= this.softRatioValue };
+      return {
+        layer, used, limit, ratio, over, soft: ratio >= this.softRatioValue,
+        composition: { base, topUp },
+      };
     });
   }
 
@@ -615,6 +695,10 @@ export class BudgetGuard {
 
 // ──────────────────────────────── 小工具 ────────────────────────────────
 
+/**
+ * 该层在投影里的已消耗。**这里不重算 token 口径**——投影里的 `tokensTask` / `tokensToday`
+ * 已经是 `budgetTokensOf`（非缓存口径）折出来的数，本函数只做"层 → 字段"的搬运。
+ */
 function usedOf(layer: BudgetLayer, p: Projection): number {
   switch (layer) {
     case 'step': return p.budget.toolCallsThisStep;
@@ -633,6 +717,23 @@ function composeHint(hits: readonly BudgetLayerStatus[]): string {
 
 function pickLimit(raw: unknown, fallback: number): number {
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : fallback;
+}
+
+/**
+ * 从原始配置解出六个生效上限（**唯一一处**：构造与 `configure` 共用）。
+ *
+ * 非法值一律退 `FALLBACK_LIMITS`：配置是外部输入，一个 `taskTokens: 0` 或字符串
+ * 不该让刹车消失，也不该让进程起不来——退到兜底值仍然是个硬上限。
+ */
+function deriveLimits(config: Partial<BudgetGuardConfig>): BudgetGuardConfig {
+  return {
+    stepTools: pickLimit(config.stepTools, FALLBACK_LIMITS.stepTools),
+    turnSteps: pickLimit(config.turnSteps, FALLBACK_LIMITS.turnSteps),
+    taskTokens: pickLimit(config.taskTokens, FALLBACK_LIMITS.taskTokens),
+    dailyTokens: pickLimit(config.dailyTokens, FALLBACK_LIMITS.dailyTokens),
+    softRatio: pickSoftRatio(config.softRatio),
+    failStreakMax: pickLimit(config.failStreakMax, FALLBACK_LIMITS.failStreakMax),
+  };
 }
 
 /** 软阈值比例的兜底规则（CLI 的 budget 命令也读它：两处各写一遍必然口径漂移） */

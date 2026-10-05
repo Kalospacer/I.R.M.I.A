@@ -152,7 +152,7 @@ export class TopicSummarizer {
     return topic;
   }
 
-  /** 自己记一笔 light 账：与 necessity-gate、injection-judge、记忆整理同一份口径 */
+  /** 自己记一笔 light 账：与 injection-judge、记忆整理同一份口径 */
   private account(
     startedMs: number,
     model: string,

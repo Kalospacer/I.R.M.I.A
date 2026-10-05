@@ -25,6 +25,10 @@ class IrmiaTheme {
   static const radiusCtl = 8.0;
   static const radiusAvatar = 16.0;
 
+  /// 暗主题那两处白描边的宽度（用户原话："改成白色描边"，要**细**）。
+  /// **只有这一处定义宽度**；谁用、什么时候用见 [IrmiaDarkPair]。
+  static const hairlineWidth = 1.0;
+
   /// 动效节奏（MaidKit 实证值）
   static const durPage = Duration(milliseconds: 180);
   static const durCard = Duration(milliseconds: 240);
@@ -260,6 +264,53 @@ class IrmiaTheme {
         ..strokeCap = StrokeCap.round,
     );
   }
+}
+
+/// **暗主题那两处的形态**——用户 2026-10-05 的原话（两句，第二句把范围又收了一格）：
+///
+///   > 「暗主题时。发送按钮和气泡改成白色描边不就行了。改其他的干嘛？」
+///   > 「怎么把亮主题时的蓝色改掉了。我不是让你改暗主题的吗？」
+///   > 「暗色主题的气泡和发送按钮是改成**只有白色描边**。**蓝色全部去掉**哦。
+///   >  **底色和背景相同即可**。」
+///
+/// 于是一个扩展管住这两处（**消息气泡**与**发送键**）在两种主题下的全部取色。
+/// 四条边界写在这里，下一个人不要再顺手"优化"：
+///
+///   ① **亮主题一个色都不动**。亮模下这两个 getter 给的就是用户原来那两样
+///      （填充 `primary`、前景 `onPrimary`、气泡无描边、按钮 `const CircleBorder()`，
+///      后者的 `side` 本来就是 `BorderSide.none`）——不是"差不多的蓝"，是逐字节相同。
+///   ② **暗主题只有一圈白描边**：蓝色填充整个去掉，填充与背景一致（[pairFill] 透明），
+///      字与图标走正常前景（[pairOn]）。**只有这两处**——侧栏选中项与工具行"出错"
+///      上一轮也被改过，用户一句"改其他的干嘛"已经全部退回原样，别在这里再伸手。
+///   ③ **填充为什么是"透明"而不是某个色值**：这两处坐在内容区那层背景上，而背景不是一种
+///      纯色——它是 [IrmiaTheme.dawn] 的竖直渐变（顶部 7% 主色晕开 → 底色）。
+///      取任何固定色值都会在渐变那一段差一点点色；透明才是"底色和背景相同"的唯一实现。
+///   ④ **判据、取值、白色都只有这一处**：明暗由 `ColorScheme.brightness` 自己给，
+///      页面里不许再写 `Theme.of(context).brightness == Brightness.dark`；
+///      白取主题里最接近白的那一档（暗模 `onSurface` = `#E9ECEF`），**不新增写死的
+///      十六进制**。真嫌它不够白，改的是 `IrmiaTheme._build` 里的 `onSurface`（全主题的白），
+///      而不是在这里塞一个 `Color(0xFFFFFFFF)`。
+extension IrmiaDarkPair on ColorScheme {
+  /// 判据本体：暗主题下这两处"只有一圈白描边"。**只此一处判明暗**。
+  bool get darkPairOutlined => brightness == Brightness.dark;
+
+  /// 这两处的**填充**：暗模 = 透明（＝与背景相同，蓝去掉）；亮模 = 原来的 `primary`。
+  Color get pairFill => darkPairOutlined ? Colors.transparent : primary;
+
+  /// 这两处的**前景**（气泡里的字、发送键的图标）：暗模 = `onSurface`（主题的白，正常前景）；
+  /// 亮模 = 原来的 `onPrimary`。描边用的也是它——暗模下这一处就是那圈白。
+  Color get pairOn => darkPairOutlined ? onSurface : onPrimary;
+
+  /// 气泡那一圈：暗模 = 1px 白描边；亮模 = `null`（用户原来的样子，一个像素都不加）。
+  BoxBorder? get bubbleHairline => darkPairOutlined
+      ? Border.all(color: pairOn, width: IrmiaTheme.hairlineWidth)
+      : null;
+
+  /// 发送键那一圈（圆形按钮的描边长在它自己的形状上）：暗模 = 1px 白描边；
+  /// 亮模 = 用户原来的 `const CircleBorder()`。
+  OutlinedBorder get sendButtonShape => darkPairOutlined
+      ? CircleBorder(side: BorderSide(color: pairOn, width: IrmiaTheme.hairlineWidth))
+      : const CircleBorder();
 }
 
 // ──────────────────────────────── 品牌图案 ────────────────────────────────

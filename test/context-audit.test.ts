@@ -14,8 +14,8 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import {
-  CACHE_BREAK_CLASS_LABEL, CONTEXT_LABEL, DEFAULT_CACHE_BREAK_THRESHOLDS,
-  detectCacheBreak, describeContext, hashOf, lastAuditedCall,
+  CACHE_BREAK_CAUSE_LABEL, CACHE_BREAK_CLASS_LABEL, CONTEXT_LABEL, DEFAULT_CACHE_BREAK_THRESHOLDS,
+  detectCacheBreak, describeContext, hashOf, isExpectedCause, lastAuditedCall,
   type AuditedCall, type ContextBreakdown,
 } from '../src/model/context-audit.ts';
 import { RENDER_VERSION, render, type RenderInput, type RenderPersona } from '../src/model/render.ts';
@@ -293,6 +293,237 @@ describe('缓存破坏哨兵：只在真破坏时记一条', () => {
   test('默认阈值是保守的：空闲线 30 分钟、跌幅门槛一半', () => {
     assert.equal(DEFAULT_CACHE_BREAK_THRESHOLDS.idleMs, 30 * MIN_MS);
     assert.equal(DEFAULT_CACHE_BREAK_THRESHOLDS.hitDrop, 0.5);
+  });
+});
+
+// ──────────────────────────── ④ 归因与分级（2026-10-05） ────────────────────────────
+
+/**
+ * 用户那次的原话（2026-10-05）：框架提示天天报失守，而今天绝大多数失守是**我们自己造成的**
+ * ——十几次重启后端、她自己频繁改 `STATE.md`、工具清单变更。**预期内的代价和真正的异常混在
+ * 同一条告警里 ⇒ 告警常态化 ⇒ 人就不看了**。所以这一节钉住两件事：
+ *   · 四类归因各自的判据（谁解释哪一段、没有证据不许替它编原因）；
+ *   · 分级——预期内的 `silent === true`（普通记录），**只有 `unattributable` 仍然告警**。
+ */
+describe('失守归因：预期内的降级成普通记录，无法归因的才告警', () => {
+  const base = renderOnce().context;
+  /**
+   * 两次调用之间"形状可比"的那一份。
+   *
+   * 为什么不能直接用 `base`：
+   *   · 固定块的 `items` 只有真发了块才是 1（`renderOnce` 没给 `turnBlock`，默认是 0 条）
+   *     ——换轮重建那条判据要求"两次都发了块"，0 条时它按"没发"处理；
+   *   · 历史的 `headHash` 只在两边都攒满前 8 条时才直接可比（见 `historyRewritten`），
+   *     要让"前段被改写"成立，就得先把窗口攒满。
+   */
+  const comparable: ContextBreakdown = {
+    ...base,
+    state: { tokens: 120, hash: 'block-v1', items: 1 },
+    history: { tokens: 500, hash: 'hist-v1', items: 26, headHash: 'head-v1' },
+  };
+  /** 带 seq + 轮号的调用（归因要切事件窗口、判断是不是换轮，两者都由调用自己带） */
+  const seqCall = (
+    context: ContextBreakdown, seq: number, minutes: number, hit: number, miss: number, turn = 1,
+  ): AuditedCall => ({ ...call(context, minutes, hit, miss), seq, turn });
+
+  /** 造一条事件：只给归因认得的字段，够用 */
+  const evt = (seq: number, type: string, data: Record<string, unknown> = {}): AppEvent =>
+    ({ seq, ts: new Date(T0_MS + seq * 1000).toISOString(), type, data, visibility: 'internal' }) as unknown as AppEvent;
+
+  test('① 接管/重启：窗口里有 session/start → 归因 restart，**不告警**', () => {
+    const prev = seqCall(comparable, 10, 0, 100, 0);
+    // 重启后工具清单换了版（这正是当天那几条的形状）
+    const cur = seqCall({ ...comparable, tools: { ...comparable.tools, hash: 'after-restart' } }, 20, 5, 0, 200);
+    const events = [evt(14, 'session/end'), evt(15, 'instance/takeover'), evt(16, 'session/start')];
+
+    const found = detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS, events);
+    assert.equal(found?.class, 'tools');
+    assert.equal(found?.cause, 'restart');
+    assert.deepEqual(found?.causes, [{ class: 'tools', cause: 'restart' }]);
+    assert.equal(found?.silent, true, '重启是预期内的代价：记一条普通记录，不进告警区');
+    assert.match(found?.reason ?? '', /接管\/重启/u);
+  });
+
+  test('② 她自己改 STATE.md：归因 asset（固定块那一段），**不告警**', () => {
+    const prev = seqCall(comparable, 40, 0, 100, 0);
+    // 固定块换版：只有 state 段变（STATE 只进固定块，见 renderTurnBlock）
+    const cur = seqCall({ ...comparable, state: { tokens: 90, hash: 'state-v2', items: 1 } }, 60, 2, 40, 60);
+    const events = [
+      evt(45, 'turn/end'),
+      evt(47, 'persona/updated', { file: 'STATE.md', diffHash: 'h2', by: 'agent' }),
+      evt(48, 'turn/start'),
+    ];
+
+    const found = detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS, events);
+    assert.equal(found?.class, 'state', '固定块被改写是它自己的类别');
+    assert.equal(found?.cause, 'asset');
+    assert.equal(found?.silent, true, '她自己刚改的资产是预期内的：不告警');
+    assert.match(found?.reason ?? '', /她自己刚改了资产/u);
+  });
+
+  test('②b 她写记忆 ⇒ 索引重建：同样归因 asset（写 MEMORIES 下的文件就是证据）', () => {
+    const prev = seqCall(comparable, 70, 0, 100, 0);
+    const cur = seqCall({ ...comparable, state: { tokens: 90, hash: 'index-rebuilt', items: 1 } }, 80, 1, 50, 50);
+    const events = [evt(75, 'tool/call', {
+      callId: 'c1', name: 'safe_edit', arguments: '{"path":"MEMORIES/facts.md","old":"a","new":"b"}',
+    })];
+
+    assert.equal(detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS, events)?.cause, 'asset');
+  });
+
+  test('③ 前缀无故变化 → 归因 unattributable，**仍然告警**', () => {
+    const prev = seqCall(comparable, 90, 0, 100, 0);
+    const cur = seqCall({ ...comparable, instructions: { ...comparable.instructions, hash: 'who-changed-this' } }, 92, 1, 0, 200);
+    // 窗口里只有无关的事（她只是在干活）——没有任何东西能解释 instructions 为什么变
+    const events = [evt(91, 'tool/call', { callId: 'c9', name: 'safe_read', arguments: '{"path":"README.md"}' })];
+
+    const found = detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS, events);
+    assert.equal(found?.class, 'persona');
+    assert.equal(found?.cause, 'unattributable');
+    assert.equal(found?.silent, false, '说不清为什么的失守才是要人看一眼的那一类');
+    assert.equal(isExpectedCause('unattributable'), false);
+    assert.match(found?.reason ?? '', /原因不明/u);
+  });
+
+  test('④ 判据只紧不松：STATE 被改**不能**替 instructions 段作证', () => {
+    const prev = seqCall(comparable, 100, 0, 100, 0);
+    // instructions 变了，而窗口里只有一条"改 STATE.md"——STATE 不在 instructions 段里
+    const cur = seqCall({ ...comparable, instructions: { ...comparable.instructions, hash: 'x' } }, 110, 1, 0, 200);
+    const events = [evt(105, 'persona/updated', { file: 'STATE.md', diffHash: 'h', by: 'agent' })];
+
+    const found = detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS, events);
+    assert.equal(found?.cause, 'unattributable', '没有证据就落无法归因，不许拿别的段的证据顶替');
+    assert.equal(found?.silent, false);
+  });
+
+  test('④b 没有事件窗口（老日志 / 手写调用）时归因一律"无法归因"，行为与本次改动前逐条一致', () => {
+    const prev = call(comparable, 0, 100, 0);   // 不带 seq
+    const cur = call({ ...comparable, tools: { ...comparable.tools, hash: 't2' } }, 1, 0, 100);
+    const found = detectCacheBreak(prev, cur);
+    assert.equal(found?.class, 'tools', '类别判据一个字没动');
+    assert.equal(found?.cause, 'unattributable');
+    assert.equal(found?.silent, false, '没有窗口就没有归因：宁可多报一条');
+  });
+
+  test('压缩换了一版早期摘要 → 归因 compaction（记忆层与历史前段都算它的）', () => {
+    const prev = seqCall(comparable, 120, 0, 100, 0);
+    const cur = seqCall({
+      ...comparable,
+      memory: { tokens: 30, hash: 'summary-v2', items: 1 },
+      history: { tokens: 80, hash: 'hist-v2', items: 12, headHash: 'head-v2' },
+    }, 130, 3, 0, 200);
+    const events = [evt(125, 'compaction/summary', { coveredUpToSeq: 900, summary: '早前的事' })];
+
+    const found = detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS, events);
+    assert.deepEqual(found?.causes, [
+      { class: 'memory', cause: 'compaction' },
+      { class: 'history', cause: 'compaction' },
+    ]);
+    assert.equal(found?.silent, true);
+  });
+
+  test('记忆层变了**却没有**压缩事件 → 无法归因（这条是压缩那一条的对照）', () => {
+    const prev = seqCall(comparable, 140, 0, 100, 0);
+    const cur = seqCall({ ...comparable, memory: { tokens: 30, hash: 'summary-v2', items: 1 } }, 150, 3, 0, 200);
+    assert.equal(detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS, [])?.cause, 'unattributable');
+  });
+
+  test('工具清单变更（配置热更 / 技能目录）→ 归因 tool-inventory，**不告警**', () => {
+    const prev = seqCall(comparable, 160, 0, 100, 0);
+    const cur = seqCall({ ...comparable, tools: { ...comparable.tools, hash: 'destructive-on' } }, 170, 1, 0, 200);
+
+    const byConfig = detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS,
+      [evt(165, 'config/changed', { fields: ['tools.destructiveEnabled'], configHash: 'c' })]);
+    assert.equal(byConfig?.cause, 'tool-inventory');
+    assert.equal(byConfig?.silent, true);
+
+    const bySkill = detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS,
+      [evt(165, 'skill/installed', { name: 'x', path: 'x', by: 'human' })]);
+    assert.equal(bySkill?.cause, 'tool-inventory');
+
+    const byMcp = detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS,
+      [evt(165, 'mcp/server-started', { name: 'srv', pid: 1, tools: ['t'] })]);
+    assert.equal(byMcp?.cause, 'tool-inventory');
+
+    // 没有任何清单动作的对照：同一个指纹变化落"无法归因"
+    assert.equal(detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS, [])?.cause, 'unattributable');
+  });
+
+  const blockChangedContext = { ...comparable, state: { tokens: 90, hash: 'block-v2', items: 1 } };
+
+  test('固定块的形状差异：换轮重建不算失守，同一轮内被改写照旧算', () => {
+    // 上一轮第 1 步（turn 9）→ 这一轮第 1 步（turn 10）：块在轮首重建，形状本就不同 → 不报
+    const t9 = seqCall(comparable, 100, 0, 100, 0, 9);
+    const t10 = seqCall(blockChangedContext, 200, 1, 100, 0, 10);
+    const acrossTurn = detectCacheBreak(t9, t10, DEFAULT_CACHE_BREAK_THRESHOLDS,
+      [evt(150, 'turn/end'), evt(160, 'turn/start')]);
+    assert.equal(acrossTurn, null, '换轮时固定块换的是快照，不是故障');
+
+    // 上一轮那一步没发块（第 2 步起摘了）：两块不可比 → 也不报（2026-10-05 seq=26240 的形状）
+    const noBlockBefore = seqCall({ ...comparable, state: { tokens: 0, hash: 'no-block', items: 0 } }, 100, 0, 100, 0, 10);
+    assert.equal(
+      detectCacheBreak(noBlockBefore, t10, DEFAULT_CACHE_BREAK_THRESHOLDS, [evt(150, 'tool/result')]),
+      null,
+    );
+
+    // **同一轮内**（两边块都发了、轮号相同）块被改写 = 真失守 → 照旧报
+    const sameTurn = detectCacheBreak(
+      seqCall(comparable, 100, 0, 100, 0, 9),
+      seqCall(blockChangedContext, 150, 1, 100, 0, 9),
+      DEFAULT_CACHE_BREAK_THRESHOLDS,
+      [evt(120, 'tool/result')],
+    );
+    assert.equal(sameTurn?.class, 'state');
+    assert.equal(sameTurn?.cause, 'unattributable', '同一轮内改动无法归因 ⇒ 仍然告警');
+    assert.equal(sameTurn?.silent, false);
+
+    // 判据只紧不松：同一次换轮里她**真改了 STATE** ⇒ 有内容变化，照旧报（归因 asset）
+    const withAsset = detectCacheBreak(t9, t10, DEFAULT_CACHE_BREAK_THRESHOLDS, [
+      evt(120, 'persona/updated', { file: 'STATE.md', diffHash: 'h', by: 'agent' }),
+      evt(150, 'turn/end'),
+      evt(160, 'turn/start'),
+    ]);
+    assert.equal(withAsset?.class, 'state', '她真改了资产时不许被"形状差异"盖掉');
+    assert.equal(withAsset?.cause, 'asset');
+    assert.equal(withAsset?.silent, true);
+  });
+
+  test('渲染版本换代与空闲塌陷：各自算一条原因，都不告警', () => {
+    const prev = seqCall(comparable, 200, 0, 900, 100);
+    const renderOnly = seqCall({ ...comparable, renderVersion: 'next' }, 210, 1, 0, 100);
+    const r = detectCacheBreak(prev, renderOnly, DEFAULT_CACHE_BREAK_THRESHOLDS, []);
+    assert.equal(r?.cause, 'render');
+    assert.equal(r?.silent, true);
+
+    const idleOnly = seqCall(comparable, 220, 60, 10, 990);
+    const i = detectCacheBreak(prev, idleOnly, DEFAULT_CACHE_BREAK_THRESHOLDS, []);
+    assert.equal(i?.cause, 'idle');
+    assert.equal(i?.silent, true, '空闲回收是服务端的正常行为，不是异常');
+  });
+
+  test('多段同时失守：主原因是**最早那一段**的原因，只要有一段说不清就仍然告警', () => {
+    const prev = seqCall(comparable, 240, 0, 100, 0);
+    const cur = seqCall({
+      ...comparable,
+      tools: { ...comparable.tools, hash: 't2' },
+      memory: { ...comparable.memory, hash: 'm2' },
+    }, 250, 1, 0, 200);
+    // 压缩能解释 memory 段，却解释不了 tools 段为什么变
+    const found = detectCacheBreak(prev, cur, DEFAULT_CACHE_BREAK_THRESHOLDS,
+      [evt(245, 'compaction/summary', { coveredUpToSeq: 1, summary: 's' })]);
+    assert.deepEqual(found?.causes, [
+      { class: 'tools', cause: 'unattributable' },
+      { class: 'memory', cause: 'compaction' },
+    ]);
+    assert.equal(found?.cause, 'unattributable', '主原因 = 最早的段（tools）');
+    assert.equal(found?.silent, false, '有一条说不清，整条就还得告警');
+  });
+
+  test('词表由后端给：原因短标签齐了，界面不维护第二份', () => {
+    assert.equal(CACHE_BREAK_CAUSE_LABEL.restart, '接管/重启');
+    assert.equal(CACHE_BREAK_CAUSE_LABEL.asset, '她改了资产');
+    assert.equal(CACHE_BREAK_CAUSE_LABEL.unattributable, '无法归因');
+    assert.equal(CACHE_BREAK_CLASS_LABEL.state, '固定块改写');
   });
 });
 

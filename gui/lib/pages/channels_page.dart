@@ -1037,15 +1037,47 @@ class _ChannelsPageState extends State<ChannelsPage> {
             children: [
               Text('会话联系人', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: scheme.onSurface)),
               const SizedBox(width: 8),
+              // **短标签 + 一行要点，长解释收进「说明」折叠**（用户 2026-10-05 定的文案规则）。
+              //
+              // 原来这里是**一整段散文**（四句、占四五行的口语说明挂在一行标题右边），
+              // 用户点名的反面样本就是它。现在这一行只说"这里能干什么"，
+              // 下面两个『说明』折叠各收一组细节：口径与边界一组、字段各归谁管一组。
+              //
+              // 事实一个字都没丢，只是换了地方——尤其是"其余能不能收到取决于官方 Bot 的
+              // 消息权限"（2026-10-04 改准的那半句）：它仍逐字在，`channels_contact_note_test`
+              // 钉着它（那是"我们侧单方面做不到一句一条不丢"的如实口径，不许再退回去）。
               Expanded(
                 child: Text(
-                  'QQ 不给昵称，所以她只能看到一串 openid——在这里告诉她那是谁，她认人就不会认错。'
-                  '群聊里只有 @ 她或喊她的名字才会进对话流，其余照旧进信箱（一条不丢）。'
-                  '在群里 @ 过她的人会自动登记到那个群下面（她再看到就不只是 openid）——展开可以改名。',
+                  'QQ 不给昵称，在这里告诉她谁是谁。',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant),
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 6),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: DetailFold(
+              // 定位件：这一页有好几处「说明」折叠（通道配置也有一处），
+              // 用例要的是"会话联系人卡里这一处"——按 key 找，不按文字找。
+              key: const ValueKey('contacts-note'),
+              label: '说明',
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '群聊里只有 @ 她或喊她的名字才会进对话流；其余能不能收到取决于官方 Bot 的消息权限'
+                    '——平台推给我们的，照旧进信箱。'
+                    '在群里 @ 过她的人会自动登记到那个群下面（她再看到就不只是 openid）——展开可以改名。'
+                    '她自己记的备注（写在名字后括号里的那段）只在这里显示，不算名字、也改不动——'
+                    '那一格保存的是名字，备注留在她自己的记忆里。',
+                    style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
           ),
           const SizedBox(height: 12),
           if (mine.isEmpty)
@@ -1082,6 +1114,11 @@ class _ChannelsPageState extends State<ChannelsPage> {
     final members = _groupMembers[sid] ?? const <Map<String, dynamic>>[];
     final chat = s['chatType'] == 'c2c' ? '单聊' : '群聊';
     final when = '${s['lastSeenAt']}'.replaceFirst('T', ' ').split('.').first;
+    // 备注（她写在别名名字后面括号里的那段口径）：**只读**，与名字分两处。
+    // 为什么不让它进那个可编辑的格子：那一格保存时写回 `config.persona.contacts`（人声明的名字），
+    // 备注长在她自己的 `MEMORIES/aliases.md` 里——把它塞进输入框，改一次名字就等于替她把口径
+    // 抄进人的表里，还会把原话挤得只剩尾巴（用户看到的就是这个形状）。
+    final note = '${s['note'] ?? ''}'.trim();
     final ctl = _contactCtls.putIfAbsent(
       sid,
       () => TextEditingController(text: '${s['name'] ?? ''}'),
@@ -1112,6 +1149,22 @@ class _ChannelsPageState extends State<ChannelsPage> {
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(fontFamily: 'monospace', fontSize: 10.5)),
+                      // **她的备注另起一行，比 sid 还低一档**（用户 2026-10-04 报的 bug：
+                      // 备注原来混在名字里，长长的口径把那一格挤得只剩尾巴）。为什么不做成
+                      // 纯 hover 提示：这句是"她在群里怎么说话"的口径，看的人要能一眼扫到，
+                      // 而不是先猜到那儿有东西；所以常态可见，整行单行 + 省略号（行高不变），
+                      // 悬浮再给完整原话——那句话往往比一行宽。
+                      if (note.isNotEmpty)
+                        Tooltip(
+                          message: note,
+                          child: Text('备注：$note',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                color: scheme.onSurfaceVariant.withValues(alpha: 0.85),
+                              )),
+                        ),
                     ],
                   ),
                 ),
@@ -1429,8 +1482,19 @@ class _ChannelsPageState extends State<ChannelsPage> {
           Padding(
             padding: const EdgeInsets.only(top: 6),
             child: Text(
-              '写入 config.json，进程重启后接管；密钥类字段直接填值（存本机密钥文件，不进 config.json）。清空一项 = 回到默认值。',
+              '写入 config.json，重启后接管；清空一项 = 回到默认值。',
               style: TextStyle(fontSize: 12.5, height: 1.5, color: scheme.onSurfaceVariant),
+            ),
+          ),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: DetailFold(
+              label: '说明',
+              child: Text(
+                '密钥类字段直接填值：它存本机密钥文件，不进 config.json。'
+                '环境变量优先于这些文件。',
+                style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+              ),
             ),
           ),
           if (def.switchPath != null) ...[

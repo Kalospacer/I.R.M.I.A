@@ -82,7 +82,7 @@ import {
 import type {
   McpConnectionHost, McpProcess, McpServerEntry, McpShutdownReport, McpToolInfo,
 } from '../mcp/client.js';
-import { collectSessions, normalizeSid, parseAliases, resolveSessionName, sidLookupKeys } from '../channel/sessions.ts';
+import { aliasNoteOf, collectSessions, normalizeSid, parseAliases, resolveSessionName, sidLookupKeys, type SessionAlias } from '../channel/sessions.ts';
 import { readEndpointFromConfig, resolveServiceDir } from '../services/snowluma.ts';
 import { loadPersona } from '../persona/loader.ts';
 import { readMemoryIndexTextReadOnly } from '../persona/memory-injection.ts';
@@ -103,10 +103,10 @@ import { runDoctor } from '../runtime/doctor.ts';
 import type { RenderInput, RenderedRequest } from '../model/render.js';
 import { CACHE_HIT_LOW, CACHE_SAMPLE_MIN, clipTaskTitle, inputContentText, render, wakeTitle } from '../model/render.ts';
 import {
-  CACHE_BREAK_CLASS_LABEL, CACHE_BREAK_LABEL,
+  CACHE_BREAK_CAUSE_LABEL, CACHE_BREAK_CLASS_LABEL, CACHE_BREAK_LABEL,
 } from '../model/context-audit.ts';
 import { SKILL_DESCRIPTION_MAX_CHARS, SKILL_FILE_NAME, SkillManager, skillNameProblem } from '../skill/skills.ts';
-import { applyOne, finalizePressure, wakeSourceOf } from '../state/fold.ts';
+import { applyOne, budgetTokensOf, finalizePressure, wakeSourceOf } from '../state/fold.ts';
 import { compactTimestamp } from '../tools/fs/text-codec.ts';
 import { estimateTokens } from '../tools/registry.ts';
 import type { ToolRegistry } from '../tools/registry.js';
@@ -261,6 +261,12 @@ const SEED_MARKER = '<!-- SEED';
 const REVIEW_STALE_MS = 3 * 24 * 3600 * 1000;
 const ARCHIVE_STALE_MS = 7 * 24 * 3600 * 1000;
 const PERSONA_STALE_MS = 30 * 24 * 3600 * 1000;
+/**
+ * 丢弃死信时那句理由的长度上限（`POST /api/commands/discard` 的 `reason`）。
+ * 它进事件、进日志行、进界面——理由要能说清"为什么不再重投"，但不必变成一篇文档；
+ * 超限一律 400 报错而不是静默截断（截断过的理由读起来像原话，那是在伪造留痕）。
+ */
+const DISCARD_REASON_MAX = 500;
 
 /**
  * 危险操作的 `X-Confirm` 短语表（frontend.md §4：短语 = 操作的英文标识，防误触而不防人）。
@@ -276,6 +282,9 @@ export const CONFIRM_PHRASES: Record<string, string | null> = {
   'review-resolve': null,
   answer: null,
   requeue: null,
+  // 丢弃死信（运行情况页 · 死信队列）：**只标记为已处理，不删任何记录**——日志只增不改。
+  // 与 requeue 同级（短语 null）：它不动能力边界，只决定"这条不再重投"。
+  discard: null,
   'persona-approve': null,
   'persona-reject': null,
   // 本人在 GUI 里直接编辑人格资产（写 persona/ 下的 .md）。与 persona-approve 同级：
@@ -352,9 +361,21 @@ export const CONFIRM_PHRASES: Record<string, string | null> = {
 /**
  * 字段级危险标识：改这些字段等于改"它能碰什么"，因此 `config-update` 必须带上字段短语。
  * 防的是误触：把 destructive 开关顺手打开，那之后她能删你任意路径下的东西。
+ *
+ * `trust.mode` 按同一条判据够格（2026-10-05 补），**而且两个方向都要短语**：
+ *   • 写 `"full"` = 把边界从"只有那个工作目录"放开到**整台电脑**（`config.ts` 的 TrustConfig：
+ *     `workspace` 档下越界的读写与命令是**被拒绝**的，不是提醒）——这就是"改它能碰什么"，
+ *     而且是往宽的那一边改，最该防误触；
+ *   • 写 `"workspace"` = 收紧。**这里刻意不做方向区分**：只给"放宽"加门就得让服务端先读盘上
+ *     现值、再判方向，那会变成同一件事的**第二处判据**（现值从哪读、读的是盘上还是生效那份、
+ *     并发写怎么算——每一条都能吵），而"改这个字段一律要短语"是一句话能核对完的规则。
+ *     代价是收紧那一下也要带短语，方向明确、代价可接受（防误触不防人）。
  */
 export const DANGEROUS_FIELDS: Record<string, string> = {
   'tools.destructiveEnabled': 'enable-destructive',
+  // 短语名取"最该防的那一件事"（改成完全信任），不取 `trust-mode` 这种中性名：
+  // 客户端把它写进 X-Confirm 时，人一眼看得出自己点的这个按钮要放开什么。
+  'trust.mode': 'trust-full-access',
 };
 
 /**
@@ -362,9 +383,6 @@ export const DANGEROUS_FIELDS: Record<string, string> = {
  * 不造假事件的理由是硬的：事件日志是唯一真相源，没有对应事件类型的"状态变更"写下去就是脏数据。
  */
 export const UNIMPLEMENTED_COMMANDS: Record<string, string> = {
-  'dead-discard':
-    '丢弃死信是状态变更，而 schema 里还没有对应事件类型（需新增 input/discarded）：'
-    + '在事件类型落地前不做近似实现（写一条假事件比不实现更糟）',
   export: '日志导出属于运维模块（M6）的动作，尚未接到本服务',
   backup: '备份快照属于运维模块（M6）的动作，尚未接到本服务',
   'archive-now': '归档属于运维模块（M6）的动作，尚未接到本服务',
@@ -566,6 +584,16 @@ export interface DashboardView {
   state: DashboardState;
   stateText: string;
   detail: string;
+  /**
+   * **当刻状态的一句话旁注**（可以为空）——目前只有一种："预算暂停已解除（X 层）"。
+   *
+   * 为什么它不能并进 `stateText`：状态词说的是**当刻在干什么**（执行中/待机/降级…），
+   * 而这句话说的是**已经过去的那件事的下文**。混在一起就会出现用户 2026-10-05 看到的
+   * 那种自相矛盾的句子：「已暂停（预算耗尽）」+「Agent 正在值守」同时挂在一个进程上。
+   *
+   * 判据与 `state` 同源（{@link livePausedLayers}），界面**照抄不推断**。
+   */
+  stateNote: string;
   guardedDays: number | null;
   nextWakeAt: string | null;
   tiles: {
@@ -632,13 +660,19 @@ export interface EventsPage {
 /**
  * 预算口径的那一句话（`BudgetView.metricNote`）：服务端一处给出，界面照抄。
  *
- * 口径 = **未扣缓存**的 token 数（cacheHit + cacheMiss 一起算）。这不是账单价，
- * 也不能当账单价读——真实花销比它小得多。用户 2026-10-03 把上限按这个口径抬过一次，
- * 原因就是"按真实花销定上限，会把缓存命中的那一大截当成没花过的钱"。
+ * 口径 = **非缓存**的 token 数 = `(inputTokens − cacheHitTokens) + outputTokens`：
+ * 只算输入里没命中缓存的那部分 **+ 输出**，也就是"**真花钱的那部分**"
+ * （唯一一处定义在 `state/fold.ts` 的 `budgetTokensOf`）。2026-10-05 用户换的口径，原话逐字：
+ *
+ *   > 「另外单日预算改成只算不命中缓存的部分吧。单日非缓存预算 2M，妥善改完，不要不协调。」
+ *
+ * 换之前是"未扣缓存"（cacheHit + cacheMiss 一起算）：心跳每 5~15 分钟一拍、约 97% 的输入
+ * 是缓存命中，旧口径把命中那一大截也算进去 ⇒ 计数器飞快见顶、"预算耗尽"天天响，
+ * 而真实花销很小。这不是账单价，但至少与"真花钱的那部分"同向——不再是那个吓人的数。
  */
 export const BUDGET_METRIC_NOTE =
-  '口径：未扣缓存的 token 数（命中缓存的那部分也算在内），与账单上的实际用量不是同一个数；'
-  + '真实花销比它小。';
+  '口径：非缓存 token（输入里没命中缓存的那部分 + 输出，即"真花钱的那部分"）；'
+  + '命中缓存的那一大截不算在内，与账单上的实际用量仍不是同一个数。';
 
 export interface BudgetView {
   range: 'today' | '7d';
@@ -647,9 +681,9 @@ export interface BudgetView {
   /**
    * 预算口径的那一句话，**由服务端一处给出**，界面照抄（2026-10-04 加）。
    *
-   * 为什么必须摆在数字旁边：五档上限数的是**未扣缓存**的 token（cacheHit + cacheMiss），
-   * 与账单上的实际用量不是同一个数——第一次看到"今日用量 34599.9k"的人，反应都是
-   * "我没用这么多"。真实花销比它小得多（缓存命中的那部分便宜一个量级）。
+   * 为什么必须摆在数字旁边：token 那两档数的是**非缓存**的 token
+   *（`(input − cacheHit) + output`，2026-10-05 之前的读数是"未扣缓存"、含 cacheHit——
+   * 两者在同一个真实分片上差约 25 倍）。口径换了而说明没换，人读到的就是上一套语义。
    * 让每个消费者各写一份措辞，迟早会写出三种说法（这一条与"标签词只有一处"同源）。
    */
   metricNote: string;
@@ -1141,6 +1175,10 @@ function hourlyKeys(nowMs: number): string[] {
 /**
  * 最近 24 小时的逐小时序列。总览趋势线与预算弹层共用**同一份实现**：
  * 两处各算一遍必然会漂移，而“图表不一样”比“图没数据”更难查。
+ *
+ * `tokens` / `heavy` / `light` 三格是**预算口径**（非缓存，`budgetTokensOf`，与卡片上那个数同源）；
+ * `input` / `output` / `hit` / `miss` 是**原始分量**（照事件原样记，图表想拆开看时用）。
+ * 这张图与「今日用量」那张卡必须在同一个口径上——两个数不一样，人只会以为其中之一坏了。
  */
 export function buildHourlySeries(events: readonly AppEvent[], nowMs: number): HourlyPoint[] {
   const keys = hourlyKeys(nowMs);
@@ -1154,7 +1192,7 @@ export function buildHourlySeries(events: readonly AppEvent[], nowMs: number): H
     if (bucket === undefined) continue;
     bucket.input += event.data.inputTokens;
     bucket.output += event.data.outputTokens;
-    bucket.tokens += event.data.inputTokens + event.data.outputTokens;
+    bucket.tokens += budgetTokensOf(event.data);
     bucket.hit += event.data.cacheHitTokens;
     bucket.miss += event.data.cacheMissTokens;
   }
@@ -1164,7 +1202,7 @@ export function buildHourlySeries(events: readonly AppEvent[], nowMs: number): H
 function deriveState(
   p: Projection,
   nowMs: number,
-): { state: DashboardState; stateText: string; detail: string; nextWakeAt: string | null } {
+): { state: DashboardState; stateText: string; detail: string; nextWakeAt: string | null; stateNote: string } {
   let nextWakeAt: string | null = null;
   for (const timer of p.timers) {
     if (timer.at === undefined) continue;
@@ -1179,17 +1217,17 @@ function deriveState(
       stateText: `有 ${p.needsReview.length} 个调用等你确认`,
       detail: `最早一条 ${oldest.callId}（${oldest.at}）${days > 0 ? `，已搁置 ${days} 天` : ''}`,
       nextWakeAt,
+      stateNote: '',
     };
   }
-  const paused = (Object.keys(p.lastExhausted) as BudgetLayer[]).filter(
-    (layer) => p.lastExhausted[layer] !== undefined,
-  );
-  if (paused.length > 0) {
+  const live = livePausedLayers(p);
+  if (live.length > 0) {
     return {
       state: 'paused',
-      stateText: `预算暂停（${paused.join(' / ')} 层）`,
+      stateText: `预算暂停（${live.join(' / ')} 层）`,
       detail: `进度已保留，加注后从原地继续（待办 ${p.pending.length} 条）`,
       nextWakeAt,
+      stateNote: '',
     };
   }
   if (p.degraded !== null) {
@@ -1198,8 +1236,16 @@ function deriveState(
       stateText: `降级运行中（${p.degraded.lane}）`,
       detail: `${p.degraded.reason}（自 ${p.degraded.since}）`,
       nextWakeAt,
+      stateNote: '',
     };
   }
+  // 曾经耗尽、当刻已经不在暂停态：这件事要**说出来**（不然人只记得屏幕上那句"已暂停"，
+  // 见 Owner 2026-10-05 的现场）。它是"已经解除的历史"，不是当前故障——所以进 stateNote，
+  // 不进 stateText（状态词说的是当刻在干什么）。
+  const lifted = pausedRecordLayers(p);
+  const stateNote = lifted.length === 0
+    ? ''
+    : `预算暂停已解除（${lifted.join(' / ')} 层）：当刻没有一层停在撞线状态，照常值守`;
   if (p.openTurn !== null) {
     return {
       state: 'running',
@@ -1207,14 +1253,16 @@ function deriveState(
       detail: `turn ${p.openTurn.turn} · 第 ${p.openTurn.step} 步`
         + (p.lastAssistantText === null ? '' : ` · ${p.lastAssistantText.slice(0, 30)}`),
       nextWakeAt,
+      stateNote,
     };
   }
   if (p.idleTicks >= 4) {
     return {
       state: 'sleeping',
       stateText: '沉睡中',
-      detail: `已空转 ${p.idleTicks} 拍（退避中）`,
+      detail: `已连续空转 ${p.idleTicks} 拍（安静中：心跳按概率抽签，越久越可能醒）`,
       nextWakeAt,
+      stateNote,
     };
   }
   return {
@@ -1225,7 +1273,66 @@ function deriveState(
       : `最近唤醒 ${p.lastWake.source} @ ${p.lastWake.at}`
         + (nextWakeAt === null ? '' : ` · 下次 ${nextWakeAt}`),
     nextWakeAt,
+    stateNote,
   };
+}
+
+/** 投影里**还留着** `budget/exhausted` 记录的层（不管那条记录是不是已经过时） */
+function pausedRecordLayers(p: Projection): BudgetLayer[] {
+  return (Object.keys(p.lastExhausted) as BudgetLayer[])
+    .filter((layer) => p.lastExhausted[layer] !== undefined)
+    .sort();
+}
+
+/**
+ * **当刻真的还停着**的预算层（判据一处，界面不自己推断）。
+ *
+ * 这一条修的是用户 2026-10-05 的现场：「GUI 上还是一直显示预算耗尽」，左上角写着
+ * 「已暂停（预算耗尽）」，而她已经跑了十几个小时。
+ *
+ * 根因不在界面，在**这条判据太松**：`deriveState` 过去把"投影里还有一条 `budget/exhausted`
+ * 记录"直接当成"现在暂停着"。而那条记录是**历史事实**，投影不保证它会消失：
+ *
+ *   · `task` / `daily` 两层由 `BudgetGuard.liftedPauses` 判"抬上限解开"并落 `budget/resumed`
+ *     （那条路会 `delete p.lastExhausted[layer]`）；
+ *   · **`step` / `turn` 两层没有这条路**——它们数的是当拍计数器（本步工具数、本 turn 步数），
+ *     而计数器在 `turn/start` / `step/start` 时归零。于是"某次 turn 走到第 30 步撞线"这条记录
+ *     会**永远粘在投影里**（实测：本实例 data/projection.json 里就留着 `turn` 层那条
+ *     `limit=30, actual=30`，而它之后的每一个 turn 都从第 1 步重新开始）。
+ *
+ * 所以判据补一条**用当刻的计数器验一遍**（与 `BudgetGuard` 的越线口径同向）：
+ *
+ *   · 记录里的层不是 `step` / `turn` ⇒ 照旧算暂停（`task` / `daily` 的解账由运行期那条路走，
+ *     服务端不替它判定——判据多一处就必然出现一处说暂停、一处说正常的两个口径）；
+ *   · 记录说"不可恢复"（`resumable: false`，人审挂起超时那一类）⇒ 照旧算暂停：
+ *     它的解除条件是"人答了"，不是计数器，拿计数器去解它等于谎报解除；
+ *   · `turn`：记录里写着撞线时的 `limit`（步数）。当刻本 turn 步数 **小于** 它 ⇒ 那个 turn
+ *     已经结束（计数器归零）或新 turn 还没走到那一步 ⇒ 暂停早就不在了。
+ *     步数到达上限才算真撞（`budget-guard.ts` 的 `over` 对 turn 层就是 `used >= limit`）。
+ *   · `step`：同上，用记录里的 `limit`（当拍工具数上限）。
+ *
+ * 被这一条除掉的层同时是 {@link pausedRecordLayers} 的成员——于是它进 `stateNote`
+ * （"预算暂停已解除"），而不是悄悄消失：人昨天看见的那句话必须有下文。
+ */
+export function livePausedLayers(p: Projection): BudgetLayer[] {
+  // `step` / `turn` 两层的计数器量法，与 `state/fold.ts` 折进投影的两个字段同源：
+  //   step  → budget.toolCallsThisStep（step/start 归零、每调一次工具 +1）
+  //   turn  → budget.stepsThisTurn（turn/start 归零、step/start 无条件赋成步号）
+  const counter = (layer: BudgetLayer): number => {
+    if (layer === 'step') return p.budget.toolCallsThisStep;
+    if (layer === 'turn') return p.budget.stepsThisTurn;
+    return 0;
+  };
+
+  return pausedRecordLayers(p).filter((layer) => {
+    const record = p.lastExhausted[layer];
+    if (record === undefined) return false;
+    // 不可恢复的暂停（人审挂起超时）：解除条件是"人答了"，不拿计数器解它
+    if (record.resumable === false) return true;
+    // 只有 step / turn 两层由**当拍计数器**定生死；task / daily 照旧按投影（运行期那条路的账）
+    if (layer !== 'step' && layer !== 'turn') return true;
+    return counter(layer) >= record.limit;
+  });
 }
 
 function buildSuggestions(p: Projection, events: AppEvent[], nowMs: number): Suggestion[] {
@@ -1313,6 +1420,125 @@ function buildSuggestions(p: Projection, events: AppEvent[], nowMs: number): Sug
   return out;
 }
 
+/**
+ * 重启那条 WMI 命令行的**拼法**（唯一一处，可单测）。
+ *
+ * 为什么把它单拎出来：用户 2026-10-05 的要求逐字是「带路径的请求**必须有留痕**」，
+ * 而"留痕"里最要紧的那一列就是这条命令行——它同时是"脚本会收到什么参数"的唯一凭据
+ * （WMI 建的进程没有 stdout，脚本那边的输出无处可去）。
+ *
+ * 拼法本身有两条实测依据（见 `_research/probe-restart-chain.ps1`）：
+ *   · **每个参数各自加引号**：路径带空格时（`C:\Program Files\...`）不加引号会被拆成两截；
+ *   · **不用 `--%`**：实测它把带引号的 `-File` 路径当字面量
+ *     （`Processing -File '"…"' failed: Illegal characters in path`），
+ *     而重启这条路上任何一点不确定都不该引入。
+ */
+export function restartCommandLine(input: { shellExe: string; argv: readonly string[] }): string {
+  return `"${input.shellExe}" ${input.argv.join(' ')}`;
+}
+
+/**
+ * 重启回执那句话（**唯一一处**：服务端的响应 `note` 与界面上的 toast 说的是同一件事）。
+ *
+ * 三种结局的文案必须**不同**（用户 2026-10-05：「点了没有反馈」+「所谓的'重启前后端'
+ * 也没有重启前端」）：
+ *   · 没读回执：不能说"正在重启"——那正是过去那种"屏幕上说在重启、实际什么都没发生"；
+ *   · 只重启后端（没带界面路径）：必须**如实说**"只重启了后端"，别让人以为界面也重启了；
+ *   · 带路径且读了回执：说"主进程与界面"。
+ */
+export function restartNote(input: { gui: boolean; scriptStarted: boolean }): string {
+  if (!input.scriptStarted) {
+    return '重启没能确认：脚本没有留下回执（它可能根本没起来）。什么都没被重启——'
+      + '请手动跑一次 tools/restart-agent.ps1，或看 data/restart-trace.log';
+  }
+  return input.gui
+    ? '正在重启主进程与界面（约 20 秒）'
+    : '正在重启主进程（约 20 秒；**界面不在本次动作范围内**，它只是重连回来）';
+}
+
+/**
+ * 等脚本写下的那行 `[回执]`（最多约 [RESTART_RECEIPT_WAIT_MS] 毫秒）。
+ *
+ * 为什么要有这一步：`Win32_Process.Create` 的返回码**不能证明脚本跑起来了**。
+ * 本仓实测（见 `_research/probe-restart-chain.ps1` 与同一批 WMI 对照实验）：
+ *   · 内联 `-Command "Set-Content …"` 经 WMI 跑 → 文件真的写出来了；
+ *   · `<shell> -File <脚本>` 经 WMI 跑 → **返回码 0、pid 也有，脚本一个字都没执行**；
+ *   · `cmd.exe /c "… > 日志 2>&1"` 那一层被拒时，stderr 只有一句"拒绝访问。"，
+ *     而 `Create` 照样返回 0。
+ * 也就是"启动失败"可以完全无声。服务端过去只检查返回码 ⇒ 屏幕上说"正在重启"，而
+ * 实际上什么都没发生（用户 2026-10-05 的「点了没有反馈」正是这种形状）。
+ *
+ * 判据很朴素：脚本**第一件事**就是往约定文件追加一行带 `[回执]` 的日志。
+ * 文件长度比发起前大了 = 那行写下来了 = 脚本真的在中途跑着。读不到就如实说"没读到"，
+ * **不假装成功**（这一条的代价说清：脚本那行日志本身写失败时也会读到"没有回执"——
+ * 但那种情况下我们确实没有任何证据说它起来了，如实存疑比谎报成功好）。
+ */
+const RESTART_RECEIPT_WAIT_MS = 400;
+const RESTART_RECEIPT_STEP_MS = 20;
+
+function waitForScriptReceipt(traceLog: string, sizeBefore: number): boolean {
+  const deadline = Date.now() + RESTART_RECEIPT_WAIT_MS;
+  for (;;) {
+    try {
+      const size = existsSync(traceLog) ? statSync(traceLog).size : -1;
+      if (size > sizeBefore) return true;
+    } catch {
+      // 读不到就当"还没有"：这一路只问"有没有新内容"，不把读失败当证据
+    }
+    if (Date.now() >= deadline) return false;
+    // 忙等 20ms：这条路上不能 await（回执要在这一个请求里给出去），而总等待只有 400ms
+    const until = Date.now() + RESTART_RECEIPT_STEP_MS;
+    while (Date.now() < until) { /* spin */ }
+  }
+}
+
+/**
+ * **原始告警 → 它的"已恢复"** 的配对表（`seq` → 恢复那条的说明）。
+ *
+ * 用户 2026-10-05 的现场：运行情况页最上面那条「预算耗尽（任务 token）：已用 178734979 /
+ * 上限 57000000」以"严重"挂了一整天，而它当天就解除了（`budget/resumed{layer:task}` 落了库、
+ * `notifier.ok` 也返回成功）。
+ *
+ * 不配对的根因不是界面：`alarm/sent` 上**除 `recovered` 外没有任何字段**说"这条后来好了"，
+ * 于是界面只能把**恢复通知本身**（它带 `recovered: true`）渲染成提示，而**原始那条**照旧是
+ * `level: 'critical'`——这正是"旧状态没被解除"的读感来源。
+ *
+ * 配对用的是数据里本来就有的两个字段（`src/log/types.ts` 的 `AlarmSent`），**不是推断**：
+ *
+ *   · `key`：故障键（`category:budget-exhausted` 这类）。同一次故障的报警与已恢复**同 key**，
+ *     这是 notifier 的既有口径（`foldStalls` 就按它销账）；
+ *   · `recovered: true`：这条是恢复通知，不是故障本身。
+ *
+ * 口径三条：
+ *   ① **一次恢复只销一条**（同一个 key 上最早那条还没销的），按日志顺序推进——于是
+ *      "报两次、好了一次"仍然剩一条没销的严重告警，与 `foldStalls` 的 count 语义一致；
+ *   ② **配对只看它之后**：恢复通知出现在前、原始告警在后（时间倒挂的坏日志）不算数；
+ *   ③ **没配对的一律照旧严重**——宁可让一条真没好起来的告警继续红着，
+ *      也不许把还没好的事说成"已恢复"（那是造假事实）。
+ */
+export function pairedRecoveries(events: readonly AppEvent[]): Map<number, string> {
+  const pending = new Map<string, number[]>(); // key → 还没被销掉的告警 seq（按出现顺序）
+  const paired = new Map<number, string>();
+  for (const event of events) {
+    if (event.type !== 'alarm/sent') continue;
+    const data = event.data;
+    // key 是配对用的身份；老日志（没有 key）退回指纹——同类别同参数的告警指纹相同，
+    // 仍然配得上；代价是"层"不再参与身份（老日志里 task / daily 会被算作同一个）
+    const key = data.key !== undefined && data.key !== '' ? data.key : `fp:${data.fingerprint}`;
+    if (data.recovered === true) {
+      const original = pending.get(key)?.shift();
+      if (original !== undefined) {
+        paired.set(original, `已恢复（${event.ts} 的恢复通知，seq ${event.seq}）：${data.title}`);
+      }
+      continue;
+    }
+    const list = pending.get(key) ?? [];
+    list.push(event.seq);
+    pending.set(key, list);
+  }
+  return paired;
+}
+
 /** 总览页的全部数据（frontend.md §3.1：状态机 + 磁贴 + 建议 + 24h 序列） */
 export function buildDashboard(input: {
   projection: Projection;
@@ -1344,6 +1570,7 @@ export function buildDashboard(input: {
     state: derived.state,
     stateText: derived.stateText,
     detail: derived.detail,
+    stateNote: derived.stateNote,
     guardedDays,
     nextWakeAt: derived.nextWakeAt,
     tiles: {
@@ -1441,7 +1668,8 @@ export function buildBudgetView(input: {
     if (event.type !== 'budget/consumed') continue;
     const bucket = dayBuckets.get(event.ts.slice(0, 10));
     if (bucket === undefined) continue;
-    const total = event.data.inputTokens + event.data.outputTokens;
+    // 按天分桶也走**预算口径**（非缓存）：7d 视图与「今日用量」那张卡必须是同一个数
+    const total = budgetTokensOf(event.data);
     bucket.tokens += total;
     if (event.data.lane === 'heavy') bucket.heavy += total;
     else bucket.light += total;
@@ -1518,7 +1746,10 @@ function buildTurnRows(events: readonly AppEvent[], limit = 20): BudgetTurnRow[]
     });
 }
 
-/** 本月估算（页脚）：token 累计 / 跨过的 turn 数 / 单次均价 */
+/**
+ * 本月估算（页脚）：token 累计 / 跨过的 turn 数 / 单次均价。
+ * token 走**预算口径**（非缓存，`budgetTokensOf`）——页脚那个数与卡片、趋势线同一套语义。
+ */
 function buildMonth(events: readonly AppEvent[], now: Date): { tokens: number; turns: number; avgPerTurn: number } {
   const prefix = now.toISOString().slice(0, 7);
   let tokens = 0;
@@ -1526,7 +1757,7 @@ function buildMonth(events: readonly AppEvent[], now: Date): { tokens: number; t
   for (const event of events) {
     if (event.type !== 'budget/consumed') continue;
     if (!event.ts.startsWith(prefix)) continue;
-    tokens += event.data.inputTokens + event.data.outputTokens;
+    tokens += budgetTokensOf(event.data);
     turns.add(event.data.turn);
   }
   return { tokens, turns: turns.size, avgPerTurn: turns.size > 0 ? Math.round(tokens / turns.size) : 0 };
@@ -1786,7 +2017,7 @@ function currentPersonaHashOf(personaRoot: string): string {
  * 与 CLI 的重放同一条口径（那边是 runtime/replay.ts 的 readAliasesForReplay）：
  * 别名表不在事件里，重放只能取**现在这份**，报告里也如实说了这一点。
  */
-function aliasesUnder(dataDir: string): ReadonlyMap<string, string> {
+function aliasesUnder(dataDir: string): ReadonlyMap<string, SessionAlias> {
   try {
     return parseAliases(readFileSync(join(dataDir, 'workspace', 'MEMORIES', 'aliases.md'), 'utf8'));
   } catch {
@@ -1946,8 +2177,10 @@ export function buildReplay(input: {
     }),
     // 用度是"当时那一刻的累计值"：日志里只有这一 step 自己那笔，所以按它给个下界
     //（此刻层只在告警时才写这一行，重建时给个诚实的近似比给 null 更有用）
+    // 口径与运行期同源（`budgetTokensOf`，非缓存）：**预览里那一行必须与当时她那行逐字一样**，
+    // 而"一样"的前提是两个数在同一个口径上。
     usage: usage === null ? null : {
-      tokensToday: usage.inputTokens + usage.outputTokens,
+      tokensToday: budgetTokensOf(usage),
       dailyLimit: null,
       cacheHitTokens: usage.cacheHitTokens,
       cacheMissTokens: usage.cacheMissTokens,
@@ -3653,6 +3886,45 @@ class WebServerImpl implements WebServer {
         sendJson(res, 200, { ok: true, seq: event.seq, type: event.type, inputSeq, source });
         return;
       }
+      case 'discard': {
+        // 丢弃死信（`input/discarded`）：**只标记为已处理，不删记录**。
+        //
+        // 与 requeue 是同一格抽屉的两面（同一形状的载荷 {inputSeq}）：
+        //   · requeue  = 再给一次机会（回到 pending）；
+        //   · discard  = 到此为止（输入有意作废）。
+        // 两条都销掉同一条死信，所以第二条必然撞 404——同一个 inputSeq 只可能有一次终局，
+        // 这就是幂等的落点（判据是**当刻的投影**，不靠内存记账）。
+        const inputSeq = Number(payload['inputSeq']);
+        if (!Number.isInteger(inputSeq) || inputSeq < 1) {
+          throw badRequest(`inputSeq 必须是 >= 1 的整数，收到 ${String(payload['inputSeq'])}`);
+        }
+        const dead = this.deps.projection.deadLetters.find((item) => item.inputSeq === inputSeq);
+        if (dead === undefined) {
+          throw notFound(`seq ${inputSeq} 不在死信队列里（可能已经重投或丢弃）`, 'dead-letter-not-found');
+        }
+        const reasonRaw = payload['reason'];
+        const reason = typeof reasonRaw === 'string' && reasonRaw.trim() !== ''
+          ? reasonRaw.trim()
+          : '人工丢弃：不再重投';
+        if (reason.length > DISCARD_REASON_MAX) {
+          throw badRequest(`reason 最多 ${DISCARD_REASON_MAX} 字，收到 ${reason.length} 字`);
+        }
+        const byRaw = payload['by'];
+        const by = typeof byRaw === 'string' && byRaw.trim() !== '' ? byRaw.trim() : 'human';
+        // **留痕**：死信是"已经发生过的事实"，丢弃是"人决定不再重投"——后者落成自己的事件，
+        // 前者一个字都不动（`input/dead-letter` 照旧在日志里）。claimCount 从投影里那条记录抄，
+        // 不另算一遍：人回看时"它试了几次"要与死信那条说同一个数。
+        const event = this.appendSync('input/discarded', {
+          inputSeq,
+          claimCount: dead.claimCount,
+          reason,
+          by,
+        }, 'internal');
+        sendJson(res, 200, {
+          ok: true, seq: event.seq, type: event.type, inputSeq, claimCount: dead.claimCount,
+        });
+        return;
+      }
       case 'persona-approve': {
         const file = typeof payload['file'] === 'string' ? payload['file'] : '';
         const diffHash = typeof payload['diffHash'] === 'string' ? payload['diffHash'] : '';
@@ -3766,19 +4038,56 @@ class WebServerImpl implements WebServer {
       case 'restart': {
         // 运行情况页那颗按钮（原来这里是"立即唤醒"，用户 2026-10-04 说那个没用了，改成重启）。
         //
-        // 三条纪律：
+        // 四条纪律：
         //   • **延迟两秒再动手**：让这次 HTTP 回执先发出去，界面不至于拿到一个断掉的连接；
         //   • 用 WMI 起**分离**的 pwsh 去跑 tools/restart-agent.ps1——本进程不能自己重启自己，
         //     而那条脚本里写着"只杀主进程、不碰 SnowLuma"（协议端登录态杀了要人重登）；
-        //   • 界面路径由调用方给（`guiExe`）：脚本不该猜界面装在哪。
+        //   • 界面路径由调用方给（`guiExe`）：脚本不该猜界面装在哪。**给了路径就必须留痕**
+        //     （见下面那段"留痕"注释：用户 2026-10-05 说按了按钮"没有任何日志痕迹，
+        //     无法判断请求有没有带界面路径"）；
+        //   • 路径在盘上不存在时**当场拒绝**，绝不悄悄降级成"只重启后端"——
+        //     界面按契约带上路径，就是要求连界面一起重启；做不到要说出来
+        //     （用户 2026-10-05：「所谓的'重启前后端'也没有重启前端」）。
         const guiRaw = payload['guiExe'];
         const guiExe = typeof guiRaw === 'string' ? guiRaw.trim() : '';
+        const guiExeExists = guiExe !== '' && existsSync(guiExe);
+        if (guiExe !== '' && !guiExeExists) {
+          this.appendSync(
+            'config/changed',
+            {
+              fields: ['restart'], configHash: 'restart-rejected-bad-gui-exe',
+              guiExe, guiExeExists: false,
+            },
+            'internal',
+          );
+          this.write(`[重启] 拒绝：请求带了 guiExe=${guiExe}，但盘上没有这个文件——`
+            + '界面按契约带路径就是要求连界面一起重启，做不到就不装作做到了。一个进程都没动');
+          throw badRequest(
+            `重启请求带了界面路径，但那个文件不存在：${guiExe}。`
+            + '没有重启任何东西（宁可什么都不做，也不把"只重启了后端"说成"重启了前后端"）。',
+            'restart-bad-gui-exe',
+          );
+        }
         const repo = dirname(this.configPath);
         const script = join(repo, 'tools', 'restart-agent.ps1');
-        const args: string[] = [
-          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `"${script}"`,
-          '-Repo', `"${repo}"`,
-          ...(guiExe === '' ? [] : ['-GuiExe', `"${guiExe}"`]),
+        // 留痕文件：**脚本与这里约定同一个路径**（`<dataDir>/restart-trace.log`）。
+        // 为什么由服务端显式传：脚本的默认值只能靠 `-Repo` 推，而 `-Repo` 本身也是别人给的；
+        // 两处各推一次就会出现"服务端读 A、脚本写 B"的分岔，而这条留痕的全部意义就是"能对上"。
+        const traceLog = join(this.deps.dataDir, 'restart-trace.log');
+        const traceLogAt = existsSync(traceLog) ? statSync(traceLog).size : -1;
+        // 每个参数各自加引号（路径带空格时也必须是一个参数）。`"pwsh" -File "a b.ps1" -GuiExe "c d.exe"`
+        // 在 PowerShell 里逐字对应四条参数，不会把路径拆成两截。
+        //
+        // 为什么不用 `--%`（逐字传参、听起来更稳）：实测它在**带引号的 `-File` 路径**上反而被
+        // 当成字面量（`Processing -File '"…"' failed: Illegal characters in path`），
+        // 而重启这条路上任何一点不确定都不该引入。逐参数引号这条路已经在本机验过
+        // （见 _research/probe-restart-chain.ps1：`-GuiExe` 那一段完整送达）。
+        const q = (value: string): string => `"${value}"`;
+        const argv: string[] = [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', q(script),
+          '-Repo', q(repo),
+          ...(guiExe === '' ? [] : ['-GuiExe', q(guiExe)]),
+          '-TraceLog', q(traceLog),
         ];
         // 谁来跑这个脚本：`resolveRestartShell` 按"显式指定 → PATH → 标准安装目录 → 系统自带"
         // 四级探测（见 `runtime/restart-shell.ts` 的文件头）。
@@ -3788,32 +4097,76 @@ class WebServerImpl implements WebServer {
         // 这件事要求我们**给出一个真的存在的绝对路径**，不能靠猜；探测失败时用
         // `powershell.exe`（在 System32 里，WMI 环境也找得到；脚本按 5.1 兼容写，兜底是安全的）。
         const shellExe = resolveRestartShell({ env: process.env, fileExists: existsSync });
-        const command = `"${shellExe}" ${args.join(' ')}`;
-        const created = spawnSync('powershell.exe', [
-          '-NoProfile', '-Command',
-          // ShowWindow = 0：WMI 建进程默认会把控制台窗口显示出来（用户截图里那个黑框就是它）
-          `$si = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); $si.ShowWindow = 0; `
-            + `$c = ([wmiclass]'Win32_Process').Create('${command.replace(/'/gu, "''")}', '${repo.replace(/'/gu, "''")}', $si); exit $c.ReturnValue`,
-        ], { encoding: 'utf8' });
+        const command = restartCommandLine({ shellExe, argv });
+        const wmi = `$si = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); $si.ShowWindow = 0; `
+          + `$c = ([wmiclass]'Win32_Process').Create('${command.replace(/'/gu, "''")}', '${repo.replace(/'/gu, "''")}', $si); exit $c.ReturnValue`;
+        // ── 留痕（2026-10-05 加，用户报"按钮那条路没有任何日志痕迹"）──
+        //
+        // 按下按钮之后能查到的只有一条 `config/changed{fields:['restart']}`，而它的 hash 是
+        // 时间戳——**看不出这次请求有没有带界面路径**。于是"界面到底有没有被重启"在事后
+        // 完全无法证伪：脚本的 stdout 随 WMI 进程消失（WMI 建的进程不带控制台），
+        // 事件里也没有这个字段。
+        //
+        // 现在把四件事写下来（两处，同一份内容）：① `guiExe` 的**值**与它在盘上存不存在；
+        // ② WMI 实际要执行的**完整命令行**；③ spawn 的结果（WMI 返回码 + stderr）；
+        // ④ **脚本有没有真的跑起来**——由脚本自己写的那行 `[回执]` 判定。
+        // 一处进事件日志（可查询、可回放），一处进服务端 stdout（本机 console 日志）。
+        const trace = (): string => `guiExe=${guiExe === '' ? '（空：只重启后端）' : guiExe}`
+          + ` · 盘上存在=${guiExeExists} · shell=${shellExe} · 命令行=${command}`;
+        const created = spawnSync('powershell.exe', ['-NoProfile', '-Command', wmi], { encoding: 'utf8' });
+        const createdDetail = `status=${created.status === null ? '未知' : created.status}`
+          + ` stderr=${(created.stderr ?? '').trim()}`;
         if (created.status !== 0) {
+          this.write(`[重启] 启动失败：${trace()} · ${createdDetail}`);
+          this.appendSync(
+            'config/changed',
+            {
+              fields: ['restart'], configHash: 'restart-failed',
+              guiExe, guiExeExists, command, wmiStatus: created.status, wmiError: (created.stderr ?? '').trim(),
+            },
+            'internal',
+          );
           throw badRequest(
             `重启没能启动（WMI 返回码 ${created.status === null ? '未知' : created.status}）：${(created.stderr ?? '').trim()}`,
             'restart-failed',
           );
         }
+        // **回执判定**：WMI 返回码 0 **不等于脚本跑起来了**。
+        //
+        // 本仓实测（_research/probe-restart-chain.ps1 + WMI 对照实验）：
+        // `Win32_Process.Create` 对一个随后会被系统拒掉的命令行**照样返回 0**——
+        // 探针里 `cmd.exe /c "… > 日志 2>&1"` 那一层被拒（stderr 只有一句"拒绝访问。"），
+        // 脚本一个字都没执行，而返回码是 0、pid 也有。同一个坑在用户机器上就是
+        // "按钮点了、后端起来了、界面没有"这种最难查的形状。
+        //
+        // 所以这里多问一句**脚本自己**：它在第一件事上写一行 `[回执] ...` 到约定的留痕文件。
+        // 读得到新的那一行 = 脚本真的起来了；读不到 = 如实说"不确定"，不假装成功。
+        const scriptStarted = waitForScriptReceipt(traceLog, traceLogAt);
+        this.write(`[重启] 已发出：${trace()} · ${createdDetail}`
+          + ` · 脚本回执=${scriptStarted ? '已确认' : '**没读到**（脚本可能没起来）'}（${traceLog}）`);
         const event = this.appendSync(
           'config/changed',
-          { fields: ['restart'], configHash: sha256Hex(String(this.deps.now().getTime())).slice(0, 16) },
+          {
+            fields: ['restart'], configHash: sha256Hex(String(this.deps.now().getTime())).slice(0, 16),
+            // 这几个字段是这次留下的痕：事后要能回答"这次到底带没带界面路径、带了什么、
+            // 脚本会收到什么、脚本有没有起来"。老字段一个不动（`fields` 仍是 `['restart']`），
+            // 只多几列。
+            guiExe, guiExeExists, command, traceLog, scriptStarted,
+          },
           'internal',
         );
         sendJson(res, 200, {
           ok: true,
           seq: event.seq,
           type: event.type,
+          // 界面按这两个字段决定 toast 说什么（`gui:false` 时**不许**说"连界面一起重启了"）
           gui: guiExe !== '',
-          note: guiExe === ''
-            ? '正在重启主进程（约 20 秒；界面会自动重连）'
-            : '正在重启主进程与界面（约 20 秒）',
+          guiExe,
+          // `scriptStarted` 也下发给界面：读到 `false` 时界面说的那句是"没读到脚本回执"，
+          // 而不是"正在重启"——两种结局的文案不同（用户 2026-10-05：点了要有反馈）。
+          scriptStarted,
+          traceLog,
+          note: restartNote({ gui: guiExe !== '', scriptStarted }),
         });
         return;
       }
@@ -4664,8 +5017,12 @@ class WebServerImpl implements WebServer {
       }
       const dangerous = DANGEROUS_FIELDS[path];
       if (dangerous !== undefined && !phrases.includes(dangerous)) {
+        // 理由里**点名是哪个字段**（2026-10-05）：危险字段不止一条之后，"需要追加字段短语 X"
+        // 这句本身答不出"是我这次改的这个字段危险，还是顺带碰到的别的东西"——而客户端要弹的
+        // 那张确认卡上写的就是"你要改的那一项会放开什么"。字段路径是唯一能对上号的坐标。
         throw badRequest(
-          `字段级危险操作：X-Confirm 需要追加字段短语 ${dangerous}（形如 "update-config; ${dangerous}"）`,
+          `字段级危险操作：改 ${path} 需要 X-Confirm 追加字段短语 ${dangerous}`
+          + `（形如 "update-config; ${dangerous}"）`,
           'confirm-required',
         );
       }
@@ -5127,7 +5484,7 @@ class WebServerImpl implements WebServer {
     // 她自己认的人（`MEMORIES/aliases.md`）：读不到就是空表，不是错误。
     // 为什么这里也要读：界面上的名字与她那边的名字必须是同一个来源（`resolveSessionName`），
     // 否则会出现"界面上有名字、她上下文里还是 openid"这种两边不一致
-    let aliases: ReadonlyMap<string, string> = new Map();
+    let aliases: ReadonlyMap<string, SessionAlias> = new Map();
     try {
       aliases = parseAliases(readFileSync(join(this.deps.dataDir, 'workspace', 'MEMORIES', 'aliases.md'), 'utf8'));
     } catch {
@@ -5139,6 +5496,10 @@ class WebServerImpl implements WebServer {
       // 会话身份归一之后条目是 `qq:group:<群id>`，而用户手里那张表可能还是 `qq:group-at:<群id>`
       // ——只按一种写法查，会让"我给这个群起过名字"在界面上变成一串 openid（实测踩到）
       const resolved = resolveSessionName(entry, contacts, aliases);
+      // 备注（她写在别名名字后面括号里的那段口径）：判据在 `aliasNoteOf` 里，**不在这儿再拼一遍**。
+      // 只在"名字真源就是那条别名"时才给——联系人表把人写的名字改掉了，还挂着她给旧名字写的口径，
+      // 人会以为那句口径还作数（见 `aliasNoteOf` 的注释）。
+      const { note } = aliasNoteOf(entry, contacts, aliases);
       return {
         sid: entry.sid,
         channel: entry.channel,
@@ -5152,6 +5513,9 @@ class WebServerImpl implements WebServer {
         unread: entry.unread,
         // 没有名字时给 null（界面据此显示"未命名会话"），而不是把 openid 当名字发过去
         name: resolved === entry.person ? null : resolved,
+        // 备注是**次要文本**，与名字分开两个字段：界面那格可编辑的只有名字，
+        // 混在一起发过去就等于让界面自己再切一次——那正是这次 bug 的形状。
+        note,
       };
     });
     return {
@@ -5204,7 +5568,7 @@ class WebServerImpl implements WebServer {
   }
 
   /**
-   * 框架提示（运行情况页 ·「框架提示」卡片的数据源，v33）。
+ * 框架提示（运行情况页 ·「框架提示」卡片的数据源，v33）。
    *
    * 为什么单开一条读端点、而不是让界面去 `/api/events` 自己筛：事件流里这两条混在几万条
    * 内部簿记中间（`step/start`、`budget/consumed`…），界面按类型筛等于把判据复制一份到前端，
@@ -5215,13 +5579,20 @@ class WebServerImpl implements WebServer {
    *   · **引用必须截断**：`quotes` 是外部原文片段，一条长消息能到几千字，见 {@link clipFrameworkQuotes}；
    *   · **空就是空**：没有提示是常态，返回空数组——不是 404、不是 null（对比 `/api/alarms?file=` 的 404：
    *     那是"你指名要的文件不存在"，这里是"最近没什么事"）；
-   *   · **不挑新的也不排重**：同一类告警会被限流挡在写入侧（`alarm/sent` 本来就稀疏），
-   *     这里如实按时间倒序摆出来，不做"合并相似条目"的聪明事——那会让人看不出发生过几次。
-   */
-  private async frameworkNotesView(url: URL): Promise<Record<string, unknown>> {
+ *   · **不挑新的也不排重**：同一类告警会被限流挡在写入侧（`alarm/sent` 本来就稀疏），
+ *     这里如实按时间倒序摆出来，不做"合并相似条目"的聪明事——那会让人看不出发生过几次；
+ *   · **"已恢复"要与它的原始那条配对**（2026-10-05 加，见 {@link pairedRecoveries}）：
+ *     配上的原始告警不再按当前严重渲染，而是渲染成历史。
+ */
+private async frameworkNotesView(url: URL): Promise<Record<string, unknown>> {
     const contacts = this.deps.config.persona.contacts;
     const events = await readAllEvents(this.deps.log);
     const limit = frameworkNoteLimit(url.searchParams.get('limit'));
+
+    // 配对表**在倒扫之前整份算出来**：倒扫为了 `?limit=` 小的时候提前停，只看得到日志的尾巴，
+    // 而"某条 17:33 的告警后来被销掉了吗"要看它**之后**发生了什么——那可能远在尾巴之外
+    // （真实日志里 09:33 那条告警的配对在 09:47，隔着一万四千条事件）。
+    const recoveries = pairedRecoveries(events);
 
     // 从尾部往前扫：要的是"最近若干条"。日志按 seq 追加，seq 序即时间序——
     // 几种类型混着走一遍就是全局时间倒序，不需要再排一次（`?limit=` 小的时候还提前停）
@@ -5231,6 +5602,12 @@ class WebServerImpl implements WebServer {
     // ——每条都要占两行（标题 + 整条等式），而且它说的根本不是"提示"：**归因是事实，事实去日志页看**
     // （事件 `budget/consumed.context` 一直都在，想核对的人打开日志就能逐条读）。
     // 所以这张卡只留"要人看一眼"的三类：注入预警、告警、缓存破坏，各自拿到完整的 limit。
+    //
+    // **预期内的缓存失守也不进这张卡**（2026-10-05，用户批准的「让失守提示带上归因」）：
+    // 失守这件事本身天天发生，而绝大多数是**我们自己造成的**（重启后端、她自己改 STATE、
+    // 工具清单变更、上下文压缩）——它们的代价是预期内的，混进告警区就等于把告警变成背景音。
+    // 判据不在这里：`cacheBreak.silent` 由 `model/context-audit.ts` 的 `segmentCause` 算好，
+    // 服务端只**照分级展示**（降级的那些一条都不删——它们照旧逐条在日志里，只增不改）。
     const notes: Array<Record<string, unknown>> = [];
     const used: Record<string, number> = { injection: 0, alarm: 0 };
     const quota: Record<string, number> = { injection: limit, alarm: limit };
@@ -5267,6 +5644,10 @@ class WebServerImpl implements WebServer {
         if (used['alarm']! >= quota['alarm']!) continue;
         used['alarm'] = used['alarm']! + 1;
         const data = event.data;
+        // 这条原始告警后来被"已恢复"销掉了吗（配对判据见 {@link pairedRecoveries}）：
+        // 销掉的那条**不再按当前严重渲染**——渲染成"已恢复 · 历史"、等级降到提示。
+        // 这是数据里带的配对，不是推断：`alarm/sent` 事件上本来就有 `key` / `recovered`。
+        const pair = recoveries.get(event.seq);
         notes.push({
           seq: event.seq,
           at: event.ts,
@@ -5274,7 +5655,7 @@ class WebServerImpl implements WebServer {
           label: '告警',
           level: data.level,
           title: data.title,
-          reason: '',
+          reason: pair === undefined ? '' : pair,
           quotes: [],
           by: null,
           // 指纹是告警的身份（限流按它算），排障时要拿它对上告警目录里的文件
@@ -5284,6 +5665,7 @@ class WebServerImpl implements WebServer {
           person: '',
           chatType: '',
           name: null,
+          ...(pair === undefined ? {} : { recovered: true, historical: true }),
         });
         continue;
       }
@@ -5293,6 +5675,9 @@ class WebServerImpl implements WebServer {
         const data = event.data;
         const cacheBreak = data.cacheBreak;
         if (cacheBreak !== undefined) {
+          // 预期内（归因说得清是哪一类自己人干的）：**不进这张卡**——它是日志里的一条普通记录。
+          // 老日志没有 `silent` 字段 ⇒ 按"要告警"处理（历史条目一条不丢）。
+          if (cacheBreak.silent === true) continue;
           if (used['alarm']! >= quota['alarm']!) continue;
           used['alarm'] = used['alarm']! + 1;
           notes.push({
@@ -5302,7 +5687,9 @@ class WebServerImpl implements WebServer {
             label: CACHE_BREAK_LABEL,
             // 缓存失守是"钱与体感都变差"的事，但循环没坏：warn，不是 critical
             level: 'warn',
-            title: `缓存前缀失守：${CACHE_BREAK_CLASS_LABEL[cacheBreak.class]}`,
+            // 标题带上**归因**（2026-10-05）：能走到这里的就是"说不清为什么"的那一类
+            title: `缓存前缀失守：${CACHE_BREAK_CLASS_LABEL[cacheBreak.class]}`
+              + `${cacheBreak.cause === undefined ? '' : `（${CACHE_BREAK_CAUSE_LABEL[cacheBreak.cause]}）`}`,
             // reason 是**当时记下来的那句话**（渲染/比对同一个纯函数产出），界面原样贴，不加工
             reason: cacheBreak.reason,
             quotes: [],

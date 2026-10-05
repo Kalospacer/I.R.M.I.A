@@ -203,8 +203,8 @@ test('M5-2 状态类去重：快照类工具与心跳按 key 只留最新一次'
     evt('tool/result', { turn: 1, step: 1, callId: 't1', callSeq: 1, status: 'ok', content: '旧表：空' }),
     evt('tool/call', { turn: 2, step: 1, callId: 't2', name: 'list_timers', arguments: '{}', sideEffect: 'none' }),
     evt('tool/result', { turn: 2, step: 1, callId: 't2', callSeq: 3, status: 'ok', content: '新表：每日整理 08:00' }),
-    evt('wake/heartbeat', { quietSeconds: 600, idleTicks: 1, pressure: 0.05 }),
-    evt('wake/heartbeat', { quietSeconds: 1800, idleTicks: 2, pressure: 0.05 }),
+    evt('wake/heartbeat', { quietSeconds: 600, idleTicks: 1, pressure: 0.05, probability: 0.1, roll: 0.05 }),
+    evt('wake/heartbeat', { quietSeconds: 1800, idleTicks: 2, pressure: 0.05, probability: 0.2, roll: 0.1 }),
   ];
 
   const note = renderHandoffNote(events);

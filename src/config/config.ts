@@ -116,6 +116,20 @@ export const DEFAULT_MEMORY_MAINTAIN_CRON = '0 4 * * *';
  */
 export const DEFAULT_STATE_BUDGET_BYTES = 8 * 1024;
 
+/**
+ * `wake.heartbeatTargetMeanMin`（心跳目标均值，分钟）的合理范围：**5~60**。
+ *
+ * 这是"外层合理性"那一道，不是判据本体：真正的判据是"必须严格落在 heartbeatFloorMin 与
+ * heartbeatCeilMin 之间"（见 `checkHeartbeatTargetMean`）——下面这两个数只是把明显荒唐的值
+ * （平均 0 分钟、平均 10 小时）挡在门外，让报错信息说得出一个可照抄的范围。
+ *
+ * 为什么还是留着这一层：下限/上限**可以被使用者改**（例如 floor=1、ceil=120），
+ * 而"平均 2 分钟醒一次"或"平均 90 分钟才醒"在语义上已经越过心跳这件事的边界
+ * （心跳是呼吸，不是轮询、也不是排班表），所以在交叉校验之外单列一条。
+ */
+export const HEARTBEAT_TARGET_MEAN_MIN = 5;
+export const HEARTBEAT_TARGET_MEAN_MAX = 60;
+
 // ──────────────────────────────── JSON 值类型 ────────────────────────────────
 
 export type JsonValue =
@@ -146,15 +160,22 @@ export interface ModelsConfig {
   degraded?: ModelLaneConfig | undefined;
 }
 
-/** 三层预算 + 每日额度 + 软阈值 + 连续失败上限（design.md §4.6 的默认值） */
+/**
+ * 三层预算 + 每日额度 + 软阈值 + 连续失败上限（design.md §4.6 的默认值）。
+ *
+ * ⚠️ `taskTokens` / `dailyTokens` 数的是**非缓存 token**（2026-10-05 起）：
+ * `(inputTokens − cacheHitTokens) + outputTokens`——"输入里没命中缓存的那部分 + 输出"，
+ * 也就是**真花钱的那部分**。唯一一处定义在 `src/state/fold.ts` 的 `budgetTokensOf`。
+ * `stepTools` / `turnSteps` 数的是**次数**，与 token 口径无关。
+ */
 export interface BudgetConfig {
-  /** 单 step 工具调用数上限 */
+  /** 单 step 工具调用数上限（**次数**） */
   stepTools: number;
-  /** 单 turn step 数上限 */
+  /** 单 turn step 数上限（**次数**） */
   turnSteps: number;
-  /** 单任务累计 token 上限 */
+  /** 单任务累计**非缓存** token 上限 */
   taskTokens: number;
-  /** 每日累计 token 上限 */
+  /** 每日累计**非缓存** token 上限 */
   dailyTokens: number;
   /** 软阈值比例（0-1）：达到 上限×ratio 时先往尾部 developer 消息提示，越过才硬停 */
   softRatio: number;
@@ -162,31 +183,56 @@ export interface BudgetConfig {
   failStreakMax: number;
 }
 
-/** 心跳与空闲退避（design.md §4.12）、周期任务（design.md §4.17） */
+/** 心跳（概率模型，design.md §4.12）与周期任务（design.md §4.17） */
 export interface WakeConfig {
-  /** 心跳基线间隔（分钟）。间隔 = 基线 × 2^空拍数 ×（1.5 − pressure） */
-  heartbeatBaselineMin: number;
-  /** 空闲退避上限倍数（基线 ×2^n 封顶于基线 × 本值） */
-  idleBackoffMax: number;
   /**
-   * 心跳间隔下限（分钟，默认 10）。
+   * 安静下限（分钟，默认 **5**）：安静不足它**绝不**触发心跳。
    *
-   * 公式自己算不到这么短（30×0.5=15），所以它是安全网：以后把基线改小、
-   * 或压力项变得更激进，也不会把心跳变成连爆。
+   * 它是概率模型的硬下界（p 在这一段恒为 0），不是"安全网"——下限以下的概率根本不存在。
    */
   heartbeatFloorMin: number;
   /**
-   * 心跳间隔上限（分钟，默认 60）。
+   * 安静上限（分钟，默认 **60**）：安静到点**必然**触发（p 在这一刻为 1）。
    *
-   * 纯退避算下去安静久了会慢到 6 小时（30×8×1.45），那个尺度上“她还在”的
-   * 体感就没了。超过一小时不露面，人会觉得她睡着了。
+   * 上一版这个数只是"退避撞上去的封顶值"，现在是分布自身的支撑上界：尾巴不会再长出去，
+   * 也就不会出现"配错一个倍数就静默六小时"。
    */
   heartbeatCeilMin: number;
+  /**
+   * 抽签节奏（分钟，默认 **1**）：每这么多分钟抽一次签，抽中才触发。
+   *
+   * 注意它不是"心跳间隔"——心跳间隔是抽签的**结果**。调大 = 触发时刻更粗
+   * （只能落在它的整数倍上）；调小只是更细，不会让心跳更频繁。
+   */
+  heartbeatTickMin: number;
+  /**
+   * **心跳目标均值**（分钟，默认 **15**）：平均多久醒一次——想改频率就改这一个数。
+   *
+   * 概率曲线的形状指数 α 不是旋钮：启动时按这个目标均值**反解**出来
+   * （`src/wake/heartbeat.ts` 的 `solveHeartbeatAlpha`，用的是与实测同一套 pmf，二分且确定）。
+   * 想要平均 30 分钟醒一次就写 30，不需要知道 α 是什么。
+   *
+   * 校验（写错了当场报配置错，不做"尽力而为"的猜测）：必须**严格**落在安静下限与上限之间
+   * （`heartbeatFloorMin` < 本字段 < `heartbeatCeilMin`），且落在 5~60 的合理范围内——
+   * 一个比下限还小的"平均"是自相矛盾的（下限那一段根本不触发）。
+   * 模型实际能表达的均值区间是 [floor + tick, ceil]：tick 粒度会让"最短均值"变成 floor + tick，
+   * 够不着的目标会被解到搜索边界（启动日志与分布摘要里报的解析均值才是实际值）。
+   *
+   * **启动参数：改完要重启进程才生效**（心跳是启动期建的，《operations.md》§1.3 有可照抄的例子）。
+   */
+  heartbeatTargetMeanMin: number;
   /**
    * 每日记忆整理的 cron（五段：分 时 日 月 周）。空字符串 = 关闭该任务。
    * 到期以 `wake/timer` 唤醒，real-loop 按 payload.kind 认出这是整理而不是普通 turn。
    */
   memoryMaintainCron: string;
+  // ── 已删除的两个字段（2026-10-04，随概率模型一起；别再加回来）──
+  //   `heartbeatBaselineMin` 与 `idleBackoffMax` 是旧确定性排程的参数
+  //   （间隔 = 基线 × min(2^n, 退避上限) × 压力调制）。新模型里**没有任何地方会读它们**：
+  //   间隔不再由基线乘出来，空拍也不再让间隔翻倍。按"不留没人读的配置"的规矩**直接删掉**，
+  //   不保留兼容字段——留一个读了不生效的旋钮比没有它更坏（会让人以为自己调过分寸）。
+  //   老配置文件里残留的这两个键会被解析器忽略（逐字段读，不认识的键不进结果），
+  //   不会报错、也不会假装生效。
 }
 
 /** 发言节奏（design.md §4.20 的 speak 三路投递） */
@@ -268,6 +314,28 @@ export interface ToolsConfig {
    * 因为那等于让某一方替人做决定（design §6.1 明说不设这条）。
    */
   askHumanTimeoutMin: number;
+  /**
+   * **隔离子代理工具 `task` 的开关（默认 false = 不注册）**，design §4.21。
+   *
+   * 为什么默认关（与 `rg_search` / `es_search` 那种"本机装了才注册"的条件注册不是一回事）：
+   * 那两件的判据在**机器**上（引擎在不在），这一件的判据在**代价**上——
+   *
+   *   • 工具清单是请求**冻结前缀**的一部分（docs/schema.md §13：模型请求的全部内容可由
+   *     model 事件 + 人格资产重建）。多一件 = 每次请求都多付一份 schema 的常驻 token；
+   *   • 更要紧的是**前缀一变就是一次缓存 miss**：清单出现在请求最前面，那之后的所有内容
+   *     在服务端缓存里整段失效。实测口径（docs/design.md §4.13 缓存三铁律）就是"同签名
+   *     命中 85.2%、换签名 41.2%"，所以"加一件工具"从来不是免费的加法；
+   *   • 它还是一层**嵌套**能力（子代理有自己的预算与工具集），默认替所有人打开，
+   *     等于替他们接受了一种新的花费形态（一次 task 调用可能烧掉几千 token）。
+   *
+   * 打开之后会发生什么（实测数见 docs/operations.md §1.2）：清单 24 → 25 件、`tools` 段的常驻
+   * token +172（它自己那一件），她多一件能把"读一批文件再汇总"这类活整块外包的工具
+   * （子代理独立上下文、预算从父扣减、默认不能再下派）。
+   *
+   * **它是启动期读一次的参数**（装配参数）：改完要重启进程才接管——与 `destructiveEnabled`
+   * 同理，清单在进程起来那一刻就定下了。
+   */
+  taskEnabled: boolean;
 }
 
 export interface AlertsConfig {
@@ -664,16 +732,63 @@ function buildDefaults(dir: string): AppConfig {
     budget: {
       stepTools: 20,
       turnSteps: 30,
-      taskTokens: 500_000,
-      dailyTokens: 2_000_000,
+      // 出厂单任务额度 = 5e8 —— **非缓存口径**。
+      //
+      // 口径 = `(inputTokens − cacheHitTokens) + outputTokens`：**输入里没命中缓存的那部分 + 输出**，
+      // 也就是"真花钱的那部分"。旧口径（未扣缓存、含 cacheHit）在真实唤醒的心跳之下是失真的：
+      // 心跳每一拍约 4.5 万 input 里约 97% 是缓存命中，旧口径把命中那 97% 也当钱算，
+      // 计数器飞快见顶、"预算耗尽"天天响，而真实花销很小。
+      //
+      // 为什么是 **5e8**（= 日额度 5e7 的 **10 倍**）：**让"日"那一层当主力刹车**。
+      // task 撞线 = "这次任务收尾、进待确认"，daily 撞线 = "今天拒绝唤醒"——一整天的量该由日额度管，
+      // 所以 task 要比 daily 宽出量级去。这一条与更早的默认（task = daily = 1e8）方向相反，是**有意**的。
+      //
+      // ⚠️ 写**十进制字面量**（不写 `5e8`、也不写算式）：出包脚本 Read-CodeDefaults 按正则抓字段
+      // 默认值，算式抓不到就当场拒绝出包。理由与下面 dailyTokens 那条同源（那条注释里还有一笔账）。
+      taskTokens: 500000000,
+      // 出厂日额度 = **5e7，非缓存口径**。
+      //
+      // 为什么是 5e7（不是拍的，是一笔账）：心跳是**真实唤醒**——每一拍都真发一次 heavy 请求，
+      // 并且刻意共用同一份冻结前缀去保温供方的前缀缓存（见 design.md §4.12）。于是心跳自己就有
+      // 日开销：按现在这套概率分布实测均值约 15 分钟一拍 ⇒ 约 96 拍/天；每拍**非缓存**的部分
+      // ≈ 该 turn 第 1 拍的未命中 + 输出 ≈ **0.36 万 + 0.035 万 ≈ 0.4 万 token**
+      //（实测分量：一拍里命中约 4.2 万、**未命中约 0.36 万**、输出中位约 350——未命中那一项就是
+      // 下面这笔账的乘数。口径、样本量与脚本：`_research/heartbeat-real-wake-audit.mjs`，
+      // 结论记在 design.md §4.12）。
+      // 于是 ≈ **96 × 0.35 万 ≈ 0.35M/天**——5e7 是它的**约 140 倍**，心跳只占日额度的零头，
+      // 剩下的量级全部留给"心跳之上的真实工作"。
+      //
+      // ⚠️ 这个数**贴不贴**，如实记一笔实测（2026-10-05：00:00→17:13 本地、494 次调用）：
+      // 非缓存 2,050,232（miss 1,471,532 + 输出 578,700）。也就是说一个正常工作日 ≈ 2M 量级，
+      // 5e7 是它的约 **25 倍**——真正在动的量级是这个，不是心跳本身。
+      //
+      // ⚠️ 写**十进制字面量**、不写算式（不写 `5e7`、也不写 `5 * 1000 * 1000`）：出包脚本
+      // `tools/make-config-example.ps1` 的 Read-CodeDefaults 按正则抓字段默认值，算式抓不到就
+      // 当场拒绝出包（"字段改名了？"）。理由与 persona.stateBudgetBytes 那条同源。
+      // 测试侧还有一条**反向断言**拦着它被调小（test/config.test.ts），那条断言里的账按新口径重算过。
+      dailyTokens: 50000000,
+      // 软阈值比例：到 上限×ratio 时先提示她收尾，越过才硬停（`budget-guard.ts`）。
+      // **语义不变**（"日软阈值 = 日额度 × ratio"），含义随口径更新：
+      //   日那一档：软 5e7 × 0.8 = **4e7 非缓存**，硬 5e7；
+      //   task 那一档：软 5e8 × 0.8 = **4e8 非缓存**，硬 5e8。
+      // 于是**日那一档是主力刹车**（5e7 < 5e8 ⇒ 日先响）：一个正常日子在她烧到 4e7 时先收到
+      // 一句软提示（尾部插播，不改已渲染历史），烧到 5e7 就拒绝唤醒。task 那一层退成"单个任务
+      // 跑得太久"的兜底（它比日额度宽 10 倍，正常任务在一天之内撞不到它）。
+      // 与更早的默认（task = daily = 1e8，日软阈值 80M 是名义值、真正起作用的是 task 那一层）
+      // 方向相反，是有意改的：预算只盯真花钱的那部分，而"一整天"该由日额度管。
+      // ⚠️ 这两档都是**启动参数：改完要重启进程才生效**（`config.budget` 整段如此）。
       softRatio: 0.8,
-      failStreakMax: 5,
+      failStreakMax: 20,
     },
     wake: {
-      heartbeatBaselineMin: 30,
-      idleBackoffMax: 8,
-      heartbeatFloorMin: 10,
+      heartbeatFloorMin: 5,
       heartbeatCeilMin: 60,
+      heartbeatTickMin: 1,
+      // 目标均值 30 分钟：出厂默认的节奏是"平均每半小时露一次面"。
+      // 参考量级：同一套分布形状在 5/60/1/15 那组参数下实测平均约 15 分钟醒一次
+      //（中位数 15，5% 分位 8，95% 分位 24）——30 就是把这个节奏放宽一倍，心跳开销也跟着减半。
+      // 它同时也是"没写过这个字段的人"的值。
+      heartbeatTargetMeanMin: 30,
       memoryMaintainCron: DEFAULT_MEMORY_MAINTAIN_CRON,
     },
     vision: {
@@ -703,6 +818,9 @@ function buildDefaults(dir: string): AppConfig {
     tools: {
       destructiveEnabled: false, groupSceneHardRefusal: false, planMode: false, disabled: [],
       askHumanTimeoutMin: DEFAULT_ASK_HUMAN_TIMEOUT_MIN,
+      // 默认**关**：见 ToolsConfig.taskEnabled 那一段（清单是冻结前缀的一部分，
+      // 加一件 = 一次缓存 miss + 常驻 token，所以要人显式要，而不是默认替所有人付）
+      taskEnabled: false,
     },
     // 默认一个路径都不指定：探测的三段顺序里"用户指定"是显式干预，
     // 默认值必须是"没干预"，否则框架自装目录与 PATH 就永远轮不到
@@ -853,6 +971,16 @@ function defaultDocument(dir: string): JsonObject {
       $comment: [
         '三层刹车 + 每日额度 + 软阈值（design.md §4.6）。全部跨重启累计。',
         'softRatio：达到 上限×ratio 时先提示模型收尾，越过才硬停。',
+        'taskTokens / dailyTokens 的口径是**非缓存**的 token 数 = (input − cacheHit) + output：',
+        '  只算输入里没命中缓存的那部分 + 输出，也就是"真花钱的那部分"。命中缓存的那一大截不算，',
+        '  因为心跳每拍约 97% 的输入都是缓存命中，按未扣缓存的口径算，计数器会飞快见顶。',
+        'dailyTokens 默认 50000000（5e7，单日非缓存预算）：心跳是**真实唤醒**（每拍真发一次请求去保温',
+        '  供方的前缀缓存），一天约 96 拍、每拍非缓存约 0.4 万 ⇒ 心跳自己约 0.35M/天，',
+        '  5e7 是它的约 140 倍——心跳只占零头，其余留给真实工作。',
+        '  参考量级：一个满负荷的工作日实测约 2M 非缓存（494 次调用），5e7 是它的约 25 倍。',
+        'taskTokens 默认 500000000（5e8，= 日额度的 10 倍）：让"日"那一层当主力刹车',
+        '  （日撞线 = 今天拒绝唤醒、task 撞线 = 这次任务收尾），所以 task 要比 daily 宽出量级去。',
+        '⚠️ 这里的额度由你自己定；上面两个是**出厂默认**，改完要重启进程才生效。',
       ],
       stepTools: d.budget.stepTools,
       turnSteps: d.budget.turnSteps,
@@ -863,14 +991,21 @@ function defaultDocument(dir: string): JsonObject {
     },
     wake: {
       $comment: [
-        '心跳基线 30 分钟，空拍按 2^n 退避、封顶 8 倍；任何外部事件到达即复位（design.md §4.12）。',
-        'heartbeatFloorMin / heartbeatCeilMin：间隔的实际下上下限（分钟）。退避再深也不超过 60 分钟不露面，压力再大也不短于 10 分钟一拍。',
+        '心跳是**概率**的：安静不足 heartbeatFloorMin 分钟绝不触发，到 heartbeatCeilMin 分钟必然触发，',
+        '中间每 heartbeatTickMin 分钟抽一次签，命中概率随安静时间单调上升（design.md §4.12）。',
+        '**改频率只需要改 heartbeatTargetMeanMin（目标均值，分钟）**——平均多久醒一次就写多少，',
+        '  曲线的形状指数 α 由它在启动时反解出来，不用（也不能）手调。',
+        '默认 5 / 60 / 1 / 30 分钟：安静不足 5 分钟绝不触发，到 60 分钟必然触发，中间每 1 分钟抽一次签。',
+        'heartbeatTargetMeanMin 必须**严格**落在 heartbeatFloorMin 与 heartbeatCeilMin 之间（否则启动报配置错），',
+        '  且落在 5~60 的合理范围内；它与 floor/ceil/tick 一样是**启动参数：改完要重启进程才生效**。',
+        'floor / ceil 仍然兜住两端：不管目标均值写多少，安静不足 floor 分钟绝不触发、到 ceil 分钟必然触发。',
+        '任何外部事件到达即复位安静计时。',
         'memoryMaintainCron：每日记忆整理的 cron（五段：分 时 日 月 周），默认凌晨 4 点；空串关闭该任务。',
       ],
-      heartbeatBaselineMin: d.wake.heartbeatBaselineMin,
-      idleBackoffMax: d.wake.idleBackoffMax,
       heartbeatFloorMin: d.wake.heartbeatFloorMin,
       heartbeatCeilMin: d.wake.heartbeatCeilMin,
+      heartbeatTickMin: d.wake.heartbeatTickMin,
+      heartbeatTargetMeanMin: d.wake.heartbeatTargetMeanMin,
       memoryMaintainCron: d.wake.memoryMaintainCron,
     },
     vision: {
@@ -922,10 +1057,17 @@ function defaultDocument(dir: string): JsonObject {
         'askHumanTimeoutMin：她用 ask_human 问了人之后多久没人答，就落一条「未批准、未拒绝」的事实'
           + '（human/expired）。它**不是**"超时怎么办"的默认动作——超时不批准、不拒绝、也不撤卡，'
           + '只是让她得知人可能不在机器旁，换不换方式找人是她自己的判断。',
+        'taskEnabled：**隔离子代理工具 `task`**（design §4.21），默认 false（不注册）。',
+        '  为什么默认关：工具清单是请求**冻结前缀**的一部分——多一件不只是每轮多付一份 schema，'
+          + '更是**清单一变就一次缓存 miss**（前缀之后的内容在服务端缓存里整段失效）。所以要人显式要。',
+        '  打开后：清单 24 → 25 件；她多一件能把「读一批文件再汇总」「与主线无关的调查」整块外包的工具'
+          + '（子代理独立上下文、预算从父扣减、默认不能再下派）。',
+        '  它是启动期读一次的参数：改完要重启进程才接管。',
       ],
       destructiveEnabled: d.tools.destructiveEnabled,
       planMode: d.tools.planMode,
       askHumanTimeoutMin: d.tools.askHumanTimeoutMin,
+      taskEnabled: d.tools.taskEnabled,
       disabled: [...d.tools.disabled],
     },
     deps: {
@@ -1302,6 +1444,49 @@ function pickGatewayUrlOptional(raw: JsonValue | undefined, where: string): stri
 }
 
 /**
+ * 心跳目标均值的**交叉校验**：必须严格落在安静下限与上限之间（floor < target < ceil）。
+ *
+ * 为什么这是一个**配置错**而不是"夹到区间里"：这个字段的含义是"平均多久醒一次"，
+ * 而安静不足 floor 分钟的那一段概率恒为 0——说"我要平均每 3 分钟醒一次，但 5 分钟内绝不触发"
+ * 是自相矛盾的，静默地把它夹成 6 分钟会让使用者以为自己调过了一个调不动的旋钮。
+ * 消息里必须**同时给出两个边界的值**（floor 与 ceil），否则拿到报错的人还得回去翻配置才知道
+ * 该改成什么；顺手把"能填的范围"与"另一条出路（改 floor/ceil）"也说出来。
+ *
+ * ⚠️ 报出来的"能填的范围"是**两条约束的交**：除了 floor < 目标 < ceil，本字段自身还限定
+ * 5~60（见 `HEARTBEAT_TARGET_MEAN_MIN/MAX`）。只报 `floor+1 ~ ceil−1` 会给出一个填进去仍然报错的
+ * 范围（例如 floor=20、ceil=90 时那个范围是 21~89，而 61 以上根本过不了外层校验）；
+ * 两条约束凑不出任何值时（floor ≥ 60 或 ceil ≤ 5）得如实说"先改 floor / ceil"。
+ *
+ * 两条边界之外还有一条**退化区间**：ceil ≤ floor（上限写反了，解析器已按"上限 = 下限"夹过）。
+ * 那种配置里分布只剩"到点必响"一个点，α 无意义，**不做这条校验**——既有夹取语义一个字不改
+ * （见上面 heartbeatCeilMin 的解析：`静默更久才是坏方向`）。
+ *
+ * `explicit`：使用者在配置里写过这个字段没有。没写过时报错要说明"这是代码默认值"——
+ * 否则消息会像是他自己填错了一个他从没碰过的数（例如只把 floor 调到 20 的那种配置）。
+ */
+function checkHeartbeatTargetMean(wake: WakeConfig, explicit: boolean): void {
+  const floor = wake.heartbeatFloorMin;
+  const ceil = wake.heartbeatCeilMin;
+  const target = wake.heartbeatTargetMeanMin;
+  if (!(ceil > floor)) return; // 退化区间：没有中间地带，也就没有"目标均值"可谈
+  if (target > floor && target < ceil) return;
+  // 两条约束的交：floor < 目标 < ceil **且** 5 ≤ 目标 ≤ 60
+  const low = Math.max(floor + 1, HEARTBEAT_TARGET_MEAN_MIN);
+  const high = Math.min(ceil - 1, HEARTBEAT_TARGET_MEAN_MAX);
+  const range = low <= high
+    ? `能填的是 ${low}~${high} 之间的整数分钟（floor < 目标 < ceil，且本字段限定 ${HEARTBEAT_TARGET_MEAN_MIN}~${HEARTBEAT_TARGET_MEAN_MAX}）`
+    : `当前 floor / ceil 下**没有任何合法取值**（floor < 目标 < ceil 与"本字段限定 ${HEARTBEAT_TARGET_MEAN_MIN}~${HEARTBEAT_TARGET_MEAN_MAX} 分钟"两条凑不到一起）`;
+  const origin = explicit ? '' : `（这个 ${target} 是**代码默认值**，你没在配置里写过 heartbeatTargetMeanMin）`;
+  throw new ConfigError(
+    `wake.heartbeatTargetMeanMin（心跳目标均值：平均多久醒一次，分钟）= ${target} 必须**严格**落在`
+    + `安静下限与上限之间，收到 floor = ${floor}、ceil = ${ceil}${origin}；${range}。两条出路：`
+    + `① 把 wake.heartbeatTargetMeanMin 改成上面那个范围里的整数；`
+    + `② 或者把 wake.heartbeatFloorMin（现在 ${floor}）调小 / wake.heartbeatCeilMin（现在 ${ceil}）调大。`,
+    'wake.heartbeatTargetMeanMin',
+  );
+}
+
+/**
  * 全量解析：把（已剔注释、已迁移的）文档逐字段合并到默认值上。
  * 缺字段 → 默认值；类型错 → ConfigError。所有相对路径以 `dir` 为基准解析为绝对路径。
  */
@@ -1336,14 +1521,14 @@ function parseAppConfig(doc: JsonObject, dir: string): AppConfig {
 
   const wakeRaw = objectOr(doc['wake'], 'wake');
   const wake: WakeConfig = {
-    heartbeatBaselineMin: pickInt(
-      wakeRaw['heartbeatBaselineMin'], 'wake.heartbeatBaselineMin', base.wake.heartbeatBaselineMin, 1,
-    ),
-    idleBackoffMax: pickInt(wakeRaw['idleBackoffMax'], 'wake.idleBackoffMax', base.wake.idleBackoffMax, 1),
     heartbeatFloorMin: pickInt(
       wakeRaw['heartbeatFloorMin'], 'wake.heartbeatFloorMin', base.wake.heartbeatFloorMin, 1,
     ),
     heartbeatCeilMin: 1,
+    heartbeatTickMin: pickInt(
+      wakeRaw['heartbeatTickMin'], 'wake.heartbeatTickMin', base.wake.heartbeatTickMin, 1,
+    ),
+    heartbeatTargetMeanMin: 1,
     memoryMaintainCron: pickCron(
       wakeRaw['memoryMaintainCron'],
       'wake.memoryMaintainCron',
@@ -1355,6 +1540,17 @@ function parseAppConfig(doc: JsonObject, dir: string): AppConfig {
     wake.heartbeatFloorMin,
     pickInt(wakeRaw['heartbeatCeilMin'], 'wake.heartbeatCeilMin', base.wake.heartbeatCeilMin, 1),
   );
+  // 抽签节奏不许超过下限：超过就不是"每分钟抽一次"，而是"下限被推后"，那会改掉分布的支撑下界
+  wake.heartbeatTickMin = Math.min(wake.heartbeatTickMin, wake.heartbeatFloorMin);
+  // 目标均值：外层先卡一个合理范围（5~60 分钟），"必须落在 (floor, ceil) 里"那条交叉校验在下面
+  wake.heartbeatTargetMeanMin = pickInt(
+    wakeRaw['heartbeatTargetMeanMin'],
+    'wake.heartbeatTargetMeanMin',
+    base.wake.heartbeatTargetMeanMin,
+    HEARTBEAT_TARGET_MEAN_MIN,
+    HEARTBEAT_TARGET_MEAN_MAX,
+  );
+  checkHeartbeatTargetMean(wake, wakeRaw['heartbeatTargetMeanMin'] !== undefined);
 
   const visionRaw = objectOr(doc['vision'], 'vision');
   const vision: VisionConfig = {
@@ -1441,6 +1637,9 @@ function parseAppConfig(doc: JsonObject, dir: string): AppConfig {
     ),
     // 只收非空字符串；去重后保持首次出现顺序（界面开关写入的顺序即名单顺序）
     disabled: pickToolNameList(toolsRaw['disabled'], 'tools.disabled', base.tools.disabled),
+    // 隔离子代理（design §4.21）。只收 true / false（`pickBoolean` 的纪律）：它是"要不要
+    // 多一件常驻工具"的开关，写成 "false" 或 0 在这里当场报错，而不是让它静默取默认值
+    taskEnabled: pickBoolean(toolsRaw['taskEnabled'], 'tools.taskEnabled', base.tools.taskEnabled),
   };
 
   const depsRaw = objectOr(doc['deps'], 'deps');

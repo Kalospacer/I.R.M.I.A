@@ -4,6 +4,7 @@ import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../format.dart';
 import '../theme.dart';
 import '../ui_kit.dart';
 import 'page_chrome.dart';
@@ -39,6 +40,13 @@ class _OverviewPageState extends State<OverviewPage> {
   List<_FrameworkNote>? notes;
   String? notesError;
   bool notesLoading = true;
+
+  /// 死信动作（重投 / 丢弃）上一次失败的原因。
+  ///
+  /// 为什么留在页面上而不是只弹一条 toast：toast 四秒就没了，而人真正需要读到的是
+  /// **为什么没成**（"seq 42 不在死信队列里"这种话得能对着卡再看一眼）。成功之后
+  /// 重新读页面时它自己清掉。
+  String? deadActionError;
 
   @override
   void initState() {
@@ -155,7 +163,20 @@ class _OverviewPageState extends State<OverviewPage> {
                     const SizedBox(height: 18),
                     const _SectionTitle('建议'),
                     CappedChildren(children: [
-                      for (final item in _advice) _AdviceCard(text: item, onTap: () => _goto('persona')),
+                      for (final item in _advice)
+                        _AdviceCard(
+                          key: ValueKey('advice-${item.id}'),
+                          advice: item,
+                          // 死信明细来自投影（`inputSeq` 的唯一来源，见 [_deadLetters]）；
+                          // 其余几条用不上，传空就是不改样子的老卡片
+                          deadLetters: _deadLetters,
+                          error: deadActionError,
+                          onRequeue: (seq) => unawaited(_requeue(seq)),
+                          onDiscard: (seq) => unawaited(_discard(seq)),
+                          // 死信那条自己有按钮 ⇒ 整卡不再是链接：正在瞄"重投"却点到卡面
+                          // 会被带去人格配置（其余几条保持原样）
+                          onTap: item.id == 'dead-letters' ? null : () => _goto('persona'),
+                        ),
                     ]),
                   ],
                   const SizedBox(height: 16),
@@ -190,18 +211,41 @@ class _OverviewPageState extends State<OverviewPage> {
     return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
   }
 
-  List<String> get _advice {
-    final out = <String>[];
+  /// 建议清单（服务端 `DashboardView.suggestions`，结构见 src/web/server.ts:549）。
+  List<_Advice> get _advice {
+    final out = <_Advice>[];
     final list = stats?['suggestions'];
     if (list is List) {
       for (final s in list.whereType<Map>()) {
-        final title = s['title']?.toString() ?? '';
-        final body = s['body']?.toString() ?? '';
-        if (title.isNotEmpty) out.add(body.isEmpty ? title : '$title：$body');
+        final item = _Advice.from(s);
+        if (item.title.isNotEmpty) out.add(item);
       }
     }
     if (stats?['personaIsSeed'] == true) {
-      out.add('人格资产未初始化：IDENTITY.md 仍为模板，先补全身份与语气。');
+      out.add(const _Advice(
+        id: 'persona-seed',
+        title: '人格资产未初始化：IDENTITY.md 仍为模板，先补全身份与语气。',
+      ));
+    }
+    return out;
+  }
+
+  /// 死信明细（`{inputSeq, claimCount, at}`），来自 `GET /api/projection`——本页为了磁贴与
+  /// 「待确认」本来就在取它（见 [load]）。
+  ///
+  /// **`inputSeq` 只能从这里来**：服务端那条建议（`Suggestion`）只有 id / level / title /
+  /// body / act，**不带 seq**；而投影里的 `deadLetters[]` 正是折叠结果，`requeue` 与
+  /// `discard` 要的就是它。所以这一页拿得到 seq——不必让服务端在建议里再塞一个字段，
+  /// 更不必猜一个写死的号。
+  ///
+  /// 认不出 seq 的条目一律丢掉：按钮得有一个**确定**的号才敢发（见 `_AdviceCard._deadRows`）。
+  List<_DeadLetter> get _deadLetters {
+    final raw = proj?['deadLetters'];
+    if (raw is! List) return const [];
+    final out = <_DeadLetter>[];
+    for (final item in raw.whereType<Map>()) {
+      final dead = _DeadLetter.from(item);
+      if (dead.seq > 0) out.add(dead);
     }
     return out;
   }
@@ -211,23 +255,69 @@ class _OverviewPageState extends State<OverviewPage> {
   /// 界面把自己的可执行路径一起发过去——脚本不该猜界面装在哪；给了路径它就连界面一起重启。
   /// 服务端会用 WMI 起一个**分离的** pwsh 去跑 tools/restart-agent.ps1（本进程不能自己重启
   /// 自己），并延迟两秒动手，好让这次回执先发回来。
+  ///
+  /// **反馈要说实话**（用户 2026-10-05：「点了没有反馈」+「所谓的'重启前后端'也没有重启
+  /// 前端」）：服务端的响应里有 `gui`（这次带没带界面路径）与 `scriptStarted`（脚本有没有
+  /// 真的起来，判据是它自己写的回执），三种结局的 toast **各不相同**：
+  ///   · 没读回执 ⇒ "没能确认：脚本没有留下回执"——**不说**"正在重启"；
+  ///   · 只重启后端 ⇒ 如实说"只重启了后端"；
+  ///   · 带路径且读了回执 ⇒ "正在重启前后端（界面会先关掉再起来）"。
+  ///
+  /// 回执先给一条**正在重启**的即时反馈，等后端回来之后再补一条"已就绪"——
+  /// 否则那 20 秒里人不知道点没点上（这正是"点了没有反馈"的现场）。
   Future<void> _restart() async {
     try {
-      await widget.state.api.post(
+      final result = await widget.state.api.post(
         '/api/commands/restart',
         {'guiExe': Platform.resolvedExecutable},
         confirm: 'restart',
       );
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('正在重启前后端（约 20 秒）')),
-        );
+      if (!mounted) return;
+      final map = result is Map ? result : const {};
+      final gui = map['gui'] == true;
+      final started = map['scriptStarted'] != false; // 老服务端没有这个字段 ⇒ 按"启动了"读
+      if (!started) {
+        // 服务端那句话本身就是给人读的（`restartNote`），原样贴出来
+        IrmiaToast.show(context, map['note']?.toString() ?? '重启没能确认：脚本没有留下回执。',
+            kind: ToastKind.error);
+        return;
       }
+      IrmiaToast.show(
+        context,
+        gui
+            ? '正在重启前后端（后端 + 界面，约 20 秒）：界面会先关掉，随后自己起来'
+            // toast 是纯文本，没有加粗：这里别写 Markdown 记号（`**…**` 会原样显示出来）
+            : '正在重启后端（约 20 秒）：界面不在本次动作范围内，它只是重连回来',
+      );
+      // 等它回来：`state.online` 在后端断开时转 false、回来后转 true（同一个心跳）。
+      // 只等一次"回来"，最多约 90 秒——超时也如实说，不假装"已就绪"。
+      unawaited(_announceReady());
     } catch (err) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('重启失败：$err')));
+        IrmiaToast.show(context, '重启失败：$err', kind: ToastKind.error);
       }
     }
+  }
+
+  /// 后端回来之后补一句"已就绪"（最多等约 90 秒；等不到就说等不到）。
+  Future<void> _announceReady() async {
+    final state = widget.state;
+    var sawOffline = false;
+    for (var i = 0; i < 90; i += 1) {
+      await Future<void>.delayed(const Duration(seconds: 1));
+      if (!mounted) return;
+      if (!state.online) sawOffline = true;
+      if (sawOffline && state.online) {
+        IrmiaToast.show(context, '已就绪：后端回来了', kind: ToastKind.success);
+        return;
+      }
+    }
+    if (!mounted) return;
+    IrmiaToast.show(
+      context,
+      sawOffline ? '后端还没回来（等了 90 秒）：看一眼 data/restart-trace.log' : '后端没有断开过：这次请求可能没生效',
+      kind: ToastKind.error,
+    );
   }
 
   Future<void> _resolve(String callId, String outcome) async {
@@ -242,6 +332,69 @@ class _OverviewPageState extends State<OverviewPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('标记失败：$err')));
       }
+    }
+  }
+
+  // ──────────────── 死信队列上那两颗按钮（重投 / 丢弃） ────────────────
+  //
+  // 这一对是用户 2026-10-05 卡住的那件事：建议卡写着"需要人工决定重投还是丢弃"，
+  // 而界面上既没有重投也没有丢弃（他的原话："我在哪里重投？"）。服务端两条命令都已经在
+  // 那条通道上（`requeue` 见 src/web/server.ts:3663），界面这边过去只是**没把它们摆出来**。
+
+  /// 重投一条死信 → `POST /api/commands/requeue {inputSeq}`（认领计数由服务端归零）。
+  Future<void> _requeue(int inputSeq) => _deadAction(
+        inputSeq: inputSeq,
+        verb: '重投',
+        path: '/api/commands/requeue',
+        done: '已重投 seq $inputSeq：它回到队列，下一拍重新认领',
+      );
+
+  /// 丢弃一条死信 → `POST /api/commands/discard {inputSeq}`。
+  ///
+  /// **不可逆，所以先问一次**。确认文案必须把两件事都说清（设计里"丢"从来不等于"抹掉"）：
+  /// 这条输入不会被重投、也不会被执行；而它**仍留在事件日志里**——日志是唯一真相源，
+  /// 这个动作只是让它退出待处理。
+  Future<void> _discard(int inputSeq) async {
+    final yes = await confirm(
+      context,
+      title: '丢弃这条死信？',
+      body: 'seq $inputSeq 不会被重投，也不会被执行——它就此退出待处理。\n'
+          '这次决定会写进日志：那条输入本身仍留在事件日志里，日后可以查。',
+      confirmLabel: '确认丢弃',
+      danger: true,
+    );
+    if (!yes) return; // 取消 = 什么都没决定：一个请求都不发
+    await _deadAction(
+      inputSeq: inputSeq,
+      verb: '丢弃',
+      path: '/api/commands/discard',
+      done: '已丢弃 seq $inputSeq：它不会再被执行，日志里仍留着那条输入',
+      // 短语 = 命令名（`restart` / `set-key` / `skill-remove` 那族的惯例）。服务端若把
+      // `discard` 登记成"不需要短语"（与 requeue 同级：只推进状态、不改能力边界），这个头
+      // 会被忽略；登记成需要时正好对上（表允许客户端多声明，见 CONFIRM_PHRASES 的注释）。
+      phrase: 'discard',
+    );
+  }
+
+  /// 死信动作的公共路径：发命令 → 成功就重读这一页（队列空了，那条建议自己消失）+ toast；
+  /// 失败**留在卡上**（toast 会自己消失，而"为什么没成"得能对着卡再读一遍）。
+  Future<void> _deadAction({
+    required int inputSeq,
+    required String verb,
+    required String path,
+    required String done,
+    String? phrase,
+  }) async {
+    if (mounted) setState(() => deadActionError = null);
+    try {
+      await widget.state.api.post(path, {'inputSeq': inputSeq}, confirm: phrase);
+      if (!mounted) return;
+      IrmiaToast.show(context, done, kind: ToastKind.success);
+      await load();
+    } catch (err) {
+      if (!mounted) return;
+      setState(() => deadActionError = '$verb seq $inputSeq 失败：$err');
+      IrmiaToast.show(context, '$verb失败：$err', kind: ToastKind.error);
     }
   }
 
@@ -315,8 +468,27 @@ class _HeroCard extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // 状态词与旁注都**照抄服务端**：
+                //   · `stateText` 说当刻在干什么（判据一处，见 src/web/server.ts 的 deriveState）；
+                //   · `stateNote` 说"曾经耗尽、现已恢复"这类**已经过去的那件事的下文**。
+                // 界面过去自己按 `paused` 拼"已暂停（预算耗尽）"，而那时候她早就跑起来了
+                // （用户 2026-10-05 报的假话）。现在这里一个字都不推断。
                 Text(state.stateText,
                     style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600)),
+                if (state.stateNote.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(Icons.history_rounded, size: 14, color: scheme.onSurfaceVariant),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(state.stateNote,
+                            style: TextStyle(fontSize: 12, height: 1.5, color: scheme.onSurfaceVariant)),
+                      ),
+                    ],
+                  ),
+                ],
                 const SizedBox(height: 4),
                 Text(state.subText, style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant)),
               ],
@@ -416,8 +588,14 @@ class _Tiles extends StatelessWidget {
       children: [
         Expanded(
           child: _Tile(
-            value: tokens >= 1000 ? '${(tokens / 1000).toStringAsFixed(1)}k' : '$tokens',
+            // 数字走**唯一那一处**格式化（`format.dart`，与 src/format/units.ts 逐字镜像）：
+            // 2705946 在这里与日志页都是 `2.7M`。过去这一行是内联三目（只会 k），
+            // 与日志页的 `_num()` 各写一遍——用户报的"同一个数两种写法"就是这么来的。
+            value: formatCompact(tokens),
+            // 卡面印紧凑写法、悬停给真数：`2705.9k` 那种写法既不统一、也没解决"看不到真数"
+            tooltip: '今日用量 ${budgetTokensTooltip(tokens)}',
             label: '今日用量',
+            metric: kBudgetMetricLabel,
             series: tokenSeries,
           ),
         ),
@@ -439,15 +617,24 @@ class _Tiles extends StatelessWidget {
 }
 
 class _Tile extends StatelessWidget {
-  const _Tile({required this.value, required this.label, this.series});
+  const _Tile({required this.value, required this.label, this.series, this.metric, this.tooltip});
   final String value;
   final String label;
   final List<double>? series;
 
+  /// 口径词（"非缓存口径"）：**只在"这个数计入预算"的磁贴上出现**——
+  /// 待确认、连续失败那些数不是 token，印口径词就是噪音。
+  final String? metric;
+
+  /// 悬停给原始精确值（见 [budgetTokensTooltip]）
+  final String? tooltip;
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Container(
+    final tooltip = this.tooltip;
+    final metric = this.metric;
+    final body = Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: scheme.surface,
@@ -462,7 +649,18 @@ class _Tile extends StatelessWidget {
               style: const TextStyle(
                   fontSize: 26, fontWeight: FontWeight.w600, fontFeatures: [FontFeature.tabularFigures()])),
           const SizedBox(height: 2),
-          Text(label, style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+          Row(
+            children: [
+              Flexible(child: Text(label, style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant))),
+              if (metric != null) ...[
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(metric,
+                      style: TextStyle(fontSize: 10.5, color: scheme.onSurfaceVariant.withValues(alpha: 0.85))),
+                ),
+              ],
+            ],
+          ),
           if (series != null && series!.isNotEmpty) ...[
             const SizedBox(height: 8),
             SizedBox(
@@ -476,6 +674,8 @@ class _Tile extends StatelessWidget {
         ],
       ),
     );
+    // 悬停才出现的真数：鼠标停在磁贴上即可（不用点、不用进日志页去对账）
+    return tooltip == null ? body : Tooltip(message: tooltip, child: body);
   }
 }
 
@@ -506,33 +706,192 @@ class _SectionTitle extends StatelessWidget {
   }
 }
 
+/// 一条建议：服务端 `Suggestion`（`src/web/server.ts:549`）的界面形态。
+///
+/// 为什么不再在取值时拼成一句话（原来的 `'$title：$body'`）：建议里的**动作**随后就丢了，
+/// 于是"死信队列非空"那条只留下一段正文——人读完只看到"需要人工决定重投还是丢弃"，
+/// 界面上却没有那两颗按钮（用户 2026-10-05："我在哪里重投？"）。这里原样留住结构，
+/// 由 [_AdviceCard] 决定摆成什么样。
+class _Advice {
+  const _Advice({required this.id, required this.title, this.body = ''});
+
+  /// 服务端给的稳定标识（如 `dead-letters`）：界面对某一条做特殊渲染时认它，不认正文措辞
+  final String id;
+
+  /// 主行（一句话）
+  final String title;
+
+  /// 次行（细节与下一步）
+  final String body;
+
+  /// 落在卡面上的那一行：`标题：细节`（没有细节时就只有标题）
+  String get text => body.isEmpty ? title : '$title：$body';
+
+  static _Advice from(Object? raw) {
+    final map = raw is Map ? raw.cast<String, dynamic>() : const <String, dynamic>{};
+    String text(String key) => map[key] == null ? '' : '${map[key]}';
+    return _Advice(id: text('id'), title: text('title'), body: text('body'));
+  }
+}
+
+/// 一条死信（`Projection.deadLetters[]`，见 `src/log/types.ts` 与 `src/state/fold.ts`）。
+class _DeadLetter {
+  const _DeadLetter({required this.seq, required this.claimCount, required this.at});
+
+  /// 那条输入的 seq——**重投与丢弃都发它**（服务端两条命令的载荷都是 `{inputSeq}`）
+  final int seq;
+
+  /// 认领了几次才进的死信（默认阈值 3，见 `runtime/recover.ts` 的 MAX_CLAIM_COUNT）
+  final int claimCount;
+
+  /// 进死信的时刻（ISO）
+  final String at;
+
+  /// 行首一句：`seq 42 · 认领 3 次 · 09-30 03:12`（时刻读不出来就不摆那一段）
+  String get line => 'seq $seq · 认领 $claimCount 次${at.isEmpty ? '' : ' · ${_noteStamp(at)}'}';
+
+  static _DeadLetter from(Object? raw) {
+    final map = raw is Map ? raw.cast<String, dynamic>() : const <String, dynamic>{};
+    return _DeadLetter(
+      seq: (map['inputSeq'] as num?)?.toInt() ?? 0,
+      claimCount: (map['claimCount'] as num?)?.toInt() ?? 0,
+      at: map['at'] == null ? '' : '${map['at']}',
+    );
+  }
+}
+
+/// 一条建议卡：一行正文 + （死信那条才有的）每条死信两颗按钮。
 class _AdviceCard extends StatelessWidget {
-  const _AdviceCard({required this.text, required this.onTap});
-  final String text;
-  final VoidCallback onTap;
+  const _AdviceCard({
+    super.key,
+    required this.advice,
+    this.deadLetters = const [],
+    this.error,
+    this.onRequeue,
+    this.onDiscard,
+    this.onTap,
+  });
+
+  final _Advice advice;
+
+  /// 死信明细：只有 `dead-letters` 那条用得上（它是 `inputSeq` 的唯一来源）
+  final List<_DeadLetter> deadLetters;
+
+  /// 上一次动作失败的原因；非空就摆在同一张卡上（toast 会自己消失，这句不会）
+  final String? error;
+
+  final void Function(int inputSeq)? onRequeue;
+  final void Function(int inputSeq)? onDiscard;
+
+  /// 卡面点击的去处；null = 这张卡不是链接（死信那条自己有按钮）
+  final VoidCallback? onTap;
+
+  /// 服务端那条建议的 id（`buildSuggestions` 里写死的 `dead-letters`）
+  static const kDeadLettersId = 'dead-letters';
+
+  bool get _isDeadLetters => advice.id == kDeadLettersId;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final body = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(advice.text, style: const TextStyle(fontSize: 13.5)),
+          if (_isDeadLetters) ..._deadRows(context),
+        ],
+      ),
+    );
+    final onTap = this.onTap;
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Material(
         color: scheme.surface,
         borderRadius: BorderRadius.circular(10),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: onTap,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: scheme.outlineVariant),
-            ),
-            child: Text(text, style: const TextStyle(fontSize: 13.5)),
-          ),
-        ),
+        child: onTap == null
+            ? body
+            : InkWell(
+                borderRadius: BorderRadius.circular(10),
+                onTap: onTap,
+                child: body,
+              ),
       ),
     );
+  }
+
+  /// 死信那几行：每条死信摆一个 seq 加两颗按钮（**重投** / **丢弃**）。
+  ///
+  /// 为什么按条摆而不是全卡只有一对按钮：**决定是按条做的**——两条死信可以一条重投、
+  /// 一条丢弃，而一对按钮只有一个 seq 可发。明细拿不到时（投影还没回来、或读失败）只给
+  /// 一行灰字：宁可说"没读到"，也不摆一颗点了不知道会动哪条的按钮。
+  List<Widget> _deadRows(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final rows = <Widget>[];
+    if (deadLetters.isEmpty) {
+      rows.add(const Padding(
+        padding: EdgeInsets.only(top: 6),
+        child: HintLine('没读到死信明细，刷新一次再看看。'),
+      ));
+    } else {
+      for (final dead in deadLetters) {
+        rows.add(Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  dead.line,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: scheme.onSurfaceVariant,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              TextButton(
+                key: ValueKey('dead-requeue-${dead.seq}'),
+                onPressed: onRequeue == null ? null : () => onRequeue!(dead.seq),
+                child: const Text('重投'),
+              ),
+              TextButton(
+                key: ValueKey('dead-discard-${dead.seq}'),
+                style: TextButton.styleFrom(foregroundColor: IrmiaTheme.danger),
+                onPressed: onDiscard == null ? null : () => onDiscard!(dead.seq),
+                child: const Text('丢弃'),
+              ),
+            ],
+          ),
+        ));
+      }
+    }
+    final error = this.error;
+    if (error != null) {
+      rows.add(Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.error_outline_rounded, size: 15, color: IrmiaTheme.danger),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                error,
+                key: const ValueKey('advice-action-error'),
+                style: const TextStyle(fontSize: 12.5, height: 1.5, color: IrmiaTheme.danger),
+              ),
+            ),
+          ],
+        ),
+      ));
+    }
+    return rows;
   }
 }
 
@@ -651,7 +1010,11 @@ class _ExternalSessionsCard extends StatelessWidget {
       // 它是**防误读**用的：不写它，"没有积累的消息"会被读成"她都看过了"，而真相可能是那些话
       // 根本没送到（见 docs/review.md「欠账：信箱在 QQ 官方通道下收不到东西」）。用户要求换成
       // 现在这句，所以那条限制目前不在这张卡上出现——它更像是通道的属性，落点记在修订清单 ②。
-      note: '经由消息适配器添加的会话。消息自动存入信箱，由 Agent 自行查看。',
+      //
+      // 2026-10-04 改准：原来是"消息**自动**存入信箱"——那也是我们这一侧单方面做不到的一句，
+      // 它把"官方 Bot 先把事件推给我们"这个前提说成了自动成立的事实（用户已确认根因就在平台侧的
+      // 权限/订阅设置）。改成"推给我们的"——进信箱这件事我们照旧做，推不推照实说是平台的事。
+      note: '经由消息适配器添加的会话。平台推给我们的消息存入信箱，由 Agent 自行查看。',
       children: [
         if (loading)
           const StateBlock.loading(hint: '正在读外部会话…')
@@ -678,9 +1041,14 @@ class _ExternalSessionsCard extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           // 一条未读都没有时**不摆那几行**：剩下的会是一屏"来过 N 条"的零信息行，
-          // 而安静是常态、不是异常——摘要行已经答了"她有几个群聊"，这里一句灰字收尾
+          // 而安静是常态、不是异常——摘要行已经答了"她有几个群聊"，这里一句灰字收尾。
+          //
+          // 2026-10-04 改准：光写"没有积累的消息"会被读成"没有消息"或"她都看过了"，
+          // 而真相可能是"**根本没送到**"（docs/review.md:934-939 记过这条；现场就是
+          // 平台没推非 @ 群消息）。所以把"信箱里是空的"与"要官方 Bot 先推给我们"一起写出来：
+          // 这句话的任务是防误读，宁可长一点，也不能让人把"没送到"当成"没有"。
           if (unread == 0)
-            _hintLine('没有积累的消息。')
+            _hintLine('没有积累的消息（信箱里是空的；群里没 @ 她的消息，要官方 Bot 先推给我们才进得来）。')
           else
             CappedChildren(children: [
               for (var i = 0; i < list.length; i += 1) _SessionLine(row: list[i], divider: i > 0),
@@ -758,6 +1126,7 @@ class _FrameworkNote {
     required this.chatType,
     required this.name,
     required this.at,
+    required this.historical,
   });
 
   /// `injection` / `alarm` / `cache-break` / `context`。
@@ -794,6 +1163,17 @@ class _FrameworkNote {
   final String? name;
   final String at;
 
+  /// **这一条是历史**（它后来被一条"已恢复"销掉了）。
+  ///
+  /// 判据来自服务端：`/api/framework-notes` 按 `alarm/sent` 上的 `key` 把"报警"与"已恢复"
+  /// 配了对，配上的那条带 `recovered` + `historical`（见 `web/server.ts` 的
+  /// `pairedRecoveries`）。界面**不推断**——不跟后续事件比时间、也不看标题里"已恢复"三个字；
+  /// 那三个字的判断在服务端一处（配对表），这里只负责把它渲染成"历史"。
+  ///
+  /// 用户 2026-10-05 的现场：一条 17:33 的「预算耗尽（任务 token）」以"严重"在最上面挂了
+  /// 一整天，而它当天就解除了——旧状态没被解除的读感，一半来自这里。
+  final bool historical;
+
   static _FrameworkNote from(Object? raw) {
     final map = raw is Map ? raw.cast<String, dynamic>() : const <String, dynamic>{};
     String text(String key) {
@@ -803,11 +1183,18 @@ class _FrameworkNote {
 
     final quotes = map['quotes'];
     final kind = text('kind');
+    // 服务端配对过的"已恢复"原始告警：`recovered`（等级降级）与 `historical`（渲染成历史）
+    // 一起给。只认 `recovered` 的旧服务端也能用——那时按"提示"渲染，只是不写"历史"两个字。
+    final recovered = map['recovered'] == true;
     return _FrameworkNote(
       // 认不出就退回 'alarm' 的老口径（"框架自身的一条提示"），不丢条目
       kind: kind.isEmpty ? 'alarm' : kind,
       label: text('label'),
-      level: text('level'),
+      // 等级只认服务端给的字段：它标了「已恢复」（`alarm/sent` 的 `recovered`，见
+      // src/log/types.ts 与 src/alert/notifier.ts）就按 info 渲染——恢复不是事故，
+      // 红色严重留给**还没好的**那件事。界面**不推断**（不跟后续事件比时间、也不看
+      // 标题里"已恢复"那三个字）。
+      level: recovered ? 'info' : text('level'),
       title: text('title'),
       reason: text('reason'),
       quotes: quotes is List ? [for (final quote in quotes) '$quote'] : const [],
@@ -818,6 +1205,7 @@ class _FrameworkNote {
       chatType: text('chatType'),
       name: text('name').isEmpty ? null : text('name'),
       at: text('at'),
+      historical: map['historical'] == true,
     );
   }
 
@@ -838,18 +1226,30 @@ class _FrameworkNote {
 
   /// 徽章文案：类别 + （告警才有的）等级。其余三类只摆类别词——
   /// 它们各自的等级是固定的（注入预警恒 warn、归因恒 info），再缀一个等级只是噪音。
+  ///
+  /// **已恢复的那条原始告警写「已恢复 · 历史」**（用户 2026-10-05 的第三条意见）：
+  /// 它说的是"这条曾经是严重的事故，现在已经好了"，而不是"现在正严重着"。
+  /// 徽章上必须一眼分得出来——否则人扫一眼列表仍然以为那件事还挂着。
   String get badgeText {
+    if (historical) return label.isEmpty ? '已恢复 · 历史' : '$label · 已恢复 · 历史';
     if (!isAlarm) return label.isEmpty ? '框架提示' : label;
     return label.isEmpty ? levelLabel : '$label · $levelLabel';
   }
 
-  /// 等级取色：与设置页徽章同一套语义色，不另造色板；认不出的等级走中性灰
-  Color tone(ColorScheme scheme) => switch (level) {
-        'critical' => IrmiaTheme.danger,
-        'warn' => IrmiaTheme.warn,
-        'info' => scheme.primary,
-        _ => scheme.onSurfaceVariant,
-      };
+  /// 等级取色：与设置页徽章同一套语义色，不另造色板；认不出的等级走中性灰。
+  ///
+  /// **历史条目走中性灰**（哪怕它的 `level` 字段仍是 `critical` 的原值）：
+  /// 那个字段说的是"当时它是什么级别"，而现在它已经不是当前问题了。
+  /// 用红色画一条早就好了的事故，就是在屏幕上说谎。
+  Color tone(ColorScheme scheme) {
+    if (historical) return scheme.onSurfaceVariant;
+    return switch (level) {
+      'critical' => IrmiaTheme.danger,
+      'warn' => IrmiaTheme.warn,
+      'info' => scheme.primary,
+      _ => scheme.onSurfaceVariant,
+    };
+  }
 
   /// 来源一行：哪个会话、谁、判定来自哪一级；框架自身的事没有会话。
   /// 名字解析不出就退回 openid（与外部会话卡、与 `render.ts` 同一条纪律：不编名字）。
@@ -894,6 +1294,15 @@ class _FrameworkNotesCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final list = notes ?? const <_FrameworkNote>[];
+    // **当前问题排在历史之前**（同组内保持服务端给的时间倒序）。
+    //
+    // 为什么要有这个分组：服务端按时间倒序给，而"已恢复 · 历史"那条往往比当前问题**更晚**
+    // （它刚刚才被销账）——不分组的话它会顶在最上面，人扫一眼看到的仍然是那条旧事故
+    // （用户 2026-10-05 报的"还以'严重'挂在最上面"正是这个形状）。
+    // 排序只改**顺序**，一条都不删：历史仍在这张卡里，只是沉到当前问题下面。
+    final current = [for (final note in list) if (!note.historical) note];
+    final history = [for (final note in list) if (note.historical) note];
+    final ordered = [...current, ...history];
     return _Card(
       title: '框架提示',
       // 用户 ②：这张卡不要副标题（原来那句是"外部消息里的注入迹象，以及框架自己发出的告警。"）。
@@ -913,7 +1322,7 @@ class _FrameworkNotesCard extends StatelessWidget {
           _hintLine('没有需要你知道的事。')
         else
           CappedChildren(children: [
-            for (var i = 0; i < list.length; i += 1) _NoteLine(note: list[i], divider: i > 0),
+            for (var i = 0; i < ordered.length; i += 1) _NoteLine(note: ordered[i], divider: i > 0),
           ]),
       ],
     );

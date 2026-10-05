@@ -14,7 +14,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { emptyProjection, type Projection } from '../src/log/types.ts';
+import { BUDGET_ACCOUNTING_VERSION, emptyProjection, type Projection } from '../src/log/types.ts';
 import {
   PROJECTION_CACHE_FILE,
   PROJECTION_CACHE_VERSION,
@@ -46,6 +46,9 @@ function sampleProjection(): Projection {
     openTools: [{ callId: 'call_a1', name: 'http_get', sideEffect: 'none', callSeq: 4 }],
     needsReview: [{ callId: 'call_b2', name: 'shell', at: '2026-09-29T14:00:00.000+08:00' }],
     budget: {
+      // 口径版本：缓存要参与折叠，就必须说明这份累计是按哪一版口径折的（见 log/types.ts）。
+      // 缺它 = 不认识 ⇒ 载入层判不可用（重建），这条契约由下面的"旧口径"用例钉住。
+      budgetVersion: BUDGET_ACCOUNTING_VERSION,
       tokensToday: 120,
       tokensTodayHeavy: 0,
       tokensTodayLight: 120,
@@ -215,18 +218,55 @@ test('state 形状大体不对（缺关键字段/类型错）返回 null', async
   }
 });
 
-test('信封版本不认识时丢弃（不猜未知字段语义），版本缺失则按当前版本接受', async () => {
+test('信封版本不认识时丢弃（不猜未知字段语义）', async () => {
   const dir = await makeTempDir();
   const path = join(dir, PROJECTION_CACHE_FILE);
   const projection = sampleProjection();
   try {
     await writeFile(path, JSON.stringify({ version: 99, lastSeq: projection.lastSeq, state: projection }), 'utf8');
     assert.equal(await loadProjectionCache(dir), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
+test('信封版本缺失：不再按当前版本接受——它只可能来自换口径之前那一版代码', async () => {
+  // 这条契约 2026-10-05 刻意反转（原来是"版本缺失则按当前版本接受"）。
+  // 理由：`budget` 那几格是**累计量**，一半按旧算式、一半按新算式就没法对账；
+  // 而"没有版本号"正是旧文件的特征。宁可做一次全量重放，也不许把旧账续进新账。
+  const dir = await makeTempDir();
+  const path = join(dir, PROJECTION_CACHE_FILE);
+  const projection = sampleProjection();
+  try {
     await writeFile(path, JSON.stringify({ lastSeq: projection.lastSeq, state: projection }), 'utf8');
-    const cache = await loadProjectionCache(dir);
-    assert.equal(cache?.lastSeq, projection.lastSeq);
-    assert.deepEqual(cache?.state, projection);
+    assert.equal(await loadProjectionCache(dir), null, '旧文件（无信封版本）⇒ 丢弃、重建');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('投影里的口径版本缺失或过期：整份丢弃（累计量跨不了口径）', async () => {
+  const dir = await makeTempDir();
+  const path = join(dir, PROJECTION_CACHE_FILE);
+  try {
+    // ① 信封是当前版本，但 state 里没有 budgetVersion（旧口径写的投影）
+    const stale = sampleProjection();
+    delete (stale.budget as { budgetVersion?: number }).budgetVersion;
+    await writeFile(path, JSON.stringify({ version: PROJECTION_CACHE_VERSION, lastSeq: stale.lastSeq, state: stale }), 'utf8');
+    assert.equal(await loadProjectionCache(dir), null, 'budgetVersion 缺失 ⇒ 不认识 ⇒ 重建');
+
+    // ② budgetVersion 是别的版本号（换口径那一刻盘上的样子）
+    const older = sampleProjection();
+    older.budget = { ...older.budget, budgetVersion: BUDGET_ACCOUNTING_VERSION - 1 };
+    await writeFile(path, JSON.stringify({ version: PROJECTION_CACHE_VERSION, lastSeq: older.lastSeq, state: older }), 'utf8');
+    assert.equal(await loadProjectionCache(dir), null, 'budgetVersion 过期 ⇒ 重建（这就是现场那两个数量级差异的来源）');
+
+    // ③ 当前版本则照常命中（别把判据做成"永远重建"）
+    const fresh = sampleProjection();
+    await writeFile(path, JSON.stringify({ version: PROJECTION_CACHE_VERSION, lastSeq: fresh.lastSeq, state: fresh }), 'utf8');
+    const loaded = await loadProjectionCache(dir);
+    assert.equal(loaded?.lastSeq, fresh.lastSeq);
+    assert.deepEqual(loaded?.state, fresh);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

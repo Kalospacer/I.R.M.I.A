@@ -24,6 +24,7 @@ import { EventLog } from '../src/log/event-log.ts';
 import type { AppEvent, Projection } from '../src/log/types.ts';
 import { advanceWatermark, FakeLoop, maxTurnOfLog } from '../src/runtime/loop.ts';
 import { recover } from '../src/runtime/recover.ts';
+import { PROJECTION_CACHE_VERSION } from '../src/state/projection-cache.ts';
 import { ManualWatchSource, TimerWakeSource, WAKE_WATCH_DIR_NAME, wakeSourceOfType } from '../src/wake/sources.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
 
@@ -327,7 +328,10 @@ test('投影缓存走 projection-cache 信封，带 version/lastSeq/state', asyn
   await loop.writeProjectionCache();
 
   const empty = JSON.parse(readFileSync(join(fx.dataDir, 'projection.json'), 'utf8'));
-  assert.equal(empty.version, 1);
+  // 版本读常量而不是写死数字：口径一变（`PROJECTION_CACHE_VERSION` 与 `SNAPSHOT_VERSION`
+  // 一起抬，见 state/projection-cache.ts 的文件头）这条就不该再红——它要钉的是
+  // "落盘走的是同一套信封"，而不是那个数字本身
+  assert.equal(empty.version, PROJECTION_CACHE_VERSION);
   assert.equal(empty.lastSeq, 0);
   assert.equal(empty.state.watermark, 0);
 

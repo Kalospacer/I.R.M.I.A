@@ -19,12 +19,41 @@
  * 找不到文件 = 没有这个人：不注入、不报错、不猜。
  */
 import type { AppEvent } from '../log/types.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { lookupBySid, parseAliases, sidOf } from '../channel/sessions.ts';
 import { loadRelationship } from './loader.ts';
 
 /** 只有这三种唤醒可能带人（其余唤醒类型一律不注入档案） */
 const PERSON_WAKE_TYPES: ReadonlySet<string> = new Set([
   'wake/webhook', 'wake/manual', 'wake/channel',
 ]);
+
+/**
+ * 用**她已经维护的那份 sid→名字 表**（`MEMORIES/aliases.md`）把一个渠道身份解析成人名。
+ *
+ * 为什么需要这一步（2026-10-05 实测的真 bug）：档案文件名是**人名**（`RELATIONSHIPS/OWNER.md`），
+ * 而 QQ 单聊那条唤醒里的 `person` 是 **openid**（`E7FEC35E…`）——直接拿 openid 找文件必然找不到，
+ * 于是**他在 QQ 单聊里说话时不注入档案，在 GUI 里说话却注入**。同一件事两个样子，是这轮要修的。
+ *
+ * 判据只做一处：sid 的新旧写法兼容与查找顺序**复用** `channel/sessions.ts` 的
+ * `sidLookupKeys` / `lookupBySid`，这里不另写一份（两处各写一份的话，漂移的方向恰好最坏：
+ * 表里有、这里找不到 → 每一条都当"没这个人"）。
+ */
+function aliasNameFor(dataDir: string, sid: string): string | null {
+  try {
+    const text = readFileSync(join(dataDir, 'workspace', 'MEMORIES', 'aliases.md'), 'utf8');
+    const flat = new Map<string, string>();
+    for (const [key, value] of parseAliases(text)) {
+      if (value.name !== '') flat.set(key, value.name);
+    }
+    const hit = lookupBySid(flat, sid);
+    return hit === undefined ? null : hit;
+  } catch {
+    // 没有这份表（或读不动）= 没有额外线索：不注入、不报错、不猜（与"找不到文件"同一条纪律）
+    return null;
+  }
+}
 
 export interface RelationshipNote {
   who: string;
@@ -44,14 +73,26 @@ export function relationshipForWake(
     const content = loadRelationship(dataDir, person);
     if (content !== null) return { who: person, content };
   }
-  // 发言者没有档案时，**退一步看这个会话本身**有没有。
+  // ② **把渠道身份解析成人名再找一次**（2026-10-05 修）：`person` 在 QQ 那条路上是 openid，
+  //    而档案文件名是人名（`RELATIONSHIPS/OWNER.md`）——不做这一步，他在 QQ 单聊里说话就
+  //    没有档案，在 GUI 里说话却有。同一个人两个样子，是这轮要修的 bug。
+  const channel = typeof data['channel'] === 'string' ? data['channel'].trim() : '';
+  const chatType = typeof data['chatType'] === 'string' ? data['chatType'].trim() : '';
+  const chatId = typeof data['chatId'] === 'string' ? data['chatId'].trim() : '';
+  if (person !== '' && channel !== '' && chatType !== '' && chatId !== '') {
+    const aliasName = aliasNameFor(dataDir, sidOf(channel, chatType, chatId));
+    if (aliasName !== null && aliasName !== person) {
+      const content = loadRelationship(dataDir, aliasName);
+      if (content !== null) return { who: aliasName, content };
+    }
+  }
+  // ③ 发言者没有档案时，**退一步看这个会话本身**有没有。
   //
   // 为什么需要这一步：群消息的 `person` 是**发言者**，而一个刚冒头的人在群里说话，
   // 按 person 查必然查不到——于是那个群自己的档案（她可能早写过"这群一贯聊装机，
   // 气氛还行"）永远注入不进来。用户要的是"她自己维护群聊与某个人的画像"，
   // 这两层得都能落到眼前。会话级档案与话题（`channel/topic`）分工也清楚：
   // 话题是"现在在聊什么"（框架自动概括、有时效），会话档案是"这里一贯如何"（她写的、长期）。
-  const chatId = typeof data['chatId'] === 'string' ? data['chatId'].trim() : '';
   if (chatId !== '' && chatId !== person) {
     const content = loadRelationship(dataDir, chatId);
     if (content !== null) return { who: chatId, content };

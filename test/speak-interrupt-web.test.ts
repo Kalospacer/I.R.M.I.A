@@ -20,13 +20,16 @@
  *   • 接上通报口 → 插话之后剩下的气泡一条都不发（已发的不受影响）；
  *   • 摘掉通报口 → 应发的段**一条不少全发**（复现事故。这条是回归哨兵：缝再被撕开就会红）。
  *
- * ──────────────────── 2026-10-05：夹具压回 `SPEAK_SEGMENT_MAX` 以内 ────────────────────
+ * ──────────── 2026-10-05：夹具必须落在"硬门"以内（`SPEAK_TEXT_MAX` = 40） ────────────
  *
- * `speak` 现在**超过 45 字就不自动分段**（整条一次发出）。这条用例原来的夹具 107 字，
- * 于是整段只发一条：界面插话永远落在**唯一那条**之后、"说到一半被打断"这件事根本没发生，
- * 断言跟着变成空转（实测：`bubbles.length` = 1，而它在等 9）。夹具改成 4 段共 35 字，
+ * `speak` 现在**超过 40 字直接拒绝**（不截断、不照发，一个字都不发出去）。这条用例原来的夹具
+ * 107 字，于是整段被拒：一次 speak 都没发生，界面插话当然也没落库——断言跟着变成空转
+ * （实测：`bubbles.length` = 0、`wake` 停在 null，而它在等 9）。夹具改成 4 段共 33 字，
  * 段数由 `expectedSegments` **按实现算出来**（不再写死 9）——这条用例要守的是
  * "**界面插话这条投递链是通的**（消息真的落库、每条都出去了）"，不是"必须切成九条"。
+ *
+ * 早先那条"超过 45 字就不分段"的口径已被用户取消（2026-10-05）：超长改由硬门拦在**进 speak
+ * 之前**，门内的文本照旧分段——所以这里要防的不再是"不分段"，而是"整段被拒"。
  */
 
 import assert from 'node:assert/strict';
@@ -40,7 +43,7 @@ import { EventLog } from '../src/log/event-log.ts';
 import type { AppEvent, Projection } from '../src/log/types.js';
 import { defaultVisibility, emptyProjection } from '../src/log/types.ts';
 import { applyOne, finalizePressure } from '../src/state/fold.ts';
-import { createAdminTools, setSleepForTest } from '../src/tools/admin.ts';
+import { createAdminTools, setSleepForTest, SPEAK_TEXT_MAX } from '../src/tools/admin.ts';
 import type { ToolContext } from '../src/tools/types.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
 import { startWebServer, type WebServer } from '../src/web/server.ts';
@@ -48,10 +51,10 @@ import { startWebServer, type WebServer } from '../src/web/server.ts';
 const TEST_TOKEN = 'test-token-0123456789abcdef';
 
 /**
- * 她这一口气要说的话：四个逗号段，切成四条气泡（35 字，压在 `SPEAK_SEGMENT_MAX` = 45 以内）。
+ * 她这一口气要说的话：四个逗号段，切成四条气泡（33 字，落在硬门 `SPEAK_TEXT_MAX` = 40 以内）。
  *
- * 事故那轮是 9 条（seq 15491…15509）；这里减到 4 条是 2026-10-05 的连带修改——超过 45 字
- * `speak` 就不分段了，107 字的老夹具只会整条发一条，"人插话时说到一半"这件事随之消失
+ * 事故那轮是 9 条（seq 15491…15509）；这里减到 4 条是 2026-10-05 的连带修改——107 字的老夹具
+ * **超过 40 字会被 speak 直接拒绝**（一个字都发不出），"人插话时说到一半"这件事随之消失
  * （见文件头那段）。四条足够：插话落在第二条之后，还剩两条没发。
  */
 const HER_SPEECH = [
@@ -61,20 +64,18 @@ const HER_SPEECH = [
 /**
  * 这一次发言**应该**发出去几条气泡——按实现算出来的，不写死。
  *
- * 口径就是 `speak` 的分段判据（`src/tools/admin.ts`）：整段超过 `SPEAK_SEGMENT_MAX` 字时
- * 不分段（一条整发），否则按中文逗号断开、摘掉标点。这里刻意不 import `splitForChat`：
- * 要钉的是"**应发的段一条不少**"，把被测实现搬进算式里，规则一旦被改坏，这个数会跟着变坏
- * 而断言照样绿——那就成了自己给自己作证。所以只按上面那条口径数逗号段。
- * 夹具长度也在这里钉一次：它必须落在 45 以内，否则"说到一半"这件事又会消失。
+ * 口径就是 `speak` 现在的分段规则（`src/tools/admin.ts` 交给 `chat-split.ts`）：**门内的文本
+ * 照旧按中文逗号断开、摘掉标点**（"超过多少字就不分段"那条口径已被用户取消，所以这里没有
+ * 任何按长度分岔的算法）。刻意不 import `splitForChat`：要钉的是"**应发的段一条不少**"，
+ * 把被测实现搬进算式里，规则一旦被改坏、这个数会跟着变坏而断言照样绿——那就成了自己给自己
+ * 作证。所以只按上面那条口径数逗号段。
  */
-const expectedSegments = [...HER_SPEECH].length > 45
-  ? 1
-  : HER_SPEECH.split('，').length;
+const expectedSegments = HER_SPEECH.split('，').length;
 // 夹具长度用**关系**钉，不写死数字：写死 33 那种数只会在改夹具时徒增一次无关的红色，
-// 而这里真正要守的是"整段落在 45 以内"（超了就不分段，"说到一半"随之消失）。
+// 而这里真正要守的是"整段落在硬门以内"（超了整段被拒，一次 speak 都不会发生）。
 assert.ok(
-  [...HER_SPEECH].length <= 45,
-  `夹具 ${[...HER_SPEECH].length} 字超过分段上限 45：整段会一次发出，"说到一半"测不出来`,
+  [...HER_SPEECH].length <= SPEAK_TEXT_MAX,
+  `夹具 ${[...HER_SPEECH].length} 字超过硬门 ${SPEAK_TEXT_MAX}：整段会被 speak 拒绝，"说到一半"测不出来`,
 );
 assert.ok(expectedSegments > 2, `夹具要能切出多段才测得出打断，实际 ${expectedSegments} 段`);
 
@@ -298,9 +299,9 @@ test('界面插话打断她正在说的那半截话：已发的不受影响，�
     `插话之后最多再出去一条，实际出去了 ${out.bubbles.length - out.bubblesWhenOwnerSpoke} 条：`
     + out.bubbles.join('／'),
   );
-  // **这条是夹具的活性锁**：夹具一旦长过 `SPEAK_SEGMENT_MAX`（或分段规则再变），整段会一次
-  // 发出、插话落在唯一那条之后——打断分支根本不进，这条会红在"应发的还有没发完"上，
-  // 而不是让用例静悄悄地变成空转（实测踩过一次：`bubbles.length` = 1 却还在等 9）。
+  // **这条是夹具的活性锁**：夹具一旦长过硬门（`SPEAK_TEXT_MAX` = 40），整段会被 speak 直接
+  // 拒绝、一次发言都不会发生——这条会红在"应发的还有没发完"上，而不是让用例静悄悄地
+  // 变成空转（实测踩过两次：夹具 107 字时 `bubbles.length` = 0、`wake` 停在 null 却还在等 9）。
   assert.ok(
     out.bubbles.length < expectedSegments,
     `插话必须落在发言中途：应发 ${expectedSegments} 段，实际已经全发完了 ${out.bubbles.length} 条`,

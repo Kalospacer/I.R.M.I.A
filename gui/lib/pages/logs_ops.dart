@@ -355,8 +355,8 @@ extension _LogsOps on _LogsPageState {
           if (usage != null) ...[
             const SizedBox(height: 6),
             Text(
-              '当时用量：输入 ${_num(_int(usage['inputTokens']))} · 输出 ${_num(_int(usage['outputTokens']))}'
-              ' · 命中 ${_num(_int(usage['cacheHitTokens']))} · 耗时 ${_int(usage['durationMs'])}ms'
+              '当时用量：输入 ${logsCompactTokens(_int(usage['inputTokens']))} · 输出 ${logsCompactTokens(_int(usage['outputTokens']))}'
+              ' · 命中 ${logsCompactTokens(_int(usage['cacheHitTokens']))} · 耗时 ${_int(usage['durationMs'])}ms'
               ' · ${usage['model'] ?? ''} (${usage['lane'] ?? ''})',
               style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant),
             ),

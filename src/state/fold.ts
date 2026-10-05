@@ -10,7 +10,15 @@ import type {
 } from '../log/types.js';
 // 值导入必须带 .ts：Node 的 --experimental-strip-types 只擦类型、不改写路径解析，
 // 写 .js 会 ERR_MODULE_NOT_FOUND（tsc 输出时由 rewriteRelativeImportExtensions 改回 .js）。
-import { emptyProjection, humanAskSourceOf, planFingerprint } from '../log/types.ts';
+import { emptyProjection, humanAskSourceOf, planFingerprint, BUDGET_ACCOUNTING_VERSION } from '../log/types.ts';
+
+/**
+ * 预算口径版本——转出去给恢复层（`state/projection-cache.ts` / `state/snapshot.ts`）用：
+ * 它校验派生状态里的 `budget.budgetVersion` 与这一份是否相等，不等则整份丢弃、从事件重放。
+ *
+ * 定义在 `log/types.ts`（投影形状的家），这里只是转出 + 盖章，不另立一份编号。
+ */
+export { BUDGET_ACCOUNTING_VERSION };
 
 const DEDUPE_WINDOW = 1000;
 /** 距上次发言超过此时长（毫秒）计入压力 */
@@ -64,28 +72,107 @@ export function applySubagentEvent(p: Projection, e: AppEvent): void {
     case 'budget/topped-up':
     case 'budget/resumed':
       delete p.lastExhausted[e.data.layer];
+      // 解除 task 层暂停 = 那次任务结束 ⇒ 单任务累计归零（见 applyTaskBoundary 的说明）
+      applyTaskBoundary(p, e.data.layer);
       break;
     default:
       break; // 归属别的 turn 链，父层无从得知也不需要知道
   }
 }
 
+/**
+ * **预算口径：只算没命中缓存的那部分**（2026-10-05 用户换的口径）——**唯一一处定义**。
+ *
+ * 用户原话（逐字抄，这一批的根据）：
+ *
+ *   > 「另外单日预算改成只算不命中缓存的部分吧。单日非缓存预算 2M，妥善改完，不要不协调。」
+ *
+ * **为什么换**：心跳改成"真实唤醒"之后，每 5~15 分钟一次 heavy、每次约 4.5 万 input，
+ * 而其中**约 97% 是缓存命中**（每一拍刻意共用同一份冻结前缀去保温供方的前缀缓存，
+ * 见 docs/design.md §4.12）。旧口径把命中那 97% 也算进预算 ⇒ 计数器飞快见顶、
+ * "预算耗尽"天天响，而**真实花销很小**。新口径只盯"真花钱的那部分"。
+ *
+ * **定义**（`budget.dailyTokens` / `budget.taskTokens` / 投影里的三个累计量 / 所有读数都走这一条）：
+ *
+ *     计入预算的 token = (inputTokens − cacheHitTokens) + outputTokens
+ *
+ * 也就是"**输入里没命中缓存的那部分 + 输出**"。两条边界要写清：
+ *   · **输出一律计入**：输出没有缓存一说，每一次都按全价计（它本来就是"新生成的那部分"）。
+ *   · **只此两项，不含别的**。理由逐条：供方返回的 reasoning / 思维链 token 已经并进
+ *     `outputTokens`（本仓库没有第三个计数通道，`DsUsage` 只有 input/output/cached 三个数）；
+ *     上下文压缩、记忆整理这些**内部调用**各自是一条 `budget/consumed`（一步一条），
+ *     天然按同一口径计入，不需要另设一项；重试失败的调用写的是全 0（`agent-loop.failStep`），
+ *     加不加都不改变结果。
+ *
+ * **它读的是 `inputTokens − cacheHitTokens`，不是事件自带的 `cacheMissTokens`**：
+ * 事件是外部输入（手写日志、旧日志都可能自相矛盾——`cacheMissTokens ≠ input − cacheHit`），
+ * 判据必须由一个不依赖"别人写对没有"的算式给出。`cacheMissTokens` 照旧折进
+ * `cacheMissToday`（它是**记录**，喂"缓存命中率"那条观测），不参与预算判定。
+ *
+ * **不许在别处再写一遍这个算式**：`runtime/doctor.ts` 的 I7 自检、`web/server.ts` 的
+ * 趋势线/按天分桶都引这一个函数（两处各写一遍 = 前一天那个"两套数"的 bug 原样复发）。
+ */
+export function budgetTokensOf(d: {
+  inputTokens: number;
+  cacheHitTokens: number;
+  outputTokens: number;
+}): number {
+  const input = Number.isFinite(d.inputTokens) ? Math.max(0, d.inputTokens) : 0;
+  const hit = Number.isFinite(d.cacheHitTokens) ? Math.max(0, d.cacheHitTokens) : 0;
+  const output = Number.isFinite(d.outputTokens) ? Math.max(0, d.outputTokens) : 0;
+  // 命中数不许超过输入数（坏日志里出现过）：夹一下，宁可算 0 也不许算出负数把预算倒着走
+  return Math.max(0, input - Math.min(hit, input)) + output;
+}
+
 /** `budget/consumed` 的折叠：本层与子代理链共用同一份（两处各写一遍必然口径漂移） */
 function applyBudgetConsumed(p: Projection, e: AppEvent & { type: 'budget/consumed' }): void {
   const d = e.data;
-  const total = d.inputTokens + d.outputTokens;
+  // 四层统一走同一个口径（§4.6）：step/turn 数的是次数，task/daily 数的是这个数
+  const total = budgetTokensOf(d);
   if (d.lane === 'heavy') p.budget.tokensTodayHeavy += total;
   else p.budget.tokensTodayLight += total;
   p.budget.tokensToday += total;
   p.budget.cacheHitToday += d.cacheHitTokens;
   p.budget.cacheMissToday += d.cacheMissTokens;
   p.budget.tokensTask += total;
+  // 累计量与它的口径标签同源：每一次累加都把版本盖回当前值（见 Projection.budget.budgetVersion）。
+  // 从旧快照续算时这一行保证"这份累计是按哪一版折的"永远写的是**当前**这一版——
+  // 而恢复层在采信快照之前已经校验过版本，所以这里不会有"半旧半新"的累计被贴上 v2 标签。
+  p.budget.budgetVersion = BUDGET_ACCOUNTING_VERSION;
   if (d.finishReason === 'failed') {
     p.failStreak += 1;
   } else {
     p.failStreak = 0;
     p.lastModelSuccessAt = e.ts;
   }
+}
+
+/**
+ * 「任务」这一层的边界：**task 层暂停被解除 = 那次任务结束 ⇒ `tokensTask` 归零**。
+ *
+ * 为什么必须有这条（2026-10-05 实测的第二处缺陷）：`tokensTask` 原来**只累加、永不归零**
+ * （`docs/review.md` 的「单任务没有边界」一早就记着这条），于是它数的是"这个进程从第一天到
+ * 今天一共花了多少"，而不是"这次任务花了多少"。旧口径下它涨得慢、撞线之后靠人工加注续命；
+ * 换成非缓存口径也救不了它——现场全量重放出来是 13,443,843，而单任务额度是 5,000,000
+ * ⇒ **就算把旧快照全部丢掉、账重算一遍，下一次 turn 照样被立刻拒掉**。
+ *
+ * 为什么边界取"暂停解除"而不是别的：
+ *   · 它是系统里**唯一一个已经存在**的"这次任务到此为止"的事实。撞 task 线即暂停（写
+ *     `budget/exhausted{layer:'task'}`），解除只有两条路——人工加注（`budget/topped-up{layer:'task'}`）
+ *     或上限被调大（`budget/resumed{layer:'task'}`）。两条都意味着"上一段工作已经交代收尾、
+ *     现在开始新的一段"，所以归零点就在那里，判据不需要新造一个事件、也不需要读时钟。
+ *   · 「空闲即新任务」那条路**刻意不做**：空闲是渲染层看不到的事实（`lastModelSuccessAt` 只
+ *     说明"多久没成功调用"），拿它当任务边界等于让一个观测值去改账，重启一次就可能变一套数。
+ *   · `tokensToday` **不跟着归零**：日额度是主力刹车（`dailyTokens` 那一层），
+ *     "新任务"不该免掉今天的账。归零只发生在一个任务真的被结清的那一刻。
+ *
+ * 两条路都走这一个函数：本层（`applyOne`）与子代理链（`applySubagentEvent`）共用同一份——
+ * 子代理的消耗折进父层的同一个 `tokensTask`，边界自然也该是同一个（两处各写一遍必然漂移）。
+ */
+function applyTaskBoundary(p: Projection, layer: string): void {
+  if (layer !== 'task') return;
+  p.budget.tokensTask = 0;
+  p.budget.budgetVersion = BUDGET_ACCOUNTING_VERSION;
 }
 
 /**
@@ -184,7 +271,7 @@ export function applyOne(p: Projection, e: AppEvent): void {
         ...(key ? { dedupeKey: key } : {}),
       });
       p.lastWake = { source: wakeSourceOf(e.type), at: e.ts };
-      // 心跳自带空拍数（退避依据由心跳自己 +1 后落进事件）；其余唤醒复位空拍
+      // 心跳自带空拍数（连续无外部事件的拍数，**仅供诊断**：节律已改由概率模型决定，它不再参与排期）；其余唤醒复位空拍
       p.idleTicks = e.type === 'wake/heartbeat' ? e.data.idleTicks : 0;
       break;
     }
@@ -225,6 +312,13 @@ export function applyOne(p: Projection, e: AppEvent): void {
       });
       break;
     }
+    case 'input/discarded': {
+      // 人决定不再重投 = 这条死信**已处理**，它离开队列（投影只回答"现在是什么"）。
+      // 日志里那条 `input/dead-letter` 一个字都不动——"它曾经是死信、被认领过几次"
+      // 是已经发生过的事实，抹掉它才是篡改（见 log/types.ts 的 InputDiscarded 说明）。
+      p.deadLetters = p.deadLetters.filter(item => item.inputSeq !== e.data.inputSeq);
+      break;
+    }
 
     case 'timer/set': {
       const entry: TimerEntry = {
@@ -260,6 +354,7 @@ export function applyOne(p: Projection, e: AppEvent): void {
       p.budget.tokensTodayLight = 0;
       p.budget.cacheHitToday = 0;
       p.budget.cacheMissToday = 0;
+      // 跨天不清 tokensTask：任务边界是"暂停解除"，不是"换了一天"（见 applyTaskBoundary）
       break;
     case 'budget/exhausted':
       applyBudgetExhausted(p, e);
@@ -267,6 +362,9 @@ export function applyOne(p: Projection, e: AppEvent): void {
     case 'budget/topped-up':
     case 'budget/resumed':
       delete p.lastExhausted[e.data.layer];
+      // 解除 task 层暂停 = 那次任务结束 ⇒ 单任务累计归零（见 applyTaskBoundary 的说明）。
+      // 两条路（本层 / 子代理链）共用同一个归零点，否则父子对"这次任务花了多少"会有两套数。
+      applyTaskBoundary(p, e.data.layer);
       break;
 
     case 'model/degraded':
@@ -420,7 +518,8 @@ export function finalizePressure(p: Projection, referenceTs?: string): void {
   let pressure = 0.05;
   if (p.needsReview.length > 0) pressure += 0.3;
   // pending 只统计"非心跳"的挂起输入：心跳拍本身就是她自己的呼吸，把它也算成
-  // "有输入没回应"会让空转时压力虚高、退避反被压扁——压力该由真正欠着的事驱动
+  // "有输入没回应"会让空转时压力虚高。压力不参与心跳节律（概率模型只看安静时长），
+  // 它服务的是必要性门与诊断——压力该由真正欠着的事驱动
   if (p.pending.some(item => item.source !== 'heartbeat')) pressure += 0.2;
   const dueIntentions = p.intentions.filter(
     i => i.triggerAt !== undefined && Date.parse(i.triggerAt) <= ref,

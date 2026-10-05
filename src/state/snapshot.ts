@@ -31,8 +31,21 @@ import { basicProjectionShape } from './projection-cache.ts';
 
 /** 快照目录名（schema §11 目录树） */
 export const SNAPSHOT_DIR_NAME = 'snapshots';
-/** 快照信封版本；形状变化时递增，旧版本按「不认识」丢弃重算 */
-export const SNAPSHOT_VERSION = 1;
+/**
+ * 快照信封版本。递增理由与 `projection-cache.ts` 的 `PROJECTION_CACHE_VERSION` **完全一样**：
+ * 信封形状变化，或者 `state/fold.ts` 的预算口径（`budgetTokensOf` 的算式）变化。
+ * **两个常量必须一起 +1**——只动其中一个，另一条恢复路径就会把旧口径的累计量喂回新进程。
+ *
+ * 为什么这里也必须动（2026-10-05 现场）：那份进程的启动日志原文是
+ * 「投影由快照增量折叠 {"snapshot":"snap-28399.json", …}」——它**根本没走投影缓存**，
+ * 而是从快照续算，于是 `snap-28399.json` 里旧口径的 `tokensToday=29,951,973` /
+ * `tokensTask=178,734,979` 被原样继承（`foldFromSnapshot` 只对 `upToSeq` **之后**的事件
+ * 用新算式），新账压在旧账上。丢弃旧版本快照的代价是首次启动做一次全量折叠，那是**换来
+ * 一份能对账的账**，值得。
+ *
+ * 记账：v1 = 未扣缓存口径；v2 = 非缓存口径（`(input − cacheHit) + output`）。
+ */
+export const SNAPSHOT_VERSION = 2;
 /** 文件名前缀 */
 export const SNAPSHOT_FILE_PREFIX = 'snap-';
 const SNAPSHOT_FILE_RE = /^snap-(\d+)\.json$/u;

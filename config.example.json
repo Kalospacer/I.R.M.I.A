@@ -50,26 +50,44 @@
     "$comment": [
       "三层刹车 + 每日额度 + 软阈值（design.md §4.6）。全部跨重启累计。",
       "softRatio：达到 上限×ratio 时先提示模型收尾，越过才硬停。",
-      "taskTokens / dailyTokens 的口径是**未扣缓存**的 token 数（含 cacheHit）：真实花销比这个数字小。",
-      "按自己的用量调；调大之前先想清楚\"一天烧到多少我能接受\"。"
+      "taskTokens / dailyTokens 的口径是**非缓存**的 token 数 = (input − cacheHit) + output：",
+      "  只算输入里没命中缓存的那部分 + 输出，也就是\"真花钱的那部分\"。命中缓存的那一大截不算——",
+      "  心跳每拍约 97% 的输入都是缓存命中，按未扣缓存的口径算，计数器会飞快见顶，",
+      "  而真实花销很小——所以单日预算只算\"不命中缓存的那部分\"，上限按这个口径定。",
+      "dailyTokens 出厂 50000000（5e7，单日非缓存预算）：心跳是**真实唤醒**（每拍真发一次请求，共用同一份",
+      "  冻结前缀去保温服务端的前缀缓存），一天约 96 拍、每拍非缓存约 0.4 万 ⇒ 心跳自己约 0.35M/天，",
+      "  5e7 是它的约 140 倍——心跳只占零头，其余留给真实工作。",
+      "  参考量级：一个满负荷的工作日实测约 2M 非缓存（494 次调用），5e7 是它的约 25 倍。",
+      "  这两个数是**有意定的**，不是随手填的：改小之前先想清楚\"一天真花钱的部分烧到多少能接受\"。",
+      "taskTokens 出厂 500000000（5e8，= 日额度的 10 倍）：让\"日\"那一层当主力刹车",
+      "  （日撞线 = 今天拒绝唤醒、task 撞线 = 这次任务收尾），所以 task 要比 daily 宽出量级去。",
+      "  于是日那一档是主力刹车：软线 4e7 非缓存时先提示收尾，硬线 5e7 就拒绝唤醒。",
+      "按自己的用量调。⚠️ 调小 dailyTokens 之前先想清楚\"一天真花钱的部分烧到多少我能接受\"；",
+      "  这四项都是**启动参数：改完要重启进程才生效**。"
     ],
     "stepTools": 20,
     "turnSteps": 30,
-    "taskTokens": 500000,
-    "dailyTokens": 2000000,
+    "taskTokens": 500000000,
+    "dailyTokens": 50000000,
     "softRatio": 0.8,
-    "failStreakMax": 5
+    "failStreakMax": 20
   },
   "wake": {
     "$comment": [
-      "心跳基线 30 分钟，空拍按 2^n 退避、封顶 8 倍；任何外部事件到达即复位（design.md §4.12）。",
-      "heartbeatFloorMin / heartbeatCeilMin：间隔的实际上下限（分钟）。退避再深也不超过 60 分钟不露面，压力再大也不短于 10 分钟一拍。",
+      "心跳是**概率**的（design.md §4.12）：安静不足 heartbeatFloorMin 分钟绝不触发，到 heartbeatCeilMin 分钟必然触发，",
+      "中间每 heartbeatTickMin 分钟抽一次签，命中概率随安静时间单调上升。默认 5 / 60 / 1 / 30 分钟。",
+      "**想改频率只需要改 heartbeatTargetMeanMin（目标均值，分钟）**——「平均多久醒一次」就写多少，",
+      "  曲线的形状（指数 α）由它在启动时反解出来，不需要也不应该手调。想更慢就调大（例如 30），想更快就调小（例如 10）。",
+      "heartbeatTargetMeanMin 必须**严格**落在 heartbeatFloorMin 与 heartbeatCeilMin 之间（且 5~60），写错了启动会报配置错；",
+      "  改慢/改快时下限上限照旧兜住两端：安静不足 floor 分钟绝不触发、到 ceil 分钟必然触发。",
+      "这四项都是**启动参数：改完要重启进程才生效**。",
+      "任何外部事件到达即复位安静计时。抽签节奏不是「心跳间隔」——间隔是抽签的结果，不是排出来的。",
       "memoryMaintainCron：每日记忆整理的 cron（五段：分 时 日 月 周）；空串关闭该任务。"
     ],
-    "heartbeatBaselineMin": 30,
-    "idleBackoffMax": 8,
-    "heartbeatFloorMin": 10,
+    "heartbeatFloorMin": 5,
     "heartbeatCeilMin": 60,
+    "heartbeatTickMin": 1,
+    "heartbeatTargetMeanMin": 30,
     "memoryMaintainCron": "0 4 * * *"
   },
   "vision": {
@@ -120,11 +138,16 @@
       "destructive 工具开关，三态：false 全关（出厂值）/ true 全开 / 数组只开名单内的（如 [\"pwsh\",\"http_post\"]）。",
       "「危险」在系统里的含义是\"崩溃后不可自动重试\"，不代表开关可以随手打开：",
       "  确认你知道它会在这台机器上做什么，再按需放开名单，别整体打开。",
-      "planMode：开启后 destructive 调用先落 plan/pending 等人工批准，批准一次只放行一次。"
+      "planMode：开启后 destructive 调用先落 plan/pending 等人工批准，批准一次只放行一次。",
+      "taskEnabled：隔离子代理工具 task（它自己带独立上下文与预算，见 design.md §4.21）。出厂 false = 不注册。",
+      "  为什么默认关：工具清单是请求**冻结前缀**的一部分——多一件不只是每轮多一份 schema，",
+      "  更是「清单一变就一次缓存 miss」（前缀之后的内容在服务端缓存里整段失效）。所以要不要它由你自己说要。",
+      "  打开后清单 24 → 25 件；它是启动期读一次的参数，改完要重启进程才接管。"
     ],
     "destructiveEnabled": false,
     "planMode": false,
     "askHumanTimeoutMin": 30,
+    "taskEnabled": false,
     "disabled": []
   },
   "deps": {

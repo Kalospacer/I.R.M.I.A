@@ -3,8 +3,12 @@
  *
  * 覆盖（全部跑真日志 + 真折叠 + 真工具执行，绝不 mock 掉被测层）：
  *   M5-1  人格连续性   压缩后 / 崩溃恢复后的首个 turn，重建请求以 IDENTITY + STATE + 最近摘要开头
- *   M5-4  规则短路沉默 necessityGate 判定沉默：零模型调用、turn/end 记 spoke:false
- *   M5-5  必要性门路由 light lane 的调用独立记账（灰色输入的 light 判定待 necessity-gate 就位）
+ *   M5-4  沉默是正常动作（turn 内部）唤醒一律进 turn（含心跳拍——2026-10-05 起它是**真实唤醒**），
+ *         但她可以走完一拍而不开口：`turn/end{completed, spoke:false}`；"零模型调用"只剩
+ *         **没有输入可认领**那一种形态。当年的回复必要性门已拆，见 docs/design.md
+ *         「试过并废掉的口径：回复必要性门」；心跳拍的生产级判据在 test/heartbeat-real-wake.test.ts。
+ *   M5-5  唤醒一律走 heavy：不再有"先花一次 light 判定"这条路（light 车道的独立记账由
+ *         M5-8 的折叠用例与 injection-judge / memory-maintain 各自的套件覆盖）
  *   M5-6  漂移审计     write_persona 改 STATE.md → persona/updated 事件 + 注入层刷新
  *   M5-7  身份只读     write_persona 改 IDENTITY.md 被拒，拒绝原因经 tool/result 回给模型
  *   M5-8  两级预算     heavy 与 light 的消耗独立累计、独立跨天清零（fold 口径）
@@ -14,14 +18,18 @@
  *   M5-12 压缩边界     压缩当轮历史段不再构成前缀；下一轮人格层 + 摘要段逐字节稳定
  *
  * 并行实现就位后补测的项（先读实际文件，接口不编造）：
- *   M5-3 / M5-14 心跳退避与压力调制 —— src/wake/heartbeat.ts（算法 + real-loop 集成复位）
- *   M5-4 / M5-5  必要性门 —— src/runtime/necessity-gate.ts（规则短路 / light 模型门 / 端到端零调用）
+ *   M5-3  心跳概率模型 —— src/wake/heartbeat.ts（集成面：抽签落事件、审计字段、外部事件复位；
+ *                       分布本身的判据在 test/heartbeat.test.ts）
+ *   M5-4 / M5-5  唤醒路由与记账 —— 回复必要性门**已于 2026-10-05 拆掉**（原意与警告见
+ *                 docs/design.md「试过并废掉的口径：回复必要性门」）。本文件不再有任何"门"的替身：
+ *                 这些用例改成验 **turn 内部的行为**（她可以走完一拍而不 speak；唤醒一律走 heavy），
+ *                 判据一条没放宽；心跳拍的生产级判据在 test/heartbeat-real-wake.test.ts。
  *   M5-9         快照起算的折叠 —— src/state/snapshot.ts（与全量折叠等价 + 只重放快照之后）
  *
  * ── 仍未就位项（不编造接口，就位后在此补测） ──
  *   M5-13 意图唤醒（INTENTIONS.md 扫描 → wake/intention → intention/acted）—— 全仓无扫描调度器
  *   M5-8  两级预算的"独立软/硬阈值触发"—— BudgetConfig 仍是一套阈值、BudgetLayer 不含 lane
- *         （fold 侧的两级独立计数已测；necessity-gate 已按 lane=light 记账）
+ *         （fold 侧的两级独立计数已测；light 车道的活先例是 injection-judge / 话题概括 / 记忆整理）
  *   M5-6  普通文件工具（safe_write/safe_edit）写 persona/ 的拦截与 policy/denied 事件
  *         —— 全仓 policy/denied 仍只有类型、渲染与 CLI 展示，没有写侧产生点
  *   M5-2  交接笔记算法本身由 test/handoff-note.test.ts 覆盖（不在本文件重复）
@@ -49,14 +57,13 @@ import { NOW_LAYER_BANNER, TURN_BLOCK_BANNER, render, RENDER_VERSION } from '../
 import type { RenderedRequest, RenderPersona, TurnBlockFacts } from '../src/model/render.ts';
 import { ensurePersonaSeeds, loadPersona, type PersonaAssets } from '../src/persona/loader.ts';
 import { deriveRequest, runTurn, type AgentLoopPersona } from '../src/runtime/agent-loop.ts';
-import { MODEL_GATE_HINT_CHARS, NecessityGate, type NecessityVerdict } from '../src/runtime/necessity-gate.ts';
 import { RealLoop } from '../src/runtime/real-loop.ts';
 import { recover } from '../src/runtime/recover.ts';
 import { applyOne, fold } from '../src/state/fold.ts';
 import { foldFromSnapshot, loadLatestSnapshot, snapshotDirOf, writeSnapshot } from '../src/state/snapshot.ts';
 import { createAdminTools } from '../src/tools/admin.ts';
 import { ToolRegistry, type ToolDefinition } from '../src/tools/registry.ts';
-import { DEFAULT_BACKOFF_MAX, Heartbeat, type HeartbeatFiring } from '../src/wake/heartbeat.ts';
+import { makeSeededRandom, Heartbeat, type HeartbeatFiring } from '../src/wake/heartbeat.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
 
 // ──────────────────────────────── 常量与事件工厂 ────────────────────────────────
@@ -180,11 +187,6 @@ function fakeDs(
   } as unknown as DsClient;
 }
 
-/** 判定结果载荷（json_schema 的输出形态） */
-function decisionItem(shouldReply: boolean, reason: string): DsOutputItem {
-  return { type: 'message', id: 'm-decision', text: JSON.stringify({ should_reply: shouldReply, reason }) };
-}
-
 function readFileTool(): ToolDefinition {
   return {
     name: 'read_file',
@@ -206,12 +208,9 @@ interface HarnessOptions {
   script: ScriptedResult[];
   now?: () => string;
   lane?: ModelLane;
-  necessityGate?: (wakeText: string) => Promise<boolean>;
   /** 注册 admin 工具包（write_persona 等），用于人格漂移与只读保护 */
   withAdminTools?: boolean;
-  /** 装上真必要性门（src/runtime/necessity-gate.ts），M5-4/M5-5 的端到端走它 */
-  withNecessityGate?: boolean;
-  /** light 判定门的脚本（ds.generate） */
+  /** light 车道的脚本（`ds.generate`）：本文件只在"唤醒不再有 light 判定"那几条里验它一次都不被调用 */
   generateScript?: ScriptedResponse[];
   /**
    * 本轮固定块的覆盖点（B2）。缺省 = `{state: PERSONA.state, relationship: null}`，
@@ -228,8 +227,6 @@ interface Harness {
   projection: Projection;
   registry: ToolRegistry;
   requests: DsRequest[];
-  /** 真必要性门的判定留痕（按调用顺序） */
-  verdicts: NecessityVerdict[];
   append: (type: string, data: unknown, ts?: string) => AppEvent;
   events: () => Promise<AppEvent[]>;
   ofType: <T extends AppEvent['type']>(type: T) => Promise<Array<Extract<AppEvent, { type: T }>>>;
@@ -281,19 +278,6 @@ async function makeHarness(t: TestContext, opts: HarnessOptions): Promise<Harnes
   const requests: DsRequest[] = [];
   const ds = fakeDs(opts.script, requests, opts.generateScript ?? []);
 
-  const verdicts: NecessityVerdict[] = [];
-  if (opts.withNecessityGate === true) {
-    const gate = new NecessityGate({ ds, log, projection, now: () => new Date(NOW_FIXED), out: () => {} });
-    opts.necessityGate = async (_wakeText: string, wakeEvents?: readonly AppEvent[]) => {
-      const verdict = await gate.judge({
-        wakeEvents: wakeEvents ?? [],
-        turn: projection.openTurn?.turn ?? 0,
-      });
-      verdicts.push(verdict);
-      return verdict.shouldReply;
-    };
-  }
-
   const turn = (wakeEvents: readonly AppEvent[]): Promise<TurnEndReason> => runTurn({
     log,
     ds,
@@ -309,7 +293,6 @@ async function makeHarness(t: TestContext, opts: HarnessOptions): Promise<Harnes
     // 本轮固定块（B2）：素材由**宿主**在轮首读一次（real-loop 的 turnBlockFacts 同一形状）。
     // 这里是测试替身，所以直接取 PERSONA.state——覆盖点留给需要"固定块为空/换一份"的用例。
     turnBlock: opts.turnBlock ?? { state: PERSONA.state, relationship: null },
-    ...(opts.necessityGate !== undefined ? { necessityGate: opts.necessityGate } : {}),
   }, wakeEvents);
 
   const events = async (): Promise<AppEvent[]> => {
@@ -323,7 +306,7 @@ async function makeHarness(t: TestContext, opts: HarnessOptions): Promise<Harnes
   const ofType = async <T extends AppEvent['type']>(type: T): Promise<Array<Extract<AppEvent, { type: T }>>> =>
     (await events()).filter((e): e is Extract<AppEvent, { type: T }> => e.type === type);
 
-  return { dir, workspaceRoot, personaRoot, log, projection, registry, requests, verdicts, append, events, ofType, turn };
+  return { dir, workspaceRoot, personaRoot, log, projection, registry, requests, append, events, ofType, turn };
 }
 
 // ──────────────────────────────── 字节级比较工具 ────────────────────────────────
@@ -603,38 +586,50 @@ describe('M5-1 人格连续性：压缩 / 崩溃恢复后的首个 turn', () => 
   });
 });
 
-// ──────────────────────────────── M5-4 规则短路沉默 ────────────────────────────────
+// ──────────────────────────────── M5-4 沉默是正常动作 ────────────────────────────────
 
-describe('M5-4 规则短路沉默：零模型调用 + spoke:false', () => {
-  test('必要性门判定沉默：不发起任何模型调用，turn/end 记 spoke:false 且已认领输入不悬空', async (t) => {
-    const h = await makeHarness(t, { script: [], necessityGate: async () => false });
+/*
+ * 2026-10-05：回复必要性门拆了（原意与警告见 docs/design.md「试过并废掉的口径：回复必要性门」）。
+ * 那一问（"值不值得开口"）不再由框架在调模型**之前**替她答——用户把心跳改成**真实唤醒**，
+ * "闭嘴"不再等于"一个请求都不发"。所以这一族用例改成验 **turn 内部的行为**，判据一条没放宽：
+ *   · 她可以**走完一拍而不开口**（`spoke:false`），而这一拍照样调模型；
+ *   · "零模型调用"只剩**没有输入可认领**那一种形态（那时确实没有谁在跟她说话）。
+ */
+describe('M5-4 沉默是正常动作：走完一拍而不 speak / 无输入才是零调用', () => {
+  test('她走完一拍但不开口：照常调一次模型，turn/end 记 spoke:false 且已认领输入不悬空', async (t) => {
+    // 模型回空（不写一个字、不调工具）＝ 她看完之后决定"没事，接着睡"
+    const h = await makeHarness(t, { script: [{ text: '', toolCalls: [] }] });
     const wake = h.append('wake/manual', { note: '看一眼就行' });
 
     const reason = await h.turn([wake]);
     assert.deepEqual(reason, { kind: 'completed' });
 
-    assert.equal(h.requests.length, 0, '沉默 turn 必须零模型调用');
+    assert.equal(h.requests.length, 1, '这一拍照常调模型（"看一眼"必须真的发生）');
+    assert.equal(h.requests[0]!.lane, 'heavy');
     const types = (await h.events()).map(e => e.type);
-    assert.ok(!types.includes('step/start'), '沉默 turn 不得开始任何 step');
-    assert.ok(!types.includes('budget/consumed'), '沉默 turn 不产生任何消耗');
+    assert.ok(types.includes('step/start'), '这一拍真的起了一步');
+    assert.equal(
+      types.filter(type => type === 'budget/consumed').length, 1,
+      '这一拍的 token 照常记账（沉默不等于免费）',
+    );
 
     const end = (await h.ofType('turn/end')).at(-1);
-    assert.ok(end, '沉默也必须留下 turn/end（空拍在日志里有据可查）');
-    assert.equal(end.data.spoke, false, 'M5-4：沉默 turn 记 spoke:false');
+    assert.ok(end, '无论说没说话都要留下 turn/end');
+    assert.equal(end.data.spoke, false, 'M5-4：她没开口');
     assert.deepEqual(end.data.reason, { kind: 'completed' });
 
     const claimed = (await h.ofType('input/claimed')).at(-1);
-    assert.ok(claimed, '认领先于判定完成，输入不会因沉默而被反复评估');
+    assert.ok(claimed, '输入先认领再跑：认领与她开不开口无关');
     assert.deepEqual(claimed.data.wakeSeqs, [wake.seq]);
-    assert.equal(h.projection.pending.length, 0, '沉默的输入已被认领处理，不留在队列里');
+    assert.equal(h.projection.pending.length, 0, '这一拍的输入已处理，不留在队列里');
   });
 
-  test('无输入可认领的唤醒（无新事件）：同样零模型调用，仍留下 turn/start + turn/end', async (t) => {
+  test('无输入可认领的唤醒（无新事件）：零模型调用，仍留下 turn/start + turn/end', async (t) => {
     const h = await makeHarness(t, { script: [] });
 
     const reason = await h.turn([]);
     assert.deepEqual(reason, { kind: 'completed' });
-    assert.equal(h.requests.length, 0);
+    assert.equal(h.requests.length, 0, '没有输入可认领时才真的是零模型调用');
 
     const end = (await h.ofType('turn/end')).at(-1);
     assert.equal(end?.data.spoke, false);
@@ -644,11 +639,13 @@ describe('M5-4 规则短路沉默：零模型调用 + spoke:false', () => {
   });
 });
 
-// ──────────────────────────────── M5-5 必要性门路由 ────────────────────────────────
+// ──────────────────────────────── M5-5 两级路由：light 车道独立记账 ────────────────────────────────
 
-describe('M5-5 必要性门路由：light lane 独立记账', () => {
-  // TODO(M5-5)：灰色输入"经 light 模型判定"的那一半依赖 necessity-gate 实现（未就位）。
-  // 就位后在此补：同一 turn 内先有 light 判定调用、再有 heavy 主调用，两者的 budget/consumed 各自成档。
+describe('M5-5 两级路由：light lane 独立记账', () => {
+  // 2026-10-05：回复必要性门拆了，light 车道少了它这一个调用方。这里的判据（"lane=light 的调用
+  // 走 light 路由、账记 lane=light"）与门无关，原样保留；light 车道的**活**调用方现在是
+  // 通道注入判定（channel/injection-judge.ts）、话题概括（channel/topic.ts）与记忆整理
+  // （persona/memory-maintain.ts），它们各自的套件覆盖自己的路径。
   test('light lane 的调用：请求走 light 路由，budget/consumed 记 lane=light 与 light 模型', async (t) => {
     const h = await makeHarness(t, { script: [{ text: '判定结论。', toolCalls: [] }], lane: 'light' });
     const wake = h.append('wake/manual', { note: '这句该不该回？' });
@@ -820,9 +817,11 @@ describe('M5-8 两级预算独立计数', () => {
     ];
 
     const projected = fold(events);
-    assert.equal(projected.budget.tokensTodayHeavy, 1200, 'heavy 只累计自己的消耗');
+    // 非缓存口径（2026-10-05 换的）：heavy = (1000 − 800) + 200 = 400（旧口径 1200）；
+    // light = (50 + 10) + (40 + 10) = 110（这两条命中为 0，两种口径同值）
+    assert.equal(projected.budget.tokensTodayHeavy, 400, 'heavy 只累计自己的消耗（非缓存口径）');
     assert.equal(projected.budget.tokensTodayLight, 110, 'light 独立累计，不被 heavy 挤占');
-    assert.equal(projected.budget.tokensToday, 1310, '总量是两级之和（对账口径）');
+    assert.equal(projected.budget.tokensToday, 510, '总量是两级之和（对账口径）');
     assert.equal(projected.budget.cacheHitToday, 800);
     assert.equal(projected.budget.cacheMissToday, 290);
 
@@ -1269,7 +1268,14 @@ describe('M5-12 压缩边界：当轮全 miss、下一轮保底命中恢复', ()
   });
 });
 
-// ──────────────────────────────── M5-3 / M5-14 心跳退避与压力调制 ────────────────────────────────
+// ──────────────────────────────── M5-3 心跳：概率模型 + 复位 ────────────────────────────────
+
+/**
+ * 这一节 2026-10-04 整段重写：心跳从**确定性排程**（基线 × 2^n × 压力调制）换成了
+ * **概率随时间上升**的连续模型（用户：「5~60 分钟不等，越久没触发概率越高，平均 10~20 分钟」）。
+ * 模型、α 的实测反推与分布判据在 `src/wake/heartbeat.ts` 与 `test/heartbeat.test.ts`；
+ * 这里只验**集成面**：real-loop 装的心跳真的会按抽签落事件、事件带审计字段、外部事件复位。
+ */
 
 /** 假闹钟：捕获每次布防的间隔，并可手工触发当前这一拍（心跳的时间轴完全可复现） */
 interface FakeAlarm {
@@ -1302,112 +1308,139 @@ function fakeAlarm(): FakeAlarm {
   };
 }
 
-const HEARTBEAT_BASELINE_MS = 60_000;
-/** 压力乘数：1.5 − pressure（底噪 0.05 → 1.45；压力满格 1 → 0.5） */
-function pressureFactor(pressure: number): number {
-  return 1.5 - pressure;
-}
-
 interface HeartbeatRig {
   heartbeat: Heartbeat;
   projection: Projection;
   alarm: FakeAlarm;
+  /** 可推进的注入时钟（心跳的安静计时按它算） */
+  clock: { now: () => Date; advance: (ms: number) => void };
   firings: HeartbeatFiring[];
 }
 
-function makeHeartbeatRig(options: { pressure: number; idleTicks: number }): HeartbeatRig {
-  const projection = fold([]);
-  projection.pressure = options.pressure;
-  projection.idleTicks = options.idleTicks;
+/**
+ * 验收盘面：下限 5 分钟、上限 60 分钟、节奏 1 分钟（= 生产默认值），
+ * 随机源用固定种子（判据必须可复跑）。
+ */
+function makeHeartbeatRig(patch: Partial<Projection> = {}): HeartbeatRig {
+  const projection = { ...fold([]), ...patch };
   const alarm = fakeAlarm();
   const firings: HeartbeatFiring[] = [];
+  let nowMs = T0_MS;
   const heartbeat = new Heartbeat({
     projection,
-    baselineMs: HEARTBEAT_BASELINE_MS,
-    backoffMax: DEFAULT_BACKOFF_MAX,
-    // 这组验收的是**代数结构**（2^n 翻倍、8 倍封顶、压力调制），不是区间夹取——
-    // 区间单独测（test/heartbeat.test.ts）。这里把区间放开，否则默认的 10 分钟下限
-    // 会把“2 分钟、4 分钟”的布防全夹成同一个值，看不到翻倍。
-    floorMs: 1,
-    ceilMs: Number.POSITIVE_INFINITY,
-    now: () => new Date(T0_MS),
+    random: makeSeededRandom(0x49524d49),
+    now: () => new Date(nowMs),
     setTimer: (h, ms) => alarm.setTimer(h, ms),
     clearTimer: (h) => alarm.clearTimer(h),
     onFire: (firing) => {
       firings.push(firing);
-      // 模拟 fold 的语义：wake/heartbeat.idleTicks 折进投影（心跳自己不复位）
+      // 模拟 fold 的语义：wake/heartbeat.idleTicks 折进投影（心跳自己不复位安静计时）
       projection.idleTicks = firing.idleTicks;
     },
   });
-  return { heartbeat, projection, alarm, firings };
+  return {
+    heartbeat,
+    projection,
+    alarm,
+    clock: {
+      now: () => new Date(nowMs),
+      advance: (ms) => {
+        nowMs += ms;
+        // 假闹钟一次只挂一个定时器：推进到点就触发它，与真实 setTimeout 同序
+        if (ms >= (alarm.delays.at(-1) ?? Number.POSITIVE_INFINITY)) alarm.fire();
+      },
+    },
+    firings,
+  };
 }
 
-describe('M5-3 空闲退避：基线 ×2^n 至 8 倍封顶，外部事件复位', () => {
-  test('无外部事件时空拍逐次翻倍，8 倍处封顶', () => {
-    const rig = makeHeartbeatRig({ pressure: 0.05, idleTicks: 0 });
+/**
+ * 推进到"这一轮真的触发"为止（返回推进的毫秒数）；没触发就抛——上限失效必须响。
+ * `atMs` 是触发那一刻的注入时钟读数：断言安静时长用它算，别在手算里多加/少加一个 tick
+ * （这一带踩过：`quietSeconds` 的参照是"她上次开口"，不是"这一轮从哪开始等"）。
+ */
+function advanceUntilFire(rig: HeartbeatRig, tickMs = 60_000, capMs = 70 * 60_000): { elapsedMs: number; atMs: number } {
+  const before = rig.heartbeat.beatCount;
+  let elapsed = 0;
+  while (elapsed < capMs) {
+    rig.clock.advance(tickMs);
+    elapsed += tickMs;
+    if (rig.heartbeat.beatCount > before) return { elapsedMs: elapsed, atMs: rig.clock.now().getTime() };
+  }
+  throw new Error(`推进 ${capMs / 60_000} 分钟仍未触发`);
+}
+
+/** 读全部事件（先把观测类事件 flush 到盘上；日志才是唯一真相源） */
+async function readEvents(log: EventLog): Promise<AppEvent[]> {
+  log.flush();
+  const out: AppEvent[] = [];
+  for await (const event of log.readAll()) out.push(event);
+  return out;
+}
+
+describe('M5-3 心跳概率模型：安静越久命中概率越高，外部事件复位', () => {
+  test('首拍不早于下限：安静不足 5 分钟绝不触发', () => {
+    const rig = makeHeartbeatRig();
     rig.heartbeat.start();
-    const unit = HEARTBEAT_BASELINE_MS * pressureFactor(0.05);
-    assert.equal(rig.alarm.delays[0], Math.round(unit), '首拍按基线档布防（不是立刻来一拍）');
-    assert.equal(rig.heartbeat.idleTicks(), 0);
+    assert.equal(rig.alarm.delays[0], 60_000, '布防：下一个 tick 抽第一签（不是立刻来一拍）');
 
-    for (let i = 0; i < 5; i++) rig.alarm.fire();
-
-    // 5 拍之后的布防间隔：×2、×4、×8、×8（封顶）、×8
-    assert.deepEqual(
-      rig.alarm.delays.slice(1),
-      [2, 4, 8, 8, 8].map(factor => Math.round(unit * factor)),
-      'M5-3：间隔逐次翻倍，到 8 倍封顶',
-    );
-    assert.equal(rig.projection.idleTicks, 5, '空拍只由心跳自己递增（它绝不复位自己）');
-    assert.deepEqual(
-      rig.firings.map(f => f.idleTicks),
-      [1, 2, 3, 4, 5],
-      '每拍把 idleTicks + 1 落进事件，下一拍据此退避',
-    );
-    assert.equal(rig.firings[0]!.pressure, 0.05, '压力原样进事件（压力调制的事实来源）');
+    for (let i = 1; i <= 5; i++) {
+      rig.clock.advance(60_000);
+      assert.equal(rig.heartbeat.beatCount, 0, `安静 ${i} 分钟不该触发（下限 5 分钟）`);
+    }
+    assert.deepEqual(rig.firings, [], '下限之下不交付任何事实');
   });
 
-  test('心跳递送的事实三键齐备，quietSeconds 取"距上次开口"', () => {
-    const rig = makeHeartbeatRig({ pressure: 0.2, idleTicks: 2 });
-    rig.projection.lastAssistantAt = new Date(T0_MS - 90 * 60 * 1000).toISOString();
-    const firing = rig.heartbeat.fireNow();
+  test('命中的那一拍把 quietSeconds/idleTicks/pressure/probability/roll 一并落进事实', () => {
+    const spokenAt = T0_MS - 90 * 60_000;
+    const rig = makeHeartbeatRig({ pressure: 0.2, idleTicks: 2, lastAssistantAt: new Date(spokenAt).toISOString() });
+    rig.heartbeat.start();
+    const { atMs } = advanceUntilFire(rig);
+
+    const firing = rig.firings[0];
     assert.ok(firing, '策略缺失时心跳照常');
-    assert.equal(firing.quietSeconds, 90 * 60);
-    assert.equal(firing.idleTicks, 3);
-    assert.equal(firing.pressure, 0.2);
+    assert.equal(firing.quietSeconds, Math.floor((atMs - spokenAt) / 1000), '安静时长取"距上次开口"');
+    assert.ok(firing.quietSeconds >= 90 * 60, '至少距上次开口 90 分钟');
+    assert.equal(firing.idleTicks, 3, '空拍 +1 落进事件（仅供诊断）');
+    assert.equal(firing.pressure, 0.2, '压力原样进事件（不再参与节律，但门与诊断要读）');
+    assert.ok(firing.probability > 0 && firing.probability <= 1, `命中概率 ${firing.probability}`);
+    assert.ok(firing.roll >= 0 && firing.roll < 1, `抽到的数 ${firing.roll}`);
+    assert.ok(firing.roll < firing.probability, '判据是 roll < probability——这一拍为什么响可复算');
   });
 
-  test('外部事件到达即复位基线档（退避清零）', () => {
-    const rig = makeHeartbeatRig({ pressure: 0.05, idleTicks: 0 });
+  test('压力不再调制节律：同样的安静时长给出同一个概率', () => {
+    const calm = makeHeartbeatRig({ pressure: 0.05 });
+    const tense = makeHeartbeatRig({ pressure: 0.95 });
+    // 两条盘面同种子、同时钟：把安静时长推到同一个位置，得到的概率必须一样
+    for (const rig of [calm, tense]) {
+      rig.heartbeat.start();
+      advanceUntilFire(rig);
+    }
+    assert.equal(tense.firings[0]!.probability, calm.firings[0]!.probability,
+      '概率只由安静时长决定（压力改由必要性门承载）');
+  });
+
+  test('外部事件到达即复位：安静计时归零，重新从下限走起', () => {
+    const rig = makeHeartbeatRig();
     rig.heartbeat.start();
-    for (let i = 0; i < 4; i++) rig.alarm.fire();
-    const backedOff = rig.alarm.delays.at(-1)!;
-    assert.ok(backedOff > rig.alarm.delays[0]!, '空拍已经把间隔拉长');
+
+    const { elapsedMs: firstRound } = advanceUntilFire(rig);
+    assert.ok(firstRound >= 6 * 60_000, `第一轮至少安静到下限之后（实测 ${firstRound / 60_000} 分钟）`);
 
     rig.heartbeat.noteActivity();
-    assert.equal(
-      rig.alarm.delays.at(-1),
-      Math.round(HEARTBEAT_BASELINE_MS * pressureFactor(0.05)),
-      'M5-3：任一外部事件到达即复位基线（不带退避）',
-    );
-    assert.ok(rig.alarm.delays.at(-1)! < backedOff);
+    assert.equal(rig.alarm.delays.at(-1), 60_000, '复位后下一次抽签在一个 tick 之后');
+    assert.equal(rig.heartbeat.quietMs(), 0, '安静计时归零');
+
+    // 复位之后必须重新安静满下限才可能触发（这就是"外部事件的价值"）
+    for (let i = 1; i <= 5; i++) {
+      rig.clock.advance(60_000);
+      assert.equal(rig.heartbeat.beatCount, 1, `复位后安静 ${i} 分钟不该触发`);
+    }
+    const { elapsedMs: secondRound } = advanceUntilFire(rig);
+    assert.ok(secondRound <= 6 * 60_000, `重新安静后最多再等一个 tick（实测 ${secondRound / 60_000} 分钟）`);
   });
 
-  test('M5-14 压力调制：压力高压扁退避，但代数结构不变（仍 8 倍封顶）', () => {
-    const calm = makeHeartbeatRig({ pressure: 0.05, idleTicks: 3 });
-    const tense = makeHeartbeatRig({ pressure: 0.95, idleTicks: 3 });
-    const calmDelay = calm.heartbeat.nextDelayMs();
-    const tenseDelay = tense.heartbeat.nextDelayMs();
-
-    assert.equal(calmDelay, Math.round(HEARTBEAT_BASELINE_MS * 8 * pressureFactor(0.05)));
-    assert.equal(tenseDelay, Math.round(HEARTBEAT_BASELINE_MS * 8 * pressureFactor(0.95)));
-    assert.ok(tenseDelay < calmDelay, '有牵挂时睡不沉：同样的空拍下间隔更短');
-
-    const deeper = makeHeartbeatRig({ pressure: 0.05, idleTicks: 12 });
-    assert.equal(deeper.heartbeat.nextDelayMs(), calmDelay, '压力不改变 2^n 的封顶位置');
-  });
-
-  test('M5-14 集成：real-loop 收到外部事件时复位退避，心跳自身不复位', async (t) => {
+  test('集成：real-loop 落下的 wake/heartbeat 事件带 probability/roll，外部事件把空拍清零', async (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'irmia-m5-heartbeat-'));
     const config = defaultConfig(dir);
     mkdirSync(config.dataDir, { recursive: true });
@@ -1415,13 +1448,12 @@ describe('M5-3 空闲退避：基线 ×2^n 至 8 倍封顶，外部事件复位'
     const projection = fold([]);
     const alarm = fakeAlarm();
     const persona: PersonaAssets = { ...PERSONA, isSeed: false };
+    let nowMs = T0_MS;
+    // 缺省装配（真实工厂）：配置里的 5/60/1 与生产同一条路径；只注入时钟与定时器
     const heartbeat = new Heartbeat({
       projection,
-      baselineMs: HEARTBEAT_BASELINE_MS,
-      backoffMax: DEFAULT_BACKOFF_MAX,
-      floorMs: 1,
-      ceilMs: Number.POSITIVE_INFINITY,
-      now: () => new Date(T0_MS),
+      now: () => new Date(nowMs),
+      random: makeSeededRandom(0x49524d49),
       setTimer: (h, ms) => alarm.setTimer(h, ms),
       clearTimer: (h) => alarm.clearTimer(h),
     });
@@ -1429,7 +1461,7 @@ describe('M5-3 空闲退避：基线 ×2^n 至 8 倍封顶，外部事件复位'
       log,
       dataDir: config.dataDir,
       projection,
-      now: () => new Date(T0_MS),
+      now: () => new Date(nowMs),
       timezone: TZ,
       ds: fakeDs([], []),
       registry: new ToolRegistry(),
@@ -1448,152 +1480,137 @@ describe('M5-3 空闲退避：基线 ×2^n 至 8 倍封顶，外部事件复位'
 
     loop.start();
     await delay(30);
-    const baselineDelay = alarm.delays.at(-1)!;
-    assert.equal(baselineDelay, Math.round(HEARTBEAT_BASELINE_MS * pressureFactor(0.05)), '启动按基线布防');
+    assert.equal(alarm.delays.at(-1), 60_000, '启动按抽签节奏布防');
 
-    for (let i = 0; i < 3; i++) {
+    // 推进到触发为止：到点的是心跳自己的定时器 → 事件落盘
+    let elapsed = 0;
+    while (elapsed < 70 * 60_000 && projection.idleTicks === 0) {
+      nowMs += 60_000;
+      elapsed += 60_000;
       alarm.fire();
       await delay(5);
     }
-    assert.ok(projection.idleTicks >= 3, '心跳把空拍落进投影（事件已写日志）');
-    const backedOff = alarm.delays.at(-1)!;
-    assert.ok(backedOff > baselineDelay, '空拍让间隔退避——心跳自身不复位');
+    assert.equal(projection.idleTicks, 1, '心跳把空拍落进投影（事件已写日志）');
 
+    const beats = (await readEvents(log)).filter(e => e.type === 'wake/heartbeat');
+    assert.equal(beats.length, 1, '日志里恰好一条 wake/heartbeat');
+    const data = beats[0]!.data as { probability: number; roll: number; quietSeconds: number };
+    assert.ok(data.probability > 0 && data.probability <= 1, `事件带命中概率（${data.probability}）`);
+    assert.ok(data.roll >= 0 && data.roll < data.probability, '事件带抽到的数，且 roll < probability');
+
+    // 外部事件到达：空拍清零（复位语义一个字没改）
     loop.wake({ type: 'wake/manual', data: { note: '外部事件到达' } });
     assert.equal(projection.idleTicks, 0, '外部事件把空拍清零');
-    // 复位 = 丢掉空拍退避、回到基线档；压力项照常生效（此刻待处理 1 条 → pressure 0.25，
-    // 于是基线档比启动时的 1.45 倍更短——"有牵挂时睡不沉"正是 M5-14 要的行为）
-    assert.equal(projection.pressure, 0.25, '外部事件带来待处理输入，压力随之上升');
-    assert.equal(
-      alarm.delays.at(-1),
-      Math.round(HEARTBEAT_BASELINE_MS * pressureFactor(projection.pressure)),
-      'M5-14：外部事件到达即复位到基线档（不含空拍退避）',
-    );
-    assert.ok(
-      alarm.delays.at(-1)! < backedOff,
-      `复位后的间隔必须短于退避后的间隔（复位 ${alarm.delays.at(-1)} vs 退避 ${backedOff}；全部布防 ${alarm.delays.join(',')}）`,
-    );
+    assert.equal(alarm.delays.at(-1), 60_000, '外部事件到达即重新计时（下一次抽签在一个 tick 之后）');
+    assert.ok(projection.pressure > 0.05, '外部事件带来待处理输入，压力随之上升');
   });
 });
 
-// ──────────────────────────────── M5-4 / M5-5 回复必要性门 ────────────────────────────────
+// ──────────────────────────────── M5-4 / M5-5 唤醒路由与记账 ────────────────────────────────
 
-describe('M5-4 规则短路与 M5-5 必要性门路由', () => {
-  test('M5-4 仅心跳 + 无牵挂 → 规则短路：零模型调用，turn/end 记 spoke:false', async (t) => {
-    const h = await makeHarness(t, { script: [], withNecessityGate: true });
-    const beat = h.append('wake/heartbeat', { quietSeconds: 3_600, idleTicks: 3, pressure: 0.1 });
+/*
+ * 2026-10-05：回复必要性门**拆了**（`src/runtime/necessity-gate.ts` 已删，原意、为什么废与
+ * "别再把它接回心跳拍"的警告见 docs/design.md「试过并废掉的口径：回复必要性门」）。
+ *
+ * 这一族用例因此改了**载体**、没改**判据**——每一问都换到 turn 内部去问：
+ *   · "唤醒会不会被框架提前掐掉" → "每一条唤醒都真的进了 turn"（含心跳拍，一次 heavy 请求）；
+ *   · "开口与否由谁定" → 由她定：模型回空就是整拍不说话（`spoke:false`，见上面 M5-4 那组）；
+ *   · "light 判定的钱" → 不再有这笔钱：**任何唤醒都不再产生 light 调用**（这条比原来更强）。
+ * 心跳拍在真循环里的形状（heavy 车道、同一份冻结前缀、可审计链）在
+ * `test/heartbeat-real-wake.test.ts`；light 车道自己的记账由 M5-8 的折叠用例与
+ * injection-judge / 记忆整理各自的套件覆盖。
+ */
+describe('M5-4 / M5-5 唤醒一律进 turn：不再有"先花一次 light 判定"这条路', () => {
+  test('M5-4 心跳拍进正常 turn：恰好一次 heavy 请求，她可以不说话', async (t) => {
+    const h = await makeHarness(t, { script: [{ text: '', toolCalls: [] }] });
+    const beat = h.append('wake/heartbeat', { quietSeconds: 3_600, idleTicks: 3, pressure: 0.1, probability: 0.5, roll: 0.2 });
 
     const reason = await h.turn([beat]);
 
     assert.deepEqual(reason, { kind: 'completed' });
-    assert.equal(h.verdicts.at(-1)?.by, 'rule', '空转走零成本规则门');
-    assert.equal(h.verdicts.at(-1)?.shouldReply, false);
-    assert.equal(h.requests.length, 0, 'M5-4：规则短路零模型调用');
-    assert.equal((await h.ofType('step/start')).length, 0, '沉默 turn 不开始任何 step');
-    assert.equal((await h.ofType('budget/consumed')).length, 0, '沉默不产生消耗');
+    assert.equal(h.requests.length, 1, '心跳拍必须真的发一次请求（旧口径在这里是 0 次）');
+    assert.equal(h.requests[0]!.lane, 'heavy', '走主力车道：只有它与普通回合共用同一条前缀');
+    assert.equal((await h.ofType('step/start')).length, 1, '这一拍起来了');
+    assert.equal((await h.ofType('budget/consumed')).length, 1, '这一拍的 token 照常记账');
 
     const end = (await h.ofType('turn/end')).at(-1);
-    assert.equal(end?.data.spoke, false, 'M5-4：沉默 turn 记 spoke:false');
+    assert.equal(end?.data.spoke, false, '不说话是正常结局，与"发不发请求"是两件事');
     const types = (await h.events()).map(e => e.type);
     assert.deepEqual(
-      types.filter(type => type.startsWith('turn/') || type === 'input/claimed'),
-      ['turn/start', 'input/claimed', 'turn/end'],
-      '静默路径事件序列固定：turn/start → input/claimed → turn/end',
+      types.filter(type => type.startsWith('turn/') || type === 'input/claimed' || type === 'step/start'),
+      ['turn/start', 'input/claimed', 'step/start', 'turn/end'],
+      '留痕顺序：起拍 → 认领 → 真的起了一步 → 收拍（旧口径在这里只有前三与最后一条，中间没有 step）',
     );
   });
 
-  test('M5-4 非心跳来源不经规则门：真实事件直接进 turn（规则层不替她闭嘴）', async (t) => {
-    const h = await makeHarness(t, { script: [{ text: '在。', toolCalls: [] }], withNecessityGate: true });
+  test('M5-4 真实事件（人/定时器/…）照旧进 turn，且一样不花 light 的钱', async (t) => {
+    const h = await makeHarness(t, { script: [{ text: '在。', toolCalls: [] }] });
     const wake = h.append('wake/manual', { note: '人戳了一下' });
 
     await h.turn([wake]);
 
-    assert.equal(h.verdicts.at(-1)?.by, 'rule');
-    assert.equal(h.verdicts.at(-1)?.shouldReply, true);
-    assert.equal(h.requests.length, 1, '放行后照常走主力模型');
+    assert.equal(h.requests.length, 1, '真实事件直接走主力模型');
     assert.equal(h.requests[0]!.lane, 'heavy');
   });
 
-  test('M5-4 硬牵挂直接放行：到期意图 / 待确认不必花 light 的钱', async (t) => {
-    const h = await makeHarness(t, { script: [{ text: '我来处理。', toolCalls: [] }], withNecessityGate: true });
+  test('M5-4 有牵挂（到期意图在场）也走同一条路：进 turn、走 heavy、不问 light', async (t) => {
+    // 旧用例问的是"硬牵挂要不要花 light 的钱"——现在没有那笔钱了，判据落在"照样进 turn"上。
+    // （意图的可见性另有其路：投影里的到期意图由调度器变成 `wake/intention` 才叫醒她，
+    //  它本来就不直接进提示词——这条与被拆的门无关，所以这里不假装它在请求里。）
+    const h = await makeHarness(t, { script: [{ text: '我来处理。', toolCalls: [] }] });
     h.append('intention/raised', {
       intentionId: 'i1',
       content: '该提醒他复盘了',
       triggerAt: '2026-02-14T09:00:00.000+08:00',
     });
-    const beat = h.append('wake/heartbeat', { quietSeconds: 60, idleTicks: 1, pressure: 0.1 });
+    const beat = h.append('wake/heartbeat', { quietSeconds: 60, idleTicks: 1, pressure: 0.1, probability: 0.2, roll: 0.1 });
 
     await h.turn([beat]);
 
-    const verdict = h.verdicts.at(-1)!;
-    assert.equal(verdict.shouldReply, true);
-    assert.equal(verdict.by, 'rule', '到期意图属硬牵挂：规则层直接放行，不花钱问模型');
-    assert.match(verdict.reason, /到期意图/);
     assert.equal(h.requests.length, 1);
     assert.equal(h.requests[0]!.lane, 'heavy');
+    assert.equal(h.requests.filter(request => request.lane === 'light').length, 0);
+    assert.deepEqual((await h.ofType('input/claimed')).at(-1)?.data.wakeSeqs, [beat.seq]);
   });
 
-  test('M5-5 灰色输入经 light 模型门判定：budget/consumed 记 light，不产生 heavy 调用', async (t) => {
-    const h = await makeHarness(t, {
-      script: [],
-      withNecessityGate: true,
-      generateScript: [{
-        outputItems: [decisionItem(false, '只有陈年待办，没有必须回应的新事')],
-        usage: { inputTokens: 180, outputTokens: 24 },
-      }],
-    });
-    // 软牵挂（未完成 todo）超过模型门阈值 → 必须问一次 light，而不是直接静默
-    h.append('todo/updated', {
-      items: [{ content: `待办：${'盯'.repeat(MODEL_GATE_HINT_CHARS + 20)}`, status: 'pending' }],
-    });
-    const beat = h.append('wake/heartbeat', { quietSeconds: 600, idleTicks: 2, pressure: 0.3 });
+  test('M5-5 灰色输入（长待办）不再触发任何 light 判定：只有 heavy 一次，账也只有 heavy 一笔', async (t) => {
+    // 旧口径里"软牵挂超过阈值"会先花一次 light 判定再决定要不要起 turn；那条路已经不存在。
+    // 这里把 `generateScript` 留空：**一旦有 light 调用，假模型会抛**（脚本耗尽），用例就红。
+    const h = await makeHarness(t, { script: [{ text: '', toolCalls: [] }] });
+    h.append('todo/updated', { items: [{ content: `待办：${'盯'.repeat(220)}`, status: 'pending' }] });
+    const beat = h.append('wake/heartbeat', { quietSeconds: 600, idleTicks: 2, pressure: 0.3, probability: 0.3, roll: 0.1 });
 
     await h.turn([beat]);
 
-    const verdict = h.verdicts.at(-1)!;
-    assert.equal(verdict.by, 'model', '灰色地带由 light 模型判定');
-    assert.equal(verdict.shouldReply, false);
-
-    // 请求形状：light 车道 + 低档思考 + json_schema 强约束 + 只有一段提示词
-    const judged = h.requests.find(request => request.lane === 'light');
-    assert.ok(judged, '灰色输入必须经一次 light 判定');
-    assert.equal(judged.text?.type, 'json_schema');
-    assert.equal((judged.text as { name?: string }).name, 'reply_necessity');
-    assert.equal(judged.reasoning?.effort, 'low', '门用低档思考拿稳定结构化判定');
-    assert.equal(typeof judged.input, 'string', '门的输入只有一段提示词（不含人格资产与历史）');
-
-    // 记账与隔离
+    assert.equal(h.requests.filter(request => request.lane === 'light').length, 0, '不再有 light 判定这笔钱');
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.requests[0]!.lane, 'heavy');
     const consumed = await h.ofType('budget/consumed');
     assert.equal(consumed.length, 1);
-    assert.equal(consumed[0]!.data.lane, 'light');
-    assert.equal(consumed[0]!.data.model, 'fake-light');
-    assert.equal(consumed[0]!.data.inputTokens, 180);
-    assert.ok(!h.requests.some(request => request.lane === 'heavy'), 'M5-5：判定沉默时不得产生 heavy 调用');
-    assert.equal((await h.ofType('step/start')).length, 0);
-    assert.equal((await h.ofType('turn/end')).at(-1)?.data.spoke, false);
+    assert.equal(consumed[0]!.data.lane, 'heavy');
+    assert.ok(
+      !consumed.some(event => event.data.lane === 'light'),
+      'M5-5：这一拍不产生 light 消耗',
+    );
+    assert.equal((await h.ofType('step/start')).length, 1);
   });
 
-  test('M5-5 门的失败方向：light 判定抛错也放行，且失败照样记账', async (t) => {
-    const h = await makeHarness(t, {
-      script: [{ text: '门坏了，但我在。', toolCalls: [] }],
-      withNecessityGate: true,
-      generateScript: [{ throws: new Error('接口挂了') }],
-    });
-    h.append('todo/updated', {
-      items: [{ content: `待办：${'盯'.repeat(MODEL_GATE_HINT_CHARS + 20)}`, status: 'pending' }],
-    });
-    const beat = h.append('wake/heartbeat', { quietSeconds: 600, idleTicks: 2, pressure: 0.3 });
+  test('M5-5 失败方向（换成 turn 级）：模型拒了请求时这一拍不静默消失——结局是 error、输入退回队列、失败记账', async (t) => {
+    // 旧用例验的是"light 判定抛错也放行"。门拆了之后，同一件事要问在 turn 上：
+    // **失败绝不能被静默吞掉**——结局、账、输入的归宿三样都要留下。
+    const h = await makeHarness(t, { script: [{ throws: new Error('接口挂了') }] });
+    const beat = h.append('wake/heartbeat', { quietSeconds: 600, idleTicks: 2, pressure: 0.3, probability: 0.3, roll: 0.1 });
 
-    await h.turn([beat]);
+    const reason = await h.turn([beat]);
 
-    const verdict = h.verdicts.at(-1)!;
-    assert.equal(verdict.by, 'error');
-    assert.equal(verdict.shouldReply, true, '永久闭嘴比多说一句糟糕得多：出错一律放行');
-
-    const consumed = await h.ofType('budget/consumed');
-    assert.equal(consumed[0]!.data.lane, 'light');
-    assert.equal(consumed[0]!.data.finishReason, 'failed', '失败也记账，否则失败刹车永远看不到');
-    assert.equal(h.requests.filter(request => request.lane === 'heavy').length, 1, '放行之后才走 heavy');
+    assert.equal(reason.kind, 'error', '失败要如实收尾（不许伪装成 completed 的沉默）');
+    const end = (await h.ofType('turn/end')).at(-1);
+    assert.equal(end?.data.spoke, false);
+    const requeued = (await h.ofType('input/requeued')).at(-1);
+    assert.ok(requeued, '整轮失败要把认领过的输入退回去：它不该就此消失');
+    assert.deepEqual(requeued.data.wakeSeqs, [beat.seq]);
+    assert.equal(requeued.data.reason, 'turn-error');
+    assert.equal(h.projection.failStreak, 1, '失败照旧计入连续失败（失败刹车看得见）');
   });
 });
 

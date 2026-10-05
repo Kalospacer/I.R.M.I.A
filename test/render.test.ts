@@ -431,7 +431,7 @@ function buildMixedLog(): AppEvent[] {
     evt<WakeWebhook>('wake/webhook', {
       path: '/hook/ci', body: '{"evt":"push"}', headers: { 'x-id': '1' }, dedupeKey: 'hook:ci',
     }),
-    evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 900, idleTicks: 2, pressure: 0.2 }),
+    evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 900, idleTicks: 2, pressure: 0.2, probability: 0.4, roll: 0.2 }),
     evt<WakeIntention>('wake/intention', { intentionId: 'i1', content: '检查备份是否可读' }),
     evt<WakeJob>('wake/job', { jobId: 'job-7' }),
   );
@@ -885,7 +885,7 @@ describe('此刻层 · `用度：` 只在告警时出现（v24）', () => {
     // ① 日预算到软阈值（0.85）
     const overBudget = envLayer(renderOnce({ machine: MACHINE_A, usage: { ...USAGE_A, tokensToday: 1_700_000 } }));
     assert.ok(overBudget.includes('用度：⚠ 日预算已到软阈值 · '), overBudget);
-    assert.ok(overBudget.includes('今日 1,700,000 tok（占每日预算 2,000,000 的 85.0%）'), overBudget);
+    assert.ok(overBudget.includes('今日非缓存 1,700,000 tok（占每日预算 2,000,000 的 85.0%）'), overBudget);
 
     // ② 连续失败已达上限
     const failMax = envLayer(renderOnce({ machine: MACHINE_A, usage: USAGE_FAILMAX }));
@@ -1708,9 +1708,9 @@ test('wake/heartbeat 报"已安静"，分钟/秒分档', () => {
     resetFactory();
     const r = renderOnce({
       events: [
-        evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 900, idleTicks: 2, pressure: 0.2 }),
-        evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 60, idleTicks: 1, pressure: 0.1 }),
-        evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 30, idleTicks: 1, pressure: 0.1 }),
+        evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 900, idleTicks: 2, pressure: 0.2, probability: 0.4, roll: 0.2 }),
+        evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 60, idleTicks: 1, pressure: 0.1, probability: 0.3, roll: 0.1 }),
+        evt<WakeHeartbeat>('wake/heartbeat', { quietSeconds: 30, idleTicks: 1, pressure: 0.1, probability: 0.2, roll: 0.1 }),
       ],
     });
     const texts = eventItems(r).filter((i): i is MessageItem => i.type === 'message').map(i => i.content);

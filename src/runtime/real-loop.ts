@@ -19,13 +19,17 @@
  * 先落事件再删文件，然后用"配置上限 + 加注累计"重建判定器——加注抬高上限，已消耗的 token
  * 一个字节都不动（M3-5：进度不丢）。
  *
- * M5 在这里补上心跳与回复必要性门（判定逻辑在 wake/heartbeat.ts 与 runtime/necessity-gate.ts）：
- *   ⑤ **心跳**：本模块自己持有 Heartbeat（随 start/stop 布防），到点写 `wake/heartbeat`。
- *      间隔 = 基线 × min(2^idleTicks, idleBackoffMax) × (1.5 − pressure)，空拍与压力都从投影读；
- *      `noteActivity()` 只在**外部事件**到达时复位——心跳自己不复位，否则退避永远长不起来（§4.12）。
- *   ⑥ **必要性门**：心跳批次先过门（规则短路优先，light 模型兜底），判定沉默时 turn 以
- *      `turn/end{completed, spoke:false}` 收尾且零模型调用；人/定时器/文件/webhook/意图/后台
- *      这些真实事件直接进 turn——规则层不替她闭嘴（§4.11）。
+ * M5 在这里补上心跳（判定逻辑在 wake/heartbeat.ts）：
+ *   ⑤ **心跳**：本模块自己持有 Heartbeat（随 start/stop 布防），抽中时写 `wake/heartbeat`。
+ *      概率模型：安静 < floor 绝不触发、≥ ceil 必然触发、中间每 tick 抽一次签且命中概率随安静上升；
+ *      形状指数 α 不在这里给——按 `wake.heartbeatTargetMeanMin`（目标均值，"平均多久醒一次"）
+ *      在构造时反解（`solveHeartbeatAlpha`）；启动摘要会把"目标 ⇒ 解出的 α"报出来。
+ *      `noteActivity()` 只在**外部事件**到达时复位——心跳自己不复位，否则概率永远起不来（§4.12）。
+ *      心跳拍是**真实唤醒**：它照常进 turn（主力车道 + 与普通回合同一份冻结前缀），
+ *      因为"唤醒一次的花费远少于缓存前缀被供方回收的花费"（2026-10-05 用户改口径）。
+ *   ⑥ **回复必要性门已拆**（2026-10-05）：它唯一做的事是"调模型之前替她闭嘴=一个请求都不发"，
+ *      与被废掉的口径正好相反。原意、为什么废、别再把它接回心跳拍的警告见
+ *      docs/design.md 的「试过并废掉的口径：回复必要性门」。
  *
  * M5 在这里补上折叠快照：每天首次 + 每 SNAPSHOT_EVERY_EVENTS 条事件写一次 `data/snapshots/`，
  * 并写 `snapshot/checkpoint` 事件；恢复时 runtime/recover.ts 从最近快照起算（M5-9）。
@@ -39,7 +43,7 @@ import type { AppEvent, BudgetLayer, PendingInput, Projection, TurnEndReason, Wa
 import { isTopLevelEvent } from '../log/types.ts';
 import { InjectionJudge, type InjectionVerdict } from '../channel/injection-judge.ts';
 import {
-  injectionNoteOf, noteForFlagged, quotesOfHints, reasonOfHints, scanForInjection,
+  injectionNoteOf, noteForFlagged, quotesOfHints, reasonOfHints, scanForInjection, speakerWordsOf,
 } from '../channel/injection.ts';
 import { TopicSummarizer } from '../channel/topic.ts';
 import type { WakeEmission } from '../wake/sources.js';
@@ -61,7 +65,7 @@ import { runTurn, isHeartbeatTurn, compactionCoveredUpToSeq, handoffOptionsOf, t
 // 免得「提示词告诉她能发」与「实际能不能发」变成两套口径。
 import {
   collectSessions as collectSessionsFromLog, normalizeSid, parseAliases, resolveNameForSid, sidOf,
-  upsertSession as upsertSessionInto, type SessionEntry as KnownSession,
+  upsertSession as upsertSessionInto, type SessionAlias as KnownSessionAlias, type SessionEntry as KnownSession,
 } from '../channel/sessions.ts';
 import type { ChannelMessageView, ChannelSpoken } from '../tools/admin.js';
 import {
@@ -80,8 +84,10 @@ import {
 import { relationshipForWake } from '../persona/relationship.ts';
 import { BudgetGuard, DEFAULT_STALL_MS, stallOf, type StallInfo } from './budget-guard.ts';
 import { createNotifier, type AlertNotifier } from '../alert/notifier.ts';
+import {
+  backfillCandidates, backfillResolvedAlarms, pausedLayers, raisedLayers, unresolvedCategories,
+} from '../alert/startup.ts';
 import { Heartbeat, HeartbeatSource, type HeartbeatFiring } from '../wake/heartbeat.ts';
-import { NecessityGate } from './necessity-gate.ts';
 import { holdsGroupBatch } from './group-batch.ts';
 import type { SkillManager } from '../skill/skills.js';
 import type { HookRunner } from '../hook/hooks.js';
@@ -105,6 +111,8 @@ import {
 } from './slash-commands.ts';
 import { renderHandoffNote } from '../persona/handoff-note.ts';
 import { sha256Hex } from '../persona/versions.ts';
+import type { TaskLoopRuntimeDeps } from '../tools/catalog.js';
+import type { ToolPlanGate } from '../tools/executor.js';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
@@ -141,9 +149,11 @@ const BATCH_LIMIT = 8;
  * 「分区七：系统」那张卡）：人拿着告警去设置里找，标签差一个字就等于没说。
  *
  * `scope` 是这一档"数的是什么"的口径。token 那两档用的是仓库里既有的那句话
- * （与界面字段说明、`BUDGET_METRIC_NOTE` 同一口径）：数的是**未扣缓存**的 token，
- * 含缓存命中的那部分，不等于花销——第一次看到"今日用量 34599.9k"的人，反应都是"我没用这么多"。
- * 次数那两档就如实说数的是次数，不硬套 token 的话。
+ * （与界面字段说明、`BUDGET_METRIC_NOTE`、此刻层 `用度：` 那一行同一个口径）：数的是
+ * **真花钱的那部分**——输入里没命中缓存的 + 输出；缓存命中的那一大截**不算**
+ *（2026-10-05 用户换的口径，逐字原话与唯一定义在 `state/fold.ts` 的 `budgetTokensOf`）。
+ * 措辞刻意用大白话**不写术语**：这句话是撞刹车时给人看的，人要知道的是"这数是不是我花的钱"，
+ * 不是"非缓存口径"这五个字。次数那两档就如实说数的是次数，不硬套 token 的话。
  */
 const BUDGET_LAYER_FACTS: Record<BudgetLayer, { name: string; field: string; scope: string }> = {
   step: {
@@ -159,14 +169,25 @@ const BUDGET_LAYER_FACTS: Record<BudgetLayer, { name: string; field: string; sco
   task: {
     name: '任务 token',
     field: '预算 · 任务 token 上限',
-    scope: '口径是**未扣缓存**的 token 数（含缓存命中的那部分），不等于花销',
+    scope: '这一档数的是**真花钱的那部分**：输入里没命中缓存的 + 输出（缓存命中的那一大截不算在内）',
   },
   daily: {
     name: '每日 token',
     field: '预算 · 每日 token 上限',
-    scope: '口径是**未扣缓存**的 token 数（含缓存命中的那部分），不等于花销',
+    scope: '这一档数的是**真花钱的那部分**：输入里没命中缓存的 + 输出（缓存命中的那一大截不算在内）',
   },
 };
+
+/**
+ * 告警里的 token 数一律走它：**千位分隔**。
+ *
+ * 现场那张告警是「已用 178734979 / 上限 57000000」——一串没有分隔的数字，人眼要先数位数
+ * 才知道它是不是"两个数量级"的错。带上分隔符（178,734,979）这件事一眼就能看出来。
+ * 只做展示，不进事件、不进账（事件里的 limit/actual 仍是原始整数）。
+ */
+function formatTokens(value: number): string {
+  return Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/gu, ',');
+}
 
 /**
  * 进主循环上下文的事件（`AgentLoopDeps.eventFilter`）——两刀，判据都在别的模块里：
@@ -393,6 +414,18 @@ export interface RealLoopDeps {
    * 循环层的事实（它刚刚把哪批事件交给了模型），只有它知道。
    */
   currentWakeChannel?: () => WakeChannel['data'] | null;
+  /**
+   * `task`（隔离子代理）的**运行期素材**（design §4.21，装配见 tools/catalog.ts 的 taskRuntime）。
+   *
+   * 为什么由循环补而不是装配点自己拼：子代理要的里面有三样是**循环的东西**——刹车判定器
+   * （活取：加注会把实例换掉）、计划门（与父同一道门，否则子代理成了绕过事前审批的路）、
+   * 执行点钩子。其余几样（log / ds / registry / projection / persona / modelVisibility）
+   * 由装配点那侧的取值器给，所以这里**只补差集**，不重复搬一遍。
+   *
+   * 不传 = `task` 没有运行期那一半（工具如实报"未接线"）。`tools.taskEnabled: false` 时
+   * 它本来就没注册，两者互不影响。
+   */
+  taskRuntime?: TaskLoopRuntimeDeps;
 }
 
 /**
@@ -427,11 +460,9 @@ export class RealLoop {
   private readonly failCooldownMs: number;
   private readonly stallMs: number;
   private readonly failStreakMax: number;
-  /** 心跳（design §4.12 空闲退避 + pressure 调制）；本模块自己持有，随 start/stop 布防 */
+  /** 心跳（design §4.12 概率模型：安静越久命中概率越高）；本模块自己持有，随 start/stop 布防 */
   private readonly heartbeat: Heartbeat;
   private readonly heartbeatSource: HeartbeatSource;
-  /** 回复必要性门（design §4.11）：心跳批次先过它，真实事件直接进 turn */
-  private readonly necessity: NecessityGate;
   /** 注入的判定器不重建（测试注入的假阈值必须原地生效） */
   private readonly guardIsInjected: boolean;
   private guard: BudgetGuard;
@@ -612,13 +643,10 @@ export class RealLoop {
         this.appendSync('wake/heartbeat', data, 'model');
       },
     });
-    this.necessity = new NecessityGate({
-      ds: deps.ds,
-      log: deps.log,
-      projection: deps.projection,
-      now: deps.now,
-      out: this.write,
-    });
+    // **这里曾经构造回复必要性门**（`new NecessityGate({...})`）：2026-10-05 拆掉了。
+    // 它唯一的输入类是"仅心跳批次"，而心跳改成了**真实唤醒**（必须发一次 heavy 请求去保温
+    // 供方缓存）——门留在链上只会把那条口径重新变成"一个请求都不发"。
+    // 原意、为什么废、别再把它接回来的警告：docs/design.md「试过并废掉的口径：回复必要性门」。
     this.notifier = deps.notifier ?? createNotifier({
       config: deps.config.alerts,
       dataDir: deps.dataDir,
@@ -653,9 +681,15 @@ export class RealLoop {
     }, this.pollMs);
     // 心跳与主轮询无关：它是"没人说话时的呼吸"，随循环一起布防、一起停
     this.heartbeatSource.start();
-    this.write(`[心跳] 已布防，基线 ${Math.round(this.heartbeat.nextDelayMs() / 60_000)} 分钟`
-      + `（退避上限 ${Math.max(1, Math.trunc(this.deps.config.wake.idleBackoffMax))} 倍，压力调制，`
-      + `区间 ${this.deps.config.wake.heartbeatFloorMin}~${this.deps.config.wake.heartbeatCeilMin} 分钟）`);
+    const dist = this.heartbeatSource.distribution();
+    this.write(
+      `[心跳] 已布防：安静 ${Math.round(dist.floorMs / 60_000)} 分钟前不触发、`
+      + `${Math.round(dist.ceilMs / 60_000)} 分钟必然触发，每 ${Math.round(dist.tickMs / 60_000)} 分钟抽一次签`
+      + `（命中概率随安静上升，均值约 ${Math.round(dist.meanMs / 60_000)} 分钟`
+      + `${dist.targetMeanMs === null
+        ? ''
+        : `；目标均值 ${Math.round(dist.targetMeanMs / 60_000)} 分钟 ⇒ 解出 α = ${dist.alpha.toFixed(4)}`}）`,
+    );
     void this.tick();
   }
 
@@ -680,8 +714,8 @@ export class RealLoop {
   /** WakeSink：唤醒事件（model，承诺类；返回时已在磁盘上） */
   wake(emission: WakeEmission): void {
     const logged = this.appendSync(emission.type, emission.data, 'model');
-    // 任何外部事件到达即复位空拍（design §4.12）。心跳自己不走这条路：
-    // 它由 HeartbeatSource 直接落库，否则每拍都会把自己复位，退避永远长不起来。
+    // 任何外部事件到达即复位安静计时（design §4.12）。心跳自己不走这条路：
+    // 它由 HeartbeatSource 直接落库，否则每拍都会把自己复位，命中概率永远起不来。
     this.heartbeat.noteActivity();
     // 有人开口了：她若正在发言，立刻打断（本机对话流与消息适配器都算，见 noteUserSpoke）。
     // 记的是**刚落的这条事件的 seq**：speak 真被打断时要拿它销账（见 claimInterruption）
@@ -819,7 +853,7 @@ export class RealLoop {
       // 注入判定（v32）：**在本轮之前**跑完并落事件——渲染层是纯函数，它只能读事件；
       // 而且"当时提示过她什么"必须可复盘。有风险才写事件，没风险一个字都不写。
       // turn 号此刻还没分配（agent-loop 在自己的 runInner 里才定），所以挂 0——
-      // 与 necessity-gate 的记账同一口径：这条账的用途是观测 light 用量，不是 turn 归属。
+      // 与 `channel/injection-judge.ts` 的记账同一口径：这条账的用途是观测 light 用量，不是 turn 归属。
       await this.judgeChannelWakes(wakeEvents, 0);
       // 示警落库（v25）：把"框架对她说了这句话"记成事件——GUI 卡片原样贴它，此刻层那段
       // 历史数它，而"她到底看没看见"从此是可查的事实（而不是靠推断渲染时拼了什么）。
@@ -839,7 +873,7 @@ export class RealLoop {
       if (reason.kind === 'blocked' && reason.by === ASK_HUMAN_BLOCKED_BY) {
         await this.noteSuspension(batch, wakeEvents, beforeSeq);
       }
-      // 处理完一批真实事件 = 发生过活动：空拍复位。心跳批次不复位，退避才长得起来。
+      // 处理完一批真实事件 = 发生过活动：安静计时复位。心跳批次不复位，概率才长得起来。
       if (wakeEvents.some(event => event.type !== 'wake/heartbeat')) this.heartbeat.noteActivity();
       if (reason.kind === 'budget-exhausted') await this.notifyBudgetExhausted(reason.layer);
     } finally {
@@ -1130,6 +1164,15 @@ export class RealLoop {
     const status = this.guard.statuses(this.deps.projection).find(st => st.layer === layer);
     const used = status?.used ?? 0;
     const limit = status?.limit ?? 0;
+    // **上限的构成必须一眼看得出**（用户 2026-10-05：「不许不协调」）：
+    // 有效上限 = config.budget 那一档 + 累计人工加注。现场那张告警写着"上限 57000000"、
+    // 而 config.json 里是 taskTokens: 5000000 —— 差额 52M 是历史加注，不摊开就只能靠猜。
+    // 加注为 0 时不加那段（绝大多数情形），需要时又一定在场。
+    const base = status?.composition.base ?? 0;
+    const topUp = status?.composition.topUp ?? 0;
+    const breakdown = topUp > 0
+      ? `（配置 ${formatTokens(base)} + 加注 ${formatTokens(topUp)}）`
+      : '';
     const facts = BUDGET_LAYER_FACTS[layer];
     // 这一档锁不锁循环（budget-guard 的四层语义）：step / turn 只结束本 turn，
     // task / daily 会拒绝唤醒。说错这一句，人会以为整个循环死了。
@@ -1139,15 +1182,74 @@ export class RealLoop {
     await this.notifier.fail({
       category: CATEGORY.budget,
       level: 'critical',
-      title: `预算耗尽（${facts.name}）：已用 ${used} / 上限 ${limit}`,
-      body: `${facts.name}这一档到上限了：已用 ${used} / 上限 ${limit}。${state}`
-        + `两条出路：① 去「设置 → 系统」把「${facts.field}」调大——${facts.scope}；`
-        + '它是启动参数，改完要重启进程才生效。已经暂停的层，重启后新上限只要高于已用量，'
-        + '暂停就自动解除（会落一条 budget/resumed，说清是谁解的、凭什么解的）；'
+      title: `预算耗尽（${facts.name}）：已用 ${formatTokens(used)} / 上限 ${formatTokens(limit)}${breakdown}`,
+      body: `${facts.name}这一档到上限了：已用 ${formatTokens(used)} / 上限 ${formatTokens(limit)}`
+        + `。上限的构成：配置「${facts.field}」${formatTokens(base)}`
+        + `（${facts.scope}，改完要重启进程才生效）`
+        + (topUp > 0
+          ? ` + 历史累计加注 ${formatTokens(topUp)}（budget/topped-up 折出来的）。`
+          : '（这一档还没有过人工加注）。')
+        + state
+        + `两条出路：① 去「设置 → 系统」把「${facts.field}」调大`
+        + '——已经暂停的层，重启后新上限只要高于已用量，暂停就自动解除'
+        + '（会落一条 budget/resumed，说清是谁解的、凭什么解的）；'
         + '新上限仍不高于已用量则照旧停着，那就只剩加注这条路。'
         + `② 加注：irmia topup --layer ${layer} --tokens <N> —— 不用重启，循环下一拍拾取后接着跑。`,
       params: { layer },
     });
+  }
+
+  /**
+   * 启动补写「已恢复」：为**由进程状态决定、且当刻确实不成立**的未解除告警补一条销账。
+   *
+   * 判据一条都不在这里新造（三处都指向既有实现）：
+   *   · **哪些还没解除** —— `alert/startup.ts` 的 `unresolvedCategories`（与 notifier 的
+   *     `foldStalls` 同一口径）；
+   *   · **哪几类可以补** —— 那里面的 `STARTUP_BACKFILL` 表（`budget-exhausted`、`stall`），
+   *     以及 `NEVER_BACKFILLED`（"模型连续失败"这类**历史事实**：重启不等于它没发生过，
+   *     一个字都不许补——那条判据写在 startup.ts 上）；
+   *   · **当刻到底成不成立** —— 预算层用 `raisedLayers`（有效上限已经高过
+   *     撞线时那个上限 = 当刻不越线，与 `liftedPauses` 判据③同一个比较）；停滞用
+   *     `stallReport()`（运行期那一份判据本身，不另写一遍）。
+   *
+   * 幂等：写下去的那条 `recovered:true` 进日志，下一次启动 `foldStalls` 就把它销掉了；
+   * 同一次启动只调一次（warmUp）。**不谎报**：三条判据缺一条都不写。
+   */
+  private async backfillResolvedAlarms(
+    events: readonly AppEvent[],
+    pausedAtStartup: readonly BudgetLayer[],
+  ): Promise<void> {
+    const pending = unresolvedCategories(events);
+    if (pending.length === 0) return;
+
+    // ② 停滞：跑一次运行期那份判据本身（队列里有没有人等超时）。没有这一类告警时不白读盘。
+    const stallStillOn = pending.includes(CATEGORY.stall)
+      ? this.stallReport(this.deps.projection) !== null
+      : false;
+    // 当刻**还停着**哪几层：只有 `releaseLiftedPauses` 之后这一读才算数（抬上限解开的层
+    // 已经被它从 `lastExhausted` 里清掉；还挂着的就是上限没高过已用量的那些）。
+    // `pausedAtStartup`（抬上限之前读的那一份）只进正文——它说得出"上一次停的是哪一层"，
+    // 不参与判定（拿它一起判就会把"刚解开的那层"又算成还停着，正好把该补的账挡掉）。
+    const pausedNow = pausedLayers(this.deps.projection);
+
+    const candidates = backfillCandidates(events, { pausedLayers: pausedNow, stallNow: stallStillOn });
+    if (candidates.length === 0) return;
+
+    const raised = raisedLayers(events, layer => this.guard.limitOf(layer));
+    const written = await backfillResolvedAlarms(this.notifier, candidates, (category) => {
+      if (category === CATEGORY.budget) {
+        return raised.length === 0
+          ? `启动时核对：${pausedAtStartup.join('、')} 层那条撞线记录已被后来的 budget/resumed 或加注销掉，`
+            + '当刻不再越线。'
+          : `启动时核对：撞线的是 ${raised.join('、')} 层，当刻有效上限已高过撞线时那个上限，`
+            + '暂停不再成立。';
+      }
+      return '启动时核对：队列里没有等了超过阈值的输入，水位停滞当刻不成立。';
+    });
+    for (const category of written) {
+      this.write(`[告警] 启动核对：${category} 当刻已不成立，补写一条「已恢复」销账`
+        + '（上一次是重启/改配置/加注解开的，进程内没有那一刻可写）');
+    }
   }
 
   /**
@@ -1530,11 +1632,25 @@ export class RealLoop {
       this.write(`[人审] 停机期间收到答复（「${hanging.answered.answer}」）：turn ${hanging.answered.suspension.turn} 的输入将重新入队`);
     }
     this.setTopUps(foldTopUps(events));
+    // **补写「已恢复」**（2026-10-05 修的真 bug）：上一次那串故障是**重启 + 改额度**解开的，
+    // 而这个进程里再没有任何一刻会判"它解除了"（解除动作发生在上一个进程/人手里），
+    // 于是运行情况页那条「预算耗尽」永远红着——见 alert/startup.ts 那一篇的现场说明。
+    //
+    // 先在**抬上限之前**读一次"当时还停着哪几层"：这一份只进补写的正文（它说得出
+    // "上一次停的是哪一层"），不参与判定——判定用的是 `releaseLiftedPauses` 之后那一份
+    // （见 `backfillResolvedAlarms` 里的 `pausedNow`）。两份都在这一小段里读，
+    // 判据只有一处，不存在"两处各判一次"。
+    const pausedAtStartup = pausedLayers(this.deps.projection);
     // 抬上限解除暂停：**启动时就判一次**。「设置 → 系统」那四项是启动参数，改完重启才生效，
     // 所以"改配置解暂停"这条路只可能在这里落地（判据看活的有效上限，见 releaseLiftedPauses）。
     // 必须排在 setTopUps 之后：有效上限 = 配置 + 加注累计，两个来源都齐了才能比；
     // 也必须排在 scanSuspension 之后：人审挂起在台上时 task 层要让路。
     this.releaseLiftedPauses();
+    // **补写告警的账**（与上面那条 `budget/resumed` 是两件事：那条说"怎么解的"，
+    // 这条把"已恢复"补给告警卡）。必须排在 `releaseLiftedPauses` **之后**：那一步会把
+    // 抬上限解开的层从 `lastExhausted` 里清掉，清掉之后"当刻还停着哪几层"才是真正的答案
+    // （还停着的层 = 上限没高过已用量的那些，见 `pausedLayers`）。
+    await this.backfillResolvedAlarms(events, pausedAtStartup);
     // 信任门的真相源是日志：重启后谁被确认过必须原样重建，否则已生效的 skill 会集体掉出 catalog
     this.skills?.setTrustEvents(events);
     for (const event of events) {
@@ -1668,6 +1784,21 @@ export class RealLoop {
   }
 
   /**
+   * 当前的刹车判定器（`task` 子代理要它）。
+   *
+   * 为什么必须是**活的**、不能拷一份快照：有效上限含人工加注，而加注（`topup`）会把
+   * `this.guard` 整个换掉（见 setTopUps / 跨天 rollover）。装配期拷一份，子代理的刹车就会
+   * 一直按加注前的上限算——"我明明加过额度，子代理还是说超了"。
+   *
+   * 判定器本身是**无状态判定**：`checkBeforeStep(projection)` 只读传进来的那份投影，
+   * `breachOf` / `limitOf` 同理，所以父子共用同一个实例不会串账——各自的账在各自的投影里
+   * （子代理的投影从父投影的累计起算，见 subagent.ts 的 childProjectionOf）。
+   */
+  budgetGuard(): BudgetGuard {
+    return this.guard;
+  }
+
+  /**
    * 判定器工厂：有效上限 = config.budget + 人工加注累计。
    * 加注抬高上限而不是清零消耗，所以"已消耗的 token"这条事实在任何时候都不被改写。
    */
@@ -1722,6 +1853,12 @@ export class RealLoop {
         }, 'internal');
       },
     });
+    // 场景鉴权 + 计划模式合成的那一道门。**一份实例两处用**（父循环与子代理链）：
+    // 门本身无状态（判据读的是传入的 call 与上下文），两处各造一份只会有"其中一处漏了一条
+    // 分支"的空间——而那正是"用 task 派个子代理就把审批绕过去"这类洞的成因。
+    const toolGate: ToolPlanGate = {
+      intercept: (call) => authzGate.intercept(call) ?? this.planMode.intercept(call),
+    };
     return {
       log: d.log,
       ds: d.ds,
@@ -1779,7 +1916,11 @@ export class RealLoop {
       eventFilter: contextEventFilter,
       // 大结果外置（§4.12）：阈值与预览长度走 blob-store 的默认口径（估算 8k token / 2k 字符）
       blobOffload: { dataDir: d.dataDir },
-      necessityGate: (wakeText, wakeEvents) => this.gateAdmits(wakeText, wakeEvents ?? []),
+      // **这里曾经接回复必要性门**（`necessityGate: …` → `gateAdmits`）：2026-10-05 拆掉了。
+      // 现在**每一条唤醒都照常进 turn**，包括心跳拍——用户要的是"心跳真的发一次请求去保温
+      // 供方缓存"（唤醒一次远比缓存前缀被回收便宜）。"开不开口"仍由她在 turn 里自己定。
+      // 别再把它接回来：接回来就等于"沉默 = 一个请求都不发"，缓存又会被回收。
+      // 见 docs/design.md「试过并废掉的口径：回复必要性门」。
       // 压缩点（persona.md §4、design §4.13 铁律 5）：turn 结束且可见历史估算超过 config 阈值时，
       // 由循环层写一份交接笔记作为 compaction/summary（历史只遮蔽、不改写）
       compaction: {
@@ -1850,9 +1991,21 @@ export class RealLoop {
       ...(d.hooks !== undefined ? { hooks: d.hooks } : {}),
       // **场景鉴权门**（2026-10-04 用户定稿）：清单恒定之后，"客人能不能碰这台机器"在这里判。
       // 与 plan 模式共用同一个挂点：场景先判（这是安全问题），过了再看要不要请人批准。
-      planGate: {
-        intercept: (call) => authzGate.intercept(call) ?? this.planMode.intercept(call),
-      },
+      planGate: toolGate,
+      // `task` 子代理（design §4.21）：这一格补的是**只有循环才知道**的那三样，与装配点
+      // 那半格子合并后才是一份完整素材（见 tools/catalog.ts 的 taskRuntime）。
+      //
+      // 三样都必须与父**共用同一个实例**：`planGate` 让子代理内的 destructive 调用照旧
+      // 请人批准（不传它 = `task` 成了一条绕过事前审批的路），`guard` 是与父同一个判定器
+      // （活取，见 budgetGuard()——加注会把实例换掉），`hooks` 是同一份执行点钩子。
+      ...(d.taskRuntime === undefined ? {} : {
+        taskRuntime: {
+          ...d.taskRuntime,
+          guard: this.budgetGuard(),
+          planGate: toolGate,
+          ...(d.hooks === undefined ? {} : { hooks: d.hooks }),
+        },
+      }),
     };
   }
 
@@ -2043,7 +2196,7 @@ export class RealLoop {
   }
 
   /** 读 `MEMORIES/aliases.md`（她给外部会话起的名字）；读不到就当没有，不报错 */
-  private readAliases(): Map<string, string> {
+  private readAliases(): Map<string, KnownSessionAlias> {
     try {
       const path = join(memoriesDir(this.deps.dataDir), 'aliases.md');
       return parseAliases(readFileSync(path, 'utf8'));
@@ -2164,9 +2317,11 @@ export class RealLoop {
       const d = event.data;
       if (exempt.isExempt(d)) continue;
       if (this.notedMessageIds.has(d.messageId)) continue;
-      // 判过的用它那句（含语义级），没判过的现扫字面——与渲染层同一个判据、同一段文案
+      // 判过的用它那句（含语义级），没判过的现扫字面——与渲染层同一个判据、同一段文案。
+      // 素材过 `speakerWordsOf`（判据的唯一实现）：转述块里常常是她自己的发言，扫它就会被
+      // 当成"这条消息在指挥你"贴回她眼前——与判定入口同一处判据，不另写一份。
       const flagged = this.flaggedNotes.get(d.messageId);
-      const hints = flagged === undefined ? scanForInjection(d.text) : [];
+      const hints = flagged === undefined ? scanForInjection(speakerWordsOf(d.text)) : [];
       const note = flagged?.note ?? injectionNoteOf(hints);
       if (note === null) continue;
       this.notedMessageIds.add(d.messageId);
@@ -2320,6 +2475,9 @@ export class RealLoop {
         text: d.text,
         messageId: d.messageId,
         msgSeq: d.msgSeq,
+        // 落库时分配的事件 seq：`read_channel` 判"这个会话有没有新东西"用的就是它
+        //（平台序号答不了这个问题——官方单聊恒为 1，见 tools/admin.ts 的 ChannelMessageView.seq）
+        seq: event.seq,
         ts: event.ts,
         ...(d.attachments === undefined ? {} : { attachments: d.attachments }),
         // 判过的消息**回放时也要带预警**：那句话她可能正是在"翻旧账"这一刻才看到的，
@@ -2604,21 +2762,27 @@ export class RealLoop {
   // ──────────────────────────────── 心跳与必要性门 ────────────────────────────────
 
   /**
-   * 心跳节律：基线 × min(2^idleTicks, idleBackoffMax) × (1.5 − pressure)。
-   * 空拍数与压力都从投影读（日志的折叠结果），本模块不另立一份账。
+   * 心跳节律：概率模型（design §4.12）。安静 < floor 绝不触发、≥ ceil 必然触发，
+   * 中间每个 tick 抽一次签且命中概率随安静时间单调上升。
+   *
+   * 四个旋钮：floor / ceil / tick，加上**目标均值**（`wake.heartbeatTargetMeanMin`，
+   * "平均多久醒一次"）——曲线的形状指数 α 不在这里给，`Heartbeat` 构造时按目标均值反解
+   * （`solveHeartbeatAlpha`，见 src/wake/heartbeat.ts 的文件头）。**没有基线也没有退避倍数**：
+   * 旧模型那两个字段已随 `wake.heartbeatBaselineMin` / `wake.idleBackoffMax` 一起删除。
    */
   private makeHeartbeat(): Heartbeat {
     const minutes = (value: number): number | undefined =>
       Number.isFinite(value) && value > 0 ? value * 60_000 : undefined;
-    const baseMs = minutes(this.deps.config.wake.heartbeatBaselineMin);
     const floorMs = minutes(this.deps.config.wake.heartbeatFloorMin);
     const ceilMs = minutes(this.deps.config.wake.heartbeatCeilMin);
+    const tickMs = minutes(this.deps.config.wake.heartbeatTickMin);
+    const targetMeanMs = minutes(this.deps.config.wake.heartbeatTargetMeanMin);
     return new Heartbeat({
       projection: this.deps.projection,
-      ...(baseMs !== undefined ? { baselineMs: baseMs } : {}),
-      backoffMax: this.deps.config.wake.idleBackoffMax,
       ...(floorMs !== undefined ? { floorMs } : {}),
       ...(ceilMs !== undefined ? { ceilMs } : {}),
+      ...(tickMs !== undefined ? { tickMs } : {}),
+      ...(targetMeanMs !== undefined ? { targetMeanMs } : {}),
       now: this.deps.now,
       policy: () => this.heartbeatPolicy(),
       onDebug: this.write,
@@ -2655,24 +2819,25 @@ export class RealLoop {
 
   /** 心跳落地：事件已在 HeartbeatSource 里写盘（appendSync），这里只留一行可读的诊断 */
   private noteHeartbeat(firing: HeartbeatFiring): void {
-    this.write(`[心跳] 安静 ${firing.quietSeconds}s，空拍 ${firing.idleTicks}，`
-      + `压力 ${firing.pressure.toFixed(2)}，下一拍 ${Math.round(this.heartbeat.nextDelayMs() / 60_000)} 分钟后`);
+    this.write(`[心跳] 安静 ${firing.quietSeconds}s，命中（p=${firing.probability.toFixed(3)}，`
+      + `roll=${firing.roll.toFixed(3)}），空拍 ${firing.idleTicks}，`
+      + `压力 ${firing.pressure.toFixed(2)}，下一次抽签 ${Math.round(this.heartbeat.nextDelayMs() / 60_000)} 分钟后`);
   }
 
   /**
-   * 必要性门接线（design §4.11）：**只有心跳批次过门**。人/定时器/文件/webhook/意图/后台
-   * 这些都是真实发生的事，直接进 turn，由她在 turn 里决定怎么回应——规则层不替她闭嘴。
-   * 判定结论落在日志里：沉默 turn 的事件序列是 `turn/start → input/claimed →
-   * turn/end{completed, spoke:false}`（由 agent-loop 的收尾路径写），零模型调用。
+   * **这里曾经是唤醒路由 `gateAdmits`**（必要性门的接线点）：2026-10-05 连门一起拆掉了。
+   *
+   * 它当年做两件事：① 心跳批次先过门（规则短路优先、light 模型兜底）；② 其余来源直接进 turn。
+   * 拆它的原因只有一条但足够：门对心跳拍给出的"沉默"在旧口径里等于**一个请求都不发**，而用户把
+   * 心跳改成**真实唤醒**——心跳这一拍就是去保温供方那份 KV 前缀的（唤醒一次的花费远少于前缀被
+   * 回收的花费；实测拆之前全库 52 次心跳、走了模型的 0 次）。现在**每一条唤醒都照常进 turn**，
+   * "开不开口"由她自己定，所以这里不再需要任何分流——这也是为什么它没有留下一个空壳方法。
+   *
+   * 原意、为什么废、以及"**别再把它接回心跳拍**"的警告：docs/design.md 的
+   * 「试过并废掉的口径：回复必要性门」。心跳拍本身的形状（同一份冻结前缀、heavy 车道、
+   * 可审计链 `wake/heartbeat → input/claimed → memory/selected{injection:'heartbeat'} →
+   * step/start → budget/consumed{lane:'heavy'}`）在 `test/heartbeat-real-wake.test.ts` 里钉着。
    */
-  private async gateAdmits(wakeText: string, wakeEvents: readonly AppEvent[]): Promise<boolean> {
-    void wakeText;
-    if (!this.necessity.appliesTo(wakeEvents)) return true;
-    // turn 号取自 openTurn：agent-loop 在过门之前已写完 turn/start（记账要挂到本 turn 上）
-    const turn = this.deps.projection.openTurn?.turn ?? 0;
-    const verdict = await this.necessity.judge({ wakeEvents, turn });
-    return verdict.shouldReply;
-  }
 
   /** 刹车钩子（agent-loop 每 step 边界调用）：判定与事件写入都在 budget-guard 里 */
   private budgetHook(): AgentLoopBudget {

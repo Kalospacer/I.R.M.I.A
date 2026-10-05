@@ -318,6 +318,68 @@ test('加注：单笔累加与从日志折叠载入（跨重启后有效上限�
   assert.equal(reopened.breachOf(p), null, '500k < 600k：加注后不再撞刹车');
 });
 
+// ──────────────────────────────── 上限的构成（config + 加注） ────────────────────────────────
+
+test('上限的构成一眼看得出：base 来自 config、topUp 来自加注，两者相加 == limit', () => {
+  const p = emptyProjection();
+  // 用**现场那份配置**（task 5M / daily 2M）：现场报的是 task 57M、daily 22M
+  const guard = new BudgetGuard({ ...CONFIG, taskTokens: 5_000_000, dailyTokens: 2_000_000 });
+  guard.setTopUps({ step: 0, turn: 0, task: 52_000_000, daily: 20_000_000 });
+
+  const statuses = guard.statuses(p);
+  const task = statuses.find(st => st.layer === 'task')!;
+  const daily = statuses.find(st => st.layer === 'daily')!;
+  assert.deepEqual(task.composition, { base: 5_000_000, topUp: 52_000_000 });
+  assert.equal(task.limit, task.composition.base + task.composition.topUp, '构成必须加得上');
+  assert.equal(task.limit, 57_000_000, '现场报的 task 上限');
+  assert.equal(daily.limit, 22_000_000, '现场报的 daily 上限');
+  // 没有加注的层：topUp 为 0（不是 undefined——界面与告警读它时不该再判空）
+  assert.deepEqual(statuses.find(st => st.layer === 'step')!.composition, { base: CONFIG.stepTools, topUp: 0 });
+});
+
+test('限额实时取自 config：configure 之后**立刻**按新值判（不许留一份开户时的上限副本）', () => {
+  const p = emptyProjection();
+  p.budget.tokensTask = 7_000_000;
+  p.budget.tokensToday = 7_000_000;
+  const guard = new BudgetGuard({ ...CONFIG, taskTokens: 5_000_000, dailyTokens: 5_000_000 });
+  assert.deepEqual(guard.breachOf(p), { layer: 'task', limit: 5_000_000, actual: 7_000_000 }, '旧上限下越线');
+
+  // 宿主拿到一份新配置（重启装配 / 将来的热更回调）——同一个判定器实例立刻改口径
+  guard.configure({ ...CONFIG, taskTokens: 30_000_000, dailyTokens: 40_000_000 });
+  assert.equal(guard.limitOf('task'), 30_000_000);
+  assert.equal(guard.limitOf('daily'), 40_000_000);
+  assert.deepEqual(guard.statuses(p).find(st => st.layer === 'task')!.composition, {
+    base: 30_000_000, topUp: 0,
+  }, '构成跟着新配置走');
+  assert.equal(guard.breachOf(p), null, '新上限下不再越线——这就是"配置改了立刻按新值判"');
+
+  // 加注那部分不许被 configure 冲掉（它是日志折出来的另一条来源）
+  guard.addTopUp('task', 1_000_000);
+  guard.configure({ ...CONFIG, taskTokens: 30_000_000, dailyTokens: 40_000_000 });
+  assert.equal(guard.limitOf('task'), 31_000_000, '有效上限 = 新配置 + 累计加注');
+});
+
+test('configure 之后"本进程已写过"的标记重新武装：新上限下再撞仍会落事件', () => {
+  const p = emptyProjection();
+  p.budget.tokensTask = 6_000_000;
+  const captured: Array<{ type: string; data: unknown }> = [];
+  const guard = new BudgetGuard({
+    config: { ...CONFIG, taskTokens: 5_000_000 },
+    projection: p,
+    emit: (type, data) => captured.push({ type, data }),
+    now: () => new Date(T0),
+  });
+  assert.deepEqual(guard.checkBeforeStep(p), { kind: 'budget-exhausted', layer: 'task' });
+  assert.equal(captured.filter(x => x.type === 'budget/exhausted').length, 1);
+
+  // 上限调大 → 不再越线；再调小 → 又越线。第二次必须还能写事件（否则改完配置这一层哑了）
+  guard.configure({ ...CONFIG, taskTokens: 30_000_000 });
+  assert.equal(guard.checkBeforeStep(p), null);
+  guard.configure({ ...CONFIG, taskTokens: 1_000_000 });
+  assert.deepEqual(guard.checkBeforeStep(p), { kind: 'budget-exhausted', layer: 'task' });
+  assert.equal(captured.filter(x => x.type === 'budget/exhausted').length, 2);
+});
+
 // ──────────────────────────────── 单步工具数（M3-1） ────────────────────────────────
 
 test('单步切分与收束：超限部分不执行，收束结局由预算实现给出', () => {

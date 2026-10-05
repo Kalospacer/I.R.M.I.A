@@ -342,6 +342,50 @@ export function lookupBySid(
 }
 
 /**
+ * 别名表里一条记的是什么：`name` 是名字本身，`note` 是名字后括号里的备注。
+ *
+ * 为什么备注要留下来而不是解析时丢掉：它是**她的行为口径**（"这个群里不聊什么、要不要接话"），
+ * 人得看得见它才敢改名字——丢掉之后界面上就只剩一个光名字，改名等于替她把口径也删了。
+ */
+export interface SessionAlias {
+  /** 显示名（第一个括号之前那部分） */
+  name: string;
+  /** 括号里的备注；没写括号就没有这一项 */
+  note?: string;
+}
+
+/**
+ * 别名表的值有两种形态：她自己写的（{@link SessionAlias}）与人声明的联系人表（纯名字串）。
+ *
+ * 为什么要这个并集：名字查找（`lookupBySid` / `resolveSessionName` / `readableSessionName`）
+ * 对两张表是**同一套**判据，只有"这张表里有没有备注"不同。与其在每个调用点把其中一张转成另一种
+ * 形状（那等于把同一件事抄好几遍），不如让查找自己认这两种值——**从值里取名字只有下面一处**。
+ */
+export type AliasEntry = string | SessionAlias;
+/** 按 sid 查名字的表（联系人表、别名表都符合） */
+export type AliasTable = ReadonlyMap<string, AliasEntry>;
+
+/** 表里一条的显示名（空串与查不到都返回 undefined：这两种对调用方是同一件事——没有名字） */
+function aliasNameOf(entry: AliasEntry | undefined): string | undefined {
+  if (entry === undefined) return undefined;
+  const name = (typeof entry === 'string' ? entry : entry.name).trim();
+  return name === '' ? undefined : name;
+}
+
+/** 在名字表里查（联系人表与别名表共用；查不到返回 undefined，不编） */
+function lookupAliasBySid(table: AliasTable | undefined, sid: string): SessionAlias | undefined {
+  if (table === undefined) return undefined;
+  for (const key of sidLookupKeys(sid)) {
+    const entry = table.get(key);
+    const name = aliasNameOf(entry);
+    if (name === undefined) continue;
+    const note = typeof entry === 'string' ? undefined : entry?.note?.trim();
+    return note === undefined || note === '' ? { name } : { name, note };
+  }
+  return undefined;
+}
+
+/**
  * 单个 sid 的名字（联系人表优先，其次别名表）：给"只拿到一个 sid"的调用方用。
  *
  * 与 `resolveSessionName` 同一套查找（含新旧两种写法的兼容），差别只是输入不是会话条目。
@@ -351,9 +395,19 @@ export function lookupBySid(
 export function resolveNameForSid(
   sid: string,
   contacts: ReadonlyMap<string, string> | undefined,
-  aliases: ReadonlyMap<string, string> | undefined,
+  aliases: AliasTable | undefined,
 ): string | null {
-  return lookupBySid(contacts, sid) ?? lookupBySid(aliases, sid) ?? null;
+  return lookupBySid(contacts, sid) ?? aliasNameBySid(aliases, sid) ?? null;
+}
+
+/**
+ * 名字表里一条的**名字**（别名表那条可能带着备注，这里只要名字）。
+ *
+ * 与 `lookupBySid` 分工：那个给纯名字表（人声明的联系人表）用，这个给她的别名表用，
+ * 两者都走 [sidLookupKeys] 的顺序——新旧两种 sid 写法的兼容只在这一层，别处不许再判一次。
+ */
+function aliasNameBySid(aliases: AliasTable | undefined, sid: string): string | undefined {
+  return lookupAliasBySid(aliases, sid)?.name;
 }
 
 /**
@@ -365,9 +419,9 @@ export function resolveNameForSid(
 export function resolveSessionName(
   entry: Pick<SessionEntry, 'sid' | 'label' | 'person'>,
   contacts: ReadonlyMap<string, string> | undefined,
-  aliases: ReadonlyMap<string, string> | undefined,
+  aliases: AliasTable | undefined,
 ): string {
-  return lookupBySid(contacts, entry.sid) ?? lookupBySid(aliases, entry.sid) ?? entry.label ?? entry.person;
+  return lookupBySid(contacts, entry.sid) ?? aliasNameBySid(aliases, entry.sid) ?? entry.label ?? entry.person;
 }
 
 /**
@@ -382,9 +436,9 @@ export function resolveSessionName(
 export function readableSessionName(
   entry: Pick<SessionEntry, 'sid' | 'label' | 'person' | 'chatType'>,
   contacts: ReadonlyMap<string, string> | undefined,
-  aliases: ReadonlyMap<string, string> | undefined,
+  aliases: AliasTable | undefined,
 ): string {
-  const named = lookupBySid(contacts, entry.sid) ?? lookupBySid(aliases, entry.sid) ?? entry.label;
+  const named = lookupBySid(contacts, entry.sid) ?? aliasNameBySid(aliases, entry.sid) ?? entry.label;
   if (named !== null && named !== undefined && named.trim() !== '') return named.trim();
   const kind = entry.chatType === 'c2c' ? '一个单聊' : '一个群聊';
   const tail = entry.sid.length <= 6 ? entry.sid : entry.sid.slice(-6);
@@ -392,35 +446,136 @@ export function readableSessionName(
 }
 
 /**
- * 解析身份别名表（`MEMORIES/aliases.md`）。
+ * 这个名字是从**哪儿**来的，以及她写在那条别名后面的备注。
  *
- * 一行一条：`<sid> = <名字>`（前面的 `-` 或 `*` 随便写，当列表写也行）。
- * 左边必须长得像 sid（含 `:`）才认——否则 markdown 正文里的等号会被当成别名。
+ * 为什么名字与备注要一起答：备注是**别名的从属信息**，只有名字真源就是那条别名时它才成立。
+ * 联系人表里人写的名字把群叫成别的了，却还在旁边挂着她给旧名字写的口径，那比不显示更坏
+ * （人会以为那句口径还作数）。所以这里把"名字从哪来"与"备注是什么"一次算清，
+ * 界面与端点都不许自己再拼一遍（判据只做一处）。
+ */
+export function aliasNoteOf(
+  entry: Pick<SessionEntry, 'sid' | 'label' | 'person'>,
+  contacts: ReadonlyMap<string, string> | undefined,
+  aliases: AliasTable | undefined,
+): { source: 'contacts' | 'alias' | 'label' | 'person'; note: string | null } {
+  const contact = lookupBySid(contacts, entry.sid);
+  if (contact !== undefined) return { source: 'contacts', note: null };
+  const alias = lookupAliasBySid(aliases, entry.sid);
+  if (alias !== undefined) return { source: 'alias', note: alias.note ?? null };
+  return { source: entry.label == null ? 'person' : 'label', note: null };
+}
+
+/**
+ * 别名表里一条的键**是什么**。
+ *
+ * 这张表其实记着两类东西，形态不同：
+ *   • `sid`（`qq:c2c:<openid>`、`qq:group:<群id>`）——**会话**，用来显示"这是谁/哪个群"；
+ *   • `member`（裸 openid）——**群成员**，她的表里单起一段（`# 群成员（openid，不是 sid…）`）。
+ *     群成员不是会话（他可能从没私聊过她），而且这一段的**用途只有她本人**：在群里 @ 人时
+ *     照它写官方形态 `<qqbot-at-user id="…" />`（docs/design.md §4.20.1）。
+ *     **框架不消费它**——2026-10-05 移除"名字 → openid"那一跳后，这里的唯一职责是把这些行
+ *     **挡在会话别名表之外**（裸 openid 对那六处消费者是纯噪音，见 [parseAliases]）。
+ */
+export type AliasKeyKind = 'sid' | 'member';
+
+/** 别名表里解析出来的一行（键 + 归类 + 名字/备注） */
+export interface AliasRow {
+  key: string;
+  kind: AliasKeyKind;
+  alias: SessionAlias;
+}
+
+/**
+ * 群成员键的形状：**裸 openid**——没有 `:`，也不含空白、括号、汉字。
+ *
+ * 为什么要判形状而不是"看它在不在 `# 群成员` 那一段下面"：段标题是她手写的，位置随时会动；
+ * 而"裸 openid"这个形状本身就是**不含歧义**的（sid 一定有 `:`，正文里的等号左边不会有这种东西）。
+ * 长度下限 8 是为了把 `abc = 1` 这类随手写的行挡在外面。
+ */
+const MEMBER_KEY_RE = /^[0-9A-Za-z_-]{8,}$/u;
+
+/**
+ * 别名表的**唯一**行解析（`parseAliases` 走它）。
+ *
+ * 一行一条：`<键> = <名字>`（前面的 `-` 或 `*` 随便写，当列表写也行）。键按形状分两类
+ * （见 [AliasKeyKind]），**认不出的键一个都不收**——否则 markdown 正文里的等号会被当成别名。
+ *
+ * **名字后面的括号是备注，不是名字的一部分**（见 [splitAliasNote]）：她实际就是这么写的
+ * （模板当初只说"`<sid> = <名字>`"，没写备注该放哪儿，于是她把口径一起写在等号右边），
+ * 而读取侧原来把整串当名字，界面那格窄、长文本把光标顶到末尾，人看到的就是备注的尾巴——
+ * 像是名字坏了。备注留下来（`note`）给人看，名字只取括号前那一段。
  *
  * 它为什么是**她的资产**而不是框架配置：只有她知道"这串 openid 是谁"——
  * 可能是人告诉她的，也可能是她聊了几次之后认出来的。框架只负责读进来、显示出去。
  */
-export function parseAliases(text: string): Map<string, string> {
-  const out = new Map<string, string>();
+function forEachAliasRow(text: string, visit: (row: AliasRow) => void): void {
   for (const raw of text.split('\n')) {
     const line = raw.trim().replace(/^[-*]\s*/u, '').trim();
     if (line === '' || line.startsWith('#') || line.startsWith('```')) continue;
     const at = line.indexOf('=');
     if (at <= 0) continue;
-    const sid = line.slice(0, at).trim();
-    const name = line.slice(at + 1).trim();
-    if (sid.includes(':') && name !== '') out.set(sid, name);
+    const key = line.slice(0, at).trim();
+    const { name, note } = splitAliasNote(line.slice(at + 1));
+    if (name === '') continue;
+    const kind: AliasKeyKind | null = key.includes(':')
+      ? 'sid'
+      : (MEMBER_KEY_RE.test(key) ? 'member' : null);
+    if (kind === null) continue;
+    visit({ key, kind, alias: note === undefined ? { name } : { name, note } });
   }
+}
+
+/**
+ * 会话别名（`sid → 名字`）：**只收 sid 那类键**，成员那一段不进这张表。
+ *
+ * 为什么成员不并进来（2026-10-05）：`parseAliases` 的消费者有六处（联系人显示、关系档案注入、
+ * 重放、界面、看门名单），它们问的全是"**这个会话**叫什么"。裸 openid 塞进去对它们是纯噪音
+ * （永远匹配不上，还会在界面上多出一排点不开的条目），改口径又要动一批不许动的文件。
+ * 那一整段是**她的资产、框架不消费**（@ 时她照它写官方形态，见 docs/design.md §4.20.1）——
+ * 这里唯一的职责就是**把它挡在会话表外**（形状判据见 [MEMBER_KEY_RE]）。
+ */
+export function parseAliases(text: string): Map<string, SessionAlias> {
+  const out = new Map<string, SessionAlias>();
+  forEachAliasRow(text, (row) => {
+    if (row.kind === 'sid') out.set(row.key, row.alias);
+  });
   return out;
+}
+
+/**
+ * 把等号右边那串拆成**名字**与**备注**：名字 = 第一个 `（` 或 `(` 之前那部分。
+ *
+ * 四条边界，都按"她那支笔会怎么写"定的：
+ *   • 包裹名字的空白与 markdown 粗体标记不算名字（她写 `**甲** = 名字` 这类格式很常见）；
+ *   • 没有括号 ⇒ 整串就是名字，`note` 不出现（不是空串：空串与"没写备注"在界面上不该长得一样）；
+ *   • 括号前什么都没有（`（纯备注）`）⇒ **整串当名字**，不去括号里猜——猜错就把一条备注
+ *     变成了名字，而她写这一行时想要的恰恰相反；
+ *   • 只认**第一个**括号：备注里再写括号（`（口径：不聊 A（B））`）时它整段留在备注里，不切第二次。
+ */
+export function splitAliasNote(raw: string): { name: string; note?: string } {
+  const text = raw.trim();
+  const at = text.search(/[（(]/u);
+  if (at <= 0) return { name: stripNameMarks(text) };
+  // 粗体标记在**切完之后**再去：`**甲**（备注）` 的两个 `**` 被括号隔在两段里，
+  // 只在整串两端去标记的话，名字会留下一个 `甲**`（实测踩到）
+  const name = stripNameMarks(text.slice(0, at));
+  if (name === '') return { name: stripNameMarks(text) };
+  const note = text.slice(at + 1).replace(/[）)]\s*$/u, '').trim();
+  return note === '' ? { name } : { name, note };
+}
+
+/** 去掉包裹名字的空白与 markdown 粗体/斜体标记（`**甲**` → `甲`） */
+function stripNameMarks(text: string): string {
+  return text.trim().replace(/^\*+|\*+$/gu, '').trim();
 }
 
 /** 把别名贴到会话条目上（不改原数组；没别名的保持原样） */
 export function applyAliases(
   entries: readonly SessionEntry[],
-  aliases: ReadonlyMap<string, string>,
+  aliases: AliasTable,
 ): SessionEntry[] {
   return entries.map((entry) => ({
     ...entry,
-    label: lookupBySid(aliases, entry.sid) ?? entry.label ?? null,
+    label: aliasNameBySid(aliases, entry.sid) ?? entry.label ?? null,
   }));
 }
