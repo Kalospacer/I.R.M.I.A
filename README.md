@@ -112,7 +112,7 @@ cp config.example.json config.json   # Windows: copy config.example.json config.
 | `gui/` | Windows 桌面界面（Flutter），唯一的界面 |
 | `test/` | 后端测试；`gui/test/` 是界面测试 |
 | `tools/` `scripts/` | 运行期工具与启停脚本 |
-| `skills/` | 技能包（框架自带的 `image-dialogue`、`sd-selfie`，以及第三方的 `anysearch`——见下方许可证一节） |
+| `skills/` | 技能包（第三方 `anysearch`——见下方许可证一节） |
 | `brand/` | 项目标识的矢量母版与各尺寸导出，说明见 [`brand/README.md`](brand/README.md) |
 
 ## 测试
