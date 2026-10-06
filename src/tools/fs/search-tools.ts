@@ -27,11 +27,35 @@
  * 列号不由 rg 提供，改由本模块在匹配文本上重跑一次匹配算出来，避免依赖
  * `--column` 那种「上下文行没有列号」的不对称格式。
  *
- * es_search 的参数取自 voidtools 官方 CLI 文档（已核验）：
- *   `-n <num>` 限制结果数、`-path <path>` 限定目录、`-r` 正则、`-p` 全路径匹配；
- *   注意 `-i` 在 es 里是 **区分大小写**（与 rg 相反），所以「忽略大小写」时不能加它。
- *   退出码 8 = Everything IPC 窗口不存在（客户端没在跑）——**如实报错，不降级**：
- *   工具既然是因为探测到引擎才注册的，静默走一遍全盘扫描只会让她以为索引还有效。
+ * es_search 的参数取自 voidtools 官方 CLI 文档，并且**每一条都在本机 es.exe 1.1.0.38
+ * 上真机冒烟过**（命令形状与实测输出见 docs/tools-audit.md §8.3）：
+ *   `-n <num>` 限制结果数、`-path <path>` 限定目录、`-p` 全路径匹配、
+ *   `-r <regex>` 正则、`-w` 全词、`/ad` 只目录、`/a-d` 只文件、
+ *   `-sort <键>` 排序、`-csv -name -path-column -size -size-format 1 -date-modified` 详细输出。
+ *
+ * **关于大小写（同一个开关的两个名字，别再来一个人以为谁写错了）**：es.exe 的帮助里写的是
+ *   `-i, -case  Match case`——**两个名字是同一个开关**，语义都是「区分大小写」，
+ *   与 rg 的 `-i`（忽略大小写）**方向相反**。所以本工具只保留一个入参 `ignore_case`（默认 true），
+ *   它为 false（= 要区分大小写）时才追加 `-i`（写成 `-case` 完全等价，实测两者行为一致）。
+ *   参数名、默认值、语义与 devkit 一致，不需要兼容层，也不改名。
+ *
+ * 退出码 8 = Everything IPC 窗口不存在（客户端没在跑）——**如实报错，不降级**：
+ * 工具既然是因为探测到引擎才注册的，静默走一遍全盘扫描只会让她以为索引还有效。
+ * 另有两条实测出来的退出码：4 = `-sort` 的值不认（`Error 4: Unknown sort: bogus`）、
+ * 6 = 不认识的开关（`Error 6: Unknown switch.`）——前者我们在本地就校验掉，后者不该出现。
+ *
+ * ──────────────────────── 真机实测的两条 es.exe 解析规则（别踩） ────────────────────────
+ * ① **一个 argv 元素 = 一个搜索词**。元素里带空格不会被拆成两个词，而是被当成**整句短语**
+ *    （实测：`['has space']` 命中 `has space here.txt`，`['has','space']` 命中的是
+ *    `hast-util-whitespace` 那类「两个词分别都在名字里」的文件）。
+ *    推论：devkit 把 `ext:<值>` 拼成 `"ext:ts <query>"` **一个** argv 送出去，
+ *    Everything 收到的是短语，`ext:` 不再是过滤器 —— 实测 `['ext:ts attachment']` **0 命中**。
+ *    所以本实现在这里**有意偏离 devkit 的字面写法**：`ext:<值>` 自己一个 argv 元素
+ *    （`['ext:ts','attachment']` → 1 命中）。拼不拼的判据与 devkit 一致（只在非 regex 时拼）。
+ * ② **`-r` 必须紧挨着模式串**。`-r` 与模式之间夹任何东西（包括 `--`）都会让正则不生效：
+ *    实测 `['-r','--','index\.ts$']` 与 `['--','-r','index\.ts$']` 都是 0 命中，
+ *    而 `['-r','index\.ts$']` 命中 `index.ts`。`--`（结束选项，保护以 `-`/`/` 开头的模式）
+ *    因此只用在**非正则**那条路上：`['ext:ts','--','attachment']` 正常，`['--','-foo']` 不报错。
  */
 
 import { relative } from 'node:path';
@@ -40,6 +64,7 @@ import { PATH_BOUNDARY_HINT } from '../boundary.ts';
 import type { FsEnv } from './env.ts';
 import { resolveGuarded } from './env.ts';
 import { buildMatcher } from './search-core.ts';
+import { formatBytes } from './text-codec.ts';
 import {
   ABORTED_RESULT,
   FS_ERROR_CODES,
@@ -332,6 +357,170 @@ export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
 // ──────────────────────────────── es_search ────────────────────────────────
 
 /**
+ * `sort_by` → es.exe `-sort <键>` 的映射表，**逐键照抄 devkit**（`tools/es_search.py:30-39`
+ * 的 `SORT_MAP`）：`ext` 在 es.exe 那边叫 `extension`、`date_*` 是 `date-*` 连字符写法、
+ * `run_count` 是 `run-count`。8 个键与 8 个值都在本机 es.exe 1.1.0.38 上真机冒烟过
+ * （值不认时 es.exe 退 4 并打印 `Error 4: Unknown sort: <值>`）。
+ *
+ * 这张表是**唯一**的翻译处：参数值用下划线（模型侧好读、与 devkit 的入参同名），
+ * 实参值用 es.exe 的拼法。别在别处再写一遍这两个名字。
+ */
+const ES_SORT_MAP = {
+  name: 'name',
+  path: 'path',
+  size: 'size',
+  ext: 'extension',
+  date_created: 'date-created',
+  date_modified: 'date-modified',
+  date_accessed: 'date-accessed',
+  run_count: 'run-count',
+} as const;
+
+type EsSortBy = keyof typeof ES_SORT_MAP;
+
+const ES_SORT_KEYS = Object.keys(ES_SORT_MAP) as EsSortBy[];
+
+/** `file_type` 三态 → es.exe 的属性开关；`all` 不加任何属性过滤（devkit `tools/es_search.py:260-263`） */
+const ES_FILE_TYPES = ['all', 'file', 'folder'] as const;
+
+const ES_DETAILS = ['paths', 'full'] as const;
+type EsDetail = (typeof ES_DETAILS)[number];
+
+/**
+ * `detail:'full'` 的 CSV 列块（devkit `tools/es_search.py:279-289` 逐字同款）。
+ * `-size-format 1` = 字节数（实测：`-size-format 0` 也回字节，但写明 1 才是契约）。
+ * 实测表头恰好是 `Name,Path,Size,Date Modified`；**目录的 Size 是空串**（不是 0），
+ * 所以解析时空串必须当 0 —— 否则 `Number('')` 那种写法会把目录算成"有大小"。
+ */
+const ES_CSV_ARGS = ['-csv', '-name', '-path-column', '-size', '-size-format', '1', '-date-modified'] as const;
+
+/** 读一个枚举字符串参数（照 `readOptionalInt` 的形状：非法时给一句带合法取值的说明） */
+function readOptionalEnum<T extends string>(
+  args: Record<string, unknown>,
+  key: string,
+  allowed: readonly T[],
+): { value: T | undefined } | { error: string } {
+  const raw = args[key];
+  if (raw === undefined || raw === null) return { value: undefined };
+  if (typeof raw !== 'string') return { error: `${key} 必须是字符串，合法取值：${allowed.join(' / ')}` };
+  const hit = allowed.find((item) => item === raw);
+  if (hit === undefined) {
+    return { error: `${key} 只能是 ${allowed.join(' / ')}，实际 ${JSON.stringify(raw)}` };
+  }
+  return { value: hit };
+}
+
+interface EsCsvItem {
+  /** `Name` 列（文件名或目录名） */
+  name: string;
+  /** `Path` 列（所在目录，绝对路径） */
+  dir: string;
+  /** `Size` 列（字节；目录是空串 → 0） */
+  size: number;
+  /** `Size` 列是否真有值：目录是空串（实测），渲染时给 `-` 而不是编一个 `0 B` */
+  sizeKnown: boolean;
+  /** `Date Modified` 列（es.exe 原样给的本地时间串） */
+  dateModified: string;
+}
+
+/**
+ * 极简 CSV 解析（零依赖）：es.exe 的 `-csv` 只在**需要时**给字段加引号
+ * （实测 `"index.ts","D:\…\src\tools\fs",11280,2026/10/4 15:29:28`：名字与路径带引号，
+ * 数字与时间不带），所以"按逗号切"一定会在路径含逗号时切错。这里按 RFC4180 处理引号、
+ * `""` 转义与 CRLF，够用且不必引依赖。
+ */
+function parseCsvRows(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let quoted = false;
+  let hasField = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i] as string;
+    if (quoted) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else {
+          quoted = false;
+        }
+        continue;
+      }
+      field += ch;
+      continue;
+    }
+    if (ch === '"') {
+      quoted = true;
+      hasField = true;
+      continue;
+    }
+    if (ch === ',') {
+      row.push(field);
+      field = '';
+      hasField = true;
+      continue;
+    }
+    if (ch === '\n') {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = '';
+      hasField = false;
+      continue;
+    }
+    if (ch === '\r') continue;
+    field += ch;
+    hasField = true;
+  }
+  if (hasField || field !== '' || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+/**
+ * 把 `-csv` 输出解成结构化条目。**按表头认列**（而不是按位置猜）：es.exe 版本之间的列序
+ * 或列名若有变化，这里会退回位置序，不会把 Size 当时间用。第一行是表头，要吃掉。
+ */
+function parseEsCsv(stdout: string): EsCsvItem[] {
+  const rows = parseCsvRows(stdout).filter((row) => row.some((cell) => cell.trim() !== ''));
+  if (rows.length === 0) return [];
+  const header = (rows[0] as string[]).map((cell) => cell.trim().toLowerCase());
+  const idx = {
+    name: header.indexOf('name'),
+    dir: header.indexOf('path'),
+    size: header.indexOf('size'),
+    date: header.indexOf('date modified'),
+  };
+  // 表头不是我们认识的那一行（没有 Name/Path）：那第一行就是数据，用位置序兜底
+  const known = idx.name !== -1 && idx.dir !== -1;
+  const items: EsCsvItem[] = [];
+  for (const row of known ? rows.slice(1) : rows) {
+    const name = (row[known ? idx.name : 0] ?? '').trim();
+    const dir = (row[known ? idx.dir : 1] ?? '').trim();
+    const rawSize = (row[known ? idx.size : 2] ?? '').trim();
+    const parsedSize = Number.parseInt(rawSize, 10);
+    items.push({
+      name,
+      dir,
+      // 目录的 Size 是空串（实测）→ 0；非数字也当 0，绝不让一列脏数据把整次搜索变成错误
+      size: Number.isNaN(parsedSize) ? 0 : parsedSize,
+      sizeKnown: rawSize !== '' && !Number.isNaN(parsedSize),
+      dateModified: (row[known ? idx.date : 3] ?? '').trim(),
+    });
+  }
+  return items;
+}
+
+/** 条目 → 工作根相对的展示路径（与 `detail:'paths'` 同一条口径：`\`→`/`） */
+function esItemPath(item: EsCsvItem, root: string): string {
+  const full = item.dir === '' ? item.name : `${item.dir}\\${item.name}`;
+  return relative(root, full).replaceAll('\\', '/');
+}
+
+/**
  * es_search 的探测闸门在 v27 就有了（当时是本文件里的 `createEsSearchProbeGate`），
  * v30 把它交给了框架层：候选清单与三段顺序（用户指定 → 自装目录 → PATH）现在只有
  * `src/deps/probe.ts` 一处知道，本文件只拿结论。上一版那 5 个候选**串行各一次 ENOENT**
@@ -339,21 +528,32 @@ export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
  *
  * handler 直接照 `gate` 分派、不再探第二次：注册结论与运行行为必须一致，
  * 否则会出现"注册时说有、执行时说没有"的自相矛盾两句话。
+ *
+ * 参数面按用户的验收口径**对齐 devkit 的 es_search**（`D:\IrmiaAgent\_devkit-open\tools\es_search.py`）：
+ * `regex` / `whole_word` / `file_type` / `ext` / `sort_by` / `detail` 六项补齐后，
+ * 这边能拿到的信息**不低于**那边（那边一次调用固定回结构化条目 name/path/full/size/date_modified
+ * + count + total_size；这边 `detail:'full'` 同样给全，`detail:'paths'` 是省上下文的默认档）。
  */
 export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefinition {
   return {
     name: 'es_search',
     description:
-      '按文件名搜索（找内容用 rg_search）：由 Everything 索引秒回，支持 * 与 ? 通配符，' +
-      '也可整个路径匹配。',
+      '按文件名搜索（找内容用 rg_search）：Everything 索引秒回，支持 * ? 通配符、正则、全词、'
+      + '只找文件或目录、按大小时间排序；detail=full 连大小与修改时间一起给。',
     parameters: {
       type: 'object',
       properties: {
-        pattern: { type: 'string', description: '文件名模式，支持 * 与 ?，如 "*.test.ts"；也给字面量子串如 "config"' },
+        pattern: { type: 'string', description: '文件名模式，支持 * 与 ?，如 "*.test.ts"；也给字面量子串如 "config"；regex=true 时按正则解释' },
         path: { type: 'string', description: `限定搜索目录（相对工作根），默认工作根。${PATH_BOUNDARY_HINT}` },
-        max_results: { type: 'integer', description: '最多返回多少个文件，默认 100；传 0 表示只报数量、不列文件' },
-        match_path: { type: 'boolean', description: 'true 时对整个路径匹配而不是只匹配文件名，默认 false' },
+        max_results: { type: 'integer', description: '最多返回多少个条目，默认 100；传 0 表示只报数量、不列条目' },
+        match_path: { type: 'boolean', description: 'true 时对整个路径匹配而不是只匹配名字，默认 false；此时路径分隔符要写 \\（实测 fs/index 命中 0，fs\\index 命中 1）' },
         ignore_case: { type: 'boolean', description: '忽略大小写，默认 true' },
+        regex: { type: 'boolean', description: 'pattern 按正则解释（es.exe -r），默认 false' },
+        whole_word: { type: 'boolean', description: '全词匹配（es.exe -w），默认 false' },
+        file_type: { type: 'string', enum: [...ES_FILE_TYPES], description: '条目类型：all（默认，文件与目录都要）/ file（只要文件）/ folder（只要目录）' },
+        ext: { type: 'string', description: '扩展名过滤，如 "ts"；只在 regex=false 时生效，默认不过滤' },
+        sort_by: { type: 'string', enum: [...ES_SORT_KEYS], description: '排序键（默认由引擎决定）：name / path / size / ext / date_created / date_modified / date_accessed / run_count' },
+        detail: { type: 'string', enum: [...ES_DETAILS], description: 'paths（默认）只列路径、省上下文；full 每条再给大小与修改时间，并在头部给总大小' },
       },
       required: ['pattern'],
       additionalProperties: false,
@@ -377,6 +577,22 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
       const countOnly = maxResults === 0;
       const matchPath = readOptionalBool(args, 'match_path') ?? false;
       const ignoreCase = readOptionalBool(args, 'ignore_case') ?? true;
+      const regex = readOptionalBool(args, 'regex') ?? false;
+      const wholeWord = readOptionalBool(args, 'whole_word') ?? false;
+      // 三个枚举参数一律**先校验再落参**：值非法时给的是"参数错 + 合法取值"，
+      // 而不是把非法值拼进 es.exe 实参、换来一句 `Error 4: Unknown sort: bogus`。
+      const fileTypeRes = readOptionalEnum(args, 'file_type', ES_FILE_TYPES);
+      if ('error' in fileTypeRes) return invalidArgs('es_search', fileTypeRes.error);
+      const fileType = fileTypeRes.value ?? 'all';
+      const sortRes = readOptionalEnum(args, 'sort_by', ES_SORT_KEYS);
+      if ('error' in sortRes) return invalidArgs('es_search', sortRes.error);
+      const sortBy = sortRes.value;
+      const detailRes = readOptionalEnum(args, 'detail', ES_DETAILS);
+      if ('error' in detailRes) return invalidArgs('es_search', detailRes.error);
+      // max_results=0 一条都不列，这时 CSV 那组开关纯属白付：detail 一律按 paths 走
+      const detail: EsDetail = countOnly ? 'paths' : (detailRes.value ?? 'paths');
+      // 空串与不传同义（devkit 也是 `if ext and not regex` 的判据：空串为假 → 不拼）
+      const ext = (readOptionalString(args, 'ext') ?? '').trim();
 
       const pathInput = readOptionalString(args, 'path') ?? '.';
       const guarded = await resolveGuarded(env, ctx, pathInput, {
@@ -396,15 +612,34 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
         );
       }
       const searchRoot = guarded.path;
-      const patternText = pattern;
       if (ctx.signal.aborted) return ABORTED_RESULT;
 
-      // es 的 -i 表示「区分大小写」，与 rg 相反；忽略大小写时不能加
+      // ──────────────── 实参拼装：逐条对应 devkit 的判据（顺序按 es.exe 的实测要求） ────────────────
       // `-n` 只在 max_results > 0 时给（源 `tools/es_search.py:275-276` 同判据）
-      const esArgs = countOnly ? ['-path', searchRoot] : ['-n', String(maxResults), '-path', searchRoot];
+      const esArgs: string[] = countOnly ? [] : ['-n', String(maxResults)];
+      esArgs.push('-path', searchRoot);
+      // file_type：file ⇒ `/a-d`（只文件）、folder ⇒ `/ad`（只目录）、all ⇒ 不加（源 `:260-263` 同款）
+      if (fileType === 'file') esArgs.push('/a-d');
+      else if (fileType === 'folder') esArgs.push('/ad');
+      // `-i` 与 `-case` 是 es.exe 里**同一个开关的两个名字**（帮助原文：`-i, -case  Match case`），
+      // 语义是"区分大小写"，与 rg 的 `-i` 相反；忽略大小写时不能加（源 `:265-266` 用 -case，同义）
       if (!ignoreCase) esArgs.push('-i');
       if (matchPath) esArgs.push('-p');
-      esArgs.push('--', patternText);
+      if (wholeWord) esArgs.push('-w');
+      if (sortBy !== undefined) esArgs.push('-sort', ES_SORT_MAP[sortBy]);
+      if (detail === 'full') esArgs.push(...ES_CSV_ARGS);
+      if (regex) {
+        // **`-r` 必须紧挨着模式串**（实测：中间夹 `--` 或别的开关，正则就不生效、静默回 0 命中）。
+        // 代价是正则档下不能再用 `--` 保护"以 - 开头的模式"——那种模式本来也不是合法正则的常见形状，
+        // 真写了会让 es.exe 报 `Error 6: Unknown switch.`，如实透出。
+        esArgs.push('-r', pattern);
+      } else {
+        // ext 判据与源同（只在非 regex 时拼），但**拼法是两个 argv 元素**：
+        // 实测 `ext:ts <query>` 作为一个 argv 会被 es.exe 当整句短语，`ext:` 过滤器失效（0 命中）。
+        if (ext !== '') esArgs.push(`ext:${ext}`);
+        // `--` = 结束选项：保护以 `-` / `/` 开头的模式不被当开关（实测 `-foo` 会退 6，`-- -foo` 不会）
+        esArgs.push('--', pattern);
+      }
 
       const result = await env.deps.runProcess(gate.command, esArgs, {
         timeoutMs: 14_000,
@@ -429,17 +664,53 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
         );
       }
 
+      const engine = `engine: everything (${gate.label})`;
+      // 头部三段固定（engine / 模式 / 命中）+ 一个按 file_type 的限定语：
+      // 只要文件或只要目录时说一句，免得"命中 3 个"被读成全都在。
+      const filterNote = fileType === 'file' ? '（只要文件）' : fileType === 'folder' ? '（只要目录）' : '';
+      // max_results=0：只报数量。**一条路径都不列**——这是"先探一下有多少个"的调用，
+      // 列出来就等于没省（而省上下文正是她传 0 的目的）。不加 `-n` 时 es.exe 返回全部命中，
+      // 所以这个数就是准确的总数。
+      if (countOnly) {
+        const total = result.stdout
+          .split(/\r?\n/u)
+          .map((line) => line.trim())
+          .filter((line) => line !== '')
+          .length;
+        return ok(
+          `${engine}\n模式 ${'`'}${pattern}${'`'} · 命中 ${total} 个${filterNote}\n`
+          + '（max_results=0：只统计不列条目；要看清单请传 max_results≥1）',
+        );
+      }
+
+      // detail:'full' —— devkit 一次调用能拿到的全在这里：每条 name/size/修改时间，
+      // 外加头部总大小（源 `tools/es_search.py:316-346` 的 items + total_size + count）。
+      if (detail === 'full') {
+        const items = parseEsCsv(result.stdout);
+        const knownSizes = items.filter((item) => item.sizeKnown);
+        const totalSize = knownSizes.reduce((sum, item) => sum + item.size, 0);
+        // 目录在 es.exe 的 CSV 里**没有大小**（Size 列是空串，实测）：一个目录都没有大小时
+        // 就不编一个"共 0 B"出来（那是假信息），索性不给这一段。
+        const sizeNote = knownSizes.length === 0 ? '' : ` · 共 ${formatBytes(totalSize)}`;
+        const truncated = items.length >= maxResults;
+        const header =
+          `模式 ${'`'}${pattern}${'`'} · 命中 ${items.length} 个${filterNote}${sizeNote}`
+          + (truncated ? `（前 ${items.length} 项合计）` : '');
+        if (items.length === 0) return ok(`${engine}\n${header}\n(无命中)`);
+        const body = items
+          .map((item) => {
+            const size = item.sizeKnown ? formatBytes(item.size) : '-';
+            return `${size} · ${item.dateModified} · ${esItemPath(item, ctx.workspaceRoot)}`;
+          })
+          .join('\n');
+        return ok(`${engine}\n${header}\n\n${body}${truncationNote(items.length, maxResults)}`);
+      }
+
       const found = result.stdout
         .split(/\r?\n/u)
         .map((line) => line.trim())
         .filter((line) => line !== '');
-      const engine = `engine: everything (${gate.label})`;
-      const header = `模式 ${'`'}${patternText}${'`'} · 命中 ${found.length} 个文件`;
-      // max_results=0：只报数量。**一条路径都不列**——这是"先探一下有多少个"的调用，
-      // 列出来就等于没省（而省上下文正是她传 0 的目的）。
-      if (countOnly) {
-        return ok(`${engine}\n${header}\n（max_results=0：只统计不列文件；要看清单请传 max_results≥1）`);
-      }
+      const header = `模式 ${'`'}${pattern}${'`'} · 命中 ${found.length} 个${filterNote}`;
       const limited = found.slice(0, maxResults);
       const body = limited.map((p) => relative(ctx.workspaceRoot, p).replaceAll('\\', '/')).join('\n');
       return ok(`${engine}\n${header}\n\n${body}${found.length === 0 ? '(无命中)' : ''}${truncationNote(limited.length, maxResults)}`);

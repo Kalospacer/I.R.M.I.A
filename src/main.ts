@@ -69,7 +69,7 @@ import {
  * `web/server.ts` 的 `McpProbeHost.clientInfo`、`mcp/client.ts` 的 `DEFAULT_CLIENT_INFO`。
  * 第三个内测版：功能面到"能装能用"，但仍会有破坏性改动，所以带 `-beta.3`。
  */
-export const AGENT_VERSION = '0.1.0-beta.3';
+export const AGENT_VERSION = '0.1.0-beta.4';
 /** 事件形状版本（docs/schema.md） */
 export const SCHEMA_VERSION = '1';
 export const DEFAULT_DATA_DIR_NAME = 'data';

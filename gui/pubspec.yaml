@@ -22,7 +22,6 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # 界面显示的那份（带 v 与 beta）在 lib/pages/settings_page.dart 的 guiVersion。
 # 后端同一版号的口径是 src/main.ts 的 AGENT_VERSION = '0.1.0-beta.3'（不带 v）。
 version: 0.1.0+1
-
 environment:
   sdk: ^3.9.2
 

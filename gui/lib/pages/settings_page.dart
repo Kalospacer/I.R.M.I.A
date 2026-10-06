@@ -49,7 +49,7 @@ class SettingsPage extends StatefulWidget {
 /// 版本号（windows/runner/Runner.rc 的 FILEVERSION 是 4 个整数）与安装器，容不下预发布
 /// 标记——beta 只体现在这里与包名/说明里；后端那边对同一版号的口径是 `AGENT_VERSION`
 /// （不带 v，见 src/main.ts）。
-const guiVersion = 'v0.1.0-beta.3';
+const guiVersion = 'v0.1.0-beta.4';
 
 /// 锚点侧栏宽度（AstrBot 的左侧 section 导航）
 const _railWidth = 180.0;

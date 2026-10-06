@@ -822,6 +822,14 @@ describe('es_search（条件注册）', () => {
     await withHarness(async (h) => {
       ws.root = h.root;
       assert.equal(h.has('es_search'), true, '探到 es.exe 就该注册');
+      // 描述预算是硬门（design §4.18 / registry.ts 的 MAX_DESCRIPTION_TOKENS）：这一件是
+      // **条件注册**的，没装 es.exe 的机器上 `tool-catalog` 那条 `problems` 断言根本看不到它，
+      // 所以这里在"它确实注册了"的这条用例里直接锁一次——参数加到 10 个，描述仍要压得住。
+      const descTokens = estimateTokens(h.tool('es_search').description);
+      assert.ok(
+        descTokens < MAX_DESCRIPTION_TOKENS,
+        `es_search 的描述 ${descTokens} token，超过硬门 ${MAX_DESCRIPTION_TOKENS}（超了会静默少一件工具）`,
+      );
       const result = await h.tool('es_search').handler({ pattern: '*.test.ts' }, h.ctx);
       assert.equal(result.isError, undefined, result.content);
       assert.match(result.content, /^engine: everything \(es (fake|15\.1\.0)\)/u);
@@ -840,6 +848,22 @@ describe('es_search（条件注册）', () => {
     }, { everythingPath: 'C:\\fake\\es.exe' }, { runProcess: fakeEs });
   });
 
+  it('调用超时如实报错，不降级成"我们自己扫一遍"', async () => {
+    // 与退出码 8 那条同一条口径：工具是因为探测到引擎才注册的，
+    // 超时之后换一条自己的扫描路，只会让"结果看起来是成功的"却不说明它换了引擎。
+    await withHarness(async (h) => {
+      const res = await h.tool('es_search').handler({ pattern: 'a.txt', detail: 'full', regex: true }, h.ctx);
+      assert.equal(res.isError, true);
+      assert.equal(res.error?.code, FS_ERROR_CODES.SEARCH_FAILED);
+      assert.match(res.content, /调用超时/u);
+      assert.match(res.content, /rg_search/u, '拒绝时要给出替代路径');
+    }, { everythingPath: 'C:\\fake\\es.exe' }, {
+      runProcess: async (_command: string, args: string[]) => (args.includes('-version')
+        ? { code: 0, stdout: '1.1.0.38', stderr: '', failed: false, timedOut: false }
+        : { code: null, stdout: '', stderr: '', failed: true, timedOut: true }),
+    });
+  });
+
   it('引擎在、客户端没跑（退出码 8）时如实报错，不静默降级成扫描', async () => {
     await withHarness(async (h) => {
       const res = await h.tool('es_search').handler({ pattern: 'a.txt' }, h.ctx);
@@ -851,6 +875,244 @@ describe('es_search（条件注册）', () => {
         ? { code: 0, stdout: '1.1.0.27', stderr: '', failed: false, timedOut: false }
         : { code: 8, stdout: '', stderr: 'Everything IPC unavailable', failed: false, timedOut: false }),
     });
+  });
+});
+
+// ──────────────────── es_search 的引擎实参映射（对齐 devkit 的参数面） ────────────────────
+//
+// 这一组锁的是**参数 → es.exe 实参**那一层：devkit 的 `es_search`（`tools/es_search.py`）
+// 有 9 个参数，我们的封装曾经只有 5 个 —— 用户原话是「es.exe 是个强大的工具，
+// 我不希望被我们的封装毁了」，「至少要达到原 irmia_devkit_open 的水平」。
+// 所以每一条映射都逐条断言**完整实参数组**（而不是"包含某个开关"）：
+// 顺序与拼法错了，真机上就是"开关在、结果不对"——那是冒烟看不出来的那类坏。
+//
+// 实参形状**都在本机 es.exe 1.1.0.38 上真机冒烟过**（docs/tools-audit.md §3.4 有命令与输出）。
+// 两条实测规则直接决定了这里的拼装顺序：
+//   ① `-r` 必须**紧挨着**模式串（中间夹 `--` 或别的开关 → 正则静默失效，0 命中）；
+//   ② 一个 argv 元素 = 一个搜索词：`ext:<值>` 必须自己一个元素，拼成一个字符串会被当短语，
+//      `ext:` 过滤器失效（devkit 的字面写法 `"ext:ts <query>"` 实测 0 命中，这里有意偏离）。
+
+/** 假 es.exe：`-version` 走探测，其余把实参记进 `calls` 并按 `respond` 作答 */
+function makeFakeEs(
+  calls: string[][],
+  respond: (args: string[]) => string,
+): (command: string, args: string[]) => Promise<Record<string, unknown>> {
+  return async (command: string, args: string[]) => {
+    calls.push([command, ...args]);
+    if (args.includes('-version')) {
+      return { code: 0, stdout: '1.1.0.38', stderr: '', failed: false, timedOut: false };
+    }
+    return { code: 0, stdout: respond(args), stderr: '', failed: false, timedOut: false };
+  };
+}
+
+/**
+ * 探测调用（rg 的是 `--version`、es 的是 `-version`）——两者都不算搜索。
+ * 少滤掉一个，断言就会数到装配期那一次探测上（本仓库里 rg 与 es 同在一台装配里探测）。
+ */
+function isProbeCall(call: string[]): boolean {
+  return call.some((arg) => arg === '-version' || arg === '--version');
+}
+
+/**
+ * 取这次搜索的实参（探测那次不算），并把工作根换成 `<ROOT>`。
+ * 换掉是必要的：path-guard 交出去的是 **realpath** 规范化后的路径，
+ * 而 Windows 上 TEMP 的大小写与 mkdtemp 拿到的写法未必一致（既有用例踩过同一个坑）。
+ */
+function esArgvOf(calls: string[][], root: string): string[] {
+  const search = calls.filter((call) => !isProbeCall(call)).at(-1) ?? [];
+  return search.slice(1).map((arg) => (arg.toLowerCase() === root.toLowerCase() ? '<ROOT>' : arg));
+}
+
+describe('es_search 的引擎实参映射（逐条对齐 devkit）', () => {
+  /** 每条用例：参数 → 期望的完整实参数组（`<ROOT>` 会被换成本次工作根） */
+  const cases: Array<[string, Record<string, unknown>, string[]]> = [
+    ['默认（只列路径）', { pattern: '*.ts' }, ['-n', '100', '-path', '<ROOT>', '--', '*.ts']],
+    ['regex=true', { pattern: '^index\\.ts$', regex: true }, ['-n', '100', '-path', '<ROOT>', '-r', '^index\\.ts$']],
+    ['regex=false（字面量）', { pattern: '*.ts', regex: false }, ['-n', '100', '-path', '<ROOT>', '--', '*.ts']],
+    ['whole_word=true', { pattern: 'index', whole_word: true }, ['-n', '100', '-path', '<ROOT>', '-w', '--', 'index']],
+    ['file_type=file', { pattern: '*.ts', file_type: 'file' }, ['-n', '100', '-path', '<ROOT>', '/a-d', '--', '*.ts']],
+    ['file_type=folder', { pattern: 'src', file_type: 'folder' }, ['-n', '100', '-path', '<ROOT>', '/ad', '--', 'src']],
+    ['file_type=all（不加属性开关）', { pattern: '*.ts', file_type: 'all' }, ['-n', '100', '-path', '<ROOT>', '--', '*.ts']],
+    ['ext=ts（自己一个搜索词）', { pattern: 'config', ext: 'ts' }, ['-n', '100', '-path', '<ROOT>', 'ext:ts', '--', 'config']],
+    // devkit 同一条判据：`if ext and not regex`
+    ['regex=true 时 ext 不拼', { pattern: '^index', regex: true, ext: 'ts' }, ['-n', '100', '-path', '<ROOT>', '-r', '^index']],
+    ['ext 空串 = 不过滤', { pattern: 'config', ext: '' }, ['-n', '100', '-path', '<ROOT>', '--', 'config']],
+    ['max_results=5', { pattern: '*.ts', max_results: 5 }, ['-n', '5', '-path', '<ROOT>', '--', '*.ts']],
+    ['match_path=true', { pattern: 'tools\\fs', match_path: true }, ['-n', '100', '-path', '<ROOT>', '-p', '--', 'tools\\fs']],
+    ['ignore_case=false → -i（区分大小写）', { pattern: '*.TS', ignore_case: false }, ['-n', '100', '-path', '<ROOT>', '-i', '--', '*.TS']],
+    ['ignore_case=true（默认，不加 -i）', { pattern: '*.ts', ignore_case: true }, ['-n', '100', '-path', '<ROOT>', '--', '*.ts']],
+    ['detail=paths（默认，不加 CSV 组）', { pattern: '*.ts', detail: 'paths' }, ['-n', '100', '-path', '<ROOT>', '--', '*.ts']],
+    [
+      'detail=full → CSV 那一组',
+      { pattern: '*.ts', detail: 'full' },
+      ['-n', '100', '-path', '<ROOT>', '-csv', '-name', '-path-column', '-size', '-size-format', '1', '-date-modified', '--', '*.ts'],
+    ],
+    [
+      '全开关一起（顺序就是这个顺序）',
+      { pattern: 'index', max_results: 7, file_type: 'file', ignore_case: false, match_path: true, whole_word: true, sort_by: 'date_modified', detail: 'full', ext: 'ts' },
+      ['-n', '7', '-path', '<ROOT>', '/a-d', '-i', '-p', '-w', '-sort', 'date-modified', '-csv', '-name', '-path-column', '-size', '-size-format', '1', '-date-modified', 'ext:ts', '--', 'index'],
+    ],
+  ];
+
+  for (const [label, args, expected] of cases) {
+    it(`实参映射：${label}`, async () => {
+      const calls: string[][] = [];
+      await withHarness(
+        async (h) => {
+          const res = await h.tool('es_search').handler(args, h.ctx);
+          assert.equal(res.isError, undefined, `${label} 不该失败：${res.content}`);
+          assert.deepEqual(esArgvOf(calls, h.root), expected, `${label} 的实参形状不符`);
+        },
+        { everythingPath: 'C:\\fake\\es.exe' },
+        { runProcess: makeFakeEs(calls, () => '') },
+      );
+    });
+  }
+
+  it('sort_by 八个键 → 八个 es.exe 值（含 ext→extension / date_*→date-* / run_count→run-count）', async () => {
+    // 这张表是 devkit 的 `SORT_MAP`（tools/es_search.py:30-39）逐键抄的。
+    // 八个值都在本机 es.exe 1.1.0.38 上冒烟过（值不认时它退 4 并说 Unknown sort）。
+    const map: Array<[string, string]> = [
+      ['name', 'name'],
+      ['path', 'path'],
+      ['size', 'size'],
+      ['ext', 'extension'],
+      ['date_created', 'date-created'],
+      ['date_modified', 'date-modified'],
+      ['date_accessed', 'date-accessed'],
+      ['run_count', 'run-count'],
+    ];
+    for (const [key, esValue] of map) {
+      const calls: string[][] = [];
+      await withHarness(
+        async (h) => {
+          const res = await h.tool('es_search').handler({ pattern: '*.ts', sort_by: key }, h.ctx);
+          assert.equal(res.isError, undefined, `sort_by=${key} 不该失败：${res.content}`);
+          const argv = esArgvOf(calls, h.root);
+          const at = argv.indexOf('-sort');
+          assert.notEqual(at, -1, `sort_by=${key} 必须给 -sort`);
+          assert.equal(argv[at + 1], esValue, `sort_by=${key} → ${esValue}`);
+        },
+        { everythingPath: 'C:\\fake\\es.exe' },
+        { runProcess: makeFakeEs(calls, () => '') },
+      );
+    }
+  });
+
+  it('枚举值非法 ⇒ 明确的参数错，且消息里给出合法取值', async () => {
+    const calls: string[][] = [];
+    await withHarness(
+      async (h) => {
+        const bad: Array<[Record<string, unknown>, RegExp]> = [
+          [{ pattern: 'x', file_type: 'dirs' }, /file_type 只能是 all \/ file \/ folder/u],
+          [{ pattern: 'x', sort_by: 'modified' }, /sort_by 只能是 name \/ path \/ size \/ ext \/ date_created \/ date_modified \/ date_accessed \/ run_count/u],
+          [{ pattern: 'x', detail: 'files' }, /detail 只能是 paths \/ full/u],
+        ];
+        for (const [args, pattern] of bad) {
+          const res = await h.tool('es_search').handler(args, h.ctx);
+          assert.equal(res.isError, true, `${JSON.stringify(args)} 该被拒`);
+          assert.equal(res.error?.code, FS_ERROR_CODES.INVALID_ARGS);
+          assert.match(res.content, pattern, `错误消息要说清合法取值：${res.content}`);
+        }
+        // 参数错就**一个进程都不许起**（探测那次不算）：非法值绝不能被拼进实参、
+        // 换来一句 es.exe 的退出码 4——那是"把校验责任推给引擎"，错误信息也远不如本地这句。
+        assert.equal(calls.filter((call) => !isProbeCall(call)).length, 0);
+      },
+      { everythingPath: 'C:\\fake\\es.exe' },
+      { runProcess: makeFakeEs(calls, () => '') },
+    );
+  });
+});
+
+describe("es_search 的 detail:'full'（devkit 能拿到的一条都不少）", () => {
+  /**
+   * 真 CSV 夹具：**逐字照本机 es.exe 1.1.0.38 的 `-csv` 输出形状**（尺寸/时间都来自真机冒烟）——
+   * 表头 `Name,Path,Size,Date Modified`、名字与路径带引号而数字与时间不带、
+   * **目录的 Size 是空串**、名字里带逗号时也靠引号包住（这条正是"按逗号切"会切错的地方）。
+   */
+  function csvFixture(root: string): string {
+    return [
+      'Name,Path,Size,Date Modified',
+      `"admin.ts","${join(root, 'src', 'tools')}",136388,2026/10/5 23:26:09`,
+      `"agent-loop.ts","${join(root, 'src', 'runtime')}",82990,2026/10/5 17:26:20`,
+      `"comma,name.ts","${join(root, 'src', 'weird')}",1024,2026/10/4 15:29:28`,
+      `"tools","${join(root, 'src')}",,2026/10/3 1:02:03`,
+    ].join('\r\n');
+  }
+
+  it('解析出每条的名称/大小/修改时间，头部给总数与总大小，路径仍是工作根相对', async () => {
+    const calls: string[][] = [];
+    // 假引擎要回**工作根之下**的路径：relative() 才解得出相对路径（工作根装配时才存在，用引用接上）
+    const ws = { root: '' };
+    await withHarness(
+      async (h) => {
+        ws.root = h.root;
+        const res = await h.tool('es_search').handler({ pattern: '*.ts', detail: 'full' }, h.ctx);
+        assert.equal(res.isError, undefined, res.content);
+        assert.match(res.content, /^engine: everything \(es /u, '首行仍是 engine');
+        assert.match(res.content, /模式 `\*\.ts` · 命中 4 个/u, `头部要有命中数：\n${res.content}`);
+        // 总大小 = 136388 + 82990 + 1024（目录那一行没有大小，不参与）
+        assert.match(res.content, /共 215\.2 KB/u, `头部要有总大小：\n${res.content}`);
+        // 每条：大小 · 修改时间 · 相对路径
+        assert.match(res.content, /133\.2 KB · 2026\/10\/5 23:26:09 · src\/tools\/admin\.ts/u, res.content);
+        assert.match(res.content, /81\.0 KB · 2026\/10\/5 17:26:20 · src\/runtime\/agent-loop\.ts/u, res.content);
+        // 名字里带逗号的那条：CSV 引号解析对了才可能出现完整名字
+        assert.match(res.content, /1\.0 KB · 2026\/10\/4 15:29:28 · src\/weird\/comma,name\.ts/u, res.content);
+        // 目录没有大小 → 给 `-`（不编一个 0 B 出来），也不进总大小
+        assert.match(res.content, /- · 2026\/10\/3 1:02:03 · src\/tools/u, res.content);
+        // 相对路径：绝不能出现工作根的绝对路径
+        assert.ok(!res.content.includes(h.root), `路径要相对工作根：\n${res.content}`);
+        // 实参里必须有 CSV 那一组（真机上这一组就是"详细信息"的唯一来源）
+        const argv = esArgvOf(calls, h.root);
+        for (const flag of ['-csv', '-name', '-path-column', '-size', '-size-format', '1', '-date-modified']) {
+          assert.ok(argv.includes(flag), `detail:'full' 必须给 ${flag}：${argv.join(' ')}`);
+        }
+      },
+      { everythingPath: 'C:\\fake\\es.exe' },
+      { runProcess: makeFakeEs(calls, () => csvFixture(ws.root)) },
+    );
+  });
+
+  it('无命中时只给表头那一行：命中 0、无数据行、不报错', async () => {
+    const calls: string[][] = [];
+    await withHarness(
+      async (h) => {
+        const res = await h.tool('es_search').handler({ pattern: 'zzz', detail: 'full' }, h.ctx);
+        assert.equal(res.isError, undefined, res.content);
+        assert.match(res.content, /命中 0 个/u);
+        assert.match(res.content, /\(无命中\)/u);
+        assert.ok(!res.content.includes('共 '), '没有条目就没有"总大小"可给');
+      },
+      { everythingPath: 'C:\\fake\\es.exe' },
+      // 真机上无命中时 es.exe 只回表头一行（实测 S14）
+      { runProcess: makeFakeEs(calls, () => 'Name,Path,Size,Date Modified') },
+    );
+  });
+
+  it("detail:'paths'（默认）仍只列相对路径，不带大小与时间（省上下文的那一档）", async () => {
+    const calls: string[][] = [];
+    const ws = { root: '' };
+    await withHarness(
+      async (h) => {
+        ws.root = h.root;
+        const res = await h.tool('es_search').handler({ pattern: '*.ts' }, h.ctx);
+        assert.equal(res.isError, undefined, res.content);
+        assert.match(res.content, /src\/alpha\.ts/u);
+        assert.match(res.content, /src\/beta\.ts/u);
+        // 默认档只列路径：正文行里不许出现 full 档的 `大小 · 时间 · 路径` 形状
+        const body = res.content.split(/\n{2,}/u).at(-1) ?? '';
+        assert.ok(!body.includes(' · '), `默认档只列路径：\n${res.content}`);
+        assert.ok(!res.content.includes(h.root), '路径要相对工作根');
+        assert.ok(!esArgvOf(calls, h.root).includes('-csv'), '默认档不该付 CSV 那组开关');
+      },
+      { everythingPath: 'C:\\fake\\es.exe' },
+      {
+        // 真机默认档就是"每行一个绝对路径"（实测 S1）
+        runProcess: makeFakeEs(calls, () =>
+          `${join(ws.root, 'src', 'alpha.ts')}\r\n${join(ws.root, 'src', 'beta.ts')}\r\n`),
+      },
+    );
   });
 });
 
@@ -2088,7 +2350,7 @@ describe('参数契约与默认值（照 devkit 对齐）', () => {
     }, { ripgrepPath: 'C:\\fake\\rg.exe' }, { runProcess: fakeRg });
   });
 
-  it('es_search 的 max_results:0 = 只报数量不列文件（源语义），且不加 -n', async () => {
+  it('es_search 的 max_results:0 = 只报数量不列条目（源语义），且不加 -n', async () => {
     const calls: string[][] = [];
     const ws = { root: '' };
     const fakeEs = async (command: string, args: string[]): Promise<Record<string, unknown>> => {
@@ -2112,13 +2374,21 @@ describe('参数契约与默认值（照 devkit 对齐）', () => {
 
       const counted = await h.tool('es_search').handler({ pattern: '*.ts', max_results: 0 }, h.ctx);
       assert.equal(counted.isError, undefined, counted.content);
-      assert.match(counted.content, /命中 2 个文件/u, '要报数量');
-      assert.ok(!counted.content.includes('alpha.ts'), `只统计就不该列文件：\n${counted.content}`);
+      assert.match(counted.content, /命中 2 个/u, '要报数量');
+      assert.ok(!counted.content.includes('alpha.ts'), `只统计就不该列条目：\n${counted.content}`);
+      assert.ok(!counted.content.includes(h.root), '更不该把绝对路径列出来');
       const countArgs = calls.at(-1) ?? [];
       assert.ok(!countArgs.includes('-n'), `max_results:0 时不该给 -n（源同判据）：${countArgs.join(' ')}`);
+      // 0 = 只要数量：`detail:'full'` 那组 CSV 开关也不该付（一条都不列，CSV 解析纯属白干）
+      assert.ok(!countArgs.includes('-csv'), `max_results:0 时不该付 CSV 那组：${countArgs.join(' ')}`);
+      assert.equal(
+        (await h.tool('es_search').handler({ pattern: '*.ts', max_results: 0, detail: 'full' }, h.ctx)).content,
+        counted.content,
+        'max_results:0 时 detail 不改变输出（只统计这一档没有"详细"可言）',
+      );
 
       const listed = await h.tool('es_search').handler({ pattern: '*.ts' }, h.ctx);
-      assert.match(listed.content, /src\/alpha\.ts/u, '默认（不传 max_results）照旧列文件');
+      assert.match(listed.content, /src\/alpha\.ts/u, '默认（不传 max_results）照旧列条目');
       const listArgs = calls.at(-1) ?? [];
       assert.equal(listArgs[listArgs.indexOf('-n') + 1], '100', '默认值保持 100（与源同值）');
     }, { everythingPath: 'C:\\fake\\es.exe' }, { runProcess: fakeEs });
