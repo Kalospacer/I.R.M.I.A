@@ -524,8 +524,8 @@ function isFile(path: string): boolean {
  *
  * 只认第一个分隔符（`（` / `(` / `。`）之前的那一小截——**指路 = 那个路径**，
  * 后头的括注与句子都是**细节**（属于 SKILL.md 正文）。她写的
- * `说明：MEMORIES/skills/window-dispatch/SKILL.md（正文同目录 scripts/dispatch.py；…）`
- * 因此只留 `MEMORIES/skills/window-dispatch/SKILL.md`。
+ * `说明：MEMORIES/skills/<技能名>/SKILL.md（正文同目录 <脚本>；…）`
+ * 因此只留 `MEMORIES/skills/<技能名>/SKILL.md`。
  */
 const NOTE_POINTER = /^说明\s*[:：]\s*([^（(。]*)/u;
 
@@ -596,7 +596,7 @@ function sentenceCut(text: string, marks: RegExp): number | null {
  *      也确实是"一行一句话"）；
  *   ② 再把换行/制表/Tab 全压成空格（**这一行永远是一行**，也顺手兜住 `\r` 与别的空白）；
  *   ③ `说明：…` 那一格**只取指路**（[NOTE_POINTER]）——她那一格的本意是"细节在哪、你自己去读"，
- *      后头的括注（`正文同目录 scripts/dispatch.py`）、实测结论、命令都是**细节**；
+ *      后头的括注（`正文同目录 <脚本>`）、实测结论、命令都是**细节**；
  *      取出来的那个路径**就到此为止**（它是"路"，不是"话"——不再按句末切它，
  *      路径里真有个 `。` 时切成两半就指不到任何文件了）；
  *   ④ 剩下的**话**再判畸形：**含反引号命令**（`` `…` ``）或**括号不闭合** ⇒ 只取**第一句**

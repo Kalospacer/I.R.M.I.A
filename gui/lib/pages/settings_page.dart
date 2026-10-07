@@ -46,10 +46,11 @@ class SettingsPage extends StatefulWidget {
 /// GUI 版本号：与 gui/pubspec.yaml 的 version 同步维护（pubspec 那份是 `0.1.0+1`）。
 /// Flutter 没有运行时读取 pubspec 的内置途径，零依赖前提下写成常量。
 ///
-/// 为什么带 `v` 与 `-beta.3` 而 pubspec 里没有：pubspec 的 version 要喂给 Windows 资源
+/// 为什么带 `v` 与 `-beta` 而 pubspec 里没有：pubspec 的 version 要喂给 Windows 资源
 /// 版本号（windows/runner/Runner.rc 的 FILEVERSION 是 4 个整数）与安装器，容不下预发布
 /// 标记——beta 只体现在这里与包名/说明里；后端那边对同一版号的口径是 `AGENT_VERSION`
 /// （不带 v，见 src/main.ts）。
+/// ⚠️ 别把具体版号抄进注释：出包脚本只改这一行的字面量、不改注释，抄一处就留一处对不上。
 const guiVersion = 'v0.1.0-beta.5';
 
 /// 锚点侧栏宽度（AstrBot 的左侧 section 导航）

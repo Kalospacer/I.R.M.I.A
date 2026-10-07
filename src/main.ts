@@ -67,7 +67,9 @@ import {
  * 改这一个要同步四处：`package.json` 的 version、`gui/pubspec.yaml` 的 version、
  * `gui/lib/pages/settings_page.dart` 的 `guiVersion`（界面显示），以及下面两个自持字面量：
  * `web/server.ts` 的 `McpProbeHost.clientInfo`、`mcp/client.ts` 的 `DEFAULT_CLIENT_INFO`。
- * 第三个内测版：功能面到"能装能用"，但仍会有破坏性改动，所以带 `-beta.3`。
+ * 内测版口径：功能面到"能装能用"，但仍会有破坏性改动，所以带 `-beta` 预发布标记
+ * （**具体是第几个内测版、版号是什么，以这一行的字面量为准**——别把版号抄进注释：
+ * 出包脚本只改版号那一行、不改注释，抄一处就留一处对不上）。
  */
 export const AGENT_VERSION = '0.1.0-beta.5';
 /** 事件形状版本（docs/schema.md） */

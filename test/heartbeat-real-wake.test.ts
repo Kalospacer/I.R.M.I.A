@@ -83,8 +83,8 @@ import { heartbeatData, makeRealWakeRig, requestFingerprint } from './fixtures/r
  * 那一段已经写明"此刻层含本机事实，是环境噪声，不是行为差异"）。所以：
  *   ① `test/fixtures/real-wake-rig.ts` 的指纹**看不见**这一处改动 —— 两个常量照旧；
  *   ② v39 的对照实验**换了一个对象**（不是撤回字节，而是逐字节比对"那一行"本身）：
- *      取 `data/workspace/MEMORIES/assets.md` 里历史最长那条挑中的三条（window-dispatch /
- *      smack-talk / anysearch，逐字抄自 `data/events` 里那条 527 字符的 `memory/selected`），
+ *      取 `data/workspace/MEMORIES/assets.md` 里历史最长那条挑中的三条（<技能 A> /
+ *      <技能 B> / anysearch，逐字抄自 `data/events` 里那条 527 字符的 `memory/selected`），
  *      用 v38 的老口径与 v39 的新口径各渲染一次：527 → 162 字符，**只有那一行变了**；
  *      再把两份渲染结果各自塞进同一个"此刻层 item"里算 `requestFingerprint`
  *      ⇒ 老口径与新口径**同一个值**（`4e7a3669b7145e0e`）；而把**层外**的历史改一个字符，
