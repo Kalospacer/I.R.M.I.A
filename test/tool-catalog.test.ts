@@ -25,7 +25,7 @@ import test from 'node:test';
 
 import { buildCatalogRegistry } from '../src/tools/catalog.ts';
 import { FS_ERROR_CODES } from '../src/tools/fs/index.ts';
-import { estimateTokens } from '../src/tools/registry.ts';
+import { MAX_DESCRIPTION_TOKENS, estimateTokens } from '../src/tools/registry.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
 
 function catalog(destructiveEnabled = true): ReturnType<typeof buildCatalogRegistry> {
@@ -133,6 +133,57 @@ test('工具清单：六件被压到 60 token 以内的描述不许悄悄长回�
     const tokens = estimateTokens(tool.description);
     assert.ok(tokens < 60, `${name} 的描述又长回 ${tokens} token（本轮口径：<60）`);
   }
+});
+
+test('工具清单：任何一件的描述都不许贴到硬门上（距硬门不足 10 token 就红）', async () => {
+  // 这一条守的是"下一次静默少一件工具"的第一嫌疑人。它和上面那条 <60 的收紧线**不是一回事**：
+  // 收紧线只盖那几件（省常驻开销的取舍），这一条盖**全部件**，判据只有一个——离硬门够不够远。
+  //
+  // 为什么需要它（2026-10-06 实测）：`read_channel` 98/100 —— 距"register 抛错 → 被记进 problems
+  // → 跳过注册"只剩 **2 token**（上面 ① 那条守的就是这个后果）。而它不在收紧名单里，
+  // 所以那时候**没有任何用例会因为它的描述再多半句话而变红**：她那边只会突然少了这件能力。
+  // 有了这一条，涨到 90 就先红在数字上，不必等到 101 红在"她怎么突然不读群了"上。
+  //
+  // 10 这个余量是**判断**不是推导：一件工具的措辞改一轮通常几十 token 以内，
+  // 留 10 token 够改标点、不够再加一句（要加一句，就该走参数描述或先瘦身）。
+  const DESCRIPTION_MARGIN_TOKENS = 10;
+  const { registry } = await catalog();
+  const tight: string[] = [];
+  for (const name of registry.names()) {
+    const tool = registry.get(name);
+    if (tool === null) continue;
+    const tokens = estimateTokens(tool.description);
+    if (MAX_DESCRIPTION_TOKENS - tokens < DESCRIPTION_MARGIN_TOKENS) {
+      tight.push(`${name} ${tokens}/${MAX_DESCRIPTION_TOKENS}`);
+    }
+  }
+  assert.deepEqual(
+    tight,
+    [],
+    `这些工具的描述距硬门不足 ${DESCRIPTION_MARGIN_TOKENS} token：${tight.join('、')}`
+    + `——超了硬门不是"描述长一点"，是**这件工具静默消失**（registry.ts 的 MAX_DESCRIPTION_TOKENS）：`
+    + '要么瘦身，要么把细节挪进参数描述（参数不进这份预算）',
+  );
+});
+
+test('工具清单：常驻总量不许悄悄涨（防"文档与实测各说各话"复发）', async () => {
+  // 为什么要有这一条：件数与 token 是**每轮请求都要付的常驻开销**，而它历史上一直是"悄悄涨、
+  // 事后才发现"的（4391 / 3875 / 3699 / 3931 / 4587 / 4645 / 4839 / 4874 / 5088 / 5167 / 5435，
+  // docs/design.md §4.18 记着这一串）。单件都在各自的门内，加起来仍然可能多付一份 schema
+  // ——所以钉的是**总量**。
+  //
+  // 上界 5500 的来历（2026-10-06 实测）：有 `es.exe` 24 件 / **5415**，没 `es.exe` 23 件 / 4933
+  // （`_research/tool-count-recount-es.mts` 与 `tool-count-recount.mts`）。留 85 token 余量：
+  // 够一次措辞微调，不够再加一件（一件整件 ≥100 token）。**涨过这条线不是"改大这个数"就完事**：
+  // 先按 §4.18 那段口径复测、把权威值改准，再决定要不要接受这笔常驻开销。
+  const { registry } = await catalog();
+  const total = registry.catalogTokens({ includeDestructive: true });
+  assert.ok(
+    total < 5500,
+    `常驻工具说明 ${total} token（上界 5500）：要么加了新工具，要么某件的描述/参数 schema 又长回去了。`
+    + '先按 docs/design.md §4.18「口径与复测」复测（_research/tool-count-recount.mts / -es.mts），'
+    + '把那段权威值改准，再动这个上界——两处必须一起动',
+  );
 });
 
 test('工具清单：定时器三件已并成一件 `timer`，旧名不许回来、三个动作一个不许少', async () => {

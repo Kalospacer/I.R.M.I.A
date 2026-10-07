@@ -69,10 +69,11 @@ import type { EventLog } from '../log/event-log.js';
 import type {
   AppEvent, AppEventType, MemorySelected, ModelLane, Projection, TurnEndReason, WakeSource,
 } from '../log/types.js';
-import { defaultVisibility } from '../log/types.ts';
+import { defaultVisibility, type ContextImageChosen } from '../log/types.ts';
 import {
   DEFAULT_HANDOFF_BUDGET_TOKENS, DEFAULT_HANDOFF_FOLD_TOKENS,
-  estimateHistoryTokens, renderHandoffNote, type HandoffOptions,
+  estimateHistoryTokens, estimateMaskedTokens, mechanicalSummaryText,
+  renderHandoffNote, type HandoffOptions,
 } from '../persona/handoff-note.ts';
 import { applyOne, wakeSourceOf } from '../state/fold.ts';
 // 毒消息保护的阈值与崩溃恢复共用一处：同一条输入反复认领仍没跑完就进死信
@@ -167,9 +168,17 @@ export interface AgentLoopDeps {
   /** 子进程隔离配置，原样透传给执行器（不响应中断的工具走隔离，超时即杀） */
   isolation?: IsolationConfig;
   /**
-   * 大结果外置（design §4.12 磁盘经济学、schema §4 的 contentRef）：配上即开启，
+   * 单条工具回执的上限（design §4.12 磁盘经济学、schema §4 的 contentRef）：配上即开启，
    * 不配即全文入日志（M2 口径——最小宿主与单元测试不需要 blob 目录）。
    * 判定与写入在 state/blob-store.ts，这里只负责"先落 blob、再写事件"的顺序。
+   *
+   * **上限有两个维度**（2026-10-06：{@link BlobOffloadOptions.thresholdTokens} 估算 21k +
+   * {@link BlobOffloadOptions.maxBytes} 64 KiB，取小），它们一起构成"一条回执最多进多少
+   * 上下文"的界。**定形只发生在 {@link TurnRunner.recordToolResult} 这一处、这一刻**：
+   * 事件一旦写下，后续任何维护（压缩、交接、恢复）都不回来改它——"扫历史发现超限再剪一次"
+   * 那条路本仓没有，也**不许有**（可见前缀每轮都变 = 缓存永远命不中；先例见 blob-store 的文件头）。
+   *
+   * @see BlobOffloadOptions —— 三个上限都可覆盖；生产走默认值（`real-loop` 的 agentDeps）。
    */
   blobOffload?: BlobOffloadOptions;
   /** 压缩触发（M5 临时口径，persona.md §4 / design.md §4.13）；不传即不压缩 */
@@ -195,6 +204,17 @@ export interface AgentLoopDeps {
    * 缺省 = 整块不出现（子代理、重放、诊断）。
    */
   turnBlock?: TurnBlockFacts | null;
+  /**
+   * 本任务相关资产那一行（v34；`persona/assets.ts` 的 `renderAssetsLine` 渲染好的文本）。
+   *
+   * 由**宿主**在轮首算好（读 `MEMORIES/assets.md`、跑一次 light 选 ≤3 条），循环层每步原样
+   * 转手——与 `contact` / `machine` / `usage` 同一条纪律：渲染层不读文件、不调模型，只排版。
+   * 它进的是**此刻层的任务卡**（`当前任务：…` 后面那一行）：任务完、任务卡消失，这一行自然消失。
+   *
+   * 缺省/null/空串 = 整行不出现（清单不存在、没挑出相关的、这一拍不必干活、
+   * 或者老调用点根本没给）：渲染结果与引入它之前逐字节相同。
+   */
+  assetsLine?: string | null;
   /**
    * `persona/STATE.md` 的**字节预算**（v32；`config.persona.stateBudgetBytes`，默认 8 KB）。
    *
@@ -249,10 +269,12 @@ export interface AgentLoopDeps {
    * 图片取字节的能力（design §4.20 图片两条途径）：给了它，带图的消息才会把
    * `input_image` 放进请求——QQ 发来的图片因此"直接进上下文"，而不是只留一条地址。
    *
-   * 由宿主注入（real-loop 用 channel/attachment-store 的 readAttachmentDataUrl）。
+   * 由宿主注入（real-loop 用 channel/attachment-store 的 readAttachmentImage）。给的是
+   * **一份能进请求体的图片**（型别 + data URL），不是裸 URL 串——型别与 data URL 前缀必须
+   * 逐字一致，而拼装只此一处（见 `ContextImageChosen` 的注释：拼错就是 400）。
    * 不配 = 一条图片都不进上下文，只剩文字与 `vision_read` 的转述：子代理与重放就是这种情形。
    */
-  loadImage?: ((ref: RenderImageRef) => string | null) | null;
+  loadImage?: ((ref: RenderImageRef) => ContextImageChosen | null) | null;
   /** 最多几张图片进上下文（默认 IMAGE_INJECT_MAX = 2；0 = 关掉图片直通） */
   maxContextImages?: number;
   /**
@@ -334,6 +356,16 @@ export type MemorySelector = (input: {
   indexHash: string;
   /** 注入的索引条数（规模；不是索引全文） */
   entries: number;
+  /**
+   * 本任务相关资产那一行（v34；`MEMORIES/assets.md`，空串 = 这一轮没有）。
+   *
+   * **为什么搭这条账一起落库**：那一行进的是此刻层任务卡，而重放要能**逐字节**重建当时的请求
+   * ——盘上的 `assets.md` 是她随时会改的文件，"当时的清单挑出了哪几条"只有事件答得上来。
+   * 与 `indexHash` 同一条纪律：只记结论（那一行渲染好的文本），不记清单全文。
+   *
+   * 可选：不传 = 这一轮没有那一行（老调用点、子代理、诊断都走这一支，事件形状与之前一致）。
+   */
+  assets?: string;
 };
 
 /**
@@ -361,7 +393,17 @@ export interface RequestDerivation {
   events: readonly AppEvent[];
   /** 本轮新输入；必须不在 events 里（见文件头协同契约） */
   wakeEvent: AppEvent | null;
-  taskCard: { title: string; turn: number; step: number; todoOpen: readonly string[] } | null;
+  taskCard: {
+    title: string;
+    turn: number;
+    step: number;
+    todoOpen: readonly string[];
+    /**
+     * 本任务相关资产那一行（v34，`MEMORIES/assets.md`，由 real-loop 在轮首算好）：
+     * 渲染层只排版、缺省即整行不出现。见 `persona/assets.ts` 与 `RenderInput.taskCard.assets`。
+     */
+    assets?: string;
+  } | null;
   now: string;
   model: string;
   /** 软阈值提示：尾部插播，不落库（见文件头 M2 边界） */
@@ -393,7 +435,7 @@ export interface RequestDerivation {
    * 图片取字节的能力（宿主注入，见 AgentLoopDeps.loadImage）：给了它，带图的消息才会
    * 把 `input_image` 真的放进请求。缺省 = 只渲染文字（重放与诊断场景常常没有它）。
    */
-  loadImage?: ((ref: RenderImageRef) => string | null) | null;
+  loadImage?: ((ref: RenderImageRef) => ContextImageChosen | null) | null;
   /** 最多几张图片进上下文（见 RenderInput.maxContextImages） */
   maxContextImages?: number;
 }
@@ -412,8 +454,12 @@ export interface RequestDerivation {
  *   • 只在**群里**成立（私聊本来就该直接看到话），判据是 `contact.wakeMessage` 的
  *     `chatType !== 'c2c'` 加上"平台 @ 或关键词命中"（与此刻层一致）；
  *   • 判过注入的那条**不换**（`render` 侧按 note 判）：那种消息她必须亲眼看原话。
+ *
+ * v34 起**导出**：宿主挑"本任务相关资产"时要用**同一个口径**的标题（提及那一轮通知里带着
+ * 那一句「那边在聊：…」，比 `{"channel":"qq-official",…}` 那一坨 JSON 更能说明"要做什么"）。
+ * 两处各写一份判据，迟早会漂成"挑资产时看的是 A、任务卡上写的是 B"。
  */
-function mentionNoticeOf(
+export function mentionNoticeOf(
   contact: ContactFacts | null,
   wakeEvent: AppEvent | null,
 ): { messageId: string; text: string } | null {
@@ -427,8 +473,11 @@ function mentionNoticeOf(
  * 给联络事实补上"叫她的那一条是什么时候到的"（本机时间，'15:16'）。
  *
  * 渲染层不格式化时间（时区是配置事实），宿主这里算好；重放走同一条路，所以重建得回来。
+ *
+ * v34 起**导出**：宿主挑"本任务相关资产"的标题要用**同一条路**算出来的 contact
+ * （提及那一轮通知只在补过 `wakeMessage` 的 contact 上成立）——见 `mentionNoticeOf`。
  */
-function contactWithWakeStamp(
+export function contactWithWakeStamp(
   contact: ContactFacts | null,
   wakeEvent: AppEvent | null,
   timezone: string,
@@ -471,6 +520,24 @@ export function deriveRequest(input: RequestDerivation): RenderedRequest {
     state: input.persona.state,
     relationship: input.persona.relationship ?? null,
   };
+  // 群里"有人提到了你"那一轮：本轮输入换成**框架通知**（正文她自己 read_channel 取）。
+  // 在这里算，与 `asks`/`injection` 同一条纪律：渲染层不读 contact、也不扫日志，
+  // 而"这一轮是不是被点名"只有拿得到 contact 的人知道——replay 走同一个函数，所以重建得回来。
+  //
+  // **它同时是任务卡标题的来源**（v35 收敛，2026-10-06）：提及那一轮"她真正看到的那句话"
+  // 就是这一句，所以标题也用它。判据只留这一处，是因为一条真 bug 的形状——同一个标题原先
+  // 有三处各推一次：
+  //   • `agent-loop` 的 `taskCard()` 换过一次，用的是**没盖章**的 `this.deps.contact`，
+  //     于是标题与本轮新输入差着「（15:16 到的这一条）（这一条你还没看过）」两小段；
+  //   • `replay` 的 `locateStep` 压根没换——重放/界面预览的任务卡标题直接成了**正文原文**，
+  //     违反 v28（"通知进、正文不进"；修前它侥幸没被发现，因为那时标题是整个
+  //     `[external_event …]` 包裹，而 80 字的裁剪正好把包裹头切掉、正文还没轮到）；
+  //   • 挑资产那一侧（`real-loop` 的 `assetTaskTitle`）用的是盖章版——三种口径里唯一对的那个。
+  // 收敛到本函数之后，**运行期 / CLI 重放 / 界面预览**三条渲染路径同源（后两条都走本函数）。
+  const mentionNotice = mentionNoticeOf(
+    contactWithWakeStamp(input.contact ?? null, input.wakeEvent, input.timezone),
+    input.wakeEvent,
+  );
   const rendered = render({
     events: [...input.events],
     persona,
@@ -479,10 +546,18 @@ export function deriveRequest(input: RequestDerivation): RenderedRequest {
     taskCard: input.taskCard === null
       ? null
       : {
-        title: input.taskCard.title,
+        // 提及那一轮：标题就是那句通知——与上面给"本轮新输入"的是**同一串字节**
+        //（裁剪口径同 `clipTaskTitle`：调用方给的标题本来就是它裁过的）。
+        // 其余轮次原样转手（`wakeTitle` 的一行摘要：任务卡标题该是人写的那句话本身）。
+        title: mentionNotice === null ? input.taskCard.title : clipTaskTitle(mentionNotice.text),
         turn: input.taskCard.turn,
         step: input.taskCard.step,
         todoOpen: [...input.taskCard.todoOpen],
+        // 数字资产那一行（v34）：原样转手——它不是渲染层能算出来的东西（要读清单文件、
+        // 还要一次 light 选取），所以只有在宿主给了且非空时才带上这个字段。
+        ...(input.taskCard.assets === undefined || input.taskCard.assets === ''
+          ? {}
+          : { assets: input.taskCard.assets }),
       },
     now: input.now,
     timezone: input.timezone,
@@ -527,9 +602,8 @@ export function deriveRequest(input: RequestDerivation): RenderedRequest {
     // 所以重建出来的这一段与当时逐字节一致（与 `machine`/`usage` 那种瞬时值不同）。
     injection: notedWarningsOf(input.events, Date.parse(input.now)),
     // 群里"有人提到了你"那一轮：本轮输入换成**框架通知**（正文她自己 read_channel 取）。
-    // 在这里算，与 `asks`/`injection` 同一条纪律：渲染层不读 contact、也不扫日志，
-    // 而"这一轮是不是被点名"只有拿得到 contact 的人知道——replay 走同一个函数，所以重建得回来。
-    mentionNotice: mentionNoticeOf(contactWithWakeStamp(input.contact ?? null, input.wakeEvent, input.timezone), input.wakeEvent),
+    // 算在函数开头那一处，**任务卡的标题也从它取**（v35 收敛：判据只留一份，别在这里再换一次）。
+    mentionNotice,
     // 图片：渲染层拿不到字节，靠注入的 loader 换 data URL（重放时常常没有 loader，
     // 那条历史就退化成文字——这是有意的：重放要的是"当时说了什么"，不是把图再传一遍）
     loadImage: input.loadImage ?? null,
@@ -749,10 +823,21 @@ class TurnRunner {
    * 压缩触发（milestones.md M5-2、persona.md §4、design.md §4.13 铁律 5）：
    * turn 结束且可见历史 token 估算超过阈值时，把交接笔记写成 `compaction/summary`。
    *
-   * 遮蔽点取**上一个已结束 turn 的 `turn/end`**（见 `lastClosedTurnEndSeq`：绝不能劈开
-   * "他问的那句"与"她答的那段"）；本 turn 自己的事件（seq 更大）逐字节保留。历史只可闸蔽、
-   * 不可改写：老摘要留在现场，渲染取最大的 coveredUpToSeq，于是新摘要把老摘要自己也闸蔽进去
-   * （§13 遮蔽规则）。
+   * **遮蔽点取本 turn 自己的 `turn/end`**（2026-10-06 改；原口径是"上一个已结束 turn 的
+   * `turn/end`"）。交接是在 turn 收尾之后发生的，所以刚跑完的这一轮可以一起折进笔记；
+   * 而把它留在现场恰恰是这笔账上最贵的一项：实测 2026-10-06 21:40 那次交接，
+   * 留在现场的就是本 turn 的 43,832 token 可见历史，交接后第一次调用为它付了 72,096 未命中
+   * （交接前那次只花 1,656）。改后同一个交接点的请求体不再含这一段。
+   *
+   * 这条改动**不放松**"不能劈开他问的那句与她答的那段"那条纪律：遮蔽点仍然是 `turn/end`
+   * （不是 turn/start，也不是任意 seq），只是取**刚结束的那个** turn 而不是再往前一个。
+   * 硬前提是**笔记必须覆盖到新的遮蔽点**（`renderHandoffNote` 的收录范围就是喂进去的那批
+   * 事件，而这里喂的是含本 turn 在内的全量快照）——否则被遮蔽的内容会既不在笔记里、
+   * 也不在历史里，那是真丢信息。回归测试钉住了这一条（test/handoff-note.test.ts 的
+   * "笔记必须覆盖新的遮蔽点"）。
+   *
+   * 另外两条纪律不变：历史只可遮蔽、不可改写（老摘要留在现场，渲染取最大的 coveredUpToSeq，
+   * 于是新摘要把老摘要自己也遮蔽进去，见 §13 遮蔽规则）。
    */
   private async maybeCompact(): Promise<void> {
     const cfg = this.deps.compaction;
@@ -760,14 +845,86 @@ class TurnRunner {
     // 本 step 自己写下的事件（message/assistant、tool/result…）要先进快照：
     // 阈值判定与笔记内容都只认日志，不认内存态拼装
     await this.syncEvents();
+
+    // 触发阈值：**口径不变**（"未被已有摘要遮蔽的可见历史"越过阈值就压一次）。
+    // 刻意**不**用下面的新遮蔽点来量——那样量的是"压完之后还剩多少"，而压完必然几乎为零，
+    // 于是阈值永远越不过去，等于把自动压缩关掉（第一版就是这么写的，被回归测试逮住）。
+    // "压完之后剩多少"是 ④ 的收益闸门要回答的问题，不是触发阈值的口径。
     if (estimateHistoryTokens(this.events) <= cfg.thresholdTokens) return;
 
-    const note = renderHandoffNote(this.events, handoffOptionsOf(cfg));
-    if (note.text.trim() === '') return;
+    // 遮蔽点：**本 turn 的 `turn/end`**（`includeInFlightTurn`，2026-10-06 改）。
+    // 交接发生在 turn 收尾之后，所以把刚跑完的这一轮一起折进笔记是安全的——而留着它
+    // 才是真正贵的那一笔：实测 2026-10-06 21:40 那次，留在现场的正是本 turn 的
+    // 44,281 token 可见历史（真实 72,096 token，估算低估 1.63×），交接后第一次调用
+    // 因此付了 72,096 未命中。
+    const covered = compactionCoveredUpToSeq(this.events, this.turnStartSeq, 0, true);
 
-    const covered = compactionCoveredUpToSeq(this.events, this.turnStartSeq);
-    this.write('compaction/summary', { coveredUpToSeq: covered, summary: note.text }, { sync: true });
+    // ── ④乙 物理上界与单调性（**与甲是两件事，各管各的**）──
+    //
+    // 这一条不判"划不划算"，只判"这次折叠本身是不是一个合法的、不退步的动作"：
+    //   • 遮蔽点不得回退（回退 = 把已经不在现场的内容又变回现场，可见前缀凭空变长）；
+    //   • 折叠的结果不得比折叠前更大（那种"压缩"把请求撑大，是纯粹的负收益）。
+    // 两条都现场可判、失败了就**什么都不动**（不写事件、不改上下文）——静默退化成
+    // "这一拍不压"，下一拍照旧按阈值再来一次。真正的硬上界（整个请求放不放得下）不在这里，
+    // 那是 budget-guard 与渲染层的事（见 docs/design.md 的请求装配）。
+    const previousCovered = compactionCoveredUpToSeq(this.events, this.turnStartSeq, 0, false);
+    const beforeTokens = estimateHistoryTokens(this.events);
+    const afterTokens = estimateHistoryTokens(this.events, covered);
+    if (covered < previousCovered || afterTokens > beforeTokens) return;
+
+    // ── ④甲 收益闸门 ──
+    //
+    // 量的东西：**已有摘要的覆盖点之后、本次要折进去的那一段**（`priorCovered → covered`）。
+    //
+    // 参照点必须取**已有摘要的覆盖点**（`priorCovered`），不能取"上一个 `turn/end`"：
+    // 两者不是一回事——没有摘要时 `turn/end` 也在，可那时还没有"上一次交接"，拿它当参照
+    // 会把整段累积的可见历史（正是把阈值推过线的那批料）排除在度量之外，闸门就永远说"不够"。
+    // （这一条走了两次弯路才定下来，两次的实测数都留在 `_research/probe-handoff-mask.mts` 的输出里。）
+    //
+    // 为什么不量"整条还没折的可见历史"：那会把**还留在现场的尾部**也算进来，于是任何一次
+    // 折叠都"够本"，闸门等于没装。要的是 reasonix 那句"新闭合的历史 ≥ 一个 recent tail"：
+    // 刚折完立刻再折（那一段是 0）必须被拦住。
+    //
+    // **第一次折叠不受它管**（`priorCovered === 0`）：没有"上一次交接"就没有"新闭合的历史"；
+    // 这一次折叠的收益是**整条历史**（阈值刚被它推过），拿增量卡它只会让第一次永远压不动。
+    const priorCovered = compactionCoveredUpToSeq(this.events, this.turnStartSeq, 0, false) === 0
+      // 还没有任何摘要 ⇒ 参照点就是 0（`maybeCompact` 的第一次折叠）
+      ? 0
+      : this.priorSummaryCoverage();
+    if (priorCovered > 0
+      && estimateMaskedTokens(this.events, priorCovered, covered) < RECENT_TAIL_TOKENS) return;
+
+    // 笔记：渲染不出来（或空）时**落机械替代文本**，不许留空。
+    // 留白会被读成"那段时间什么都没发生"，然后她按这个印象编下去（reasonix 的
+    // mechanicalFoldDigest 就是为这一条写的）。所以 `summary` 字段在任何路径上都非空。
+    //
+    // 报的条数用**与闸门同一个参照点**（`priorCovered`）：那句"有 N 条往来被折进来了"
+    // 说的必须是"这一段里有多少条"，参照点换个值就会报一个对不上的数。
+    const note = renderHandoffNote(this.events, handoffOptionsOf(cfg));
+    const summary = note.text.trim() === ''
+      ? mechanicalSummaryText(countMaskedEvents(this.events, priorCovered, covered))
+      : note.text;
+
+    this.write('compaction/summary', { coveredUpToSeq: covered, summary }, { sync: true });
     this.log.flush();
+  }
+
+  /**
+   * 已有摘要的覆盖点（`0` = 还没压过）。
+   *
+   * 与 {@link compactionCoveredUpToSeq} 的 ① 同一份判据——**只取摘要的 `coveredUpToSeq`**，
+   * 不掺"上一个 `turn/end`"。④ 的参考点必须是"上一次交接折到哪"，而不是"上一轮跑到哪"：
+   * 两者在没有摘要时相差极大（前者 0、后者是上一轮的结束），混用会让闸门把整段累积的可见
+   * 历史排除在度量之外，于是永远说"不够"，自动压缩再也触发不了。
+   */
+  private priorSummaryCoverage(): number {
+    let covered = 0;
+    for (const event of this.events) {
+      if (event.type === 'compaction/summary' && event.data.coveredUpToSeq > covered) {
+        covered = event.data.coveredUpToSeq;
+      }
+    }
+    return covered;
   }
 
   // ── 工具执行 ──
@@ -861,11 +1018,18 @@ class TurnRunner {
     };
     if (result.error !== undefined) data['error'] = result.error;
 
-    // 大结果外置（§4.12）：**先写 blob 再写事件**——事件里只有预览，blob 没落盘就等于丢全文。
+    // 单条回执的上限（§4.12，2026-10-06 加）：**先写 blob 再写事件**——事件里只有预览，
+    // blob 没落盘就等于丢全文。两个维度取小（估算 21k token / 64 KiB，见 BlobOffloadOptions）。
+    //
+    // **这是唯一的定形点**：`tool/result` 一旦写下，可见字节就冻结了。压缩、交接、恢复
+    // 都不回来改它——不许加"扫历史、发现超限、再截短"那种维护（那会让前缀每轮都变）。
+    //
     // 只对 status:'ok' 外置：渲染层仅在该分支消费 contentRef（见 model/render.ts 的
     // renderToolOutput），给别的状态挂 contentRef 会得到"看着完整、其实被截断"的假象。
-    const offload = this.deps.blobOffload;
-    if (offload !== undefined && result.status === 'ok' && result.content.length > 0) {
+    // 内建默认值（不配 blobOffload 也生效）：**子代理那条路曾经就是"没有界"的**——
+    // 它不传 blobOffload，于是一次大回执能把它自己的上下文吃满而它连"被截了"都不知道。
+    const offload = this.deps.blobOffload ?? null;
+    if (result.status === 'ok' && result.content.length > 0 && offload !== null) {
       const outcome = await offloadIfLarge(result.content, offload);
       data['content'] = outcome.content;
       if (outcome.contentRef !== undefined) data['contentRef'] = outcome.contentRef;
@@ -945,6 +1109,9 @@ class TurnRunner {
   /**
    * 模型调用成功返回后的预算归账（缓存命中拆分对齐 §4.13 观测闭环）。
    *
+   * 用量里还带上 `reasoningTokens`（思维链 token，2026-10-06 起落库）：它**已经含在
+   * `outputTokens` 里**，所以只是观测——账本口径一个字都没改（`state/fold.ts` 不看它）。
+   *
    * 同一条事件上还挂两笔**上下文事实**（2026-10-03；不新增事件类型，见 context-audit.ts）：
    *   · `context`：这次请求的上下文构成（渲染层的副产物，段边界只有它知道）；
    *   · `cacheBreak`：与**上一次被审计的调用**做前缀比对的结论，只在真失守时出现。
@@ -988,6 +1155,9 @@ class TurnRunner {
       outputTokens: usage.outputTokens,
       cacheHitTokens: cacheHit,
       cacheMissTokens: Math.max(0, inputTokens - cacheHit),
+      // 思维链 token（观测字段，已含在 outputTokens 里，不参与预算算式）。
+      // **每次都写**：这一档没产思维链就是 0——见 log/types.ts 的字段注释。
+      reasoningTokens: usage.reasoningTokens,
       durationMs: result.durationMs,
       // 成功路径没有重试计数通道（DsClient 只把 attempts 挂在外抛错误上）；M3 接 onRetry 回填
       retryCount: 0,
@@ -1018,6 +1188,8 @@ class TurnRunner {
       outputTokens: 0,
       cacheHitTokens: 0,
       cacheMissTokens: 0,
+      // 调用抛错 ⇒ 服务端连 usage 都没回来，思考 token 只能是 0（字段照写，不留空）
+      reasoningTokens: 0,
       durationMs: 0,
       retryCount: known ? Math.max(0, error.attempts - 1) : 0,
       finishReason: 'failed',
@@ -1157,12 +1329,20 @@ class TurnRunner {
     }, { sync: true });
   }
 
-  /** 唤醒文本（Wake 钩子的输入与任务卡标题共用同一渲染口径） */
+  /** 唤醒文本（Wake 钩子的入参）：与请求体里"本轮新输入"那一格**同一串字节** */
   private wakeText(): string {
     const payloads = this.timerPayloads();
     // 提及那一轮：钩子与请求体看到的必须是**同一份文本**（否则"紧急信息由钩子带进来"这类判断
     // 会按着一段她已经看不到的话来做）。所以这里也换成那句通知。
-    const notice = mentionNoticeOf(this.deps.contact ?? null, this.wakeEvents[0] ?? null);
+    //
+    // **必须走 `contactWithWakeStamp`**（2026-10-06 修）：请求体那一格是 `deriveRequest` 用
+    // **盖章过**的 contact 算出来的，这里原先拿的是**没盖章**的 `this.deps.contact`——于是钩子
+    // 看到的那句通知少了「（10:00 到的这一条）（这一条你还没看过）」两小段，与它自己这条注释
+    // 说的"同一份文本"不符。同一处判据只留一份：两边都走 `contactWithWakeStamp` + `mentionNoticeOf`。
+    const notice = mentionNoticeOf(
+      contactWithWakeStamp(this.deps.contact ?? null, this.wakeEvents[0] ?? null, this.deps.timezone),
+      this.wakeEvents[0] ?? null,
+    );
     return this.wakeEvents
       .map((event) => (notice !== null && event.type === 'wake/channel'
         && event.data.messageId === notice.messageId
@@ -1172,17 +1352,23 @@ class TurnRunner {
       .join('\n');
   }
 
-  private taskCard(step: number): { title: string; turn: number; step: number; todoOpen: string[] } {
+  private taskCard(step: number): { title: string; turn: number; step: number; todoOpen: string[]; assets?: string } {
     const first = this.wakeEvents[0];
     // 标题用 wakeTitle（人读摘要），不是 renderWake（给模型看的带来源标注版）：
     // 否则任务卡会写成「[界面消息] 看一眼日志」
-    // 提及那一轮：标题用那句通知（人读得懂），而不是 wake/channel 的原始数据——
-    // 实测它曾经在任务卡里写成 `{"channel":"qq-official","chatType":"group",…}`，
-    // 那是给她看的当前任务，不该是一坨 JSON。
-    const notice = mentionNoticeOf(this.deps.contact ?? null, first ?? null);
+    //
+    // **提及那一轮的换法不在这里**（v35 收敛，2026-10-06）：那是"这一轮她到底看到哪句话"的判据，
+    // 归 `deriveRequest()` 一处管——它手上才有**盖章过**的 contact。原先在这里另换一次，
+    // 用的是没盖章的那份，于是标题与本轮新输入差着两小段；重放那一侧更是完全没换，
+    // 标题直接成了正文原文。这里只给"其余轮次"的标题（`wakeTitle`）。
+    // 提及那一轮的结果：`taskCard.title` 会被 `deriveRequest` 换成那句通知。
     const title = first === undefined
       ? ''
-      : clipTaskTitle(notice?.text ?? wakeTitle(first, this.timerPayloads()));
+      : clipTaskTitle(wakeTitle(first, this.timerPayloads()));
+    // 本任务相关资产那一行（v34）：**只在有任务卡时**才存在，且整轮原样转手（deps 里那份是
+    // 轮首算好的，见 real-loop 的 agentDeps）。她 turn 内改了 STATE 不影响它——它说的不是状态，
+    // 是"这件事可能用得上哪几件工具"，一轮之内本来就不会变。
+    const assets = (this.deps.assetsLine ?? '').trim();
     return {
       title,
       turn: this.turn,
@@ -1197,6 +1383,7 @@ class TurnRunner {
       // 会触发 `onPersonaUpdated` → 从盘上重载 STATE → 同一轮的后续 step 立刻看得见新清单。
       // 这与固定块取轮首快照那条纪律**不冲突**：任务卡在此刻层（逐 step 变），它本来就该是最新的。
       todoOpen: openTodoItems(this.deps.persona.state ?? ''),
+      ...(assets === '' ? {} : { assets }),
     };
   }
 
@@ -1246,6 +1433,9 @@ class TurnRunner {
    *
    * 心跳轮（`isHeartbeatTurn`）：宿主会回 `injection: 'heartbeat'`——没人在跟她说话，索引不注入。
    * 事件照写：这样"为什么这一轮她没看见索引"在日志里是有答案的，而不是一个沉默。
+   *
+   * v34 起这条账顺带带上**本任务相关资产那一行**（`assets`，可选）：理由同 `indexHash`——
+   * 盘上的 `assets.md` 与那份索引一样是她随时会改的，重建要逐字节复原就必须有当时的结论。
    */
   private selectMemoryForTurn(): void {
     const selector = this.deps.memorySelector;
@@ -1257,6 +1447,8 @@ class TurnRunner {
       injection: plan.injection,
       indexHash: plan.indexHash,
       entries: plan.entries,
+      // 空串 = 这一轮没有那一行：不写空字段（老事件的形状因此逐字节不变）
+      ...(plan.assets === undefined || plan.assets === '' ? {} : { assets: plan.assets }),
     }, { sync: true });
   }
 
@@ -1345,24 +1537,60 @@ class TurnRunner {
 // ──────────────────────────────── 压缩点（唯一一份口径） ────────────────────────────────
 
 /**
+ * 交接的**收益闸门**（2026-10-06 加）：新闭合的历史不足一个 recent tail 就不写摘要。
+ *
+ * 先例与理由逐字来自 reasonix（`compact_projection.go:431-436`）：
+ * 「Every checkpoint costs the whole prefix cache, so a second one waits for a tail's worth of
+ * new closed history — otherwise a small window folds every few rounds and **spends more than
+ * the fold frees**.」
+ *
+ * 为什么这条判据必须有（我们的实测）：`data/events` 里 54 次压实中**有 6 次的新闭合量是 0**
+ * （seq 709 / 820 / 5389 / 5623 / 5753 / 17720 —— 刚写完一条摘要，紧接着又写一条），
+ * 每一次都付了一整段前缀的 miss，换回来的可见历史却只有几个 token。中位数是 32,693，
+ * 所以 20,000 这条线只拒掉明显不划算的那些（54 次里拒 22 次，其中包含全部 6 次"新闭合 = 0"）。
+ *
+ * 20,000 这个数怎么来的（**不引入新配置旋钮**，用户不喜欢旋钮）：它是
+ * `DEFAULT_HANDOFF_BUDGET_TOKENS`（4096）的约 5 倍，也是现场阈值 100,000 的 1/5。
+ * 直白说：**"这次要折进去的新东西"至少得有半本笔记那么厚，才值得把整段前缀作废一次**。
+ * 取 32,000（= foldTokens 默认值 = 出厂阈值）会拒掉 24/54，对"一天干几件长活"的节奏过紧；
+ * 取 5,000 只拒 16/54，又会放过 5,111 那种明显不划算的（实测 seq 819→830）。
+ */
+export const RECENT_TAIL_TOKENS = 20_000;
+
+/**
  * 压缩的**遮蔽点**：三者取大。自动压缩（{@link TurnRunner.maybeCompact}）与人在消息里
  * 打的那条 `/compact` / `/handoff`（`runtime/real-loop.ts`）**共用这一份**——
  * 两处各算一遍，迟早会出现"同一份日志、两个遮蔽点"。
  *
  * ① **已有摘要的 `coveredUpToSeq`**（`0` = 还没压过）：摘要可以再压缩——更早的摘要本身也被
  *    新摘要遮蔽，所以取最大者；
- * ② **上一个已结束 turn 的 `turn/end`**（理由见下，那段话是这块最值钱的东西，逐字保留）；
+ * ② **某个已结束 turn 的 `turn/end`**（理由见下，那段话是这块最值钱的东西，逐字保留）；
  * ③ `floorSeq`：调用方给的**下界**（返回值至少到它）。人工指令用它把"还没被处理的输入"
  *    挡在遮蔽之外——少了这一条，一次 `/compact` 会把队列里还没轮到的消息一起吞掉。
+ *
+ * **单调性（④ 甲）**：返回值是 `max(①, ②, ③)`，所以遮蔽点**只可能收紧、不可能回退**；
+ * 而 ① 又把"上一份摘要已经遮到哪"永久记在日志里 ⇒ **退役的边界不会被复活**（reasonix 的
+ * `economics tightens a live boundary, never revives a retired one`）。这条性质由
+ * `test/handoff-mask-window.test.ts` 的单调性用例正面钉住，不靠"读代码看起来是这样"。
  *
  * @param inFlightTurnStartSeq 本 turn 的 `turn/start` seq（自动压缩在 turn 收尾时调用）。
  *   人工指令没有"正在进行的 turn"，传 `null`——那时 ② 取**日志里最后一条** `turn/end`。
  *   两者都没有（一条 `turn/end` 都没写过）时 ② 为 0，遮蔽点由 ①③ 决定。
+ * @param includeInFlightTurn ② 要不要把**本 turn 自己的 `turn/end`** 也算进来。
+ *
+ *   自动压缩传 `true`（2026-10-06 改）：它在 `turn/end` **写完之后**才跑，所以"本 turn"
+ *   已经是一个完整闭合的 turn 了，把它折进笔记是安全的；而把它留在现场正是最贵的一笔
+ *   ——实测 21:40 那次交接，交接后第一次调用的 72,096 未命中里，44,281（可见历史）
+ *   对应真实的 72,096 token（估算低估 1.63×），全是这一轮自己的内容。
+ *
+ *   人工指令（`inFlightTurnStartSeq === null`）用不到这个开关：它本来就取日志里最后一条
+ *   `turn/end`，没有"进行中的 turn"要排除。
  */
 export function compactionCoveredUpToSeq(
   events: readonly AppEvent[],
   inFlightTurnStartSeq: number | null,
   floorSeq = 0,
+  includeInFlightTurn = false,
 ): number {
   // ① 已有摘要的最大 coveredUpToSeq
   let covered = 0;
@@ -1372,7 +1600,7 @@ export function compactionCoveredUpToSeq(
     }
   }
 
-  // ② 遮蔽点：**上一个已经结束的 turn 的 `turn/end` seq**（没有就退回本 turn 起始 seq）。
+  // ② 遮蔽点：**一个已经结束的 turn 的 `turn/end` seq**（没有就退回本 turn 起始 seq）。
   //
   // 为什么不能再用本 turn 的 `turn/start.seq`（2026-10-02 修）：**叫醒她的那条输入在
   // `turn/start` 之前**——`wake/channel` 先落盘，循环才开这一轮。于是"遮蔽到本 turn 起始"
@@ -1380,12 +1608,18 @@ export function compactionCoveredUpToSeq(
   // 像她在自言自语，而接下来的新消息看起来像"新的问题"——用户实测到的那句
   // "每次上下文压缩后她又把已经回复过的东西再回复一遍"就是这么来的（样本见 review.md）。
   //
-  // 取上一个 `turn/end` 之后，"他问的那句"与"她答的那段"要么一起进笔记、要么一起留在现场，
-  // 永远不会被劈开。代价是遮蔽得少一点（多留一轮），换来的是压缩之后对话仍然对得上。
+  // 取 `turn/end` 之后，"他问的那句"与"她答的那段"要么一起进笔记、要么一起留在现场，
+  // 永远不会被劈开。
+  //
+  // 2026-10-06：`includeInFlightTurn` 让自动压缩取**刚结束的那一个** turn/end（而不是再往前
+  // 一个）。劈不开的性质与上面一样（仍然是 turn 边界），语义仍然是"每一个结束了的 turn
+  // 要么整轮进笔记、要么整轮留在现场"——变的只是"折叠的追认点往后挪了一轮"。
   let end = 0;
   for (const event of events) {
     if (event.type !== 'turn/end') continue;
-    if (inFlightTurnStartSeq !== null && event.seq >= inFlightTurnStartSeq) continue;
+    // 排除本 turn：只有"本 turn 还没结束"时才需要排除。`includeInFlightTurn` 的那条路
+    // 由调用时机保证（turn/end 已经写下去了），所以这里不排除。
+    if (!includeInFlightTurn && inFlightTurnStartSeq !== null && event.seq >= inFlightTurnStartSeq) continue;
     if (event.seq > end) end = event.seq;
   }
   // 自动压缩的旧口径：一条已结束的 turn 都没有时退回本 turn 起始 seq（它必然 > 0，
@@ -1407,6 +1641,23 @@ export function handoffOptionsOf(cfg: HandoffOptions): HandoffOptions {
   };
 }
 
+/**
+ * 遮蔽区间里的**事件条数**（机械替代文本要报的那个数）。
+ *
+ * 与 `estimateMaskedTokens` 同一个范围、同一套可见性判据，只是数条数不数 token——
+ * 两处各写一遍范围判据，迟早出现"文本说 42 条、实际折了 43 条"。
+ */
+function countMaskedEvents(events: readonly AppEvent[], fromSeq: number, toSeq: number): number {
+  let count = 0;
+  for (const e of events) {
+    if (e.seq <= fromSeq || e.seq > toSeq) continue;
+    if (e.visibility !== 'model') continue;
+    if (e.type === 'compaction/summary') continue;
+    count += 1;
+  }
+  return count;
+}
+
 // ──────────────────────────────── 小工具 ────────────────────────────────
 
 function toDsRequest(rendered: RenderedRequest, lane: ModelLane, signal: AbortSignal | undefined): DsRequest {
@@ -1416,6 +1667,20 @@ function toDsRequest(rendered: RenderedRequest, lane: ModelLane, signal: AbortSi
     input: rendered.input,
     instructions: rendered.instructions,
     tools: rendered.tools,
+    /**
+     * 思考强度：**用户的口径（2026-10-06）——heavy 一律 `high`，且不提供更改**
+     * （五处 light 各自写死 `low`：`channel/injection-judge.ts`、`channel/topic.ts`、
+     * `persona/assets.ts`、`persona/memory-maintain.ts` ×2、`tools/vision.ts`；
+     * 两档都不受任何配置影响）。
+     *
+     * 为什么把它**写出来**（原先这个字段是缺席的）：官方文档写着"思考模式默认打开、
+     * effort 默认为 `high`"——也就是说字段缺席时**恰好**也是 high（`deepseek-flash` 是思考模式
+     * 模型，日志里那几千条 `message/reasoning` 就是证据）。但那是**别人的默认值**，不是我们的
+     * 承诺：服务端改一次默认、或这个字段哪天被漏掉，她的思考强度就会无声地变，而账本上看不出来。
+     * 写死之后它只由这一行决定——`test/thinking-effort-invariant.test.ts` 钉着这一行发出去的
+     * 实际值，同时钉着"配置面里没有能改它的旋钮"。
+     */
+    reasoning: { effort: lane === 'light' ? 'low' : 'high' },
   };
   if (signal !== undefined) request.signal = signal;
   return request;

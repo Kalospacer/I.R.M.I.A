@@ -19,8 +19,8 @@ import { basename, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import type { AppEvent, Visibility, WakeChannel } from './log/types.js';
-import { inboxMsgSeqOf, mentionsKeyword, shouldWakeForChannelMessage } from './channel/inbox.ts';
-import { ManagedProtocolService, resolveServiceDir } from './services/snowluma.ts';
+import { msgSeqOf, mentionsKeyword, shouldWakeForChannelMessage } from './channel/inbox.ts';
+import { ManagedProtocolService, readEndpointFromConfig, resolveServiceDir } from './services/snowluma.ts';
 import { normalizeSid, parseAliases } from './channel/sessions.ts';
 import { createNotifier } from './alert/notifier.ts';
 import { notifyStartupRecovery } from './alert/startup.ts';
@@ -49,7 +49,7 @@ import { FakeLoop, maxTurnOfLog } from './runtime/loop.ts';
 import { EVENT_LOG_DIR_NAME, TIMER_FILE_NAME, recover, type RecoverResult } from './runtime/recover.ts';
 import { TimerStore } from './wake/timer-store.ts';
 import {
-  QqOfficialChannel, createChannelMediaPoster, createChannelReplyPoster,
+  QqOfficialChannel, createChannelReplyPoster,
 } from './channel/qq-official.ts';
 import { createWorkspaceMediaPoster } from './channel/media-poster.ts';
 import {
@@ -69,7 +69,7 @@ import {
  * `web/server.ts` 的 `McpProbeHost.clientInfo`、`mcp/client.ts` 的 `DEFAULT_CLIENT_INFO`。
  * 第三个内测版：功能面到"能装能用"，但仍会有破坏性改动，所以带 `-beta.3`。
  */
-export const AGENT_VERSION = '0.1.0-beta.4';
+export const AGENT_VERSION = '0.1.0-beta.5';
 /** 事件形状版本（docs/schema.md） */
 export const SCHEMA_VERSION = '1';
 export const DEFAULT_DATA_DIR_NAME = 'data';
@@ -362,9 +362,28 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
    * 暂时看不到群，不该让她整个停摆。连不上时适配器会自己重试，日志里也会说明原因。
    */
   const managedService = await startManagedProtocolIfConfigured(config, write);
-  /** OneBot 通道（M9）：连协议端（NapCat / SnowLuma 等）的正向 ws 端口，密钥同一条教义 */
+  /**
+   * OneBot 通道（M9）：连协议端（NapCat / SnowLuma 等）的正向 ws 端口，密钥同一条教义。
+   *
+   * **v36 起对接点不再只取一次**：`status()` 是异步的了（它要真去探"进程在不在、
+   * 在听哪个端口"），而且"它已经在跑、只是本次进程没管它"这条路上，端点也可能已经存在。
+   */
+  const managedStatus = managedService === null ? null : await managedService.status();
+  /**
+   * 端点重读口（v37）：协议端的 OneBot 配置**可能晚于本进程物化**（人登录 QQ 之后才写下来），
+   * 所以"启动时读到的是 null"不能成为定论——把它交给适配器，由它每次建连前现读一次。
+   *
+   * 读法只有一条：`readEndpointFromConfig`（协议端自己那份配置里的
+   * `networks.wsServers[0]`，**绝不猜端口**）。缓存与失效条件在适配器那边
+   * （`OneBotEndpointMemo`：硬下限 10 秒 + 建连失败即失效），所以界面轮询不看盘、
+   * 60 秒一次的退避也不会变成 60 秒一次读盘。
+   */
+  const managedOnebotDir = config.channels.onebot.managed === undefined
+    ? null
+    : resolveServiceDir(config.channels.onebot.managed.dir, config.dataDir);
   const onebotChannel = createOneBotChannelIfConfigured(
-    config.channels.onebot, write, config.dataDir, managedService?.status().endpoint ?? null,
+    config.channels.onebot, write, config.dataDir, managedStatus?.endpoint ?? null,
+    managedOnebotDir === null ? null : () => readEndpointFromConfig(managedOnebotDir),
   );
   const channels: Map<string, ChannelAdapter> = new Map();
   if (qqChannel !== null) channels.set(qqChannel.name, qqChannel);
@@ -397,8 +416,14 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
    * 而 `http_download` 落在工作根下。少了第二个根，**下载下来的图就发不出去**
    * （实测 t285 连撞两次）。顺序与判定见 `channel/media-poster.ts` 的文件头。
    *
-   * 只装配了 QQ 官方通道时才建：OneBot 那边还没实现媒体投递，与其给一个发不出去的壳，
-   * 不如让工具如实报"没有接线"（与 read_channel 没接线时同一条纪律）。
+   * **装配条件只看"有没有通道"，不看是哪条通道**（2026-10-07 修）：原先写的是
+   * `qqChannel === null ? null : …`，于是 OneBot-only 的机器上这件工具直接报"没有接线"，
+   * 而她的工具清单是恒定的——那等于"某条通道下这件能力不存在"。现在 **OneBot 也实现了
+   * 媒体接口**（`OneBotChannel.sendMediaTo`：图片/视频/语音走消息段、文件走 `upload_*_file`），
+   * 分派按回投地址的 scheme 走（`channel/media-poster.ts` 的 `createMediaDispatcher`，
+   * 与 speak 那条路共用 `admin.parseReplyUrlAny` 一份判据）。
+   * 而"这条通道到底发不发得了"仍由通道自己说了算：没有 `sendMediaTo` 就如实说清是哪条通道、
+   * 为什么不支持——**能力由通道声明，工具清单恒定不变**。
    */
   // 胶水抽到 `channel/media-poster.ts` 了（原来写在这里，一次都没被测过）：
   // 白名单、大小、字节读取那三条规则现在有主，见 `test/media-poster.test.ts`。
@@ -420,7 +445,7 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     join(dataDir, WEBHOOK_SECRET_FILE_NAME),              // data/.webhook-secret.json：webhook 专用凭据
     join(dataDir, UI_TOKEN_FILE),                         // data/.ui-token：遗留共享 token（只读兼容）
   ];
-  const mediaPoster: MediaPoster | null = qqChannel === null
+  const mediaPoster: MediaPoster | null = channels.size === 0
     ? null
     : createWorkspaceMediaPoster({
       dataDir,
@@ -578,7 +603,16 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
         const live = registryRef.registry;
         // 没填上 = 装配没走完（理论上到不了这里）：判 null，`task` 会如实报"未接线"
         if (live === null) return null;
-        return { log, ds, registry: live, projection: recovery.projection, persona };
+        return {
+          log,
+          ds,
+          registry: live,
+          projection: recovery.projection,
+          persona,
+          // 单条工具回执的上限：**与父循环同一份配置**（父那处在 real-loop 的 agentDeps）。
+          // 子代理的上下文同样是她的上下文那一类东西，不能因为"派了个子代理"就没有这条界。
+          blobOffload: { dataDir },
+        };
       },
       // 后台任务管理器惰性取值：装配顺序上 catalog 先于 jobManager 的其它消费方就位
       jobs: () => jobManager,
@@ -712,6 +746,28 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       // 只在启动时真建了实例才注入——没注入时那三条端点照常工作（报"没配置/没装配"），
       // 因为"什么都没配"恰恰是设置页最该显示出来的那种常态（见 WebServerDeps.protocolSide）。
       ...(managedService !== null ? { protocolSide: managedService } : {}),
+      /**
+       * 第三档（v36）：适配器的链路状态由它自己回答（它握着那条 ws），
+       * 协议端那两档由 protocolSide 回答——两句话合成"到底断在哪一环"。
+       *
+       * 这里给的是**取快照的函数**而不是快照本身：状态是随时变的（重连、收消息），
+       * 界面每问一次就该拿当时的那一刻。
+       */
+      onebotLink: () => {
+        const link = onebotChannel === null ? null : onebotChannel.linkView();
+        const hasEndpoint = managedStatus?.endpoint !== undefined
+          || config.channels.onebot.wsUrl.trim() !== '';
+        return {
+          enabled: config.channels.onebot.enabled,
+          connected: link?.connected ?? false,
+          hasEndpoint,
+          ...(link === null ? {} : { target: link.target }),
+          ...(link === null || link.selfId === '' ? {} : { selfId: link.selfId }),
+          reconnectAttempts: link?.reconnectAttempts ?? 0,
+          lastEventAt: onebotChannel === null ? null : (onebotChannel.snapshot().lastEventAt ?? null),
+          delivered: onebotChannel === null ? 0 : onebotChannel.snapshot().delivered,
+        };
+      },
       notifier,
       host: config.web.host,
       port: config.web.port,
@@ -790,6 +846,13 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
    * 其余进**信箱**——`channel/message` 是 internal，写进待办队列就等于唤醒，
    * 那就把"她可以选择看不看"变成了"每一条都推给她"。信箱只记账：进会话簿、算未读，
    * 她通过会话清单里的条数知晓，想看再用 `read_channel` 现取。
+   *
+   * **两条出口的 `msgSeq` 最终都补上**（2026-10-07）：规则只有一个
+   * （`channel/inbox.ts` 的 `msgSeqOf`），只是补的时机不同——
+   * 信箱这条在**落库那一刻**补（seq 就在手上），唤醒那条在 `real-loop.wake` 里补
+   * （事件 seq 是它分配的）。原先唤醒那条不补，代价是 OneBot 群 @ 那一轮的通知里**永远**
+   * 不出现「（这一条你还没看过）」：判据 `wakeEvent.data.msgSeq > entry.readUpToSeq`
+   * 遇上恒 0 永远为假，她会把它读成"又是上一次那条"而不回（报告 §3.4）。
    */
   const onChannelMessage = (data: WakeChannel['data']): void => {
     // 文本提及（关键词）也算"在叫她"：判据在分流器里，这里只把**结论**记进事件
@@ -803,11 +866,11 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       loop.wake({ type: 'wake/channel', data: byKeyword ? { ...data, mentionsMe: true } : data });
       return;
     }
-    // 信箱这条路口要把 msgSeq 补上（规则在 channel/inbox.ts 的 inboxMsgSeqOf）：
-    // 不补的话平台给不出序号的那两类消息每一条都是 0，未读永远算不出来。
+    // 信箱这条路口同样要补（规则在 channel/inbox.ts 的 msgSeqOf）：不补的话平台给不出序号的
+    // 那两类消息每一条都是 0，未读永远算不出来。
     appendWithSeq(
       'channel/message',
-      (seq) => ({ ...data, msgSeq: inboxMsgSeqOf(data, seq) }),
+      (seq) => ({ ...data, msgSeq: msgSeqOf(data, seq) }),
       'internal',
     );
   };
@@ -999,6 +1062,16 @@ function createOneBotChannelIfConfigured(
   dataDir: string | null = null,
   /** 由框架拉起的协议端给出的对接点；给了它就**压过**配置里手填的 wsUrl / tokenEnv */
   managedEndpoint: { wsUrl: string; accessToken: string } | null = null,
+  /**
+   * 端点重读口（v37）：给内置协议端用——**每次建连前现读一次它的配置**。
+   *
+   * 为什么必须有它：协议端的 OneBot 配置是**人登录 QQ 之后**才物化到盘上的，
+   * 而框架进程可能比它先起（实测现场：01:58 起进程时 `config/onebot.json` 还不存在，
+   * 02:04 用户登录 QQ 之后它才写下来）。只在启动时读一次、读不到就固化，后果不是"晚一点连上"
+   * 而是**永远连不上**：适配器此后每一拍都拿着空 token 去敲那个端口，日志里只有 401。
+   * 读盘频率与失效条件在 `OneBotEndpointMemo`（缓存 + 硬下限 10 秒），这里只提供读法。
+   */
+  resolveEndpoint: (() => { wsUrl: string; accessToken: string } | null) | null = null,
 ): OneBotChannel | null {
   if (!channelConfig.enabled) {
     write('[通道/OneBot] 未启用（config.channels.onebot.enabled=false），跳过');
@@ -1011,6 +1084,10 @@ function createOneBotChannelIfConfigured(
    *     是有意的——两边各填一遍就会有"填得不一样"的故障，而它的表现形式是"连上了但收不到消息"，
    *     最难查。既然端口和 token 本来就由它生成，就以它为准。
    *   • **外部协议端**：沿用原来的教义（wsUrl 从配置来、token 只写变量名、值从环境或密钥文件读）。
+   *
+   * **v37 起这两份只是"第一拍用的那份"**：`resolveEndpoint` 给了的话，适配器每次建连前会
+   * 重新问一次协议端的配置（读法与缓存见那个参数与 `OneBotEndpointMemo`）。原因见它的注释：
+   * 装配这一刻读到的 null 不能固化——协议端的配置本来就可能在框架之后才写下来。
    */
   const wsUrl = managedEndpoint?.wsUrl ?? channelConfig.wsUrl;
   const tokenFromEnv = managedEndpoint === null
@@ -1023,7 +1100,10 @@ function createOneBotChannelIfConfigured(
   if (accessToken === null) {
     write(
       `[通道/OneBot] 密钥未配置（环境变量 ${channelConfig.tokenEnv} 与本地密钥文件都没有值）：按"协议端未开校验"匿名连接`
-      + '（若 NapCat 开了 access_token，握手会被拒，日志里会看到连接失败）',
+      + '（若 NapCat 开了 access_token，握手会被拒，日志里会看到连接失败）'
+      + (resolveEndpoint === null
+        ? ''
+        : '；**每次重连前会现读一次协议端的配置**——它登录 QQ 之后写下的端点与 token 会被自动带上'),
     );
   }
   const log = {
@@ -1033,9 +1113,11 @@ function createOneBotChannelIfConfigured(
   const channel = new OneBotChannel({
     wsUrl,
     ...(accessToken === null ? {} : { accessToken }),
+    ...(resolveEndpoint === null ? {} : { resolveEndpoint }),
     log,
   });
-  write(`[通道/OneBot] 已装配：连 ${wsUrl}（正向 ws，群@与单聊/群聊全量；回复无被动窗口限制）`);
+  write(`[通道/OneBot] 已装配：连 ${wsUrl}（正向 ws，群@与单聊/群聊全量；回复无被动窗口限制）`
+    + (resolveEndpoint === null ? '' : '；端点每次重连前现读一次（协议端配置晚于本进程物化时不会被固化成"没有 token"）'));
   return channel;
 }
 

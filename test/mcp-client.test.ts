@@ -217,7 +217,7 @@ test('M7-1 全链路：握手 → initialized → tools/list → tools/call，�
   assert.ok(initialize !== undefined, '夹具收到了 initialize');
   // 不声明 roots/sampling/elicitation：capabilities 就是空对象
   assert.deepEqual(initialize.capabilities, {});
-  assert.deepEqual(initialize.clientInfo, { name: 'irmia-agent', version: '0.1.0-beta.4' });
+  assert.deepEqual(initialize.clientInfo, { name: 'irmia-agent', version: '0.1.0-beta.5' });
   assert.ok(marks.some((m) => m.t === 'initialized'), '握手第二步发了 notifications/initialized');
   assert.equal(marks.filter((m) => m.t === 'list').length, 1, 'tools/list 在进程启动时拉一次');
   assert.equal(marks.find((m) => m.t === 'call')?.name, 'echo');
@@ -608,16 +608,19 @@ test('progress 通知重置软超时时钟，但硬上限不可越过', async (t
 // ──────────────────────────────── 大结果外置 ────────────────────────────────
 
 test('MCP content[] 超阈值走 blob 外置，全文可用 read_blob 取回', async (t) => {
-  const h = createHarness(t);
+  // 阈值**显式给**：这条要测的是"过线就外置 + 指针可寻回"，不是出厂阈值是多少
+  // （出厂阈值 2026-10-06 从 8k 提到 21k，见 blob-store 的 DEFAULT_BLOB_THRESHOLD_TOKENS；
+  //  同一次改动把估算口径收口成 tools/registry 那一份，中文 20,000 字估算约 13,334 token）。
+  const h = createHarness(t, { pool: { blobThresholdTokens: 8_000 } });
   await h.pool.registerAll();
 
   const result = await h.registry.get('mcp__fake__big')?.handler({ chars: 20_000 }, toolCtx());
   assert.ok(result !== undefined);
   assert.equal(result.isError ?? false, false);
-  assert.match(result.content, /完整结果 \d+ 字节，可用 read_blob 取：[0-9a-f]{64}/);
+  assert.match(result.content, /完整结果 \d+ 字节，不在本次对话里；用 read_blob 取（offset\/limit 可翻页）：[0-9a-f]{64}/);
   assert.ok(result.content.length < 3_000, '预览控制在头部切片量级');
 
-  const blobId = /read_blob 取：([0-9a-f]{64})/u.exec(result.content)?.[1];
+  const blobId = /可翻页）：([0-9a-f]{64})/u.exec(result.content)?.[1];
   assert.ok(blobId !== undefined);
   const full = await readBlob(h.dataDir, blobId);
   assert.equal(full.toString('utf8').length, 20_000, 'blob 里是完整全文');

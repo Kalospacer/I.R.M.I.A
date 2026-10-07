@@ -24,7 +24,7 @@ import { CONFIG_FILE_NAME, defaultConfig, loadConfig, type AppConfig, type JsonO
 import { EventLog } from '../src/log/event-log.ts';
 import { emptyProjection } from '../src/log/types.ts';
 import type { AppEvent, Projection } from '../src/log/types.js';
-import type { ManagedServiceState, ManagedServiceStatus } from '../src/services/snowluma.ts';
+import type { ManagedServiceReport, ManagedServiceState, ManagedServiceStatus } from '../src/services/snowluma.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
 import { startWebServer, type ProtocolSideHost, type WebServer } from '../src/web/server.ts';
 
@@ -42,27 +42,69 @@ function entryOf(serviceDir: string): string {
 
 /**
  * 协议端实例的假实现。**它必须照着 `ManagedProtocolService` 的语义写**——
- * 尤其是 `stop()` **不清 endpoint**（真实现就是这样：main.ts 只在启动时取一次，
- * 所以它留着不影响对接；而视图要据此把"活着的对接点"与"它配置里写的"分开）。
+ * 尤其是这三条（各自都直接决定了视图里的一个取值）：
+ *   · `stop()` **不清 endpoint**（真实现就是这样：main.ts 只在启动时取一次，
+ *     所以它留着不影响对接；而视图要据此把"活着的对接点"与"它配置里写的"分开）；
+ *   · `webuiUrl` **进程在跑就给**（v36 的口径：旧口径"只有 ready/starting 才给"把
+ *     "面板开着"绑在了"OneBot 端口开着"上，而那两件事恰恰要分开说）；
+ *   · `report` 三档齐全（视图直接读它，缺一档界面就会说"未观测"）。
+ *
+ * v36 起它是**异步**的（真实现要真去探进程与端口），所以 `status()` 返回 Promise。
  */
 class FakeHost implements ProtocolSideHost {
   state: ManagedServiceState = 'stopped';
   detail = '';
   endpoint: { wsUrl: string; accessToken: string } | undefined;
-  webuiUrl: string | undefined = 'http://localhost:5099';
   entry: string | null = null;
   startCalls = 0;
   stopCalls = 0;
   /** start() 的预设结局（默认 success：状态转 ready 并把对接点填上） */
   startOutcome: 'ready' | 'not-installed' | 'failed' | 'throw' = 'ready';
+  /** 三档的开关（默认：进程没在跑、配置缺失、没有口令——即"什么都没开"的常态） */
+  processRunning = false;
+  processPid: number | undefined;
+  processManaged: 'spawned' | 'discovered' | 'unmanaged' = 'discovered';
+  configPresent = false;
+  credential: { user: string; password: string; source: 'stdout' | 'console-log' | 'none' } | undefined;
 
-  status(): ManagedServiceStatus {
-    const out: ManagedServiceStatus = { state: this.state, detail: this.detail };
+  /** 真正的 report 形状（视图读它，所以假的也必须给全） */
+  private report(): ManagedServiceReport {
+    const webuiUrl = this.processRunning ? 'http://127.0.0.1:5099' : undefined;
+    const credential = this.credential ?? { source: 'none' as const };
+    return {
+      state: this.state,
+      detail: this.detail,
+      process: {
+        running: this.processRunning,
+        ...(this.processRunning && this.processPid !== undefined ? { pid: this.processPid } : {}),
+        ...(this.processRunning ? { managed: this.processManaged } : {}),
+        ...(this.processRunning && this.processPid !== undefined ? { startedAt: '2026-02-14T10:00:00.000Z' } : {}),
+        ...(webuiUrl === undefined ? {} : { webuiUrl }),
+      },
+      onebotConfig: this.configPresent
+        ? {
+            present: true,
+            endpoint: { wsUrl: 'ws://127.0.0.1:3001/', accessToken: SECRET_TOKEN },
+            path: '/tmp/onebot.json',
+          }
+        : { present: false },
+      webui: {
+        consentRecorded: false,
+        mustChangePassword: true,
+        ...(webuiUrl === undefined ? {} : { url: webuiUrl }),
+        open: this.processRunning,
+        credential,
+      },
+    };
+  }
+
+  async status(): Promise<ManagedServiceStatus> {
+    const out: ManagedServiceStatus = { state: this.state, detail: this.detail, report: this.report() };
     // 两处**照抄真实现**的语义（假的注入点自己也要守被注入接口的语义，见 review v30）：
     //   · endpoint 在 stop 之后**仍留着**上一次的（main.ts 只在启动时取一次，不受影响）；
-    //   · webuiUrl 只在 ready / starting 时给（"那个页面此刻打不开"就不摆它）。
+    //   · webuiUrl 进程在跑就给（v36）。
     if (this.endpoint !== undefined) out.endpoint = this.endpoint;
-    if (this.state === 'ready' || this.state === 'starting') out.webuiUrl = this.webuiUrl;
+    if (this.processRunning) out.webuiUrl = 'http://127.0.0.1:5099';
     return out;
   }
 
@@ -72,24 +114,28 @@ class FakeHost implements ProtocolSideHost {
     if (this.startOutcome === 'not-installed') {
       this.state = 'not-installed';
       this.detail = '没找到可执行入口（找过 dist/index.mjs / launcher.bat / launcher.sh）——请先下载协议端发行包并解压';
-      return this.status();
+      return await this.status();
     }
     if (this.startOutcome === 'failed') {
       this.state = 'failed';
-      this.detail = '等 30 秒仍没等到 OneBot 端口——它可能还没登录，或者启动失败了（日志见服务日志）';
-      return this.status();
+      this.detail = '等 30 秒仍没等到 OneBot 端口——协议端进程没在跑，而 OneBot 配置缺失'
+        + '（config/onebot.json 还没有）——这一份是它登录 QQ 之后才物化的。去它的 WebUI 里接入 QQ。';
+      return await this.status();
     }
     this.state = 'ready';
     this.detail = '已就绪，OneBot 在 ws://127.0.0.1:3001/';
     this.endpoint = { wsUrl: 'ws://127.0.0.1:3001/', accessToken: SECRET_TOKEN };
-    this.webuiUrl = 'http://localhost:5099';
-    return this.status();
+    this.processRunning = true;
+    this.processPid = 34552;
+    this.configPresent = true;
+    return await this.status();
   }
 
   async stop(): Promise<void> {
     this.stopCalls += 1;
     this.state = 'stopped';
     this.detail = '已停止';
+    this.processRunning = false;
   }
 
   entryPath(): string | null {
@@ -283,14 +329,55 @@ test('配置齐备且真跑起来时：一次 GET 就够画完整张卡', async 
   assert.equal(res.body['state'], 'ready');
   assert.equal(res.body['stateText'], '已就绪');
   assert.equal(res.body['detail'], '已就绪，OneBot 在 ws://127.0.0.1:3001/');
-  assert.equal(res.body['webuiUrl'], 'http://localhost:5099');
+  assert.equal(res.body['webuiUrl'], 'http://127.0.0.1:5099');
   assert.equal(res.body['installed'], true);
   assert.equal(res.body['entryPath'], entryOf(fx.serviceDir));
   assert.equal(res.body['restartRequired'], false, '盘上与启动时一致：不该喊重启');
 
+  // 三档（v36）：一次 GET 就够回答"到底断在哪一环"
+  assert.equal((res.body['process'] as Record<string, unknown>)['running'], true);
+  assert.equal((res.body['process'] as Record<string, unknown>)['pid'], 34552);
+  assert.equal((res.body['onebotConfig'] as Record<string, unknown>)['present'], true);
+  assert.equal((res.body['adapter'] as Record<string, unknown>)['state'], 'not-assembled',
+    '本进程没注入适配器快照时就如实说"未装配"，不假装它连着');
+  assert.match(String(res.body['summary']), /^进程在跑 · OneBot 配置在/u);
+
   // 对接点只给"在哪儿 + 有没有凭据"，值永不出门（红线已由 call() 全文查过一遍）
   const endpoint = res.body['endpoint'] as Record<string, unknown>;
   assert.deepEqual(endpoint, { wsUrl: 'ws://127.0.0.1:3001/', hasToken: true, source: 'live' });
+});
+
+/**
+ * 三档里最要命的那一档（这次改动的落点）：**进程活着、OneBot 配置缺失**。
+ *
+ * 旧口径只能报"启动失败"——一句话和事实相反，而人下一步该做什么（去登录 vs 去看日志）
+ * 全看这一句。这条用例锁的就是"这两件事必须分成两句说"。
+ */
+test('三档：进程在跑而 OneBot 配置缺失 ⇒ 显示"进程在跑 · OneBot 配置缺失"，不是"启动失败"', async (t) => {
+  const fx = await setup(t, { diskOnebot: (svc) => onebotOnDisk(svc), boot: 'disk' });
+  fx.host!.processRunning = true;
+  fx.host!.processPid = 34552;
+  fx.host!.processManaged = 'discovered';
+  fx.host!.configPresent = false;
+  fx.host!.state = 'failed';
+  fx.host!.detail = '等 30 秒仍没等到 OneBot 端口——协议端进程在跑（pid 34552，面板在 http://127.0.0.1:5099），'
+    + '而 OneBot 配置缺失（config/onebot.json 还没有）——这一份是它**登录 QQ 之后**才物化的。';
+
+  const res = await call(fx, '/api/protocol-side');
+
+  // 卡头那一句：三档按"进程 · 配置 · 适配器"的顺序说，正是排查那条链的顺序
+  assert.equal(res.body['summary'], '进程在跑 · OneBot 配置缺失 · 适配器未装配');
+  const process = res.body['process'] as Record<string, unknown>;
+  assert.equal(process['running'], true);
+  assert.equal(process['pid'], 34552);
+  assert.equal(process['managed'], 'discovered', '要如实说"本次进程没起它"');
+  assert.equal(process['webuiUrl'], 'http://127.0.0.1:5099', '进程在跑必须给出它实际监听的地址');
+  const config = res.body['onebotConfig'] as Record<string, unknown>;
+  assert.equal(config['present'], false);
+  assert.match(String(config['detail']), /登录 QQ 之后/u, '要说清"这一份是登录之后才有的"');
+  // **面板地址必须给**：旧口径"只有 ready 才给"会让人连登录都做不到（state 是 failed）
+  assert.equal(res.body['webuiUrl'], 'http://127.0.0.1:5099');
+  assert.equal((res.body['webuiLogin'] as Record<string, unknown>)['open'], true);
 });
 
 test('没在跑时对接点回落到它自己配置里写的那个（source: config），不猜端口', async (t) => {
@@ -320,7 +407,7 @@ test('stop 之后不再把上一次的对接点说成"活的"（服务自己会�
   await call(fx, '/api/protocol-side/stop', { method: 'POST', body: {} });
   assert.equal(fx.host?.state, 'stopped');
   // 真实现 stop() 之后仍留着 endpoint（它不清理）；视图必须据此把它降级成"它配置里写的"
-  assert.equal(fx.host?.status().endpoint?.wsUrl, 'ws://127.0.0.1:3001/');
+  assert.equal((await fx.host!.status()).endpoint?.wsUrl, 'ws://127.0.0.1:3001/');
   const stopped = await call(fx, '/api/protocol-side');
   assert.equal(stopped.body['endpoint'], null, '既没在跑、目录里也没有它的配置：不给对接点');
   assert.equal(stopped.body['webuiUrl'], null, '没在跑时不给 WebUI 地址——那个页面此刻打不开');
@@ -560,7 +647,7 @@ test('**红线**：accessToken 任何情况下都不出现在响应里，只给 
   // 或者"把整个 endpoint 对象透传出去"这两种写法。
   const fx = await setup(t, { diskOnebot: (svc) => onebotOnDisk(svc), boot: 'disk' });
   await call(fx, '/api/protocol-side/start', { method: 'POST', body: {} });
-  assert.equal(fx.host?.status().endpoint?.accessToken, SECRET_TOKEN, '假实例确实拿着那串凭据（否则这条用例什么都没验）');
+  assert.equal((await fx.host!.status()).endpoint?.accessToken, SECRET_TOKEN, '假实例确实拿着那串凭据（否则这条用例什么都没验）');
 
   const responses = [
     await call(fx, '/api/protocol-side'),

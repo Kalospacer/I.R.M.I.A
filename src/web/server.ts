@@ -49,7 +49,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
-  closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync,
+  closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync,
   statSync, unlinkSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -83,7 +83,7 @@ import type {
   McpConnectionHost, McpProcess, McpServerEntry, McpShutdownReport, McpToolInfo,
 } from '../mcp/client.js';
 import { aliasNoteOf, collectSessions, normalizeSid, parseAliases, resolveSessionName, sidLookupKeys, type SessionAlias } from '../channel/sessions.ts';
-import { readEndpointFromConfig, resolveServiceDir } from '../services/snowluma.ts';
+import { readEndpointFromConfig, resolveServiceDir, maskCredential } from '../services/snowluma.ts';
 import { loadPersona } from '../persona/loader.ts';
 import { readMemoryIndexTextReadOnly } from '../persona/memory-injection.ts';
 import {
@@ -394,22 +394,90 @@ export const UNIMPLEMENTED_COMMANDS: Record<string, string> = {
 // ──────────────────────────────── 对外类型 ────────────────────────────────
 
 /**
+ * 自由文本里**不许出现**的东西：口令。
+ *
+ * 服务层已经把口令单独放进 `webuiLogin.credential`，但这条纪律值得再钉一次：那些句子
+ * （`detail` / `summary` / `note` / `stateText`）会进日志、进事件摘要、进诊断输出，
+ * 任何一次拼接都可能把口令顺进去。所以出响应前扫一遍已知口令。
+ *
+ * **只扫自由文本，不扫结构化字段**：`credential.password` 那一个格子是**故意**带明文的
+ * （本机界面要「复制凭据」，抄的是原文）。第一版把整份视图都扫了，结果连那个格子也变成
+ * `***`——复制按钮于是把三个星号交给人（探针当场抓到的）。原则没写错（"不许泄口令"），
+ * 是扫的范围错了：**要保护的是"口令不该出现在解释性文字里"，不是"口令不该出现在它自己的格子里"**。
+ * 判据写成"这个键是不是解释性文本"而不是"值像不像口令"——后者会随口令形态漂移。
+ */
+const CREDENTIAL_TEXT_KEYS = new Set(['detail', 'summary', 'note', 'stateText']);
+
+function scrubSecrets<T>(value: T, secrets: readonly string[]): T {
+  const live = secrets.filter((secret) => secret.length >= 6);
+  if (live.length === 0) return value;
+  const walk = (input: unknown, key: string | null): unknown => {
+    if (typeof input === 'string') {
+      if (key === null || !CREDENTIAL_TEXT_KEYS.has(key)) return input;
+      let out = input;
+      for (const secret of live) out = out.split(secret).join('***');
+      return out;
+    }
+    if (Array.isArray(input)) return input.map((item) => walk(item, key));
+    if (typeof input === 'object' && input !== null) {
+      const out: Record<string, unknown> = {};
+      for (const [childKey, item] of Object.entries(input as Record<string, unknown>)) {
+        out[childKey] = walk(item, childKey);
+      }
+      return out;
+    }
+    return input;
+  };
+  return walk(value, null) as T;
+}
+
+/**
  * 内置协议端的接缝（v34）：web 层只认这个形状，实例由 main.ts 建——**运行时只有一个**。
  *
- * 为什么声明成接口而不是直接用 `ManagedProtocolService` 的类型：这四条是 web 层真正用到的
+ * 为什么声明成接口而不是直接用 `ManagedProtocolService` 的类型：这几条是 web 层真正用到的
  * 全部能力（读状态 / 启 / 停 / 问入口在哪），而"能拉起一个外部进程"这件事本身不该顺着
  * 类型漂进 HTTP 层。注入点也照 `WebServerDeps.registry` 那种姿势：可选、缺省 = 如实说
  * "本进程没有装配它"，不抛错。
  *
- * `status()` 的形状直接复用服务层的 `ManagedServiceStatus`（含 `endpoint.accessToken`）——
- * **响应体里绝不会带上它**：那是协议端的凭据，界面只需要知道"有没有"（见 buildProtocolSideView）。
+ * `status()` 的形状直接复用服务层的 `ManagedServiceStatus`（含 `endpoint.accessToken`
+ * 与 `report.webui.credential.password`）——**这两样都不会进响应体**：
+ * token 只报"有没有"，口令只在本机界面那一条路上给（且带来源标注）。
+ *
+ * **v36 起 `status()` 是异步的**：三档里那一档"进程在不在、在听哪个端口"要真去探
+ * （先探端口、再查进程表），而这些事本来就是异步的。同步签名会逼出一个假的"立刻知道"。
  */
 export interface ProtocolSideHost {
-  status(): ManagedServiceStatus;
+  status(): Promise<ManagedServiceStatus>;
   start(): Promise<ManagedServiceStatus>;
   stop(): Promise<void>;
   /** 可执行入口的绝对路径；没有 = 还没装（框架不下载它，见 services/snowluma.ts 的许可说明） */
   entryPath(): string | null;
+}
+
+/**
+ * OneBot 适配器的链路状态（第三档）。
+ *
+ * 这一档**只有适配器自己知道**（它握着那条 ws），所以从 main.ts 注入一个只读快照函数进来：
+ * 协议端那一侧（进程 / 配置）由 `ProtocolSideHost` 回答，适配器这一侧由这里回答，
+ * 两句话合成"到底断在哪一环"。
+ */
+export interface OneBotLinkView {
+  /** 通道装没装：没装 = 配置里没开它，这一档不适用（不是故障） */
+  enabled: boolean;
+  /** 适配器当前连没连上 */
+  connected: boolean;
+  /** 有没有一个"可以连的地址"（来自协议端配置或手填配置）；false = 没端点可连 */
+  hasEndpoint: boolean;
+  /** 日志里用的那个地址；有 token 时**已经打过码**（掩码规则在 channel/onebot.ts） */
+  target?: string;
+  /** 机器人 QQ 号（连上并问到过才有） */
+  selfId?: string;
+  /** 已重连次数（退避计数；链路活了会清零） */
+  reconnectAttempts: number;
+  /** 最近一条消息事件的时刻（毫秒）；null = 还没收到过 */
+  lastEventAt: number | null;
+  /** 已投递的消息条数 */
+  delivered: number;
 }
 
 /**
@@ -509,6 +577,11 @@ export interface WebServerDeps {
    * 配置与安装事实的一半在盘上，读盘不需要任何实例。
    */
   protocolSide?: ProtocolSideHost | undefined;
+  /**
+   * OneBot 适配器的链路快照（v36 的第三档）。缺省 = 本进程没装配 OneBot 通道——
+   * 那和"通道开着但连不上"是两句不同的话，视图里分开报（`enabled: false` vs `reconnecting`）。
+   */
+  onebotLink?: (() => OneBotLinkView) | undefined;
   /**
    * 「界面这条 `wake/manual` 就是人开口」的通报口（2026-10-03）。
    *
@@ -1427,33 +1500,137 @@ function buildSuggestions(p: Projection, events: AppEvent[], nowMs: number): Sug
  * 而"留痕"里最要紧的那一列就是这条命令行——它同时是"脚本会收到什么参数"的唯一凭据
  * （WMI 建的进程没有 stdout，脚本那边的输出无处可去）。
  *
- * 拼法本身有两条实测依据（见 `_research/probe-restart-chain.ps1`）：
+ * ## 2026-10-07：为什么外面必须套 `cmd.exe /c`（这是"点了按钮什么都没发生"的根因）
+ *
+ * 现场：这里过去直接送 `"<shell>" -NoProfile … -File "<脚本>" …` 给 `Win32_Process.Create`，
+ * 返回码 **0**、pid 也有，而脚本**一个字都没执行**——留痕没有新行、`data/lock.json` 里的 pid
+ * 从头到尾没变、后端照旧是原来那个进程。
+ *
+ * 本机对照实测（同一台机器、同一批参数、连续重复多轮，见 `tools/restart-agent.ps1` 的
+ * `-ProbeExit` 与文件头那段）：
+ *   · `Create('"…\pwsh.exe" -NoProfile … -File "…\restart-agent.ps1" …')`
+ *     ⇒ ret=0、有 pid，**子进程立刻消失**，脚本什么都没做；
+ *   · `Create('cmd.exe /c ""…\pwsh.exe" … -File "…\restart-agent.ps1" …"')`
+ *     ⇒ ret=0，**脚本真的跑了**（留痕写出了 `[回执]`）。
+ * 排除了编码（中文参数逐字送达）、`param()` 块、参数个数、引号与 `-File`/`-Command` 之别：
+ * 换成本机一个三行的探针脚本，**裸建 pwsh 同样什么都没写**，套 `cmd /c` 就写出来了。
+ *
+ * 所以现在的形状是三条，缺一条就会退回"静默失败"（三条都是本机实测出来的，不是推断）：
+ *   ① 外面套 `cmd.exe /s /c`（`cmd` 是 WMI 一定建得起来的那个；`/s` 让它**无条件**执行
+ *      "命令行以引号开头就剥掉首尾引号"那条规则）；
+ *   ② 里面的整段再用一对引号包起来——剥完正好是 `<shell> <参数…>`；
+ *   ③ 末尾 `>> <日志> 2>&1` 必须写在那对引号**里面**：三点对照实测
+ *      · `cmd /c  ""<exe>" "<arg>"" >> log 2>&1`   ⇒ ret=0，命令**根本没被执行**（日志都不生成）；
+ *      · `cmd /s /c ""<exe>" "<arg>"" >> log 2>&1` ⇒ ret=0，**同样什么都没执行**；
+ *      · `cmd /s /c ""<exe>" "<arg>" >> log 2>&1"` ⇒ ret=0，**命令真的跑了**（日志写出来）。
+ *      脚本的输出过去**随 WMI 进程一起消失**，于是"脚本报错"在留痕之外完全看不见——
+ *      这正是"失败无声"的另一半。
+ *
+ * 拼法本身的两条旧实测依据照旧（见 `_research/probe-restart-chain.ps1`）：
  *   · **每个参数各自加引号**：路径带空格时（`C:\Program Files\...`）不加引号会被拆成两截；
  *   · **不用 `--%`**：实测它把带引号的 `-File` 路径当字面量
  *     （`Processing -File '"…"' failed: Illegal characters in path`），
  *     而重启这条路上任何一点不确定都不该引入。
  */
-export function restartCommandLine(input: { shellExe: string; argv: readonly string[] }): string {
-  return `"${input.shellExe}" ${input.argv.join(' ')}`;
+export function restartCommandLine(input: {
+  shellExe: string;
+  argv: readonly string[];
+  /** 脚本自己（cmd 那一层）的 stdout/stderr 落点；空字符串 = 不重定向 */
+  scriptLog?: string;
+}): string {
+  // 重定向写在**外层那对引号里面**：`cmd /s` 会剥掉首尾引号，写在外面就落在引号之外，
+  // 于是整条命令行成了"一条带引号却没闭合的命令"——cmd 不报错、也不执行（实证见文件头）。
+  let inner = `""${input.shellExe}"`;
+  if (input.argv.length > 0) inner += ` ${input.argv.join(' ')}`;
+  const log = (input.scriptLog ?? '').trim();
+  if (log !== '') inner += ` >> "${log}" 2>&1`;
+  inner += '"';
+  return `cmd.exe /s /c ${inner}`;
+}
+
+/**
+ * 从留痕里读**服务端要的那两行**（`[回执]` / `[实例]` / `[结束]`）。
+ *
+ * 为什么要有解析这一步：脚本的输出过去是"人读的一段中文"，服务端除了"文件变大了吗"
+ * 什么也问不出来——于是"起来了"与"起来了但端口没就绪"在响应里长得一模一样。
+ * 现在脚本写三行**定形**的机器可读行，这里把它们读成结构；读不到就是 `null`，
+ * **绝不猜**（读不到真相时说"没读到"，比编一个"应该没问题"强）。
+ */
+export function parseRestartTrace(text: string): {
+  receipt: boolean;
+  backendPid: number;
+  port: 'ready' | 'timeout' | 'waiting' | 'unknown';
+  guiPid: number;
+  ok: boolean | null;
+} {
+  const out = {
+    receipt: text.includes('[回执]'),
+    backendPid: 0,
+    port: 'unknown' as 'ready' | 'timeout' | 'waiting' | 'unknown',
+    guiPid: 0,
+    ok: null as boolean | null,
+  };
+  const pid = /\[实例\][^\r\n]*?pid=(\d+)/u.exec(text);
+  if (pid !== null) out.backendPid = Number(pid[1]);
+  const end = /\[结束\][^\r\n]*/u.exec(text);
+  if (end !== null) {
+    const line = end[0];
+    out.ok = /\bok=True\b/u.test(line);
+    const endPid = /\bbackendPid=(\d+)/u.exec(line);
+    if (endPid !== null && Number(endPid[1]) !== 0) out.backendPid = Number(endPid[1]);
+    const port = /\bport=(\w+)/u.exec(line);
+    if (port !== null) out.port = port[1] as 'ready' | 'timeout' | 'waiting' | 'unknown';
+    const gui = /\bguiPid=(\d+)/u.exec(line);
+    if (gui !== null) out.guiPid = Number(gui[1]);
+  }
+  return out;
 }
 
 /**
  * 重启回执那句话（**唯一一处**：服务端的响应 `note` 与界面上的 toast 说的是同一件事）。
  *
- * 三种结局的文案必须**不同**（用户 2026-10-05：「点了没有反馈」+「所谓的'重启前后端'
- * 也没有重启前端」）：
- *   · 没读回执：不能说"正在重启"——那正是过去那种"屏幕上说在重启、实际什么都没发生"；
- *   · 只重启后端（没带界面路径）：必须**如实说**"只重启了后端"，别让人以为界面也重启了；
- *   · 带路径且读了回执：说"主进程与界面"。
+ * 判据要能把**三种结局**分开（用户 2026-10-07 的原话：「不许用'猜'的确认」）：
+ *   · `scriptStarted === false` ⇒ **脚本没跑起来**——那一次重启**没有发生**，
+ *     所以绝不能说"正在重启"（那正是过去那种"屏幕上说在重启、实际什么都没发生"）；
+ *   · 脚本跑了而 `ok !== true`（进程没起 / 端口没就绪 / 界面没拉起）⇒ **如实说失败与为什么**；
+ *   · 脚本跑了且 `ok === true` ⇒ 说成功，并带上**真实新 pid** 与端口就绪这两条凭据。
+ *
+ * 三态之间不许互相冒充：`ok === null`（没等到结尾那行）走的是"已发出、结局未确认"，
+ * 而不是"成功"——那不是猜，是把"我还不知道"如实说出口。
  */
-export function restartNote(input: { gui: boolean; scriptStarted: boolean }): string {
-  if (!input.scriptStarted) {
-    return '重启没能确认：脚本没有留下回执（它可能根本没起来）。什么都没被重启——'
+export function restartNote(outcome: {
+  gui: boolean;
+  scriptStarted: boolean;
+  /** 脚本结尾那行的 `ok`（没读到 = null） */
+  ok?: boolean | null | undefined;
+  /** 真实新 pid（来自 lock.json / 脚本的 `[实例]`），0 = 没拿到 */
+  backendPid?: number | undefined;
+  /** 端口那一档 */
+  port?: 'ready' | 'timeout' | 'waiting' | 'unknown' | undefined;
+  /** 脚本报的失败原因（可选） */
+  reason?: string | undefined;
+}): string {
+  const scope = outcome.gui ? '主进程与界面' : '主进程（界面不在本次动作范围内，它只是重连回来）';
+  if (!outcome.scriptStarted) {
+    return '重启未能执行：脚本没有留下回执（它根本没跑起来）。**后端没有被重启**——'
       + '请手动跑一次 tools/restart-agent.ps1，或看 data/restart-trace.log';
   }
-  return input.gui
-    ? '正在重启主进程与界面（约 20 秒）'
-    : '正在重启主进程（约 20 秒；**界面不在本次动作范围内**，它只是重连回来）';
+  if (outcome.ok === false) {
+    const why = outcome.reason === undefined || outcome.reason === '' ? '' : `（${outcome.reason}）`;
+    const pid = outcome.backendPid === undefined || outcome.backendPid === 0
+      ? '没有拿到新进程 pid'
+      : `新进程 pid ${outcome.backendPid}`;
+    const port = outcome.port === 'ready' ? '端口已就绪' : `端口未就绪（${outcome.port ?? 'unknown'}）`;
+    return `重启失败${why}：${pid} · ${port}——详见 data/restart-trace.log`;
+  }
+  if (outcome.ok === true) {
+    const pid = outcome.backendPid === undefined || outcome.backendPid === 0
+      ? '（pid 未读到）'
+      : `真实新 pid ${outcome.backendPid}`;
+    return `正在重启${scope}：${pid} · 端口已就绪`;
+  }
+  return `重启已发出${outcome.gui ? '（含界面）' : ''}，但结局还没确认——`
+    + '看 data/restart-trace.log 里这次的 `[结束]` 那行';
 }
 
 /**
@@ -1473,23 +1650,173 @@ export function restartNote(input: { gui: boolean; scriptStarted: boolean }): st
  * **不假装成功**（这一条的代价说清：脚本那行日志本身写失败时也会读到"没有回执"——
  * 但那种情况下我们确实没有任何证据说它起来了，如实存疑比谎报成功好）。
  */
-const RESTART_RECEIPT_WAIT_MS = 400;
-const RESTART_RECEIPT_STEP_MS = 20;
+/**
+ * 等脚本在留痕文件里写下**某一类行**（最多 [RESTART_RECEIPT_WAIT_MS] 毫秒）。
+ *
+ * 为什么要有这一步：`Win32_Process.Create` 的返回码**不能证明脚本跑起来了**。
+ * 本仓实测（见 `_research/probe-restart-chain.ps1` 与同一批 WMI 对照实验，2026-10-07 复现）：
+ *   · `"<shell>" -NoProfile … -File <脚本>` 经 WMI 跑 → **返回码 0、pid 也有，脚本一个字都没执行**；
+ *   · 换成 `cmd.exe /c ""<shell>" … -File <脚本>"` → 同一个脚本写出了 `[回执]`。
+ * 也就是"启动失败"可以完全无声。服务端过去只检查返回码 ⇒ 屏幕上说"正在重启"，而
+ * 实际上什么都没发生（用户 2026-10-05 的「点了没有反馈」+ 2026-10-07 的「重启没能确认」）。
+ *
+ * 判据很朴素：只看**发起之后新增的那段内容**里有没有 `[回执]`（脚本第一件事就写它），
+ * 以及有没有 `[结束]`（结尾那行：成功/失败 + 真 pid + 端口那一档）。
+ * 读不到就如实说"没读到"，**不假装成功**（这一条的代价说清：脚本那行日志本身写失败时也会
+ * 读到"没有回执"——但那种情况下我们确实没有任何证据说它起来了，如实存疑比谎报成功好）。
+ *
+ * ## 2026-10-07：等多久、等哪一行
+ *
+ * 过去固定忙等 400ms。实测这个窗口**对谁都不够**：脚本要先被 `cmd` 起、再起 pwsh
+ * （两三秒的启动本身就吃掉大半），于是"回执"永远读不到——GUI 那句"重启没能确认"
+ * 有一半是**这里太急**造成的，而不是脚本没起来。
+ * 现在按 `IRMIA_RESTART_CONFIRM_MS` 给一个默认 [RESTART_RECEIPT_WAIT_MS] 的窗口
+ * （起进程要时间，这是等得到的），并且**只等能等到的那一行**：
+ *   · `[实例]`（后端已经换了 pid）——后端要被重启时，这一行几秒内必然出现；
+ *   · 否则等 `[结束]`——不重启后端时（`-GuiOnly`）端口探测不跑，结尾也就快。
+ * 再长就该由界面去说"还没回来"，而不是把 HTTP 响应扣在这儿。
+ */
+const RESTART_RECEIPT_WAIT_MS = ((): number => {
+  const raw = Number(process.env['IRMIA_RESTART_CONFIRM_MS'] ?? '');
+  return Number.isFinite(raw) && raw > 0 ? raw : 8000;
+})();
+const RESTART_RECEIPT_STEP_MS = 50;
 
-function waitForScriptReceipt(traceLog: string, sizeBefore: number): boolean {
+function waitForScriptReceipt(
+  traceLog: string,
+  sizeBefore: number,
+  wantEnd: boolean,
+): { started: boolean; text: string } {
   const deadline = Date.now() + RESTART_RECEIPT_WAIT_MS;
+  const marker = wantEnd ? '[结束]' : '[实例]';
   for (;;) {
+    let text = '';
     try {
       const size = existsSync(traceLog) ? statSync(traceLog).size : -1;
-      if (size > sizeBefore) return true;
+      if (size > sizeBefore) {
+        // 只读新增的那一段：文件是**追加**写的，历史那些行属于过去几次重启
+        const fd = openSync(traceLog, 'r');
+        try {
+          const length = size - sizeBefore;
+          const buffer = Buffer.alloc(length);
+          readSync(fd, buffer, 0, length, sizeBefore);
+          text = buffer.toString('utf8');
+        } finally {
+          closeSync(fd);
+        }
+      }
     } catch {
       // 读不到就当"还没有"：这一路只问"有没有新内容"，不把读失败当证据
     }
-    if (Date.now() >= deadline) return false;
-    // 忙等 20ms：这条路上不能 await（回执要在这一个请求里给出去），而总等待只有 400ms
+    if (text.includes(marker)) return { started: true, text };
+    if (Date.now() >= deadline) return { started: text.includes('[回执]'), text };
+    // 忙等 50ms：这条路上不能 await（回执要在这一个请求里给出去）
     const until = Date.now() + RESTART_RECEIPT_STEP_MS;
     while (Date.now() < until) { /* spin */ }
   }
+}
+
+/**
+ * 端口**现在**有人听吗（TCP 建连，最多等 500ms）。
+ *
+ * 为什么服务端要自己问一句：脚本结尾那行 `[结束]` 里也有 `port=`，但它要等端口就绪
+ * 才写得出来——而界面的这句回执不能在那儿扣 60 秒。所以中间那一档（后端已经换了 pid、
+ * 脚本还没确认端口）由这里补上实测：**连得上 = 端口已经在服务**，这一条既是"后端起没起来"
+ * 的第二重凭据，也是 `ok=true` 的判据之一（另一重是 lock.json 里换了 pid）。
+ *
+ * 用系统自带的 `powershell.exe` 走 `TcpClient`：与 `tools/restart-agent.ps1` 里那段
+ * **同一个判据**（同一件事不写两份），而且这条路上不能 await（回执要在这一个请求里给出去），
+ * `spawnSync` 正好给出一次同步的是/否。这条命令是逐字常量，端口只以数字拼进去，
+ * 没有任何外部输入能改变它的形状。
+ */
+function portListening(host: string, port: number): boolean {
+  const script = '$c = New-Object System.Net.Sockets.TcpClient; try { '
+    + `$i = $c.BeginConnect('${host}', ${port}, $null, $null); `
+    + 'if ($i.AsyncWaitHandle.WaitOne(500, $false) -and $c.Connected) { exit 0 } } catch { } '
+    + 'finally { $c.Close() }; exit 1';
+  try {
+    const probe = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { timeout: 4000 });
+    return probe.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** 真 pid 的唯一来路：`<dataDir>/lock.json`（她启动后自己写的 {pid, startedAt, heartbeatAt}）。 */
+function readLockPid(dataDir: string): number {
+  try {
+    const lock = JSON.parse(readFileSync(join(dataDir, 'lock.json'), 'utf8')) as { pid?: unknown };
+    return typeof lock.pid === 'number' ? lock.pid : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** 重启确认的结论（三态 + 凭据）。**唯一一处**判定，界面文案与事件字段都读它。 */
+export interface RestartConfirmation {
+  /** 脚本留下了 `[回执]`（它真的跑起来了）。false ⇒ **这次重启没有发生** */
+  scriptStarted: boolean;
+  /** 后端真的换了个人：从 lock.json / 脚本 `[实例]` 读到的**真实**新 pid（0 = 没拿到） */
+  backendPid: number;
+  /** ready = 端口在服务；timeout = 脚本等到超时；waiting = 已发出、还没到那一档 */
+  port: 'ready' | 'timeout' | 'waiting' | 'unknown';
+  /** 脚本结尾那行的 ok（null = 没读到 ⇒ 结局未确认，**不冒充成功**） */
+  ok: boolean | null;
+  /** 界面新 pid（脚本 `[结束]` 里那一列；0 = 本次不动界面或没读到） */
+  guiPid: number;
+}
+
+/**
+ * **重启确认**（唯一一处）：等脚本的留痕，再把三态判出来。
+ *
+ * 三条判据各自独立，合起来才敢说"成了"（用户 2026-10-07：「不许用'猜'的确认」）：
+ *   ① `[回执]` —— 脚本**跑起来了**吗。读不到就是**没跑**，绝不说"正在重启"；
+ *   ② 真实新 pid —— 她真的**换了个人**吗。来源是 `lock.json`（她启动后自己写的）
+ *      或脚本那行 `[实例]`；**不是** WMI 返回的那个壳 pid（那是 cmd.exe 的，查无此人）；
+ *   ③ 端口 —— 起来了之后**真的能应答**吗。脚本结尾那行给得出就用它；给不出时
+ *      （还在等）由服务端自己连一次。
+ *
+ * 三态之间的区别是这条链路的全部意义（脚本没跑 / 跑了但进程没起 / 起了但端口没就绪）：
+ *   · `scriptStarted === false` ⇒ 脚本没跑起来；
+ *   · `scriptStarted && ok === false` ⇒ 跑了但失败（pid 或端口那一栏说明是哪一环）；
+ *   · `scriptStarted && 新 pid && 端口在服务` ⇒ 成了（哪怕脚本还没写结尾那行——
+ *     "她换了 pid 且端口应答"本身就是成品，不是推断）。
+ */
+function confirmRestart(input: {
+  traceLog: string;
+  sizeBefore: number;
+  guiOnly: boolean;
+  previousBackendPid: number;
+  host: string;
+  port: number;
+  dataDir: string;
+}): { receipt: { started: boolean; text: string }; parsed: ReturnType<typeof parseRestartTrace>; confirm: RestartConfirmation } {
+  const receipt = waitForScriptReceipt(input.traceLog, input.sizeBefore, !input.guiOnly);
+  const parsed = parseRestartTrace(receipt.text);
+  // 真实新 pid：脚本那两行优先，退到 lock.json（只重启界面时不比基线：那个 pid 本来就该一样）
+  let backendPid = parsed.backendPid;
+  if (backendPid === 0) {
+    const fromLock = readLockPid(input.dataDir);
+    if (fromLock !== 0 && (input.guiOnly || fromLock !== input.previousBackendPid)) backendPid = fromLock;
+  }
+  let port: RestartConfirmation['port'] = parsed.port;
+  if (input.guiOnly) {
+    // 只重启界面：后端本来就该在服务，端口那一档由服务端自己看
+    port = portListening(input.host, input.port) ? 'ready' : 'timeout';
+  } else if (port !== 'ready' && backendPid !== 0 && portListening(input.host, input.port)) {
+    // 脚本还没到"等端口"那一步，但端口已经在应答了 ⇒ 后端起真的起来了（实测，不是推断）
+    port = 'ready';
+  }
+  const scriptStarted = receipt.started;
+  let ok: boolean | null = parsed.ok;
+  if (ok === null && scriptStarted && port === 'ready') {
+    // 后端换人 + 端口在服务 = 成了（界面那一环没读到时不算失败：脚本会把它写在结尾那行）
+    ok = backendPid !== 0 || input.guiOnly;
+  }
+  return {
+    receipt, parsed,
+    confirm: { scriptStarted, backendPid, port, ok, guiPid: parsed.guiPid },
+  };
 }
 
 /**
@@ -2051,6 +2378,20 @@ export function buildReplay(input: {
   const configHashAt = sessionStart !== undefined && sessionStart.type === 'session/start'
     ? sessionStart.data.configHash
     : '';
+  // 本任务相关资产那一行（v34）：**只从事件读**（轮首那条 `memory/selected.assets`）——
+  // 与 CLI 的重放（`replay.ts` 的 `assetsFromEvents`）同一个口径。盘上的 `assets.md` 是她
+  // 随时会改的文件，从盘上重算就不是"当时那个请求"了；事件里没有（老日志 / 那一轮没挑）
+  // 就是空串 = 当时没有那一行。不写这一格，预览会比真实请求少一整行（与 2026-10-05 那次
+  // "待办恒为空"是同一类漏：预览自己手拼渲染输入，就一定会漂）。
+  const assetsLineAt = (events: readonly AppEvent[], turn: number): string => {
+    let found = '';
+    for (const event of events) {
+      if (event.type !== 'memory/selected' || event.data.turn !== turn) continue;
+      const assets = (event.data as { assets?: unknown }).assets;
+      if (typeof assets === 'string' && assets.trim() !== '') found = assets;
+    }
+    return found;
+  };
 
   const persona = loadPersona(dirname(resolve(input.personaRoot)));
   const replayDataDir = dirname(resolve(input.personaRoot));
@@ -2136,6 +2477,11 @@ export function buildReplay(input: {
       // 一直没人发现（2026-10-05 核对时抓到）。待办自 2026-10-04 起只有 STATE 一处载体，
       // 所以这里读的就是 persona.state——预览与真实请求同源，且不新增第二份真相。
       todoOpen: openTodoItems(persona.state ?? ''),
+      // 本任务相关资产那一行（v34）：**从事件读**（轮首那条 `memory/selected.assets`），
+      // 与 CLI 的重放（replay.ts 的 `assetsFromEvents`）同一个口径——盘上的 `assets.md`
+      // 是她随时会改的文件，从盘上重算就不是"当时那个请求"了。
+      // 不加这一格，预览会比真实请求少一整行（2026-10-05 那次"待办恒为空"是同一类漏）。
+      assets: assetsLineAt(eventsBefore, input.turn),
     },
     now: stepStart.ts,
     timezone: input.config.timezone,
@@ -2837,7 +3183,7 @@ class WebServerImpl implements WebServer {
           '状态只接受 GET；启停用 POST /api/protocol-side/start|stop，写配置用 PUT /api/protocol-side/config',
         );
       }
-      sendJson(res, 200, this.buildProtocolSideView(this.readSavedOnebot(), null));
+      sendJson(res, 200, await this.buildProtocolSideView(this.readSavedOnebot(), null));
       return;
     }
     if (path === '/api/protocol-side/start' || path === '/api/protocol-side/stop') {
@@ -2904,7 +3250,7 @@ class WebServerImpl implements WebServer {
   private async runProtocolSideAction(action: 'start' | 'stop', res: ServerResponse): Promise<void> {
     const host = this.deps.protocolSide;
     if (host === undefined) {
-      sendJson(res, 200, this.buildProtocolSideView(this.readSavedOnebot(), {
+      sendJson(res, 200, await this.buildProtocolSideView(this.readSavedOnebot(), {
         action,
         changed: false,
         note: '本进程启动时没有装配内置协议端（这段配置是启动之后才写下的）：重启进程后它才会被接管。'
@@ -2913,7 +3259,7 @@ class WebServerImpl implements WebServer {
       return;
     }
 
-    const before = host.status().state;
+    const before = (await host.status()).state;
     let after: ManagedServiceStatus;
     let changed = false;
     let note: string;
@@ -2938,12 +3284,12 @@ class WebServerImpl implements WebServer {
         if (before === 'stopped' || before === 'not-installed') {
           // 已经没在跑就别再去调 stop()：服务层的 stop() 会把状态改写成 "stopped"，
           // 那会把 `not-installed` 这条**给人指路的诊断**（"先去下载"）一起抹掉。
-          after = host.status();
+          after = await host.status();
           changed = false;
           note = '它本来就没在跑。';
         } else {
           await host.stop();
-          after = host.status();
+          after = await host.status();
           changed = true;
           // 说清"接下来会看到什么"：适配器还在重连，日志里必然出现连不上——
           // 那是预期行为，不是故障（不说的话下一个人会去查一个根本没坏的东西）
@@ -2956,14 +3302,14 @@ class WebServerImpl implements WebServer {
       // 这里只补一句"这次动作抛了"，界面把两份都显示出来就够定位了
       const reason = describeError(err);
       this.write(`[协议端] ${action} 异常：${reason}`);
-      sendJson(res, 200, this.buildProtocolSideView(this.readSavedOnebot(), {
+      sendJson(res, 200, await this.buildProtocolSideView(this.readSavedOnebot(), {
         action,
         changed: false,
         note: `${action === 'start' ? '启动' : '停止'}时抛了异常：${reason}`,
       }));
       return;
     }
-    sendJson(res, 200, this.buildProtocolSideView(this.readSavedOnebot(), { action, changed, note }));
+    sendJson(res, 200, await this.buildProtocolSideView(this.readSavedOnebot(), { action, changed, note }));
   }
 
   /**
@@ -3040,7 +3386,7 @@ class WebServerImpl implements WebServer {
     }, 'channels.onebot');
 
     const saved = this.readSavedOnebot();
-    const view = this.buildProtocolSideView(saved, null);
+    const view = await this.buildProtocolSideView(saved, null);
     const restartRequired = view['restartRequired'] === true;
     this.write(`[协议端] 配置已写入：${fields.join('、')}`
       + `（${restartRequired ? '需重启进程才生效' : '与当前生效的一致，无需重启'}）`);
@@ -3146,10 +3492,14 @@ class WebServerImpl implements WebServer {
   /**
    * 协议端视图：**盘上的配置**与**运行期的实例**合成一份，自包含（界面一次请求就能把整张卡画完）。
    *
-   * 四件事在这里定死：
+   * 五件事在这里定死：
    *   · **`accessToken` 永不出现在响应里**。它是协议端的凭据，界面既不需要也不该拿到；
    *     只给 `hasToken`（"有没有"）。它与 `endpoint.wsUrl` 一起放在 `endpoint` 里，
    *     而 `endpoint.source` 说明这个地址是**活的那个**（正在跑）还是**它配置里写的**（没跑）。
+   *   · **v36：一个笼统状态拆成三档**（`process` / `onebotConfig` / `adapter`），每档带自己的判据。
+   *     旧口径只有一枚 `state`，于是"进程活着 + 配置缺失"只能被说成"启动失败"——
+   *     一句话和事实相反，而人下一步该做什么（去登录 vs 去看日志）全看这一句。
+   *     `state` / `stateText` 仍然给（旧界面与旧口径不受影响），但它**不再是唯一的那句话**。
    *   · **`state` 不用猜**：有实例就问它（那是唯一知道真相的人）；没实例就是"没跑"，
    *     并在 `detail` 里说清是"没配置"还是"配置是启动之后才写的"。
    *   · **`detail` 永远非空**：界面靠它解释失败原因，而服务层在 autoStart=false 时
@@ -3157,13 +3507,20 @@ class WebServerImpl implements WebServer {
    *     这里补一句人话。
    *   · **`restartRequired` 是"盘上那份"与"本进程启动时读到的那份"的比较**，不是
    *     "有没有写过配置"：只写了同样的值就说"不用重启"，人才信这句话。
+   *
+   * 口令（`webuiLogin.password`）是**唯一一处例外**：它进响应，但只进本机界面，
+   * 而且出响应前整份视图还会被 `scrubSecrets` 扫一遍（防的是"哪次拼接把它顺进 detail"）。
    */
-  private buildProtocolSideView(
+  private async buildProtocolSideView(
     saved: OnebotSavedView,
     outcome: { action: 'start' | 'stop'; changed: boolean; note: string } | null,
-  ): Record<string, unknown> {
+  ): Promise<Record<string, unknown>> {
     const host = this.deps.protocolSide;
-    const status = host === undefined ? null : host.status();
+    const status = host === undefined ? null : await host.status();
+    const secrets: string[] = [];
+    const password = status?.report.webui.credential.password;
+    if (typeof password === 'string') secrets.push(password);
+    if (status?.endpoint !== undefined) secrets.push(status.endpoint.accessToken);
 
     // 本进程启动时读到的那份（`deps.config` 在启动时加载一次，之后不再变）
     const boot = this.deps.config.channels.onebot;
@@ -3216,6 +3573,89 @@ class WebServerImpl implements WebServer {
           : '这段配置是本次进程启动之后才写下的：重启进程后框架才会接管它的拉起与对接。')
         : '已停止（本次没有自动拉起：autoStart=false，或者还没点过「启动」）。');
 
+    /**
+     * 三档（v36）：每一档自带判据，界面上分开说。
+     *
+     * 没有实例（host === undefined）时三档里能答的照答：`onebotConfig` 与 `adapter`
+     * 压根不依赖实例（一个读盘、一个问适配器），只有 `process` 那一档需要实例——
+     * 而没有实例**不等于**没在跑（实测现场正是"进程在跑、只是本次框架没管它"）。
+     * 所以那一档如实报 `known: false`（"本进程没在看"），而不是报"没在跑"。
+     */
+    const report = status?.report ?? null;
+    const link = this.deps.onebotLink === undefined ? null : this.deps.onebotLink();
+    const processView = report === null
+      ? { known: false, running: null as boolean | null, detail: '本进程没有装配协议端实例，这一档没人在看（重启进程后才看得到）。' }
+      : {
+          known: true,
+          running: report.process.running,
+          ...(report.process.pid === undefined ? {} : { pid: report.process.pid }),
+          ...(report.process.managed === undefined ? {} : { managed: report.process.managed }),
+          ...(report.process.startedAt === undefined ? {} : { startedAt: report.process.startedAt }),
+          ...(report.process.webuiUrl === undefined ? {} : { webuiUrl: report.process.webuiUrl }),
+          detail: report.process.running
+            ? `在跑${report.process.pid === undefined ? '' : `（pid ${report.process.pid}`}`
+              + `${report.process.startedAt === undefined ? '' : `，${report.process.startedAt} 起`}`
+              + `${report.process.pid === undefined ? '' : '）'}`
+              + `；实际监听 ${report.process.webuiUrl ?? '（端口未探到）'}`
+            : '没在跑',
+        };
+    const configView = report === null
+      ? null
+      : {
+          present: report.onebotConfig.present,
+          ...(report.onebotConfig.endpoint === undefined
+            ? {}
+            : {
+                wsUrl: report.onebotConfig.endpoint.wsUrl,
+                hasToken: report.onebotConfig.endpoint.accessToken !== '',
+              }),
+          ...(report.onebotConfig.path === undefined ? {} : { path: report.onebotConfig.path }),
+          ...(report.onebotConfig.unreadable === undefined ? {} : { unreadable: report.onebotConfig.unreadable }),
+          detail: report.onebotConfig.present
+            ? `在（${report.onebotConfig.path ?? '它的配置'}），端点 ${report.onebotConfig.endpoint?.wsUrl ?? '读不出'}`
+            : report.onebotConfig.unreadable === true
+              ? `那份文件在（${report.onebotConfig.path ?? '?'}）但读不出端点——要人去修它`
+              : '缺失（它登录 QQ 之后才会生成这一份）',
+        };
+    const adapterView = link === null
+      ? { state: 'not-assembled' as const, detail: '本进程没有装配 OneBot 适配器' }
+      : {
+          state: !link.enabled ? ('disabled' as const)
+            : !link.hasEndpoint ? ('no-endpoint' as const)
+              : link.connected ? ('connected' as const) : ('reconnecting' as const),
+          connected: link.connected,
+          hasEndpoint: link.hasEndpoint,
+          ...(link.target === undefined ? {} : { target: link.target }),
+          ...(link.selfId === undefined ? {} : { selfId: link.selfId }),
+          reconnectAttempts: link.reconnectAttempts,
+          lastEventAt: link.lastEventAt,
+          delivered: link.delivered,
+          detail: !link.enabled
+            ? '通道没开（config.channels.onebot.enabled=false）'
+            : !link.hasEndpoint
+              ? '没有可连的端点（协议端的 OneBot 配置还没出现，配置里也没有手填地址）'
+              : link.connected
+                ? `已连上 ${link.target ?? '端点'}`
+                : `重连中（第 ${link.reconnectAttempts} 次）：${link.target ?? '端点'}`,
+        };
+
+    /**
+     * 三档合成的那一句（界面卡头直接显示它）。
+     *
+     * 词序是**故意的**：先说进程、再说配置、最后说适配器——那正是"到底断在哪一环"的排查顺序，
+     * 也是这次要显示出来的那条链。缺一档就不说那一档（不拿"未知"占位）。
+     */
+    const summary = [
+      processView.known
+        ? (processView.running === true ? '进程在跑' : '进程没在跑')
+        : '进程未观测',
+      configView === null ? null : (configView.present ? 'OneBot 配置在' : 'OneBot 配置缺失'),
+      adapterView.state === 'connected' ? '适配器已连上'
+        : adapterView.state === 'reconnecting' ? '适配器重连中'
+          : adapterView.state === 'no-endpoint' ? '适配器没端点可连'
+            : adapterView.state === 'disabled' ? '适配器未启用' : '适配器未装配',
+    ].filter((part): part is string => part !== null).join(' · ');
+
     const view: Record<string, unknown> = {
       // ① 盘上的配置（人刚保存的就是它）
       configured: saved.managed !== null,
@@ -3236,11 +3676,46 @@ class WebServerImpl implements WebServer {
         hasToken: endpoint.accessToken !== '',
         source: live === null ? 'config' : 'live',
       },
-      // 没在跑时不给 WebUI 地址：那个页面此刻打不开，摆一个点不出东西的按钮比不摆更糟
+      // WebUI 地址：**进程在跑就给**（v36 改的口径）。
+      // 旧口径是"只有 ready / starting 才给"——那等于把"面板开着"绑在"OneBot 端口开着"上，
+      // 而实测现场恰恰是前者开着、后者没开：界面于是不给按钮，人连登录都做不到。
       webuiUrl: status?.webuiUrl ?? null,
       // ④ 装没装（三态：true / false / null="配置改了，重启后才核对得出"）
       installed,
       entryPath,
+      // ⑤ 三档（v36）：这是"到底断在哪一环"的正式答案
+      process: processView,
+      onebotConfig: configView,
+      adapter: adapterView,
+      summary,
+      /**
+       * 面板的登录口：地址 + 凭据 + 两个门的状态。
+       *
+       * **口令只在这里出现一次**，且带着 `source`：`stdout` = 本次启动从它的输出里捕到的
+       * （权威）；`console-log` = 从框架自己的启动留痕里捞回来的（**可能是上一轮作废的那条**，
+       * 所以要标出来）；`none` = 找不回来，界面该说"重启一次让它重新打印"，而不是让人干瞪眼。
+       */
+      webuiLogin: status === null
+        ? null
+        : {
+            url: status.webuiUrl ?? null,
+            open: status.report.webui.open,
+            consentRecorded: status.report.webui.consentRecorded,
+            mustChangePassword: status.report.webui.mustChangePassword,
+            credential: {
+              source: status.report.webui.credential.source,
+              ...(status.report.webui.credential.user === undefined
+                ? {}
+                : { user: status.report.webui.credential.user }),
+              // 明文口令**只给本机界面**（本服务默认只绑回环 + 有鉴权）；响应出去前还会再扫一遍兜底
+              ...(status.report.webui.credential.password === undefined
+                ? {}
+                : {
+                    password: status.report.webui.credential.password,
+                    passwordMasked: maskCredential(status.report.webui.credential.password),
+                  }),
+            },
+          },
     };
     if (status?.pid !== undefined) view['pid'] = status.pid;
     if (outcome !== null) {
@@ -3249,7 +3724,8 @@ class WebServerImpl implements WebServer {
       view['changed'] = outcome.changed;
       view['note'] = outcome.note;
     }
-    return view;
+    // 兜底：整份视图扫一遍已知口令（detail / note / summary 都是人拼出来的，谁都可能拼错）
+    return scrubSecrets(view, secrets);
   }
 
   private async listEvents(url: URL): Promise<EventsPage> {
@@ -4039,9 +4515,14 @@ class WebServerImpl implements WebServer {
         // 运行情况页那颗按钮（原来这里是"立即唤醒"，用户 2026-10-04 说那个没用了，改成重启）。
         //
         // 四条纪律：
-        //   • **延迟两秒再动手**：让这次 HTTP 回执先发出去，界面不至于拿到一个断掉的连接；
-        //   • 用 WMI 起**分离**的 pwsh 去跑 tools/restart-agent.ps1——本进程不能自己重启自己，
-        //     而那条脚本里写着"只杀主进程、不碰 SnowLuma"（协议端登录态杀了要人重登）；
+        //   • **延迟到"这次回执已经能说清楚"之后才动手**：让 HTTP 回执先发出去，界面不至于
+        //     拿到一个断掉的连接（过去写死两秒，而回执要等脚本把新实例的 pid 写出来——
+        //     两秒不够，于是界面拿到的是一个断掉的连接 + 一句"重启没能确认"）。
+        //     现在的延迟由 `IRMIA_RESTART_DELAY_MS` 给（默认 = 确认窗口 + 4 秒余量）；
+        //   • 用 WMI 起**分离**的 `cmd /c` → pwsh 去跑 tools/restart-agent.ps1——本进程不能
+        //     自己重启自己，而那条脚本里写着"只杀主进程、不碰 SnowLuma"（协议端登录态杀了
+        //     要人重登）。**必须是 `cmd /c` 那一层**：直接建 pwsh 时 `Win32_Process.Create`
+        //     返回 0 而脚本一个字都不执行（2026-10-07 的现场，见 `restartCommandLine`）；
         //   • 界面路径由调用方给（`guiExe`）：脚本不该猜界面装在哪。**给了路径就必须留痕**
         //     （见下面那段"留痕"注释：用户 2026-10-05 说按了按钮"没有任何日志痕迹，
         //     无法判断请求有没有带界面路径"）；
@@ -4075,6 +4556,21 @@ class WebServerImpl implements WebServer {
         // 两处各推一次就会出现"服务端读 A、脚本写 B"的分岔，而这条留痕的全部意义就是"能对上"。
         const traceLog = join(this.deps.dataDir, 'restart-trace.log');
         const traceLogAt = existsSync(traceLog) ? statSync(traceLog).size : -1;
+        // **只重启界面**（`guiOnly: true`）：一个后端进程都不动。
+        // 用户 2026-10-07 的第 ③ 条要求是"不许出现没有任何消费者的死路"，而这里还有一层
+        // 更要紧的理由：让一个**正在服务这次请求**的后端"重启自己"，响应必然断在半路，
+        // 界面就只剩"没反馈"可看。这条分支把那种形状留成一个**明路**：界面单独重开，
+        // 后端照旧服务（连接不断、这次响应一定送达），重启的仍然是真的重启。
+        const guiOnly = payload['guiOnly'] === true;
+        // 请求发起前 lock.json 里的 pid：判"她是不是真的换了个人"的基线（0 = 本来没在跑）。
+        const previousBackendPid = ((): number => {
+          try {
+            const lock = JSON.parse(readFileSync(join(this.deps.dataDir, 'lock.json'), 'utf8')) as { pid?: unknown };
+            return typeof lock.pid === 'number' ? lock.pid : 0;
+          } catch {
+            return 0;
+          }
+        })();
         // 每个参数各自加引号（路径带空格时也必须是一个参数）。`"pwsh" -File "a b.ps1" -GuiExe "c d.exe"`
         // 在 PowerShell 里逐字对应四条参数，不会把路径拆成两截。
         //
@@ -4083,11 +4579,33 @@ class WebServerImpl implements WebServer {
         // 而重启这条路上任何一点不确定都不该引入。逐参数引号这条路已经在本机验过
         // （见 _research/probe-restart-chain.ps1：`-GuiExe` 那一段完整送达）。
         const q = (value: string): string => `"${value}"`;
+        // 脚本自己（cmd 那一层）的 stdout/stderr 落点：过去随 WMI 进程一起消失，
+        // 于是"脚本报了错"这件事在留痕之外完全看不见（失败无声的另一半）。
+        // 与 -TraceLog 同一个约定：路径由服务端给，脚本不猜。
+        const scriptLog = join(this.deps.dataDir, 'restart-script.log');
+        // **延迟多久才动手**：这次请求的响应必须先回到界面，否则界面拿到的是一个断掉的连接，
+        // 人看到的就是"点了没反馈"。而响应的内容里要带上"脚本有没有起来 / 后端有没有换 pid"
+        // ——那要等脚本跑起来、等新实例把自己的 lock 写出来，所以等待窗口比过去（400ms）长。
+        // 于是延迟必须**盖过那个窗口**：窗口多少，这里就等多少，再加一段余量给"响应真的送达"。
+        // （两端都能用环境变量调：IRMIA_RESTART_CONFIRM_MS / IRMIA_RESTART_DELAY_MS。）
+        const delaySeconds = ((): number => {
+          const raw = Number(process.env['IRMIA_RESTART_DELAY_MS'] ?? '');
+          if (Number.isFinite(raw) && raw > 0) return Math.round(raw / 1000);
+          return Math.ceil(RESTART_RECEIPT_WAIT_MS / 1000) + 4;
+        })();
         const argv: string[] = [
           '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', q(script),
           '-Repo', q(repo),
+          // **绝对路径的入口**：她起不来的一半原因曾经是"相对路径 + 指望工作目录"。
+          // 本机实测（2026-10-07）：`Win32_Process.Create` 出来的进程里，`cmd /c cd` 回显的
+          // 是传进去的那个目录，而 `node dist/main.js` 就是找不到文件、悄无声息退出——
+          // 症状与"按钮点了什么都没发生"一模一样。凡是能被绝对化的路径全部绝对化。
+          '-NodeEntry', q(join(repo, 'dist', 'main.js')),
           ...(guiExe === '' ? [] : ['-GuiExe', q(guiExe)]),
+          ...(guiOnly ? ['-GuiOnly'] : []),
           '-TraceLog', q(traceLog),
+          '-ScriptLog', q(scriptLog),
+          '-DelaySeconds', String(delaySeconds),
         ];
         // 谁来跑这个脚本：`resolveRestartShell` 按"显式指定 → PATH → 标准安装目录 → 系统自带"
         // 四级探测（见 `runtime/restart-shell.ts` 的文件头）。
@@ -4097,7 +4615,7 @@ class WebServerImpl implements WebServer {
         // 这件事要求我们**给出一个真的存在的绝对路径**，不能靠猜；探测失败时用
         // `powershell.exe`（在 System32 里，WMI 环境也找得到；脚本按 5.1 兼容写，兜底是安全的）。
         const shellExe = resolveRestartShell({ env: process.env, fileExists: existsSync });
-        const command = restartCommandLine({ shellExe, argv });
+        const command = restartCommandLine({ shellExe, argv, scriptLog });
         const wmi = `$si = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); $si.ShowWindow = 0; `
           + `$c = ([wmiclass]'Win32_Process').Create('${command.replace(/'/gu, "''")}', '${repo.replace(/'/gu, "''")}', $si); exit $c.ReturnValue`;
         // ── 留痕（2026-10-05 加，用户报"按钮那条路没有任何日志痕迹"）──
@@ -4133,25 +4651,49 @@ class WebServerImpl implements WebServer {
         }
         // **回执判定**：WMI 返回码 0 **不等于脚本跑起来了**。
         //
-        // 本仓实测（_research/probe-restart-chain.ps1 + WMI 对照实验）：
-        // `Win32_Process.Create` 对一个随后会被系统拒掉的命令行**照样返回 0**——
-        // 探针里 `cmd.exe /c "… > 日志 2>&1"` 那一层被拒（stderr 只有一句"拒绝访问。"），
-        // 脚本一个字都没执行，而返回码是 0、pid 也有。同一个坑在用户机器上就是
-        // "按钮点了、后端起来了、界面没有"这种最难查的形状。
+        // 本仓实测（_research/probe-restart-chain.ps1 + 2026-10-07 的复现）：
+        // `Win32_Process.Create` 对一个随后什么都没做的命令**照样返回 0**——
+        // 2026-10-07 的现场就是这条：返回码 0、pid 也有，而 `data/restart-trace.log`
+        // 一条新行都没有、`data/lock.json` 里的 pid 从头到尾没变（后端根本没被重启）。
+        // 直接送 `"…pwsh.exe" -File …` 必失败、套 `cmd.exe /c "…"` 才真的跑起来
+        // （见 `restartCommandLine` 的文件头）。
         //
-        // 所以这里多问一句**脚本自己**：它在第一件事上写一行 `[回执] ...` 到约定的留痕文件。
-        // 读得到新的那一行 = 脚本真的起来了；读不到 = 如实说"不确定"，不假装成功。
-        const scriptStarted = waitForScriptReceipt(traceLog, traceLogAt);
+        // 所以这里多问一句**脚本自己**：它第一件事写 `[回执]`，后端换了 pid 时写 `[实例]`，
+        // 收尾写 `[结束]`（带真 pid 与端口那一档）。读到哪一行就说到哪一步——
+        // **三态不许互相冒充**（用户 2026-10-07：「不许用'猜'的确认」）。
+        // 后端要被重启时等 `[实例]`（几秒内必到），否则等 `[结束]`（那时不会去杀后端，
+        // 结尾很快）。等不到就如实说"结局还没确认"，而不是编一个"成功"。
+        const { parsed, confirm } = confirmRestart({
+          traceLog, sizeBefore: traceLogAt, guiOnly,
+          previousBackendPid,
+          // 探回环地址：服务端可能只听 `0.0.0.0` / `::`（那时这两个不是能直接连的地址）。
+          // 与 `tools/restart-agent.ps1` 里那段同一个口径（同一件事不写两份判据）。
+          host: this.host === '0.0.0.0' || this.host === '::' ? '127.0.0.1' : this.host,
+          port: this.portWanted,
+          dataDir: this.deps.dataDir,
+        });
+        const scriptStarted = confirm.scriptStarted;
+        // 真实新 pid：脚本那行 `[实例]`/`[结束]` 是首选；还没有时退到 `data/lock.json`
+        // ——它是她启动后自己写的 {pid, startedAt, heartbeatAt}，比任何"壳的 pid"都真。
+        const backendPid = confirm.backendPid;
+        const outcome = {
+          gui: guiExe !== '', scriptStarted,
+          ok: confirm.ok, backendPid, port: confirm.port,
+        };
+        const note = restartNote(outcome);
         this.write(`[重启] 已发出：${trace()} · ${createdDetail}`
-          + ` · 脚本回执=${scriptStarted ? '已确认' : '**没读到**（脚本可能没起来）'}（${traceLog}）`);
+          + ` · 脚本回执=${scriptStarted ? '已确认' : '**没读到**（脚本没起来）'}`
+          + ` · 真 pid=${backendPid === 0 ? '未读到' : backendPid} · 端口=${confirm.port}`
+          + ` · 结尾=${parsed.ok === null ? '未读到' : String(parsed.ok)}（${traceLog}）`);
         const event = this.appendSync(
           'config/changed',
           {
             fields: ['restart'], configHash: sha256Hex(String(this.deps.now().getTime())).slice(0, 16),
             // 这几个字段是这次留下的痕：事后要能回答"这次到底带没带界面路径、带了什么、
-            // 脚本会收到什么、脚本有没有起来"。老字段一个不动（`fields` 仍是 `['restart']`），
-            // 只多几列。
+            // 脚本会收到什么、脚本有没有起来、真 pid 是多少、端口那一档"。
+            // 老字段一个不动（`fields` 仍是 `['restart']`），只多几列。
             guiExe, guiExeExists, command, traceLog, scriptStarted,
+            backendPid, port: confirm.port, scriptOk: parsed.ok, note,
           },
           'internal',
         );
@@ -4162,11 +4704,16 @@ class WebServerImpl implements WebServer {
           // 界面按这两个字段决定 toast 说什么（`gui:false` 时**不许**说"连界面一起重启了"）
           gui: guiExe !== '',
           guiExe,
-          // `scriptStarted` 也下发给界面：读到 `false` 时界面说的那句是"没读到脚本回执"，
-          // 而不是"正在重启"——两种结局的文案不同（用户 2026-10-05：点了要有反馈）。
+          // `scriptStarted` 也下发给界面：读到 `false` 时界面说的那句是"**重启未能执行**"
+          // （脚本根本没跑起来 ⇒ 后端没有被重启），而不是"正在重启"。
           scriptStarted,
+          // 三态证据一起下发：真 pid、端口那一档、脚本结尾那行的 ok。界面据此说
+          // "成功（真实新 pid …· 端口已就绪）" / "失败（为什么）" / "已发出但结局未确认"。
+          backendPid,
+          port: confirm.port,
+          scriptOk: confirm.ok,
           traceLog,
-          note: restartNote({ gui: guiExe !== '', scriptStarted }),
+          note,
         });
         return;
       }
@@ -6060,7 +6607,7 @@ interface McpProbeOutcome {
  */
 class McpProbeHost implements McpConnectionHost {
   // version 与 `main.ts` 的 AGENT_VERSION 同步（两处必须一起改）
-  readonly clientInfo = { name: 'irmia-agent', version: '0.1.0-beta.4' };
+  readonly clientInfo = { name: 'irmia-agent', version: '0.1.0-beta.5' };
   readonly protocolVersion = DEFAULT_PROTOCOL_VERSION;
   readonly progressHardCapMs = 60_000;
   readonly defaultRequestTimeoutMs: number;

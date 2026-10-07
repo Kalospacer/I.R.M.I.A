@@ -489,7 +489,16 @@ export function mapDispatchToWakeChannel(
     ...(isGroupAt || isGuild || isDm || (mentions?.some((m) => m.bot === true) ?? false) ? { mentionsMe: true } : {}),
     ...(mentions === undefined ? {} : { mentionsMe: mentions.some((m) => m.bot === true) }),
     ...(mentions === undefined ? {} : { mentions }),
-    dedupeKey: id,
+    /**
+     * 幂等键：**带通道命名空间**，与 OneBot 那条同形（`onebot:<messageId>`）。
+     *
+     * 原先这里是裸 `id`（与上面 `:67` 那句注释说的"通道名是 dedupeKey 命名空间的前缀来源"
+     * 相反）。今天没出故障，因为两平台的 id 形状不撞（官方是 117–137 字符的 `ROBOT1.0_…`、
+     * OneBot 是数字串）；但 `state/fold.ts` 把两条通道的键放进**同一个扁平数组**去重，
+     * 一旦 id 出现交集，表现是**一条通道的消息被另一条静默丢掉**（那里是 `break`，连日志都没有）。
+     * 一行加固：id 的归属写进键里，跨通道撞键从"靠形状侥幸"变成"不可能"。
+     */
+    dedupeKey: `${channelName}:${id}`,
   };
 }
 
@@ -1934,14 +1943,34 @@ export function parseReplyUrl(url: string): ReplyUrlParse {
  */
 /**
  * 媒体投递口（`send_media` 工具用）：与 `createChannelReplyPoster` 同一套成例——
- * 认 qq 回投地址、超时由调用方预算说了算、失败如实回报。
+ * 认回投地址、超时由调用方预算说了算、失败如实回报。
  *
  * 与文本那条的唯一区别：**超时预算更大**（默认 60s）：先上传再发送是两次往返，
  * 网络图还要平台先回源拉一遍，15s 那条线会把它误判成超时。
+ *
+ * **2026-10-07：`channelName` 参数化，装配层不再写死"只有 qq-official 会发媒体"。**
+ *
+ * 原先这里写死两件通道事：`parseReplyUrl`（只认 `qq:` 前缀）与 `channels.get(QQ_CHANNEL_NAME)`；
+ * 结果是 `main.ts` 也照着写死了装配条件（`qqChannel !== null` 才造 mediaPoster）——
+ * OneBot 上 `send_media` 直接不存在。现在"认哪个通道"由**调用方按回投地址的 scheme 决定**
+ * （`admin.parseReplyUrlAny` 已经把 scheme → 通道名映射好了，与 speak 那条路同一份判据），
+ * 这个函数只负责"把媒体交给那条通道的 `sendMediaTo`"。
+ *
+ * 三条纪律照旧：**通道没装配**如实说、**通道不会发媒体**如实说（不假装发过）、
+ * 超时由调用方预算说了算。**不在这里按通道名分支**——有没有 `sendMediaTo` 是通道自己的事。
  */
 export function createChannelMediaPoster(
   channels: ReadonlyMap<string, ChannelAdapter>,
-  options: { timeoutMs?: number } = {},
+  options: {
+    timeoutMs?: number;
+    /**
+     * 认哪条通道的媒体接口。省略 = `qq-official`（既有调用点逐字节不变）。
+     * 装配层按回投地址的 scheme 递进来。
+     */
+    channelName?: string;
+    /** 解析回投地址的入口（省略 = 本文件的 `parseReplyUrl`，即只认 `qq:` 前缀） */
+    parseUrl?: (url: string) => { ok: true; chatType: QqChatType; chatId: string } | { ok: false; error: string };
+  } = {},
 ): {
   post(
     target: { url: string; idempotencyKey: string; msgId?: string },
@@ -1949,20 +1978,31 @@ export function createChannelMediaPoster(
   ): Promise<{ ok: true; status: number } | { ok: false; reason: string }>;
 } {
   const timeoutMs = options.timeoutMs ?? 60_000;
+  const channelName = options.channelName ?? QQ_CHANNEL_NAME;
+  const parseUrl = options.parseUrl ?? parseReplyUrl;
   return {
     async post(target, media) {
-      const parsed = parseReplyUrl(target.url);
+      const parsed = parseUrl(target.url);
       if (!parsed.ok) return { ok: false, reason: parsed.error };
-      const channel = channels.get(QQ_CHANNEL_NAME);
-      if (channel === undefined) return { ok: false, reason: 'QQ 通道未装配，媒体发送跳过' };
-      const qq = channel as QqOfficialChannel;
-      if (typeof qq.sendMediaTo !== 'function') {
-        return { ok: false, reason: '这条通道不支持发媒体（只有 QQ 官方通道实现过）' };
+      const channel = channels.get(channelName);
+      if (channel === undefined) return { ok: false, reason: `${channelName} 通道未装配，媒体发送跳过` };
+      // **能力判据是"这条通道有没有那个方法"**，不是它的名字：名字会变，方法在不在是事实。
+      // 没有就如实说清（她据此决定换会话还是换方式），绝不假装发过。
+      const sender = channel as ChannelAdapter & {
+        sendMediaTo?: (
+          chatType: QqChatType,
+          chatId: string,
+          media: QqMediaInput,
+          options?: SendTextOptions,
+        ) => Promise<SendOutcome>;
+      };
+      if (typeof sender.sendMediaTo !== 'function') {
+        return { ok: false, reason: `${channelName} 通道不支持发媒体（它没有实现 sendMediaTo）` };
       }
       const timerRef: { handle: NodeJS.Timeout | null } = { handle: null };
       try {
         const outcome = await Promise.race([
-          qq.sendMediaTo(
+          sender.sendMediaTo(
             parsed.chatType,
             parsed.chatId,
             media,

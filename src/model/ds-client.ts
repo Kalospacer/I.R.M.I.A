@@ -141,7 +141,7 @@ export interface DsUsage {
   outputTokens: number;
   /** 命中上下文硬盘缓存的输入 token（§4.13 归账口径） */
   cachedTokens: number;
-  /** 思维链 token（usage.output_tokens_details.reasoning_tokens） */
+  /** 思维链 token（usage.output_tokens_details.reasoning_tokens）——**落库到 `budget/consumed.reasoningTokens`**（观测字段，已含在 outputTokens 里） */
   reasoningTokens: number;
 }
 

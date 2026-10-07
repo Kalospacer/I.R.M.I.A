@@ -399,10 +399,10 @@ export function scanSuspension(events: readonly AppEvent[]): SuspensionScan {
   return { waiting: queue[0] ?? null, answered };
 }
 
-/** 当前挂起的人审提问（最后一条未被答复的 human/asked）。answer 通道用它填 human/answered.question */
-export function pendingQuestion(events: readonly AppEvent[]): string | null {
-  return scanSuspension(events).waiting?.question ?? null;
-}
+// 这里从前还有一条 `pendingQuestion(events)`（= `scanSuspension(events).waiting?.question`），
+// 注释写着"answer 通道用它填 human/answered.question"——**那句话不实**：答复通道填的是它自己
+// 挑中的那一条的 `target.question`（见下面 `applyAnswer` 里的 human/answered），从来不经过它。
+// 它全仓 0 引用，2026-10-06 随审计删掉（docs/repo-cleanliness-audit.md §2.2 A7），别再按旧说法加回来。
 
 /** 挂起是否已超过时限。时钟由调用方注入（测试用假时钟），纯函数不读环境时间 */
 export function humanTimeoutElapsed(askedAt: string, nowMs: number, timeoutMs: number): boolean {

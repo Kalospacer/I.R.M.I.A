@@ -203,11 +203,6 @@ export async function readBackup(
   }
 }
 
-/** 确保目录存在（备份根、数据目录、blob 目录共用） */
-export async function ensureDir(path: string): Promise<void> {
-  await mkdir(path, { recursive: true });
-}
-
 export function backupDirFromHome(home: string): string {
   return join(home, '.irmia', FALLBACK_BACKUP_DIR_NAME);
 }

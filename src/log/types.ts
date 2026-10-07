@@ -288,6 +288,266 @@ export interface ChannelMessage extends EventEnvelope<'channel/message', {
   mentionsMe?: boolean;
 }> {}
 
+// ──────────────────── 附件的两个字段口径（两条通道共用，只此一处） ────────────────────
+
+/**
+ * 附件的**类型**在各通道上的两种形态（`attachments[].type` 的取值）。
+ *
+ * 为什么两种都认：这个字段是**适配器**填的，而两条通道拿到的原料不是同一种东西——
+ *   • QQ 官方附件里带的是 `content_type`，即 **MIME 型别**（`image/png`）；
+ *   • OneBot 的附件来自消息段，段类型是**裸标签**（`image` / `file` / `record` / `video`）。
+ * 上游（渲染层挑图、附件预热扫图）原先只认 MIME 前缀，于是 OneBot 发来的图
+ * **一条都进不了她的上下文**（只留一行 URL 文本）：她看得见文件名，看不见画面。
+ *
+ * 边界留在适配器：协议语义该由适配器翻（OneBot 侧的段 → 这里认的两种形态之一），
+ * 渲染层只问这一个函数"这是不是一张图"，不自己再写一遍字符串判据。
+ */
+export function isImageAttachment(attachment: { type?: string }): boolean {
+  const type = attachment.type ?? '';
+  // `image` 是 OneBot 的段类型；`image/*` 是官方（以及任何讲 MIME 的通道）的内容类型。
+  return type === 'image' || type.startsWith('image/');
+}
+
+/**
+ * 附件地址**能不能真的取到东西**（`attachments[].url` 的取值口径）。
+ *
+ * 为什么要有这一条：`url` 是给两条下游用的——附件预热与渲染（那一行"临时地址，想看就现在下载"）。
+ * OneBot 的段里 `file` 常常只是协议端那边的一个**本地文件名**（`a.jpg`），那种值摆进上下文是
+ * **点不开的假地址**，她照着它去 http_download 只会白撞一次——所以这类一律不收。
+ *
+ * 认两种：`http(s)://`（官方与 OneBot 的常规直链）与 `data:`（内联字节，Node 的 fetch 直接吃它）。
+ *
+ * **2026-10-07 收窄（P0 的连带修正）**：原先还认 `file://`。它有两个毛病：
+ *   ① 它是"协议端与本进程同机"的假设，模型侧（服务端）根本取不到那个路径；
+ *   ② 那条路上的降级链在夜里断过一次——本进程按同机路径读得动，服务端读不动，于是载荷
+ *      形态出错、整拍 400。
+ * 所以 `file://` 从此不进 `url`：附件那行事实里就不该出现一个**只有本进程能用**的地址。
+ * 协议端真的只给了本地路径时，让她用 `vision_read`（本机读得动）转述，那条路是通的。
+ */
+export function isFetchableAttachmentUrl(url: string): boolean {
+  return /^(https?:|data:)/iu.test(url.trim());
+}
+
+// ──────────────────── 「什么形态的图才进上下文」——唯一一处判据（2026-10-07） ────────────────────
+
+/**
+ * 模型**真的认**的图片媒体型别。这份名单不是我们挑的，是服务端的原话：
+ * 一次 400 的响应体写着 "Please make sure your image is valid and has one of the following
+ * formats: **webp, png, jpeg, and gif**"（现场：turn 885~898 每一拍都是这一条）。
+ *
+ * 为什么必须是一份**白名单**而不是"`image/` 开头就算"：`attachments[].type` 是适配器填的，
+ * 而 OneBot 那边填的是**段类型裸标签** `image`（见上面 `isImageAttachment` 的注释）。
+ * 裸标签当 MIME 用会拼出 `data:image;base64,…`——媒体型别没有子型别，模型侧判"unsupported image"
+ * 直接 400，而这条消息永远留在历史里 ⇒ **之后每一拍都失败**（历史是只追加的，她自己修不好）。
+ * `image/bmp` / `image/tiff` 之类同理会 400：名单外的**一律不进上下文**，改走"给地址 + vision_read"。
+ */
+export const CONTEXT_IMAGE_MEDIA_TYPES: readonly string[] = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+
+/** 媒体型别的规范写法（小写、去参数、去空白）；不在白名单里给 null。参数如 `image/jpeg; charset=x` 只取前半 */
+export function contextImageMediaType(mime: string | undefined | null): string | null {
+  if (typeof mime !== 'string') return null;
+  const bare = mime.split(';')[0]?.trim().toLowerCase() ?? '';
+  return CONTEXT_IMAGE_MEDIA_TYPES.includes(bare) ? bare : null;
+}
+
+/**
+ * 按**字节头**认图片型别（magic number），认不出给 null。
+ *
+ * 为什么非要有这一条：声明的那一栏不可信，而进请求体的字节是真的。现场那条（seq 45004）声明是
+ * 裸标签 `image`、文件名 `.webp`、字节头却是 `RIFF….WEBP`——只信声明就永远拼不出模型认的型别，
+ * 只信文件名则等于把"猜"写进协议。字节头是这三者里唯一**既真实又确定**的一栏。
+ *
+ * 只认白名单里那四种的签名：这个函数的用途就是"这一份到底进不进上下文"，
+ * 认出来的型别必须能直接写进 data URL。
+ */
+export function sniffImageMediaType(bytes: Uint8Array | undefined | null): string | null {
+  if (bytes === undefined || bytes === null || bytes.length < 12) return null;
+  const ascii = (at: number, length: number): string => {
+    let out = '';
+    for (let i = at; i < at + length; i += 1) out += String.fromCharCode(bytes[i] ?? 0);
+    return out;
+  };
+  // PNG：89 50 4E 47 0D 0A 1A 0A
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+  // JPEG：FF D8 FF（后面是 JFIF / Exif / 原始量化表都有可能，不必再看）
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  // GIF：GIF87a / GIF89a
+  if (ascii(0, 3) === 'GIF') return 'image/gif';
+  // WebP：RIFF….WEBP（第 4~7 字节是长度，不判）
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+/**
+ * 进上下文的图片**最终形态**：媒体型别 + 完整 data URL。
+ *
+ * 两者的关系是硬的：`dataUrl` 的前缀必须**逐字**等于 `data:${mediaType};base64,`——
+ * 拼错一个字符就是 400（现场那条病），所以拼装只此一处、判据也是同一个函数给的。
+ */
+export interface ContextImageChosen {
+  /** 进 data URL 的那一栏（白名单之一，来自声明或字节头） */
+  mediaType: string;
+  dataUrl: string;
+}
+
+/**
+ * 把一份图片字节拼成能进请求体的 data URL。**拼不出来（型别不在白名单）就给 null。**
+ *
+ * 优先信字节头（真的那栏），字节头认不出才退回声明（假不了太多的那栏）——顺序反过来的话，
+ * 声明是裸标签 `image` 的 OneBot 图片就永远进不去，而它恰恰是这个函数存在的理由。
+ * 两边都说不出一个白名单型别时**如实返回 null**：调用方把"没进"的理由写进留痕，
+ * 由"给地址 + vision_read"那条路兜底，绝不硬塞一个模型不认的载荷。
+ */
+export function buildContextImage(
+  bytes: Uint8Array,
+  declaredMime: string | undefined | null,
+): ContextImageChosen | null {
+  const mediaType = sniffImageMediaType(bytes) ?? contextImageMediaType(declaredMime);
+  if (mediaType === null) return null;
+  return { mediaType, dataUrl: `data:${mediaType};base64,${Buffer.from(bytes).toString('base64')}` };
+}
+
+/** 「这张图为什么没进上下文」——给留痕用的理由码（不是给模型的文案） */
+export type ContextImageSkipReason =
+  /** 声明与字节都不是白名单里的型别（例如声明 `image`、字节也不是 png/jpeg/gif/webp） */
+  | 'unknown-media-type'
+  /** 字节在本地取不到（还没下载下来 / 直链已过期） */
+  | 'no-local-bytes'
+  /** 超过进上下文的字节上限 */
+  | 'too-large'
+  /** 地址形态不是 http(s)（`file://` 协议端本地路径、`base64://` 未解析的段）——模型取不到 */
+  | 'not-http-url'
+  /** `data:` 那段内联字节解不出来（不是合法 base64，或声明的型别不在白名单里） */
+  | 'data-url-unreadable';
+
+/**
+ * 拆一个 `data:` URL（`data:<media-type>;base64,<payload>`）。
+ *
+ * 为什么要拆：Node 的 `fetch` 能吃 data URL，但"能吃"不等于"能进上下文"——里面的型别是不是
+ * 白名单、payload 是不是合法 base64，只有拆开才知道。Model 不认的形态照样 400。
+ * 声明的型别不在白名单里就直接判不可用（与 `contextImageMediaType` 同一份名单）。
+ * **只认 base64 编码**（这种形态只有它：OneBot 的内联字节就是 `base64://` 翻过来的）。
+ */
+export function parseImageDataUrl(url: string): { mediaType: string; bytes: Buffer } | null {
+  const raw = url.trim();
+  if (!/^data:/iu.test(raw)) return null;
+  const comma = raw.indexOf(',');
+  if (comma === -1) return null;
+  const header = raw.slice('data:'.length, comma);
+  const payload = raw.slice(comma + 1);
+  if (!/;base64$/iu.test(header)) return null;
+  const mediaType = contextImageMediaType(header.slice(0, header.length - ';base64'.length));
+  if (mediaType === null) return null;
+  try {
+    const bytes = Buffer.from(payload, 'base64');
+    return bytes.byteLength === 0 ? null : { mediaType, bytes };
+  } catch {
+    return null;
+  }
+}
+
+/** 地址形态是不是"模型自己能去取"的那一种（http(s) 直链） */
+export function isModelFetchableImageUrl(url: string): boolean {
+  return /^https?:\/\//iu.test(url.trim());
+}
+
+/**
+ * 这一刻手上有的信息，**够不够判"这张图许进上下文"**——渲染层挑图用的那一条。
+ *
+ * 为什么分成两个函数而不是一个带分支的：两个调用点的信息量本来就不一样——
+ *   • `remote`（通道发来的附件）：地址与声明都在手上，两条都要过（`contextImageAdmission`）；
+ *   • `file`（她自己要求看的那张，`image/attached`）：地址是工作目录内的相对路径，
+ *     它本来就不是 http(s)，**地址那一条对它不成立也不该成立**；能判的只有声明。
+ * 硬塞进一个函数就得给它编一个假 URL 才跑得通，那是把"判据"写成"跑得通"。
+ */
+export function contextImageMimeAllowed(mime: string | undefined | null): boolean {
+  return contextImageMediaType(mime) !== null;
+}
+
+/**
+ * 声明这一栏**是不是"这是一张图，型别由字节说了算"**。
+ *
+ * `image` 是 OneBot 的**段类型裸标签**：它不是格式声明，只是"这一段是图片"。
+ * 拿它当 MIME 拼 data URL 正是 2026-10-07 那个 400（`data:image;base64,…`）；
+ * 而把它**整条拒掉**又会让 OneBot 的图一张都进不来（P0-2 要修的正是这个）。
+ * 两条路的分界因此不在这一栏，而在**字节**：这一栏只负责"值不值得去取字节"，
+ * 取回来之后由 `buildContextImage` 按字节头认型别——认不出就不进上下文。
+ */
+export function isImageSegmentLabel(mime: string | undefined | null): boolean {
+  return (mime ?? '').trim().toLowerCase() === 'image';
+}
+
+/**
+ * **这一张图许不许进上下文**——纯函数、确定性，渲染层挑图与预热层共用同一个结论。
+ *
+ * 为什么要有这条（2026-10-07 的 P0）：P0-2 把 OneBot 的裸标签 `image` 放进了多模态那条路，
+ * 而载荷形态没跟上——拼出来的是 `data:image;base64,…`，模型 400，那条消息从此把**每一拍**都毒死。
+ * 判据只写在"能不能进上下文"这一侧是不够的，必须同时是**渲染层挑图时用的那条**：
+ * 挑进来又注不进去，会让"最近 N 张"的名额被一张永远注不进去的图占着，后面的好图反而被挤掉。
+ *
+ * 判据（全部可核对）：
+ *   ① 地址必须是 **http(s)**（模型自己取得动），或者是拆得开的 `data:`（内联字节）。
+ *      `file://` 是协议端与本进程同机的路径、`base64://` 是没解析的段——两者模型侧都取不到，
+ *      它们是"给地址 + vision_read"那条路的材料，不是这一条路的；
+ *   ② 声明的型别要么在白名单里（`image/png`…），要么是裸标签 `image`（"这是张图，格式看字节"）。
+ *      `image/bmp` 这种**明确的**非白名单声明直接不进——我们没有转换器，硬塞必然 400；
+ *   ③ 字节到手时**字节头说了算**（`hasBytes=true`）：认得出白名单型别才进。
+ *
+ * `hasBytes=false` 表示"此刻还没把字节取到手上"（渲染层在轮首就挑了图，而预热是异步的）：
+ * 那时只看①②两条形态判据。真正拼 data URL 的是 {@link buildContextImage}——
+ * 它拿不到白名单型别就返回 null，于是**绝不会**有非法载荷进请求体。
+ */
+export interface ContextImageAdmission {
+  /** true = 这一张可以进（前提是宿主真取到了字节、且字节头认得出白名单型别） */
+  admitted: boolean;
+  /** admitted=false 时的理由（给留痕，给测试断言） */
+  reason?: ContextImageSkipReason;
+}
+
+export function contextImageAdmission(input: {
+  url: string;
+  /** 附件声明的内容类型（`attachments[].type`）或 `image/attached` 的 `mime` */
+  mime?: string | undefined;
+  /** 本地字节取到了没有（渲染层不知道，传 false） */
+  hasBytes?: boolean;
+  /** 本地字节的型别（取到了才有；与声明冲突时以它为准） */
+  byteMediaType?: string | null;
+}): ContextImageAdmission {
+  const url = input.url.trim();
+  // 内联字节（协议端把段里的 `base64://` 翻成 data URL 时）：形态与 http(s) 完全不同，
+  // 走它自己那条判据——拆得开、型别在白名单里，才算数（拆不开就不进，理由如实写）
+  if (/^data:/iu.test(url)) {
+    return parseImageDataUrl(url) === null
+      ? { admitted: false, reason: 'data-url-unreadable' }
+      : { admitted: true };
+  }
+  if (!isModelFetchableImageUrl(url)) return { admitted: false, reason: 'not-http-url' };
+  // 字节到手时以字节头为准（声明只作兜底）；没到手时只有声明可看。两档合一：
+  // 「字节头认得出」或「声明够格」——都不成立才是不进。
+  const byteType = input.hasBytes === true ? (input.byteMediaType ?? null) : null;
+  const declaredOk = contextImageMimeAllowed(input.mime) || isImageSegmentLabel(input.mime);
+  if (byteType !== null || declaredOk) return { admitted: true };
+  return { admitted: false, reason: 'unknown-media-type' };
+}
+
+/** 理由码 → 一句人话（留痕与测试断言共用；不是给模型的文案） */
+export function contextImageSkipText(reason: ContextImageSkipReason): string {
+  switch (reason) {
+    case 'unknown-media-type':
+      return '型别不在模型认的白名单里（webp/png/jpeg/gif）——声明不是 MIME（OneBot 的段类型是裸标签 `image`）'
+        + '，字节头也认不出这四种之一';
+    case 'no-local-bytes':
+      return '本地没有这份字节（还没下载下来，或者那条临时直链已经过期）';
+    case 'too-large':
+      return '超过进上下文的字节上限（压过一道还是太大）';
+    case 'not-http-url':
+      return '地址不是 http(s)（`file://` 那种协议端本地路径模型侧取不到）——改用 vision_read 转述';
+    case 'data-url-unreadable':
+      return '`base64://` / `data:` 那段内联字节解不出来（不是合法的 base64，或声明的型别不在白名单里）'
+        + '——改用 vision_read 转述';
+  }
+}
+
 /**
  * 已读到某个会话的哪一条（她自己调 `read_channel` 时写下的话）。
  *
@@ -423,6 +683,28 @@ export interface BudgetConsumed extends EventEnvelope<'budget/consumed', {
   lane: ModelLane; model: string;
   inputTokens: number; outputTokens: number;
   cacheHitTokens: number; cacheMissTokens: number;
+  /**
+   * 这次调用的**思维链 token**（`usage.output_tokens_details.reasoning_tokens`，
+   * 即 `DsUsage.reasoningTokens`，解析在 `model/ds-client.ts` 的 `readUsage`）。
+   *
+   * 它**已经含在 `outputTokens` 里**（官方口径：reasoning 是输出的一部分），所以这个字段
+   * **不参与任何预算算式**（`state/fold.ts` 的 `budgetTokensOf` 一个字节都没改）——它是纯粹的
+   * **观测数**：回答"这条 lane 的思考到底花了多少、开了思考之后涨了多少"。
+   * 挂在这里而不是新开一种事件，与 `context` / `cacheBreak` 同一条理由（硬约束第 4 条）：
+   * `budget/consumed` 本来就是**一次模型调用一条**。
+   *
+   * **写入侧：每次都写**。没有思考（没开思考，或服务端这次没产思维链）就是 `0`——
+   * 不留 `undefined`、不省字段，这样按 lane / 按天聚合"思考花了多少"不必判空。
+   * 全部写入点：`runtime/agent-loop.ts` 的 `accountStep`（成功）/ `failStep`（失败）、
+   * `channel/injection-judge.ts`、`channel/topic.ts`、`persona/assets.ts`（资产挑选）、
+   * `persona/memory-maintain.ts`（记忆整理与维护）——两档 lane 的每一条都带。
+   *
+   * **为什么类型上是可选的（`?`）**：它 2026-10-06 才加，**这段日期之前的老日志里没有这个字段**
+   * （只增不改是事件格式的规矩，见 docs/operations.md §3 规则 2；同一事件上的 `context` /
+   * `cacheBreak` 是同一体例）。所以**读的一侧对历史事件仍要 `?? 0`**；写入侧由
+   * `test/thinking-effort-invariant.test.ts` 钉住"每次都是一个数字"。
+   */
+  reasoningTokens?: number;
   durationMs: number; retryCount: number;
   finishReason: 'completed' | 'max_output_tokens' | 'failed' | 'aborted';
   tokensTodayAccum: number;
@@ -714,6 +996,17 @@ export interface MemorySelected extends EventEnvelope<'memory/selected', {
   indexHash: string;
   /** 写这条账时注入的索引条数（规模；不是索引全文） */
   entries: number;
+  /**
+   * 本任务相关资产那一行（v34，可选；`MEMORIES/assets.md` 里挑出来的 ≤3 条，**已渲染好的文本**）。
+   *
+   * **为什么搭这条账一起落库**：它渲染在此刻层的任务卡上（`当前任务：…` 后面那一行），
+   * 而重放要逐字节重建当时的请求——盘上的清单是她随时会改的文件，"当时挑出了哪几条"只有
+   * 事件答得上来（与 `indexHash` 同一条纪律：只记结论，不记清单全文）。
+   *
+   * 缺省 = 这一轮没有那一行（清单不存在 / 没挑出相关的 / 只有心跳的那一拍 / 老调用点）。
+   * 它不是给她的输入（可见性仍是 internal）：真正给她看的是此刻层里那一行本身。
+   */
+  assets?: string;
 }> {}
 
 /**
@@ -797,6 +1090,12 @@ export interface SpeakSent extends EventEnvelope<'speak/sent', {
    * 为什么只有**投递成功**的那一条带文本：`channel='log'` 是逐段落的"本机对话流"回执，
    * 它不代表"这话真到了那个会话"（本机那条路永远可用）；`reply-url` 才代表 IM 那一路走通了。
    * 失败/被拒/没接线的发言**不写**它——那种时候"她说出去了"是假的（见 tools/admin.ts）。
+   *
+   * **2026-10-07：`report` 的正文出站也走这一条**（原来它漏了这个字段）。缺失的代价不是
+   * "少一个字段"，而是用户报的那个现象——她 report 完去翻会话，**自己刚报告的那一篇不在
+   * `（我）`那一行里**，于是她以为没发出去、再发一遍。判据现在收在 `tools/admin.ts` 的
+   * `deliverToSession` / `deliveredToSid` 一处（产生侧与消费侧引同一个实现），
+   * `send_media` 也在内（那边的文本是 `［图］` 这类可读摘要）。
    *
    * **待办（本次没做，留给用户定）**：本文件头一行写着"修改事件形状必须先改 schema 文档"，
    * 而 `docs/schema.md` 里 `SpeakSent` 仍停在旧形状——本次按纪律没有动 `docs/`，

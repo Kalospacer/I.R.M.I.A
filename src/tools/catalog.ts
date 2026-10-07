@@ -27,6 +27,7 @@ import type { MediaPoster, AdminEventEmitter, ChannelNameResolver, ChannelReader
 import type { ToolDefinition } from './types.js';
 import type { ListForModelOptions, ToolModelSpec } from './registry.js';
 import type { IsolationConfig, ToolPlanGate } from './executor.js';
+import type { BlobOffloadOptions } from '../state/blob-store.js';
 import type { HookRunner } from '../hook/hooks.js';
 import type { VisionModelClient } from './vision.js';
 import type { AgentLoopPersona } from '../runtime/agent-loop.js';
@@ -230,6 +231,15 @@ export interface TaskToolRuntimeDeps {
   hooks?: HookRunner | undefined;
   isolation?: IsolationConfig | undefined;
   skillCatalog?: string | null | undefined;
+  /**
+   * 单条工具回执的上限（2026-10-06 加）：子代理和父循环**必须用同一把尺**。
+   *
+   * 不传的后果很具体：子代理自己的上下文没有这条上限，一次 `pwsh` 的真实输出
+   * （实测最长单条 16.5 KB 正文）或一次 `safe_read` 的大文件回执就把它自己的窗口吃掉，
+   * 而它连"结果被截断了、全文在哪"都看不到。父循环的同一条上限见
+   * `agent-loop.ts` 的 `blobOffload`（唯一写入点 `recordToolResult`）。
+   */
+  blobOffload?: BlobOffloadOptions | undefined;
 }
 
 /**
@@ -415,6 +425,10 @@ function buildTaskTools(options: ToolCatalogOptions): ToolDefinition[] {
           ...(rt.hooks === undefined ? {} : { hooks: rt.hooks }),
           ...(rt.isolation === undefined ? {} : { isolation: rt.isolation }),
           ...(rt.skillCatalog === undefined ? {} : { skillCatalog: rt.skillCatalog }),
+          // 单条回执上限与父同一把尺（见 TaskToolRuntimeDeps.blobOffload）。
+          // 装配点给得出 dataDir（本函数的 options 里就有），所以这里兜一层：
+          // 循环那半格子没给时也仍然有界——**"没配就没有界"正是子代理那条路原来的洞**。
+          blobOffload: rt.blobOffload ?? { dataDir: options.dataDir },
         };
       },
   };

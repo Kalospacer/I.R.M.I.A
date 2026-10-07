@@ -26,6 +26,7 @@ import type {
 import { SELF_BRIEF, renderMentionNote, type ContactFacts, type OpenAskFacts } from '../src/model/self-brief.ts';
 import { INJECTION_WARN_WINDOW_MS, type InjectionWarnFacts } from '../src/channel/injection.ts';
 import { defaultVisibility } from '../src/log/types.ts';
+import type { ContextImageChosen } from '../src/log/types.ts';
 import type {
   AppEvent, AssistantMessage, CompactionSummary, DeveloperMessage, HumanAnswered, HumanAsked,
   InjectionFlagged, InjectionNoted, ModelLane, PolicyDenied, ReasoningMessage, ReviewResolved, SessionStart,
@@ -130,7 +131,7 @@ interface RenderOverrides {
   usage?: UsageFacts | null;
   asks?: readonly OpenAskFacts[] | null;
   injection?: readonly InjectionWarnFacts[] | null;
-  loadImage?: ((ref: RenderImageRef) => string | null) | null;
+  loadImage?: ((ref: RenderImageRef) => ContextImageChosen | null) | null;
   maxContextImages?: number;
   /** 尾部插播（软阈值提示 / 钩子注入）：2026-10-03 起由渲染层追加，归因要数到它 */
   softHint?: string | null;
@@ -1313,7 +1314,7 @@ describe('铁律 3 · 配对完整', () => {
     ];
     const outs = outputsByCallId(renderOnce({ events }));
     assert.equal(outs.get('o1'), '短正文');
-    assert.equal(outs.get('o2'), '头部预览\n[完整结果 123456 字节，可用 read_blob 取：blob-abc]');
+    assert.equal(outs.get('o2'), '头部预览\n[完整结果 123456 字节，不在本次对话里；用 read_blob 取（offset/limit 可翻页）：blob-abc，即 data/blobs/blob-abc]');
   });
 
   test('error 状态：error.message 优先，缺省回退 content', () => {
@@ -1607,6 +1608,17 @@ describe('铁律 5 · 外部输入边界', () => {
 describe('图片进上下文 · 聊天图片直通', () => {
   const IMG_URL = 'https://multimedia.nt.qq.com.cn/download?fileid=x&rkey=y';
 
+  /**
+   * 宿主 loader 交回来的**一份能进请求体的图片**（`ContextImageChosen`）。
+   *
+   * 2026-10-07 起 loader 的返回不是裸 URL 串：型别与 data URL 前缀必须逐字一致，
+   * 而拼装只此一处（`log/types.ts` 的 `buildContextImage`）。这个助手让用例里
+   * "型别"与"payload"对得上，读起来也仍然是"哪张图进了上下文"。
+   */
+  function chosen(mediaType: string, base64Payload: string): ContextImageChosen {
+    return { mediaType, dataUrl: `data:${mediaType};base64,${base64Payload}` };
+  }
+
   function channelImageEvent(seq: number): AppEvent {
     return evt<WakeChannel>('wake/channel', {
       channel: 'qq-official',
@@ -1628,7 +1640,7 @@ describe('图片进上下文 · 聊天图片直通', () => {
       { events: [channelImageEvent(1)] },
       // 故意让 loader 记录收到的引用：注入的到底是什么（远程附件还是本地文件）必须传对，
       // 否则宿主会去错地方取字节——那是"看起来注入了、其实一张也读不出来"的经典形态
-      { loadImage: (ref) => { refs.push(ref); return 'data:image/jpeg;base64,AAAA'; } },
+      { loadImage: (ref) => { refs.push(ref); return chosen('image/jpeg', 'AAAA'); } },
     );
     const m = asMessage(eventItems(r)[0], '事件流第 1 条');
     assert.ok(Array.isArray(m.content), '带图消息必须是 content 数组，否则图片没地方放');
@@ -1658,7 +1670,7 @@ describe('图片进上下文 · 聊天图片直通', () => {
     resetFactory();
     const r = renderOnce(
       { events: [channelImageEvent(1), channelImageEvent(2), channelImageEvent(3)] },
-      { loadImage: () => 'data:image/jpeg;base64,AAAA', maxContextImages: 2 },
+      { loadImage: () => chosen('image/jpeg', 'AAAA'), maxContextImages: 2 },
     );
     const items = eventItems(r);
     const withImage = items.filter(
@@ -1674,7 +1686,7 @@ describe('图片进上下文 · 聊天图片直通', () => {
     resetFactory();
     const r = renderOnce(
       { events: [channelImageEvent(1)] },
-      { loadImage: () => 'data:image/jpeg;base64,AAAA', maxContextImages: 0 },
+      { loadImage: () => chosen('image/jpeg', 'AAAA'), maxContextImages: 0 },
     );
     assert.ok(!dumpInput(r).includes('input_image'));
   });
@@ -1682,7 +1694,7 @@ describe('图片进上下文 · 聊天图片直通', () => {
   test('本轮新输入（首 step 的 wakeEvent）同样会带图——它不在 events 里也不能漏', () => {
     resetFactory();
     const wake = channelImageEvent(9);
-    const r = renderOnce({ events: [], wakeEvent: wake }, { loadImage: () => 'data:image/jpeg;base64,BBBB' });
+    const r = renderOnce({ events: [], wakeEvent: wake }, { loadImage: () => chosen('image/jpeg', 'BBBB') });
     const items = eventItems(r);
     const last = items[items.length - 1];
     const m = asMessage(last, '本轮新输入');
@@ -1695,12 +1707,81 @@ describe('图片进上下文 · 聊天图片直通', () => {
     const refs: RenderImageRef[] = [];
     const r = renderOnce(
       { events: [evt('image/attached', { key: 'pics/a.png', mime: 'image/png', name: 'a.png' })] },
-      { loadImage: (ref) => { refs.push(ref); return 'data:image/png;base64,CCCC'; } },
+      { loadImage: (ref) => { refs.push(ref); return chosen('image/png', 'CCCC'); } },
     );
     const m = asMessage(eventItems(r)[0], 'image/attached');
     assert.equal(m.content[1]?.type, 'input_image');
     assert.equal(refs[0]?.source, 'file', '本地文件与远程附件走不同的取字节路径，来源必须标对');
     assert.equal(refs[0]?.key, 'pics/a.png');
+  });
+
+  /**
+   * 附件类型有**两种形态**，而挑图的判据原先只认一种（2026-10-07 对齐 OneBot 时补的）。
+   *
+   * 来路：官方附件的 `type` 是 MIME（`content_type` → `image/png`），OneBot 的是**段类型**
+   * （`onebot.ts` 的 `attachmentsOf` → `image`）。旧判据 `startsWith('image/')` 只命中前者，
+   * 于是 OneBot 发来的图**一张都进不了她的上下文**——她只看到一行 URL 文本，
+   * 而装置自述里写着"图会直接摆在你眼前"。这两条反面用例就是那次对齐的锁。
+   */
+  describe('附件形态：MIME 与 OneBot 段类型都算图（非图不许混进来）', () => {
+    function imageEvent(type: string, seq: number): AppEvent {
+      return evt<WakeChannel>('wake/channel', {
+        channel: 'onebot',
+        chatType: 'c2c',
+        person: '10001',
+        chatId: '10001',
+        text: '看这个',
+        messageId: `m${seq}`,
+        msgSeq: 0,
+        dedupeKey: `onebot:m${seq}`,
+        attachments: [{ type, url: `${IMG_URL}&n=${seq}`, name: `p${seq}.jpg` }],
+      }, { seq });
+    }
+
+    test('内容类型形态（image/png，官方那条路）照旧进上下文', () => {
+      resetFactory();
+      const refs: RenderImageRef[] = [];
+      const r = renderOnce(
+        { events: [imageEvent('image/png', 1)] },
+        { loadImage: (ref) => { refs.push(ref); return chosen('image/png', 'AAAA'); } },
+      );
+      const m = asMessage(eventItems(r)[0], '事件流第 1 条');
+      assert.ok(Array.isArray(m.content), 'MIME 形态必须照旧进 content 数组');
+      assert.equal(m.content[1]?.type, 'input_image');
+      assert.equal(refs[0]?.mime, 'image/png', 'mime 原样递给宿主（它按这个拼 data URL）');
+    });
+
+    test('OneBot 段类型形态（裸标签 `image`）同样进上下文——这正是原先断掉的那条', () => {
+      resetFactory();
+      const refs: RenderImageRef[] = [];
+      const r = renderOnce(
+        { events: [imageEvent('image', 1)] },
+        { loadImage: (ref) => { refs.push(ref); return chosen('image/jpeg', 'BBBB'); } },
+      );
+      const m = asMessage(eventItems(r)[0], '事件流第 1 条');
+      assert.ok(
+        Array.isArray(m.content) && m.content[1]?.type === 'input_image',
+        'OneBot 的 `image` 段类型必须也进上下文，否则她看不见画面、只看得见一串地址',
+      );
+      assert.deepEqual(refs, [{
+        source: 'remote', key: `${IMG_URL}&n=1`, mime: 'image', name: 'p1.jpg',
+      }]);
+    });
+
+    for (const notImage of ['file', 'record', 'video', 'file/zip']) {
+      test(`非图形态（${notImage}）不许占图片窗口的名额`, () => {
+        resetFactory();
+        const r = renderOnce(
+          { events: [imageEvent(notImage, 1)] },
+          { loadImage: () => chosen('image/jpeg', 'AAAA') },
+        );
+        const m = asMessage(eventItems(r)[0], '事件流第 1 条');
+        assert.equal(typeof m.content, 'string', `${notImage} 不是图，不该走多模态那条路`);
+        assert.ok(!dumpInput(r).includes('input_image'));
+        // 但那一行附件事实照旧在（语音/文件的地址她要看得到，只是不占图片名额）
+        assert.match(m.content, new RegExp(`\\[${notImage}: p1\\.jpg\\]`, 'u'));
+      });
+    }
   });
 });
 

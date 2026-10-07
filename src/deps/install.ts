@@ -19,7 +19,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { get as httpsGet, type RequestOptions } from 'node:https';
 import { dirname, join, relative, resolve } from 'node:path';
 import { inflateRawSync } from 'node:zlib';
@@ -581,19 +581,5 @@ export async function readManifest(
     return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : null;
   } catch {
     return null;
-  }
-}
-
-/** 自装目录里当前有没有东西（界面用它区分"框架装的"与"PATH 上找的"） */
-export function managedDirExists(dataDir: string, name: DepName): boolean {
-  return existsSync(managedDirFor(dataDir, name));
-}
-
-/** 包里可执行文件的探测用 stat（install 内部只判存在，不判大小；这里给报告用） */
-export async function fileSizeOrZero(path: string): Promise<number> {
-  try {
-    return (await stat(path)).size;
-  } catch {
-    return 0;
   }
 }

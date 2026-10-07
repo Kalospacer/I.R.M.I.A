@@ -131,6 +131,8 @@ class _ExtensionsPageState extends State<ExtensionsPage> {
     }
     widget.state.addListener(_onStateChange);
     unawaited(loadAll());
+    // 从别处（建议卡的 `goto-tools`）跳进来时，直接落在要看的那个分组上
+    _applyPendingSection();
     // 信任门与 MCP 状态会随 agent 侧写入变化：低频轮询，只刷当前分区
     poll = Timer.periodic(const Duration(seconds: 20), (_) => _reloadSection());
   }
@@ -142,7 +144,17 @@ class _ExtensionsPageState extends State<ExtensionsPage> {
     super.dispose();
   }
 
+  /// 消费 AppState 里的落点提示（`setPage(id, section: ...)`）：**取走即清**，
+  /// 所以左侧导航进来时不会有第二次跳转。
+  void _applyPendingSection() {
+    final section = widget.state.takeSectionFor('extensions');
+    if (section == null || !mounted) return;
+    if (!_sections.any((def) => def.id == section)) return; // 认不出的段就当没这条提示
+    _select(section);
+  }
+
   void _onStateChange() {
+    _applyPendingSection();
     if (widget.state.online && _sectionKeys[selectedId]!.any((key) => errors[key] != null)) {
       _reloadSection();
     }
@@ -561,7 +573,7 @@ class _ExtensionsPageState extends State<ExtensionsPage> {
     );
   }
 
-  /// 行尾动作：待确认 = 确认 + 忽略；已忽略 = 恢复；已生效 = 停用。
+  /// 行尾动作：待确认 = 确认 + 忽略；已忽略 = 恢复；已生效 = 停用 + 删除。
   ///
   /// 为什么已生效的行没有「打开目录」：桌面壳里没有可靠的打开方式（不引外部依赖就拿不到
   /// `explorer` 的等价物），摆一枚按不出结果的按钮比不摆更糟。技能文件路径在行的「详情」里，
@@ -581,6 +593,13 @@ class _ExtensionsPageState extends State<ExtensionsPage> {
             icon: Icons.visibility_off_outlined,
             tooltip: '停用：从 catalog 里收起来（不改文件，随时可恢复）',
             onPressed: () => unawaited(_retireSkill(name))),
+        // 「删除」与「停用」并排摆着，口径差在**动不动磁盘**：停用只改 catalog 的可见性，
+        // 删除把整个目录移进回收站。两枚都在，人才不会把"想收起来"错点成"想删掉"。
+        _iconAction(context,
+            icon: Icons.delete_outline_rounded,
+            tooltip: '删除：把技能目录整份移进回收站（可恢复，不是 rm -rf）',
+            color: IrmiaTheme.danger,
+            onPressed: () => unawaited(_removeSkill(name))),
       ]);
     }
     return Row(mainAxisSize: MainAxisSize.min, children: [
@@ -623,7 +642,12 @@ class _ExtensionsPageState extends State<ExtensionsPage> {
   }
 
   /// 「停用」= 从 catalog 里收起来。它与"删技能"是两件事，所以走的是同一条忽略通道，
-  /// 而不是去删文件——撤回一个已生效的技能，目前没有对应的服务端命令（不摆假入口）。
+  /// 而不是去删文件。
+  ///
+  /// 2026-10-06 改准：这条注释从前收尾于"撤回一个已生效的技能，目前没有对应的服务端命令
+  /// （不摆假入口）"——**那句话已经不成立**：`skill-remove`（src/web/server.ts:4694，实现
+  /// `removeSkill`）一直都在，只是界面从没接过（docs/repo-cleanliness-audit.md §8 第 4 条）。
+  /// 现在删除是它自己那颗按钮，两件事各走各的门：停用不碰磁盘，删除移进回收站。
   Future<void> _retireSkill(String name) async {
     final ok = await confirm(
       context,
@@ -634,6 +658,33 @@ class _ExtensionsPageState extends State<ExtensionsPage> {
     );
     if (!ok || !mounted) return;
     await _setIgnored(name, true);
+  }
+
+  /// 删除技能：把 `<技能根>/<name>/` **整个移进** `<dataDir>/trash/`（服务端的 `skill-remove`，
+  /// 实现是 `removeSkill`）——不是 rm -rf（design §8 用户选的可恢复那条）。
+  ///
+  /// 它照危险操作走三样：确认框（danger）、危险短语 `X-Confirm: skill-remove`、服务端移进回收站。
+  /// 与上面「停用」的区别说在按钮的 tooltip 与确认框里：停用只是把它从 catalog 里收起来，
+  /// 删除动的是磁盘上那份真实资产；代价由回收站与日志留痕兜住。
+  Future<void> _removeSkill(String name) async {
+    final ok = await confirm(
+      context,
+      title: '删除技能 · $name',
+      body: '整个目录会移进回收站（<dataDir>/trash/），「不是 rm -rf」：内容一个字节不改，'
+          '把那一份移回原处就恢复。删掉之后她下一轮就看不到它了——只想让她暂时看不到，用「停用」。',
+      confirmLabel: '删除',
+      danger: true,
+    );
+    if (!ok || !mounted) return;
+    try {
+      await widget.state.api
+          .post('/api/commands/skill-remove', {'name': name}, confirm: 'skill-remove');
+      if (!mounted) return;
+      _toast('已删除：$name 已移进回收站（内容未改，可移回恢复）', kind: ToastKind.success);
+      await load('skills', silent: true);
+    } catch (err) {
+      if (mounted) _toast('删除失败：${_clip('$err', 90)}', kind: ToastKind.error);
+    }
   }
 
   /// 新建技能：名称 + 一句话描述 → 服务端按规范拼骨架 → 落进「待确认」

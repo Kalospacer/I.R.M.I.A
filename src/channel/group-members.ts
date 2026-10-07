@@ -13,6 +13,10 @@
  *    "在哪个群见的"作为字段记着（GUI 要按群分组显示）。
  * 3. **占位号只在没有昵称时发**，而且**按群、按首次出现顺序**发（群友A、群友B…），发了就不改——
  *    她昨天认得"群友A"是甲，今天不能变成乙（这条是 2026-10-03 那次"甲乙丙会飘"的教训）。
+ *    但**占位号只在运行期发**：回填（`backfill`）是"消息已经过去了"的那条路，它**不发占位号**——
+ *    没昵称就留空名，因为编出来的名字是持久的，而她当时并不在场（见 `backfill` 的四条性质）。
+ * 4. **空条目才丢**（2026-10-07 回填引入）：名字、昵称、群归属三样全空的条目没有存在的理由；
+ *    而"只有群归属、还没有名字"是回填的**正常形态**，读一次必须还活得回来（见 `load`）。
  *
  * 名字的权威顺序（与 `real-loop.personNameOf` 一致）：用户手写的联系人表 > 这份档案里的人写条目 >
  * 这份档案里的自动条目 > 她那串 id。
@@ -78,15 +82,21 @@ export class GroupMemberBook {
         if (typeof value !== 'object' || value === null) continue;
         const entry = value as Record<string, unknown>;
         const name = typeof entry['name'] === 'string' ? entry['name'].trim() : '';
-        if (name === '') continue;
+        const nickname = typeof entry['nickname'] === 'string' ? entry['nickname'].trim() : '';
+        const groupSid = typeof entry['groupSid'] === 'string' ? entry['groupSid'].trim() : '';
+        /**
+         * 空条目才丢：**一条事实都没有**的条目没有存在的理由。
+         *
+         * 为什么判据是"三样全空"而不是只看 `name`（2026-10-07 回填引入）：回填**不发占位号**
+         * （那是"凭空造名字"，见 `backfill`），所以它落下的条目可能是"只有群归属、还没有名字"
+         * 的形态——那正是"见过这个人、但平台没给昵称"的如实记录，重启后必须活着回来。
+         * 只看 `name` 的话，这类条目读一次就没了，等于回填白做。
+         */
+        if (name === '' && nickname === '' && groupSid === '') continue;
         members.set(openid, {
           name,
-          ...(typeof entry['nickname'] === 'string' && entry['nickname'] !== ''
-            ? { nickname: entry['nickname'] }
-            : {}),
-          ...(typeof entry['groupSid'] === 'string' && entry['groupSid'] !== ''
-            ? { groupSid: entry['groupSid'] }
-            : {}),
+          ...(nickname === '' ? {} : { nickname }),
+          ...(groupSid === '' ? {} : { groupSid }),
           ...(typeof entry['firstSeenAt'] === 'string' ? { firstSeenAt: entry['firstSeenAt'] } : {}),
           ...(typeof entry['lastSeenAt'] === 'string' ? { lastSeenAt: entry['lastSeenAt'] } : {}),
           source: entry['source'] === 'human' ? 'human' : 'auto',
@@ -178,6 +188,75 @@ export class GroupMemberBook {
       source: 'auto',
     });
     return true;
+  }
+
+  /**
+   * **只登记已经攒下来的事实**：回填（重启时把重启前那些"在群里叫过她"的人补进档案）。
+   *
+   * 与 {@link register} 的分工只有一条，而这条就是它存在的理由：
+   *   • `register` 是**运行期**的路——她正看着这条消息，认不出的人要当场有个称呼，
+   *     所以它会发占位号（`群友A`）。
+   *   • `backfill` 是**回填**的路——消息是过去发生的，她此刻并没有在看，**发占位号就是凭空造名字**
+   *     （"群友A"听着像她在场认过人，其实她没见过）。所以它只落**平台给的事实**：
+   *     id ↔ 平台昵称（`sender.card` / `username`，没有就留空）与"在哪个群见过"。
+   *
+   * 四条性质，都是"回填"这个词逼出来的：
+   *   ① **人写的永远不动**（`source: 'human'` 的条目整条跳过）——与 `register` 同一条纪律；
+   *   ② **不删、不覆盖已有的事实**：只补缺的那些（昵称/群归属/首见时刻），已有名字一个字不改；
+   *   ③ **幂等**：跑第二遍什么都不改（返回值 false）。所以时刻只**往前**走（`> `，不是 `!==`），
+   *      同一批历史事件折两遍，第二遍的 `lastSeenAt` 与第一遍逐字节相同；
+   *   ④ **不发占位号**：昵称缺失就留空名字——"认不出就照实留空"比"编一个群友A"诚实，
+   *      而且那个编出来的名字是**持久**的（落盘、`personNameOf` 优先读它，往后每次引用都带着它）。
+   *
+   * 返回有没有改动（调用方据此决定要不要落盘）。
+   */
+  backfill(entries: readonly {
+    openid: string;
+    groupSid: string;
+    /** 平台给的昵称；没有就不传（**不许**拿 id 或群友X 顶上） */
+    nickname?: string;
+    at: string;
+  }[]): boolean {
+    let changed = false;
+    for (const input of entries) {
+      const openid = input.openid.trim();
+      const groupSid = input.groupSid.trim();
+      if (openid === '' || groupSid === '') continue;
+      const nickname = (input.nickname ?? '').trim();
+      const existing = this.members.get(openid);
+      if (existing === undefined) {
+        // 第一次见：只落事实。有昵称就记下，没有就留空名字（**不是**占位号）
+        this.members.set(openid, {
+          name: nickname,
+          ...(nickname === '' ? {} : { nickname }),
+          groupSid,
+          firstSeenAt: input.at,
+          lastSeenAt: input.at,
+          source: 'auto',
+        });
+        changed = true;
+        continue;
+      }
+      if (existing.source === 'human') continue;
+      const next: GroupMemberEntry = { ...existing };
+      let touched = false;
+      // 昵称是这里唯一会动的"显示线索"。**不回写 `name`**：占位号是运行期发的，她可能已经
+      // 认过它（"群友A 是谁"），回填没资格替运行期改显示名——它只管补事实。
+      if (nickname !== '' && (existing.nickname ?? '') !== nickname) {
+        next.nickname = nickname;
+        touched = true;
+      }
+      if ((existing.groupSid ?? '') === '') { next.groupSid = groupSid; touched = true; }
+      if (existing.firstSeenAt === undefined) { next.firstSeenAt = input.at; touched = true; }
+      if (existing.lastSeenAt === undefined || input.at > existing.lastSeenAt) {
+        next.lastSeenAt = input.at;
+        touched = true;
+      }
+      if (!touched) continue;
+      this.members.set(openid, next);
+      changed = true;
+    }
+    return changed;
   }
 
   /** 只补群归属（回填用：人写的名字不动，只记下"这是在哪个群见到的"） */

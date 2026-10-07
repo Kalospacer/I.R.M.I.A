@@ -16,13 +16,20 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
-import test, { type TestContext, describe } from 'node:test';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test, { type TestContext, after, describe } from 'node:test';
 
 import type { WakeChannel } from '../src/log/types.js';
+// 值导入（不是 type）：附件的两个判据是**可执行**的判定，两条通道共用这一处实现
+import { isFetchableAttachmentUrl, isImageAttachment } from '../src/log/types.ts';
 import {
-  DEFAULT_ONEBOT_TOKEN_ENV, DEFAULT_ONEBOT_WS_URL, ONEBOT_CHANNEL_NAME, ONEBOT_PERMANENT_RETCODES,
-  ONEBOT_REPLY_SCHEME, OneBotChannel, buildConnectUrl, classifyRetcode, createOneBotReplyPoster,
+  DEFAULT_ONEBOT_ENDPOINT_REREAD_MS, DEFAULT_ONEBOT_TOKEN_ENV, DEFAULT_ONEBOT_WS_URL,
+  ONEBOT_CHANNEL_NAME, ONEBOT_PERMANENT_RETCODES,
+  ONEBOT_REPLY_SCHEME, OneBotChannel, OneBotEndpointMemo, buildConnectUrl, classifyRetcode,
+  createOneBotReplyPoster,
   heartbeatToReadTimeoutMs, mapEventToWakeChannel, maskAccessToken, mentionsSelf, oneBotIdOf,
   parseCqMessage, parseReplyUrl, replyUrlOf, stripCqCodes, toSegments, unescapeCqText,
   type OneBotChannelOptions,
@@ -33,6 +40,7 @@ import {
   DEFAULT_ONEBOT_WS_URL as CONFIG_ONEBOT_WS_URL,
   defaultConfig,
 } from '../src/config/config.ts';
+import { readEndpointFromConfig } from '../src/services/snowluma.ts';
 import { parseReplyUrlAny, replyUrlForWake } from '../src/tools/admin.ts';
 
 // ──────────────────────────────── 脚手架 ────────────────────────────────
@@ -86,7 +94,45 @@ interface FakeNapCat {
 }
 
 /** 假 NapCat：够用的一次升级 + 帧收发；服务端帧不掩码（客户端帧必须掩码） */
-async function startFakeNapCat(t: TestContext): Promise<FakeNapCat> {
+interface FakeNapCatOptions {
+  /**
+   * 开了 access_token 校验的假协议端：升级请求里的凭据不对就回 **401** 并关连接，
+   * 判据与回法与 SnowLuma 的 `authorizeUpgrade` / `verifyClient` 逐字同源
+   * （见 `snowLumaAuthorized`）。不给这个字段就是"没开校验"。
+   */
+  accessToken?: string;
+}
+
+/**
+ * SnowLuma 认不认这次升级请求，**判据照抄它的产物**
+ * （`data/services/snowluma/index.mjs` 的 `isAuthorized`）：
+ *
+ * ```js
+ * function isAuthorized(request, token) {
+ *   if (!token) return true;
+ *   if ((request.headers.authorization ?? "") === `Bearer ${token}`) return true;
+ *   try {
+ *     if (new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get("access_token") === token) return true;
+ *   } catch {}
+ *   return false;
+ * }
+ * ```
+ *
+ * 测试里用它当"服务端认不认"的唯一判据——这样"我们发的形式对不对"就不是我们自己说了算，
+ * 而是与真实协议端同一份规则说了算。
+ */
+function snowLumaAuthorized(headers: Map<string, string>, path: string, token: string): boolean {
+  if (token === '') return true;
+  if ((headers.get('authorization') ?? '') === `Bearer ${token}`) return true;
+  try {
+    if (new URL(path, 'http://127.0.0.1').searchParams.get('access_token') === token) return true;
+  } catch {
+    /* URL 都解析不了就是没带凭据 */
+  }
+  return false;
+}
+
+async function startFakeNapCat(t: TestContext, options: FakeNapCatOptions = {}): Promise<FakeNapCat> {
   const frames: RecordedFrame[] = [];
   const handshakes: Array<{ path: string; headers: Map<string, string> }> = [];
   const sockets: Socket[] = [];
@@ -117,6 +163,14 @@ async function startFakeNapCat(t: TestContext): Promise<FakeNapCat> {
         }
         handshakes.push({ path: requestLine.split(' ')[1] ?? '', headers });
         handshakeDone.add(socket);
+        const requestPath = handshakes[handshakes.length - 1]?.path ?? '';
+        if (options.accessToken !== undefined && !snowLumaAuthorized(headers, requestPath, options.accessToken)) {
+          // 与 SnowLuma 的回法同形：401 + 关连接。我们那侧会读到
+          // 「升级被拒：HTTP/1.1 401 Unauthorized」——现场日志里就是这一句
+          socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n', 'utf8');
+          socket.end();
+          return;
+        }
         const key = headers.get('sec-websocket-key') ?? '';
         const accept = createHash('sha1')
           .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, 'binary')
@@ -400,7 +454,8 @@ describe('onebot：事件转 wake/channel', () => {
       ],
     }));
     assert.equal(wake?.text, '看看这个');
-    // 只把真正的 http(s) 地址当 URL：image 的 file 常常只是本地文件名
+    // 只把**真取得到东西**的地址当 URL 收下：image 的 file 常常只是协议端那边的本地文件名
+    // （`b.jpg` 那种摆进上下文是点不开的假地址），所以她看得见名字、看不见一个假链接。
     assert.deepEqual(wake?.attachments, [
       { type: 'image', url: 'http://x/a.jpg', name: 'a.jpg' },
       { type: 'image', name: 'b.jpg' },
@@ -408,7 +463,80 @@ describe('onebot：事件转 wake/channel', () => {
     ]);
   });
 
-  test('群@：chatType=group-at，chatId=group_id，person=user_id（self_id 来自事件）', () => {
+  /**
+   * 图片能不能进她的上下文，断在**附件类型这个字段的形态**上（2026-10-07 对齐两条通道时修）。
+   *
+   * 官方给的 `type` 是 MIME（`content_type` → `image/png`），OneBot 给的是**段类型裸标签**
+   * （`image`）。上游判据原先只认 `image/` 前缀，于是 OneBot 发来的图一张都进不了上下文。
+   * 现在两条通道走同一个判据（`log/types.ts` 的 `isImageAttachment`）——
+   * **所以适配器这边不许"顺手把段类型翻成 MIME"**：段类型是协议事实，翻出来的 MIME 是猜的。
+   * 这条用例锁的就是"发出去的仍是裸标签"。
+   */
+  test('附件类型照原样带段类型（`image` 不是 MIME）——两条通道由同一个判据认图', () => {
+    const wake = mapEventToWakeChannel(privateEvent({
+      raw_message: '',
+      message: [
+        { type: 'image', data: { file: 'a.png', url: 'http://x/a.png' } },
+        { type: 'record', data: { file: 'v.silk', url: 'http://x/v.silk' } },
+      ],
+    }));
+    assert.equal(wake?.attachments?.[0]?.type, 'image', '段类型原样带出，不翻成 image/png');
+    assert.equal(wake?.attachments?.[1]?.type, 'record');
+    assert.equal(isImageAttachment(wake?.attachments?.[0] ?? {}), true, '裸标签算图（渲染层判据）');
+    assert.equal(isImageAttachment(wake?.attachments?.[1] ?? {}), false, 'record 不是图');
+  });
+
+  /**
+   * 附件地址的形态（2026-10-07 晚**收窄**，起因是一个 P0）。
+   *
+   * 原先这里认三种（http(s) / file:// / data:），理由是"协议端与本进程同机时给的是 file://"。
+   * 那一晚的 400 证明这条假设有毒：`file://` 只有**本进程**读得动，而进上下文的那份载荷是给
+   * **服务端**读的——形态一旦错配，整拍就 400，而那条消息永远留在历史里（历史只追加）。
+   *
+   * 现在的口径：只把**模型自己取得动**的地址收下（http(s) / data:）。协议端只给本机路径时
+   * 那条路仍然通——她让 `vision_read` 读本机文件（那条路本来就是为"本机的图"准备的）。
+   */
+  test('附件地址形态：http(s) 与 data: 收；file:// 与 base64:// 不收（模型那边取不到）', () => {
+    const wake = mapEventToWakeChannel(privateEvent({
+      raw_message: '',
+      message: [
+        { type: 'image', data: { file: 'http://x/a.png' } },
+        { type: 'image', data: { file: 'data:image/png;base64,AAAA' } },
+        { type: 'image', data: { file: 'file:///D:/tmp/a.png' } },
+        { type: 'image', data: { file: 'base64://iVBORw0KGgo=' } },
+        { type: 'image', data: { file: 'a.png' } },
+      ],
+    }));
+    assert.equal(wake?.attachments?.[0]?.url, 'http://x/a.png');
+    assert.equal(wake?.attachments?.[1]?.url, 'data:image/png;base64,AAAA');
+    assert.equal(
+      wake?.attachments?.[2]?.url,
+      undefined,
+      'file:// 是"只有本进程读得动"的路径，模型那边取不到——摆进上下文只换来 400',
+    );
+    assert.equal(
+      wake?.attachments?.[3]?.url,
+      undefined,
+      'base64:// 是没解析的段：既不是地址也不是 data URL，交出去没人认得',
+    );
+    assert.equal(wake?.attachments?.[4]?.url, undefined, '裸文件名是点不开的假地址，不许摆进上下文');
+  });
+
+  test('语音段里的平台转写（`record.text`）原样带出——官方通道的 asr_refer_text 是同一件事', () => {
+    // 未核实协议端是否真的下发这个字段（本机没有语音事件样本）；有就带上，没有这条线是空的。
+    const withText = mapEventToWakeChannel(privateEvent({
+      raw_message: '',
+      message: [{ type: 'record', data: { file: 'v.silk', url: 'http://x/v.silk', text: '今晚七点见' } }],
+    }));
+    assert.equal(withText?.attachments?.[0]?.text, '今晚七点见');
+    const without = mapEventToWakeChannel(privateEvent({
+      raw_message: '',
+      message: [{ type: 'record', data: { file: 'v.silk', url: 'http://x/v.silk' } }],
+    }));
+    assert.equal(without?.attachments?.[0]?.text, undefined, '没有转写就不许编一个');
+  });
+
+  test('群@：chatType=group-at，chatId=group_id，person=user_id（self_id 来自事件），mentionsMe 如实填 true', () => {
     const wake = mapEventToWakeChannel({
       post_type: 'message',
       message_type: 'group',
@@ -421,6 +549,9 @@ describe('onebot：事件转 wake/channel', () => {
         { type: 'text', data: { text: ' 帮我看看' } },
       ],
     });
+    // `mentionsMe: true` 是 2026-10-07 补的（原先 OneBot 一条都不填）：
+    // `real-loop` 的群成员档案**唯一入口**就是它——不填的话，OneBot 群里 @ 过她的人
+    // 一个都进不了档案，她问"甲是谁"时框架给不出名字。官方的 group-at 也同样填（qq-official.ts）。
     assert.deepEqual(wake, {
       channel: 'onebot',
       chatType: 'group-at',
@@ -429,6 +560,7 @@ describe('onebot：事件转 wake/channel', () => {
       text: '帮我看看',
       messageId: 'g-1',
       msgSeq: 0,
+      mentionsMe: true,
       dedupeKey: 'onebot:g-1',
     });
   });
@@ -492,6 +624,90 @@ describe('onebot：事件转 wake/channel', () => {
     const wake = mapEventToWakeChannel(privateEvent(), { channelName: 'onebot-b' });
     assert.equal(wake?.channel, 'onebot-b');
     assert.equal(wake?.dedupeKey, 'onebot-b:4242');
+  });
+
+  /**
+   * `mentionsMe` —— **群成员档案与"这一条在叫她"的唯一入口**（2026-10-07 补的）。
+   *
+   * 原先 OneBot 一条都不填（官方的 `GROUP_AT_MESSAGE_CREATE` 每条都填），后果不是"少一个标志"：
+   * `real-loop.ts` 的 `registerGroupMembers` 判据就是 `data.mentionsMe === true`，
+   * 于是 OneBot 群里 @ 过她的人在 `data/group-members.json` 里**一个都不出现**，
+   * 她问"甲是谁"时框架只能给出一串 QQ 号。下面四条把"什么算叫她、什么不算"钉死。
+   */
+  describe('群消息里的 mentionsMe：如实填，判不出就不填', () => {
+    const groupEvent = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      post_type: 'message',
+      message_type: 'group',
+      group_id: 20002,
+      user_id: 10001,
+      self_id: 30003,
+      message_id: 'g-1',
+      message: [{ type: 'text', data: { text: '这个不行' } }],
+      ...overrides,
+    });
+
+    test('@ 了她 ⇒ mentionsMe=true（与官方 group-at 同一条语义）', () => {
+      const wake = mapEventToWakeChannel(groupEvent({
+        message: [{ type: 'at', data: { qq: 30003 } }, { type: 'text', data: { text: '在吗' } }],
+      }));
+      assert.equal(wake?.chatType, 'group-at');
+      assert.equal(wake?.mentionsMe, true);
+    });
+
+    test('回复的是她自己发的那条 ⇒ 也算叫她（mentionsMe=true 且提到 group-at）', () => {
+      const wake = mapEventToWakeChannel(groupEvent({
+        message: [{ type: 'reply', data: { id: '9001' } }, { type: 'text', data: { text: '这个不行' } }],
+      }), { isReplyToSelf: (id) => id === '9001' });
+      assert.equal(wake?.mentionsMe, true, '接着她那句说下去 = 在叫她');
+      assert.equal(wake?.chatType, 'group-at', '被回复要从信箱提成唤醒（那是"被叫到"的一种）');
+      assert.equal(wake?.text, '[引用 #9001] 这个不行', '被引哪条要如实写进前缀——OneBot 只给 id');
+    });
+
+    test('回复的是**别人**那条 ⇒ 不算叫她（进信箱，不登记成"叫过她"的人）', () => {
+      const wake = mapEventToWakeChannel(groupEvent({
+        message: [{ type: 'reply', data: { id: '5555' } }, { type: 'text', data: { text: '同意楼上' } }],
+      }), { isReplyToSelf: () => false });
+      assert.equal(wake?.mentionsMe, undefined, '判不出是回复她，就不许填 true');
+      assert.equal(wake?.chatType, 'group');
+      assert.equal(wake?.text, '[引用 #5555] 同意楼上', '但"这是回复哪一条"仍然照实说');
+    });
+
+    test('没 @ 也没回复 ⇒ 不填 mentionsMe（满群闲话不许灌进群成员档案）', () => {
+      const wake = mapEventToWakeChannel(groupEvent());
+      assert.equal(wake?.chatType, 'group');
+      assert.equal(wake?.mentionsMe, undefined);
+      assert.equal(wake?.text, '这个不行');
+    });
+
+    test('私聊不填 mentionsMe（一对一本来就是在跟她说话，说成"提及"会让此刻层多一行不对句式的提示）', () => {
+      const wake = mapEventToWakeChannel(privateEvent());
+      assert.equal(wake?.mentionsMe, undefined);
+    });
+
+    test('@全体（qq=all）不算叫她——那是发给所有人的', () => {
+      const wake = mapEventToWakeChannel(groupEvent({ message: '[CQ:at,qq=all] 大家好' }));
+      assert.equal(wake?.mentionsMe, undefined);
+      assert.equal(wake?.chatType, 'group');
+    });
+  });
+
+  /**
+   * `msgSeq` ——「这一条你还没看过」那一个判据的来源（2026-10-07）。
+   *
+   * 原先恒记 0，而判据是 `wakeEvent.data.msgSeq > entry.readUpToSeq`（`agent-loop.ts:491`）——
+   * `0 > 0` 永远为假，于是 OneBot 群里 @ 她的那一轮通知里**永远**不出现"（这一条你还没看过）"，
+   * 她会把它读成"又是上一次那条"，选择不回（用户已经踩过一次的那个坑）。
+   *
+   * 适配器这一层只做一件诚实的事：**协议给了 `message_seq` 就照它记**。协议没给（0）时由宿主
+   * 在落库那一刻补成事件 seq——那是与信箱那条路**同一个数**（`channel/inbox.ts` 的 `msgSeqOf`）。
+   */
+  test('msgSeq：协议给了 message_seq 就照它记；没给就是 0（由宿主落库时补事件 seq）', () => {
+    const withSeq = mapEventToWakeChannel(privateEvent({ message_seq: 88412 }));
+    assert.equal(withSeq?.msgSeq, 88412);
+    const stringSeq = mapEventToWakeChannel(privateEvent({ message_seq: '88413' }));
+    assert.equal(stringSeq?.msgSeq, 88413, 'OneBot 的 id 类字段时而数字时而字符串，两种都认');
+    const without = mapEventToWakeChannel(privateEvent());
+    assert.equal(without?.msgSeq, 0, '协议没给就如实记 0——不在适配器里编一个序号');
   });
 });
 
@@ -597,6 +813,67 @@ describe('onebot：正向 ws 链路（假 NapCat）', () => {
     });
     // echo 必须唯一：配对全靠它
     assert.notEqual(sends[0]?.['echo'], sends[1]?.['echo']);
+  });
+
+  /**
+   * 非 message 的事件**留一行日志**（与官方通道同一条口径）。
+   *
+   * 官方那边这条注释的来历是一次实测："群里 @ 了她却没反应"，查日志要看"平台到底推没推"。
+   * OneBot 原先对 `notice` / `request` 这类直接 `return`，一个字不记——同一个坑又踩一遍：
+   * 出问题时既查不到"收到了但没认"，也查不到"压根没推"。
+   */
+  test('非 message 事件留一行日志（排障要回答"协议端推没推、我们认没认"）', async (t) => {
+    const cat = await startFakeNapCat(t);
+    const lines: string[] = [];
+    const log = { info: (line: string): void => { lines.push(line); }, warn: (line: string): void => { lines.push(line); } };
+    const { channel } = startChannel(cat, { accessToken: 'secret', readTimeoutMs: 0, log });
+    t.after(() => { channel.stop(); });
+    await waitConnected(channel);
+
+    cat.sendJson({ post_type: 'notice', notice_type: 'friend_add', user_id: 10001, self_id: 30003 });
+    cat.sendJson({ post_type: 'request', request_type: 'friend', user_id: 10002, self_id: 30003 });
+    await waitFor(() => lines.filter((line) => line.includes('收到分发')).length === 2, 8000, '两条分发日志');
+
+    const dispatches = lines.filter((line) => line.includes('收到分发'));
+    assert.match(dispatches[0] ?? '', /\[OneBot\] 收到分发：notice/u);
+    assert.match(dispatches[1] ?? '', /\[OneBot\] 收到分发：request/u);
+    // 只记类型与短 id：整条事件不抄进日志
+    assert.ok(!dispatches.some((line) => line.includes('friend_add') && line.length > 120), '别把整条事件抄进日志');
+  });
+
+  /**
+   * 她**自己发出去的**那条 id 要被记住——"有人回复她那句"才算在叫她（`mentionsMe`）。
+   *
+   * 这份表是本地才知道的事实（协议端的 `reply` 段只给"回复的是哪一条"），
+   * 而它是群成员档案与唤醒的入口（见 `mapEventToWakeChannel` 判据②）。
+   */
+  test('她发出去的消息 id 被记住：随后"回复那条"的事件算在叫她', async (t) => {
+    const cat = await startFakeNapCat(t);
+    const { channel, received } = startChannel(cat, { accessToken: 'secret', readTimeoutMs: 0 });
+    t.after(() => { channel.stop(); });
+    await waitConnected(channel);
+
+    cat.autoReply = false;
+    cat.onText = (text) => {
+      const call = JSON.parse(text) as Record<string, unknown>;
+      if (call['action'] === 'get_login_info') {
+        cat.replyJson({ status: 'ok', retcode: 0, data: { user_id: 30003 }, echo: call['echo'] });
+        return;
+      }
+      cat.replyJson({ status: 'ok', retcode: 0, data: { message_id: 9001 }, echo: call['echo'] });
+    };
+    const sent = await channel.sendText('group-at', '20002', '我看看');
+    assert.equal(sent.ok, true);
+
+    cat.sendJson({
+      post_type: 'message', message_type: 'group', message_id: 'g-9', group_id: 20002,
+      user_id: 10001, self_id: 30003,
+      message: [{ type: 'reply', data: { id: 9001 } }, { type: 'text', data: { text: '这个不行' } }],
+      raw_message: '这个不行',
+    });
+    await waitFor(() => received.length === 1, 8000, '回复事件投递');
+    assert.equal(received[0]?.mentionsMe, true, '回复的是她刚发的那条 = 在叫她');
+    assert.equal(received[0]?.chatType, 'group-at');
   });
 
   test('并发动作各配各的 echo：后发的先回也不串台', async (t) => {
@@ -799,3 +1076,217 @@ describe('onebot：正向 ws 链路（假 NapCat）', () => {
     const at = channel.snapshot().lastEventAt;
     assert.ok(at !== null && at >= before, `应当是刚刚那个时刻：${String(at)}`);
   });
+
+// ──────────────────────────────── ⑤ 端点重读（配置晚于进程物化） ────────────────────────────────
+
+/**
+ * 现场那条故障的形状：框架进程比协议端的 OneBot 配置**先起**——
+ * 起来时 `config/onebot.json` 还不存在（人还没登录 QQ），于是适配器拿到的是"地址是默认的、
+ * token 是空的"这一份。此后它每一拍都拿着空 token 去敲那个端口，SnowLuma 回
+ * `rejected unauthorized WebSocket upgrade` / HTTP 401，无限重连，永远连不上。
+ *
+ * 这一组用例锁的就是"配置晚到"这条路：**下一次重连必须重读，读到就带上 token 连上**
+ * （而且形式必须是 SnowLuma 认的那一种）。
+ */
+describe('onebot：端点重读（协议端配置晚于本进程物化）', () => {
+  const tempRoots: string[] = [];
+  after(() => {
+    for (const dir of tempRoots) {
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* 清理失败不影响结论 */ }
+    }
+  });
+
+  function tempDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'irmia-onebot-endpoint-'));
+    tempRoots.push(dir);
+    return dir;
+  }
+
+  /** 照现场那份 `data/services/snowluma/config/onebot_<uin>.json` 的形状写一份按账号快照 */
+  function writeOnebotSnapshot(dir: string, server: { port: number; accessToken: string }): void {
+    mkdirSync(join(dir, 'config'), { recursive: true });
+    writeFileSync(join(dir, 'config', 'onebot_2175258788.json'), JSON.stringify({
+      mode: 'snapshot',
+      networks: {
+        wsServers: [{
+          name: 'ws-default',
+          host: '127.0.0.1',
+          port: server.port,
+          path: '/',
+          accessToken: server.accessToken,
+          messageFormat: 'array',
+          role: 'Universal',
+        }],
+      },
+    }), 'utf8');
+  }
+
+  test('OneBotEndpointMemo：peek 不读盘；硬下限 + 失效理由决定何时重读', () => {
+    let clock = 0;
+    let reads = 0;
+    const memo = new OneBotEndpointMemo({
+      read: () => { reads += 1; return { wsUrl: `ws://127.0.0.1:${3000 + reads}/`, accessToken: `t${reads}` }; },
+      now: () => clock,
+      rereadMs: 1_000,
+    });
+
+    assert.equal(memo.peek(), null, '没读过盘时 peek 给 null（它绝不读盘）');
+    assert.equal(reads, 0);
+    assert.deepEqual(memo.current(), { wsUrl: 'ws://127.0.0.1:3001/', accessToken: 't1' });
+    assert.equal(reads, 1, '第一次问必读');
+    assert.equal(memo.peek()?.accessToken, 't1', 'peek 报的是手里那份，不读盘');
+
+    // ① 失效了但没过硬下限：不重读（退避期 1 秒一拍不许变成 1 秒一次读盘）
+    clock = 100;
+    memo.invalidate();
+    assert.equal(memo.current()?.accessToken, 't1');
+    clock = 999;
+    assert.equal(memo.current()?.accessToken, 't1');
+    assert.equal(reads, 1);
+
+    // ② 失效 + 过了硬下限：重读——这正是"配置晚到"被治好的那一拍
+    clock = 1_000;
+    assert.equal(memo.current()?.accessToken, 't2');
+    assert.equal(reads, 2);
+
+    // ③ 没失效：多久都不重读（链路活着的时候一次盘都不读）
+    clock = 600_000;
+    assert.equal(memo.current()?.accessToken, 't2');
+    assert.equal(reads, 2);
+
+    // ④ 再失效 + 过了硬下限：重读
+    clock = 601_000;
+    memo.invalidate();
+    assert.equal(memo.current()?.accessToken, 't3');
+    assert.equal(reads, 3);
+    assert.equal(memo.reads, 3, '读过几次盘是可观测的');
+
+    // ⑤ 读不出来就是读不出来：**绝不编一个端口出来**（回落由调用方按它自己那份配置决定）
+    const empty = new OneBotEndpointMemo({ read: () => null, now: () => clock, rereadMs: 1_000 });
+    assert.equal(empty.current(), null);
+    assert.equal(empty.peek(), null);
+
+    // ⑥ 默认硬下限的意思：不到 DEFAULT_ONEBOT_ENDPOINT_REREAD_MS 不重读，到了才重读
+    let defaultReads = 0;
+    let dclock = 0;
+    const dflt = new OneBotEndpointMemo({
+      read: () => { defaultReads += 1; return { wsUrl: 'ws://127.0.0.1:3001/', accessToken: 'a' }; },
+      now: () => dclock,
+    });
+    dflt.current();
+    dflt.invalidate();
+    dclock = DEFAULT_ONEBOT_ENDPOINT_REREAD_MS - 1;
+    dflt.current();
+    assert.equal(defaultReads, 1, `默认硬下限（${DEFAULT_ONEBOT_ENDPOINT_REREAD_MS}ms）内不许重复读盘`);
+    dclock = DEFAULT_ONEBOT_ENDPOINT_REREAD_MS;
+    dflt.current();
+    assert.equal(defaultReads, 2, '过了默认硬下限才重读');
+  });
+
+  test('配置后出现 ⇒ 下一拍重连就带上 token 并连上（形式与 SnowLuma 认的一致）', async (t) => {
+    // token 的形状取自现场那份配置（48 位 base64url）
+    const token = 'nIdI43XlvUSQGe_ybLBSYLQbYQIXu_LQ5l5eM1zoa6A';
+    const cat = await startFakeNapCat(t, { accessToken: token });
+    const dir = tempDir(); // 空目录：协议端还没登录 QQ，配置还没物化
+    let reads = 0;
+    const { channel } = startChannel(cat, {
+      // 启动时那份：地址对、**没有 token**——现场就是这个形状（进程 01:58 起，配置 02:04 才写）
+      wsUrl: cat.url,
+      resolveEndpoint: () => { reads += 1; return readEndpointFromConfig(dir); },
+      endpointRereadMs: 0, // 硬下限由上面的用例验；这条要的是"下一拍就重读"
+      reconnectBaseMs: 20,
+      maxReconnectDelayMs: 40,
+      readTimeoutMs: 0,
+    });
+    t.after(() => { channel.stop(); });
+
+    await waitFor(() => cat.handshakes.length >= 1, 8000, '第一拍握手');
+    const first = cat.handshakes[0]!;
+    assert.equal(
+      snowLumaAuthorized(first.headers, first.path, token), false,
+      '第一拍本来就不该带对 token（那一刻配置还没写下来）',
+    );
+    assert.equal(channel.snapshot().connected, false);
+    assert.equal(channel.linkView().target.includes(token), false, 'token 永不出现在状态里');
+
+    // 用户登录 QQ：协议端把按账号的配置快照写下来（端口 3001 + 随机 access_token）
+    writeOnebotSnapshot(dir, { port: cat.port, accessToken: token });
+
+    const authorized = (entry: { path: string; headers: Map<string, string> }): boolean =>
+      snowLumaAuthorized(entry.headers, entry.path, token);
+    await waitFor(() => cat.handshakes.some(authorized), 8000, '带 token 的握手');
+    await waitConnected(channel, '带上 token 之后链路就绪');
+
+    const ok = cat.handshakes.filter(authorized).at(-1)!;
+    const query = new URL(ok.path, 'http://127.0.0.1').searchParams;
+    assert.equal(query.get('access_token'), token, 'token 走 query 的 access_token——SnowLuma 认的那一种');
+    // ws-client 刻意不留自定义握手头的口子（逐字校验 Sec-WebSocket-Accept，白名单越窄越好），
+    // 所以两种形式里我们只能用 query 这一种；这条断言把"以后有人顺手加了头"挡在门外
+    assert.equal(ok.headers.get('authorization'), undefined, '不带 Authorization 头（token 只能走 query）');
+    assert.equal(ok.headers.get('host'), `127.0.0.1:${cat.port}`, '端口来自协议端配置，不是猜的');
+    assert.ok(reads >= 2, '重连时确实又读了一次盘');
+    assert.match(
+      channel.linkView().target, /access_token=\*\*\*/u,
+      '状态里要能看出"这一次带上了 token"，而 token 的值必须打码',
+    );
+  });
+
+  test('配置一直在 ⇒ 重连复用缓存，不重复读盘（硬下限兜住抖动的退避）', async (t) => {
+    const token = 'token-steady-0123456789';
+    const cat = await startFakeNapCat(t, { accessToken: token });
+    const dir = tempDir();
+    writeOnebotSnapshot(dir, { port: cat.port, accessToken: token });
+    let reads = 0;
+    const { channel } = startChannel(cat, {
+      wsUrl: cat.url,
+      resolveEndpoint: () => { reads += 1; return readEndpointFromConfig(dir); },
+      endpointRereadMs: 60_000, // 硬下限：一分钟里绝不重复读盘
+      reconnectBaseMs: 20,
+      maxReconnectDelayMs: 40,
+      readTimeoutMs: 0,
+    });
+    t.after(() => { channel.stop(); });
+
+    await waitConnected(channel, '第一拍就连上（配置已经在盘上）');
+    assert.equal(reads, 1, '第一次建连读一次盘');
+
+    for (const count of [2, 3]) {
+      cat.dropAll();
+      await waitFor(() => cat.handshakes.length >= count, 8000, `第 ${count} 次握手`);
+      await waitConnected(channel, `第 ${count} 次链路就绪`);
+    }
+    assert.equal(reads, 1, '断了两次、重连两次：盘一次都没再读（缓存 + 硬下限）');
+    const last = cat.handshakes.at(-1)!;
+    assert.equal(snowLumaAuthorized(last.headers, last.path, token), true, '复用缓存也要真的带上 token');
+  });
+
+  test('配置读不出 ⇒ 回落到配置里那个地址，绝不自己猜一个端口', async (t) => {
+    const cat = await startFakeNapCat(t); // 没开校验
+    const dir = tempDir(); // 空目录：这一刻确实读不出端点
+    assert.equal(readEndpointFromConfig(dir), null, '前提：协议端配置里读不出端点');
+    const { channel } = startChannel(cat, {
+      // 配置里那份（唯一允许用的兜底）：地址 + 凭据都来自配置/环境，不是这里编的
+      wsUrl: cat.url,
+      accessToken: 'from-config-or-env',
+      resolveEndpoint: () => readEndpointFromConfig(dir),
+      endpointRereadMs: 0, // 每次都试着重读——读不出也不许编
+      reconnectBaseMs: 20,
+      readTimeoutMs: 0,
+    });
+    t.after(() => { channel.stop(); });
+
+    await waitConnected(channel, '按配置里那个地址连上');
+    await sleep(120);
+    assert.equal(cat.handshakes.length, 1, '只连了配置里那一个地址');
+    const handshake = cat.handshakes[0]!;
+    assert.equal(
+      handshake.headers.get('host'), `127.0.0.1:${cat.port}`,
+      '连的是配置里那个端口（这里是随机端口）：读不出端点时也不许猜 3001 之类的默认值',
+    );
+    assert.equal(
+      new URL(handshake.path, 'http://127.0.0.1').searchParams.get('access_token'), 'from-config-or-env',
+      '凭据还是配置/环境里那份',
+    );
+    assert.equal(channel.linkView().target.includes('from-config-or-env'), false, '状态里 token 必须打码');
+  });
+});

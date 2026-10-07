@@ -200,6 +200,15 @@ class _IrmiaAppState extends State<IrmiaApp> {
         payload,
         confirm: command,
       ),
+      // 托盘那条「重启前后端」也要**有反馈**（用户 2026-10-05：「点了没有反馈」）。
+      // 托盘点击时窗口可能收着，弹 toast 没有落点；但结论照旧要落地——服务端那句
+      // `note` 是**唯一一处**判据（成功带真实新 pid 与端口、失败带原因、未确认就说未确认），
+      // 这里原样记下来，不加工、不粉饰（debugPrint 会进 release 日志）。
+      onRestartResult: (result) {
+        final map = result is Map ? result : const {};
+        final note = map['note']?.toString() ?? '重启已发出（服务端没有给出结论）';
+        debugPrint('[托盘·重启前后端] $note');
+      },
       // 托盘提示里是**她的名字**（读不到时由 her_name.dart 决定显示什么）
       displayName: state.herDisplayName,
     ));
@@ -950,11 +959,35 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 按注册表 id 切页；未知 id 视为无效操作，保持当前页
-  void setPage(String id) {
-    if (pageId == id || pageEntryById(id) == null) return;
+  /// 按注册表 id 切页；未知 id 视为无效操作，保持当前页。
+  ///
+  /// [section] 可选：目标页要落在**哪一段**（认识的页会消费，见 [takeSectionFor]）。
+  /// 为什么需要它：`Suggestion.act` 的四个动作里有一个要落在目标页的某一段
+  /// （`goto-tools` → 扩展页的「工具」分组）。只切页的话人落在页首、还得自己找那一段——
+  /// 那等于把"去处理"缩水成"去那一页"。
+  void setPage(String id, {String? section}) {
+    if (pageEntryById(id) == null) return;
+    if (section != null) _pendingSection = (page: id, section: section);
+    if (pageId == id) {
+      // 同一页也要通知一次：落点提示刚写进去，目标页正等这一拍把它取走
+      if (section != null) notifyListeners();
+      return;
+    }
     pageId = id;
     notifyListeners();
+  }
+
+  /// 跨页跳转的**落点**：`(页面 id, 那一段)`。由目标页取用一次即清——留着的话，
+  /// 下一次进这一页会白跳一次（人按的是左侧导航，不是建议卡）。
+  ({String page, String section})? _pendingSection;
+
+  /// 目标页取走落点提示；**不是给自己的就留着**（同一个提示只服务一个页面）。
+  /// 返回非 null = 这一次要落到那一段。
+  String? takeSectionFor(String page) {
+    final pending = _pendingSection;
+    if (pending == null || pending.page != page) return null;
+    _pendingSection = null;
+    return pending.section;
   }
 
   /// 答复她在问的那一条：`POST /api/commands/answer` 带上 `askSeq`。

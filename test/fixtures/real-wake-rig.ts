@@ -25,8 +25,10 @@ import { EventLog } from '../../src/log/event-log.ts';
 import type { AppEvent, ModelLane, Projection, WakeHeartbeat } from '../../src/log/types.ts';
 import { defaultVisibility } from '../../src/log/types.ts';
 import type { DsClient, DsOutputItem, DsRequest, DsResponse, DsStreamResult, DsUsage } from '../../src/model/ds-client.ts';
+import type { HookRunner } from '../../src/hook/hooks.ts';
 import { NOW_LAYER_BANNER } from '../../src/model/render.ts';
 import type { PersonaAssets } from '../../src/persona/loader.ts';
+import type { SkillManager } from '../../src/skill/skills.ts';
 import { RealLoop } from '../../src/runtime/real-loop.ts';
 import { applyOne, fold } from '../../src/state/fold.ts';
 import { ToolRegistry } from '../../src/tools/registry.ts';
@@ -91,6 +93,35 @@ export interface RigOptions {
    * 在用例里手工 new 一个组件证明不了接线（接线正是最容易漏的一步）。
    */
   patchConfig?: (config: AppConfig) => void;
+  /**
+   * 数字资产事实层里 `[path]` 条目的探测覆盖点（v34）。
+   *
+   * 为什么不让它真查 PATH：真探测依环境（这台机器上有没有那条命令），同一个用例在两台机器上
+   * 会渲染出不同的那一行。给了它，"探测得出什么"就是用例的输入，断言才确定。
+   */
+  probeAssetPath?: (command: string) => { found: boolean; path?: string };
+  /**
+   * 数字资产事实层里 MCP 那一格的覆盖点（v34）：**配置声明了哪些 server**（只有名字）。
+   *
+   * 不传时真 RealLoop 走 `declaredMcpServers(dataDir)`（读 `<dataDir>/../config.json` 的
+   * `mcp.servers`）。台子不写那份配置（临时目录），所以不传就是"读不到配置面"（`undefined`）
+   * 那一支；要测"配置里声明了 server"就传它。
+   */
+  mcpServers?: readonly string[];
+  /**
+   * 技能管理器工厂（v34）：数字资产事实层的 skill 那一半要它（"她清单里那条技能还在不在"）。
+   *
+   * 传的是**工厂**而不是实例：技能根要挂在这个台子的临时目录上，而那个目录要等台子建好才知道。
+   * 用例先往 `<dir>/skills/<名字>/SKILL.md` 写一份真技能，再让这里 `new SkillManager({baseRoot: dir})`。
+   */
+  skills?: (baseRoot: string) => SkillManager;
+  /**
+   * 执行点钩子（`HookRunner`）：`Wake` 钩子的**入参**是"这一轮她看到的那句话"，
+   * 而这句话在运行期与请求体里各有一份——"两份是不是同一串字节"只有接上真钩子才验得了。
+   *
+   * 不传 = 没有钩子（`runWakeHooks` 返回 null，与大多数用例无关）。
+   */
+  hooks?: HookRunner;
 }
 
 /** 心跳事件的数据形状（与 `HeartbeatSource` 落库时逐字段一致） */
@@ -199,6 +230,14 @@ export async function makeRealWakeRig(options: RigOptions = {}): Promise<RealWak
     out: (line) => lines.push(line),
     // 轮询不起：本台子只手工驱动 `tick()`（`tickOnce` 是生产定时器回调的同一份逻辑）
     pollMs: 3_600_000,
+    // 数字资产事实层的探测覆盖点（v34）：不传就是真查 PATH（环境依赖，用例一般会给）
+    ...(options.probeAssetPath === undefined ? {} : { probeAssetPath: options.probeAssetPath }),
+    // 技能管理器（v34 事实层的 skill 那一半）：不传就是"没有技能目录可核对"
+    ...(options.skills === undefined ? {} : { skills: options.skills(workspaceRoot) }),
+    // MCP 声明面（v34 事实层的 mcp 那一半）：不传就是"这一轮读不到配置面"
+    ...(options.mcpServers === undefined ? {} : { mcpServers: () => options.mcpServers ?? [] }),
+    // 执行点钩子：只有要验"钩子入参与请求体是不是同一串字节"的用例才传
+    ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
   });
 
   const append = (type: string, data: unknown, ts?: string): AppEvent => {

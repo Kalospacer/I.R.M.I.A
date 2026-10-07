@@ -18,7 +18,9 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { inboxMsgSeqOf, mentionsKeyword, sidOfChannelData, shouldWakeForChannelMessage, type WakeCriteria } from '../src/channel/inbox.ts';
+import { inboxMsgSeqOf, msgSeqOf, mentionsKeyword, sidOfChannelData, shouldWakeForChannelMessage, type WakeCriteria } from '../src/channel/inbox.ts';
+// 唤醒那条路的补法在 real-loop（事件 seq 是它分配的）；判据与上面同一个 `msgSeqOf`
+import { withMsgSeqFallback } from '../src/runtime/real-loop.ts';
 
 /** 判据的两个输入：用例只覆盖它关心的那一维，其余留默认（没关注、没关键词） */
 function criteria(
@@ -164,5 +166,31 @@ describe('通道消息分流 · 什么该叫她、什么只进信箱', () => {
     // 给得出真序号的（OneBot 带 message_seq 的那些）原样留着：那是平台自己的编号，量纲别混
     const onebot = { ...group, channel: 'onebot', msgSeq: 77 };
     assert.equal(inboxMsgSeqOf(onebot, 4242), 77, '有真序号就别覆盖');
+    // 两个名字指向同一个实现（改名只为让 review 分得清"行为变化"与"重命名"）
+    assert.equal(msgSeqOf, inboxMsgSeqOf);
+  });
+
+  test('唤醒那条路也补齐（同一个判据）：OneBot 群 @ 那一轮的通知才说得出"这一条你还没看过"', () => {
+    // `agent-loop.ts` 的判据是 `wakeEvent.data.msgSeq > entry.readUpToSeq`。
+    // OneBot 的群 @ 原先落 0 —— `0 > 0` 恒假，于是那一轮的通知里**永远**不出现
+    // 「（这一条你还没看过）」，她会读成"又是上一次那条"而不回（报告 §3.4；
+    // 用户 2026-10-02 踩过的那个坑：「她老是觉得自己已经回过了就不回」）。
+    const onebotGroupAt = {
+      channel: 'onebot', chatType: 'group-at' as const, person: '10001', chatId: '20002',
+      text: '在吗', messageId: 'g-1', msgSeq: 0,
+    };
+    const seq = 947;
+    const filled = withMsgSeqFallback(onebotGroupAt, seq) as { msgSeq: number };
+    assert.equal(filled.msgSeq, seq, '平台没给序号 → 用事件 seq（单调、重放稳定）');
+    assert.ok(filled.msgSeq > 0, '必须是**正**数：判据是 `> readUpToSeq`，0 永远为假');
+    assert.equal(onebotGroupAt.msgSeq, 0, '不改入参：落库的是拷一份之后的那个对象');
+
+    // 平台给了真序号就不许覆盖（量纲不同）
+    const withSeq = withMsgSeqFallback({ msgSeq: 77, channel: 'onebot' }, 947) as { msgSeq: number };
+    assert.equal(withSeq.msgSeq, 77);
+    // 不带 msgSeq 的载荷（定时器、意图、心跳）原样返回：逐字节不变
+    const timer = { note: '看看备份' };
+    assert.equal(withMsgSeqFallback(timer, 947), timer, '不是通道载荷就别动它');
+    assert.equal(withMsgSeqFallback(null, 947), null);
   });
 });

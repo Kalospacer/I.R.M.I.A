@@ -213,6 +213,9 @@ class _ChannelsPageState extends State<ChannelsPage> {
 
   bool saving = false;
 
+  /// 「测试告警出口」正在飞（那颗按钮只在 Webhook 那一项的配置卡上，见 [_testAlertExit]）
+  bool alertTesting = false;
+
   /// 配置卡锚点：行尾齿轮、引导条与状态卡的动作都滚到这里
   final _configKey = GlobalKey();
 
@@ -551,6 +554,39 @@ class _ChannelsPageState extends State<ChannelsPage> {
   Future<void> _reload() async {
     await load();
     if (mounted) _toast('已按生效配置重新加载');
+  }
+
+  /// 给 `alerts.webhookUrl` 发一条**真测试消息**（`POST /api/commands/webhook-test`）。
+  ///
+  /// 为什么摆在这一项（Webhook 与文件监听）的配置卡上、而不是别处：出口地址就是这个卡片里
+  /// 那格「告警出口 webhook」，**改了地址不知道通不通**正是这颗按钮要答的问题。
+  /// 服务端走的是与真告警**同一条** notifier 路（`notifier.alert({category:'webhook-test'})`），
+  /// 所以"测通了"就等于"真告警也送得出去"。
+  ///
+  /// 两个**不许说错话**的地方：
+  ///   · 它只认**生效配置**里的出口：请求里带 `url` 也必须与生效值一致，服务端直接 400。
+  ///     所以刚改完地址还没保存时点它会得到一句"请先保存再测"——那是事实，不是故障，照原样转达。
+  ///   · **送达失败也回 HTTP 200**（`{ok:false, reason}`）：不能只看"有没有抛错"，
+  ///     否则出口不通会被说成"测好了"。判据只认回包里的 `sent`/`ok`。
+  Future<void> _testAlertExit() async {
+    if (alertTesting) return;
+    setState(() => alertTesting = true);
+    try {
+      final reply = await widget.state.api.post('/api/commands/webhook-test', const <String, dynamic>{});
+      if (!mounted) return;
+      final map = reply is Map ? reply.cast<String, dynamic>() : const <String, dynamic>{};
+      final url = map['url']?.toString() ?? '';
+      if (map['sent'] == true || map['ok'] == true) {
+        _toast('已送达：${url.isEmpty ? '告警出口' : url} 收到了这条测试消息', kind: ToastKind.success);
+      } else {
+        final reason = map['reason']?.toString() ?? '';
+        _toast('没送到${reason.isEmpty ? '：出口没有应答' : '：$reason'}', kind: ToastKind.error);
+      }
+    } catch (err) {
+      if (mounted) _toast('测试失败：${_clip('$err', 90)}', kind: ToastKind.error);
+    } finally {
+      if (mounted) setState(() => alertTesting = false);
+    }
   }
 
   /// 行尾齿轮、引导条与状态卡的「配置」都落到配置卡：先选中该渠道，再滚过去并闪一下描边
@@ -1515,6 +1551,23 @@ class _ChannelsPageState extends State<ChannelsPage> {
                 ),
                 child: const Text('重新加载'),
               ),
+              // 「测试」只长在**有出口地址的那一项**上（Webhook 与文件监听）：
+              // 另外两项（QQ / OneBot）与告警出口无关，摆一颗按不出结果的按钮比不摆更糟。
+              if (def.id == _hookChannelId) ...[
+                const SizedBox(width: 6),
+                TextButton(
+                  key: const ValueKey('alert-test'),
+                  onPressed: alertTesting ? null : () => unawaited(_testAlertExit()),
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    minimumSize: const Size(0, 36),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  child: alertTesting
+                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Text('测试告警出口'),
+                ),
+              ],
               const Spacer(),
               if (dirty) ...[
                 const DirtyPill(),

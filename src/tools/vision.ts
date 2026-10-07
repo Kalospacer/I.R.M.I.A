@@ -32,7 +32,7 @@ import type { Dirent } from 'node:fs';
 import { PATH_BOUNDARY_HINT } from './boundary.ts';
 import { resolveInsideRoot } from './fs/path-guard.ts';
 import { FS_ERROR_CODES } from './fs/types.ts';
-import type { DsResponse } from '../model/ds-client.ts';
+import type { DsReasoningEffort, DsResponse } from '../model/ds-client.ts';
 import {
   TOOL_ERROR_CODES,
   ToolArgumentError,
@@ -144,6 +144,19 @@ export interface VisionGenerateRequest {
     name: string;
     schema: Record<string, unknown>;
   };
+  /**
+   * 思考强度。**视觉这一路是 light ⇒ 一律 `low`（用户的口径，2026-10-06，不提供更改）**：
+   * 与 `channel/injection-judge.ts`、`channel/topic.ts`、`persona/assets.ts`、
+   * `persona/memory-maintain.ts` 四处同形；另一档 heavy 一律 `high`
+   * （唯一落点 `runtime/agent-loop.ts` 的 `toDsRequest`）。
+   *
+   * 这个字段**曾经是缺席的**（2026-10-06 补）：适配器把整个对象原样透传给 `DsClient`，
+   * 于是"没写"就等于**服务端默认**（官方文档：思考模式默认打开、effort 默认 `high`）——
+   * 一条本该便宜的 light 调用实际跑在 high 上，而账本上看不出来。
+   * **不提供更改**：config.json 里没有、也不许长出能改它的字段；判据钉在
+   * `test/thinking-effort-invariant.test.ts`（六处调用点逐个断言）。
+   */
+  reasoning?: { effort: DsReasoningEffort };
 }
 
 /** 落盘的缓存条目 */
@@ -674,6 +687,11 @@ export function createVisionTools(options: VisionToolsOptions): ToolDefinition[]
               },
             ],
             text: { type: 'json_schema', name: 'vision_result', schema: VISION_RESULT_SCHEMA },
+            // 思考强度：**用户的口径（2026-10-06）—— light 一律 `low`，不提供更改**。
+            // 这一行不是随手选的：补上之前它是**缺席**的，而缺席 = 服务端默认 `high`
+            // （官方文档），也就是每张图都在最贵的档上想。**别给这里加配置项**——
+            // 判据钉在 `test/thinking-effort-invariant.test.ts`（六处调用点逐个断言）。
+            reasoning: { effort: 'low' },
           };
 
           let raw: string;

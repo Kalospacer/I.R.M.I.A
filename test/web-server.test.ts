@@ -46,7 +46,8 @@ import { TimerStore } from '../src/wake/timer-store.ts';
 import { AUTH_FILE_NAME, SCRYPT_PARAMS, UI_TOKEN_FILE, readLegacyToken } from '../src/web/auth.ts';
 import { WebhookSecretStore } from '../src/web/webhook-secret.ts';
 import {
-  DASHBOARD_EVENT_WINDOW, buildPersonaFiles, instanceIdOf, restartCommandLine, restartNote, startWebServer,
+  DASHBOARD_EVENT_WINDOW, buildPersonaFiles, instanceIdOf, parseRestartTrace, restartCommandLine, restartNote,
+  startWebServer,
   type WebServer,
 } from '../src/web/server.ts';
 
@@ -1756,25 +1757,52 @@ test('POST /api/commands/restart：带了盘上不存在的界面路径 ⇒ 当�
   );
 });
 
-test('重启回执：三种结局三句话（"只重启了后端"必须与"连界面一起"说得不一样）', () => {
+test('重启回执：三态三句话（"没跑起来" / "跑了但失败" / "成功带真 pid 与端口"）', () => {
   // 用户 2026-10-05：按了按钮没有反馈，而且"所谓的'重启前后端'也没有重启前端"。
+  // 用户 2026-10-07：「界面文案不许撒谎」、「不许用'猜'的确认」，判据要能区分
+  // **脚本没跑起来 / 跑了但进程没起 / 起了但端口没就绪** 三态。
   // 文案只有这一处（`restartNote`），服务端的 note 与界面的 toast 说的是同一件事。
   const notStarted = restartNote({ gui: true, scriptStarted: false });
-  assert.match(notStarted, /没能确认/u);
+  assert.match(notStarted, /未能执行/u, '脚本没跑起来就是"没执行"——不能说成"没能确认"那种含糊话');
   assert.equal(/正在重启/u.test(notStarted), false, '没读回执就绝不能说"正在重启"——那是过去那种假话');
+  assert.match(notStarted, /没有被重启/u, '把"后端没有被重启"这个事实说出口');
 
-  const backendOnly = restartNote({ gui: false, scriptStarted: true });
+  // ② 跑了但失败：必须带**为什么**（进程没起 / 端口没就绪），不能只说一句"失败"
+  const failed = restartNote({
+    gui: true, scriptStarted: true, ok: false, backendPid: 4242, port: 'timeout',
+  });
+  assert.match(failed, /失败/u);
+  assert.match(failed, /4242/u, '失败也要给出读到的那点凭据（真 pid）');
+  assert.match(failed, /端口未就绪/u, '端口这一环没就绪要指名道姓');
+  assert.equal(/正在重启/u.test(failed), false, '失败就不许说"正在重启"');
+
+  // ③ 成功：要说成功，并且带**真实新 pid**与端口就绪两条凭据
+  const ok = restartNote({ gui: true, scriptStarted: true, ok: true, backendPid: 70788, port: 'ready' });
+  assert.match(ok, /70788/u, '成功必须给出真实新 pid（过去那个是 cmd 壳的 pid，查无此人）');
+  assert.match(ok, /端口已就绪/u, '端口就绪是"她真的起来了"的第二重凭据');
+  assert.match(ok, /主进程与界面/u);
+
+  const backendOnly = restartNote({ gui: false, scriptStarted: true, ok: true, backendPid: 1, port: 'ready' });
   assert.match(backendOnly, /界面不在本次动作范围内/u, '只重启了后端就要如实说，别让人以为界面也重启了');
-  assert.match(backendOnly, /主进程/u);
+  assert.notEqual(backendOnly, ok, '两种结果的文案必须不同');
 
-  const both = restartNote({ gui: true, scriptStarted: true });
-  assert.match(both, /主进程与界面/u);
-  assert.notEqual(both, backendOnly, '两种结果的文案必须不同');
+  // ④ 结局未确认：说"还没确认"，**不冒充成功**
+  const pending = restartNote({ gui: true, scriptStarted: true, ok: null, port: 'waiting' });
+  assert.match(pending, /还没确认/u);
+  assert.equal(/端口已就绪/u.test(pending), false, '没读到端口就绪就不许说它已就绪');
+
+  assert.notEqual(notStarted, failed);
+  assert.notEqual(failed, ok);
 });
 
-test('重启命令行：界面路径逐字进命令行（带空格的路径不许被拆成两截）', () => {
+test('重启命令行：外面套 cmd /s /c、里面一对引号，界面路径逐字进命令行', () => {
   // 用户 2026-10-05：「带了路径的请求**必须有留痕**」——留痕里最要紧的那一列就是这条
   // 命令行（WMI 建的进程没有 stdout，脚本的输出无处可去，只有它证明"参数确实送到了"）。
+  //
+  // 2026-10-07：这条命令行**多了一层 `cmd.exe /s /c`**，而且不是风格问题——
+  // 直接送 `"<shell>" -File …` 时 `Win32_Process.Create` 返回 0 而脚本一个字都不执行
+  // （GUI 那句"重启没能确认"、"后端仍是原来那个 pid"就是这么来的）。
+  // 三层实测纪律各有一条断言守着（见 `restartCommandLine` 的文件头）。
   const spaced = String.raw`C:\Program Files\Irmia\irmia_gui.exe`;
   const shell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
   const command = restartCommandLine({
@@ -1784,10 +1812,50 @@ test('重启命令行：界面路径逐字进命令行（带空格的路径不�
       '-Repo', '"D:\\repo"', '-GuiExe', `"${spaced}"`, '-TraceLog', '"D:\\repo\\data\\restart-trace.log"',
     ],
   });
-  assert.ok(command.startsWith(`"${shell}" `), `第一个 token 是那个 shell 的绝对路径（WMI 里没有 PATH）：${command}`);
+  assert.ok(command.startsWith('cmd.exe /s /c '), `外面必须是 cmd /s /c（WMI 建 pwsh 会静默失败）：${command}`);
+  assert.ok(command.includes(`"${shell}"`), '那个 shell 照旧是绝对路径（WMI 环境里没有 PATH）');
   assert.ok(command.includes(`-GuiExe "${spaced}"`), `界面路径必须原样带引号出现在命令行里：${command}`);
   assert.ok(command.includes('-TraceLog '), '留痕文件路径也在命令行里（脚本与服务端约定同一个文件）');
   assert.equal(command.includes('--%'), false, '实测 --% 会把带引号的 -File 路径当字面量：不许用');
+  // 内层整段被一对引号包着：这是 cmd 剥引号那条规则要求的形状（剥完正好剩下 shell + 参数）
+  assert.ok(command.endsWith('"'), '内层命令行必须以引号收尾（cmd /s 会剥掉首尾那一对）');
+  // 脚本自己的输出也要有去处：不加这一段，脚本报的错会随 WMI 进程一起消失
+  const withLog = restartCommandLine({ shellExe: shell, argv: ['-File', '"x.ps1"'], scriptLog: 'D:\\repo\\data\\restart-script.log' });
+  assert.ok(withLog.includes('>> "D:\\repo\\data\\restart-script.log" 2>&1'),
+    `脚本的 stdout/stderr 必须收进日志（失败不再无声）：${withLog}`);
+  assert.ok(withLog.indexOf('2>&1') < withLog.lastIndexOf('"'),
+    '重定向必须落在 cmd /s 会剥掉的那对引号**里面**（写在外面 = 一条引号没闭合的命令，什么都不执行）');
+});
+
+test('留痕解析：`[回执]`/`[实例]`/`[结束]` 三行读成结构，读不到就是 null（不猜）', () => {
+  // 服务端过去只知道"文件变大了吗"——于是"起来了"与"起来了但端口没就绪"在响应里
+  // 长得一模一样。现在脚本写三行定形的机器可读行，这里把它们读成结构。
+  const unknown = parseRestartTrace('');
+  assert.equal(unknown.receipt, false);
+  assert.equal(unknown.backendPid, 0);
+  assert.equal(unknown.port, 'unknown');
+  assert.equal(unknown.ok, null, '什么都没读到就是 null——不许推断成 true');
+
+  const receiptOnly = parseRestartTrace('2026-10-07 03:00:00 [重启] [回执] 脚本已启动 · GuiExe=（收到=False）');
+  assert.equal(receiptOnly.receipt, true, '`[回执]` = 脚本真的跑起来了（这是"没跑起来"那一态的判据）');
+  assert.equal(receiptOnly.ok, null, '只有回执时结局仍未确认——不许冒充成功');
+  assert.equal(receiptOnly.backendPid, 0);
+
+  const started = parseRestartTrace('[回执] x\n[实例] 后端已接管 pid=70788 source=lock.json\n');
+  assert.equal(started.backendPid, 70788, '`[实例]` 给的是**真实**新 pid（来自 lock.json）');
+  assert.equal(started.ok, null, '还没到结尾那行');
+
+  const done = parseRestartTrace('[回执] x\n[实例] 后端已接管 pid=70788 source=lock.json\n'
+    + '[结束] ok=True backendPid=70788 port=ready guiPid=99 留痕可用=True');
+  assert.equal(done.ok, true);
+  assert.equal(done.port, 'ready');
+  assert.equal(done.backendPid, 70788);
+  assert.equal(done.guiPid, 99);
+
+  const bad = parseRestartTrace('[回执] x\n[结束] ok=False backendPid=0 port=timeout guiPid=0 失败=backend-not-started');
+  assert.equal(bad.ok, false, '失败那行照读');
+  assert.equal(bad.port, 'timeout', '端口那一档是三态之一（ready/timeout/waiting），不是布尔');
+  assert.equal(bad.backendPid, 0, '没拿到真 pid 就记 0（不许拿壳 pid 顶上）');
 });
 
 test('GET /api/framework-notes：一条提示都没有时给空数组（不是 404、不是 null）', async (t) => {

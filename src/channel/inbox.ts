@@ -129,7 +129,7 @@ export function mentionsKeyword(text: string, keywords: readonly string[]): bool
 }
 
 /**
- * 信箱落库时这条消息的 `msgSeq`：**平台给不出真序号（0）就填事件 seq**。
+ * 落库时这条消息的 `msgSeq`：**平台给不出真序号（0）就填事件 seq**。
  *
  * 为什么必须补：未读的判据是 `msgSeq > readUpToSeq`（见 `sessions.ts` 的 fold）。平台给不出
  * 序号的那两类——OneBot 没 @ 的群消息、官方全量群消息（事件体里压根没有这个字段）——如果
@@ -137,7 +137,27 @@ export function mentionsKeyword(text: string, keywords: readonly string[]): bool
  * 正好把这个信箱废掉。事件 seq 单调、重放稳定，正是这里要的那个数（约定写在 sessions.ts 那段）。
  *
  * 给得出真序号的（OneBot 带 message_seq 的那些）原样留着——那是平台自己的编号，量纲别混。
+ *
+ * **2026-10-07：唤醒那条路（`wake/channel`）也走它**（原来只有信箱那条走）。理由是同一个判据
+ * 在**两处**读同一个字段：
+ *   • 信箱：未读 `msgSeq > readUpToSeq`；
+ *   • 唤醒：「这一条你还没看过」，`wakeEvent.data.msgSeq > entry.readUpToSeq`
+ *     （`agent-loop.ts` 的 `contactWithWakeStamp`）。
+ * 唤醒那条原先不补，于是 OneBot 群里 @ 她的那一轮 `0 > 0` 恒假——通知里**永远**不出现
+ * 「（这一条你还没看过）」，她会读成"又是上一次那条"而选择不回（报告 §3.4；那正是用户
+ * 2026-10-02 踩过的那个坑，这段代码存在的唯一理由就是修它）。
+ * 两条路走**同一个函数**（唤醒那条是 `runtime/real-loop.ts` 的 `withMsgSeqFallback`，
+ * 它调的也是这里）⇒ 同一个数、同一套量纲，"信箱说 5 条、唤醒说没看过"这种自相矛盾
+ * 从源头不可能出现。
  */
-export function inboxMsgSeqOf(data: WakeChannel['data'], eventSeq: number): number {
-  return data.msgSeq > 0 ? data.msgSeq : eventSeq;
+export function msgSeqOf(data: { msgSeq?: number | undefined }, eventSeq: number): number {
+  const platform = data.msgSeq ?? 0;
+  // 非正数一律当"平台没给"：0 是"没有这个字段"的既有写法，负数不是合法序号
+  return platform > 0 ? platform : eventSeq;
 }
+
+/**
+ * 旧名字（信箱那条路的调用点用惯了）。逐字节等价于 `msgSeqOf`——留它是为了**不让这次
+ * 语义扩大变成一次改名**：改名会让 review 分不清"哪些是行为变化、哪些只是重命名"。
+ */
+export const inboxMsgSeqOf = msgSeqOf;

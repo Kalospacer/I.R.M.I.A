@@ -10,12 +10,16 @@ import '../ui_kit.dart';
 import 'page_chrome.dart';
 
 /// 运行情况页（默认首页）——与 Web 端同构。
-/// 状态卡 → 磁贴四枚（带 24h 趋势）→ 建议 → 外部会话 → 框架提示 → 最近事件（默认 8 条）。
+/// 状态卡 → 磁贴四枚（带 24h 趋势）→ 建议 → 外部会话 → 定时器 → 框架提示 → 最近事件（默认 8 条）。
 ///
 /// 「外部会话」与「框架提示」两张卡（v33）答的是用户自己的两个问题：
 /// **她手边那个软件里攒了多少**（谁来过、她还没看的有几条）、**框架有没有替她留意到什么**
 /// （注入预警、告警）。数据分别来自 `GET /api/sessions` 与 `GET /api/framework-notes`，
 /// 两张卡**各有自己的三态**——它们读的是附加信息，读不到时该灰的是这张卡，不是整页。
+///
+/// 「定时器」那张卡（2026-10-06）答的是第三个问题：**她接下来什么时候会自己醒**。
+/// 数据来自同一份 `/api/projection`（`timers` 是 `timer/set` 折出来的），每行一颗「撤销」——
+/// 那是 `timer-cancel` 在界面上唯一的入口（后端一直在，界面从前 0 调用）。
 class OverviewPage extends StatefulWidget {
   const OverviewPage({super.key, required this.state});
   final AppState state;
@@ -47,6 +51,12 @@ class _OverviewPageState extends State<OverviewPage> {
   /// **为什么没成**（"seq 42 不在死信队列里"这种话得能对着卡再看一眼）。成功之后
   /// 重新读页面时它自己清掉。
   String? deadActionError;
+
+  /// 正在撤销的定时器 id（非 null 时那一整排「撤销」都禁用——防连点出一串并发写）
+  String? cancellingTimer;
+
+  /// 上一次撤销失败的原因（与 [deadActionError] 同一条纪律：失败要能对着卡再读一遍）
+  String? timerActionError;
 
   @override
   void initState() {
@@ -156,28 +166,13 @@ class _OverviewPageState extends State<OverviewPage> {
               children: [
                 if (loading) const _Loading() else if (error != null) _ErrorBlock(message: error!, onRetry: load) else ...[
                   _HeroCard(state: widget.state, stats: stats, onRestart: _restart, onGoto: _goto),
-                  if (_reviewItems.isNotEmpty) _ReviewCard(items: _reviewItems, onResolve: _resolve),
+                  if (_reviewItems.isNotEmpty) _ReviewCard(key: _reviewKey, items: _reviewItems, onResolve: _resolve),
                   const SizedBox(height: 16),
                   _Tiles(stats: stats, proj: proj),
                   if (_advice.isNotEmpty) ...[
                     const SizedBox(height: 18),
                     const _SectionTitle('建议'),
-                    CappedChildren(children: [
-                      for (final item in _advice)
-                        _AdviceCard(
-                          key: ValueKey('advice-${item.id}'),
-                          advice: item,
-                          // 死信明细来自投影（`inputSeq` 的唯一来源，见 [_deadLetters]）；
-                          // 其余几条用不上，传空就是不改样子的老卡片
-                          deadLetters: _deadLetters,
-                          error: deadActionError,
-                          onRequeue: (seq) => unawaited(_requeue(seq)),
-                          onDiscard: (seq) => unawaited(_discard(seq)),
-                          // 死信那条自己有按钮 ⇒ 整卡不再是链接：正在瞄"重投"却点到卡面
-                          // 会被带去人格配置（其余几条保持原样）
-                          onTap: item.id == 'dead-letters' ? null : () => _goto('persona'),
-                        ),
-                    ]),
+                    CappedChildren(children: [for (final item in _advice) _adviceCardFor(item)]),
                   ],
                   const SizedBox(height: 16),
                   _ExternalSessionsCard(
@@ -185,6 +180,13 @@ class _OverviewPageState extends State<OverviewPage> {
                     error: sessionsError,
                     loading: sessionsLoading,
                     onRetry: _loadSessions,
+                  ),
+                  const SizedBox(height: 16),
+                  _TimersCard(
+                    timers: _timers,
+                    busyId: cancellingTimer,
+                    actionError: timerActionError,
+                    onCancel: (id) => unawaited(_cancelTimer(id)),
                   ),
                   const SizedBox(height: 16),
                   _FrameworkNotesCard(
@@ -230,6 +232,70 @@ class _OverviewPageState extends State<OverviewPage> {
     return out;
   }
 
+  /// 待确认那张卡的锚点：`goto-review` 的落点就在**本页**（`_ReviewCard` 就在建议上面），
+  /// 所以那个动作不是"切页"，而是把那张卡滚进视野。
+  final _reviewKey = GlobalKey();
+
+  /// 一张建议卡：把 `act` 翻成一个能按的动作，并把死信那条的两颗按钮接上。
+  ///
+  /// 三个口径：
+  ///   · **认不出的 act 一颗按钮都不摆**（老服务端、或将来新增的动作）：摆一颗不知道去哪儿的
+  ///     按钮比不摆更糟；
+  ///   · 死信那条**不摆 act 按钮**：它自己有「重投 / 丢弃」两颗按条决定的按钮，服务端给它
+  ///     的 `goto-review` 是"去待确认区"的意思，与那两颗按钮挤在同一张卡上只会让人点错；
+  ///   · 卡面点击 = 同一个动作；**没有 act 的条目保持老行为**（去人格配置）。
+  Widget _adviceCardFor(_Advice item) {
+    final act = _actionFor(item);
+    final isDeadLetters = item.id == _AdviceCard.kDeadLettersId;
+    return _AdviceCard(
+      key: ValueKey('advice-${item.id}'),
+      advice: item,
+      // 死信明细来自投影（`inputSeq` 的唯一来源，见 [_deadLetters]）；
+      // 其余几条用不上，传空就是不改样子的老卡片
+      deadLetters: _deadLetters,
+      error: deadActionError,
+      onRequeue: (seq) => unawaited(_requeue(seq)),
+      onDiscard: (seq) => unawaited(_discard(seq)),
+      onAct: isDeadLetters ? null : act,
+      // 死信那条自己有按钮 ⇒ 整卡不再是链接：正在瞄"重投"却点到卡面
+      // 会被带去别处（其余几条的卡面点击与它那颗按钮同一个去处）
+      onTap: isDeadLetters ? null : (act ?? () => _goto('persona')),
+    );
+  }
+
+  /// `Suggestion.act` → 动作。四个 id 与服务端的 `buildSuggestions` 一一对应
+  /// （src/web/server.ts 的 `Suggestion.act` 注释里逐字写着这四个）。
+  ///
+  /// 四个去处都在既有页面上，**没有为它新开页面**：
+  ///   · `goto-review` → 本页的待确认卡（滚过去）；
+  ///   · `open-budget` → 日志页（它的第一个 tab「概览」就是预算面板，见 logs_page.dart:28）；
+  ///   · `goto-tools`  → 扩展页的「工具」分组（落点提示走 `AppState.setPage` 的 section）；
+  ///   · `goto-persona`→ 人格配置页。
+  VoidCallback? _actionFor(_Advice advice) {
+    switch (advice.act) {
+      case 'goto-review':
+        return _gotoReview;
+      case 'open-budget':
+        return () => _goto('logs');
+      case 'goto-tools':
+        return () => widget.state.setPage('extensions', section: 'tools');
+      case 'goto-persona':
+        return () => _goto('persona');
+      default:
+        return null;
+    }
+  }
+
+  /// 把待确认卡滚进视野。卡不在（`needsReview` 为空）时**如实说一句**，不假装跳过去了。
+  void _gotoReview() {
+    final target = _reviewKey.currentContext;
+    if (target == null) {
+      IrmiaToast.show(context, '现在没有待确认的调用', kind: ToastKind.info);
+      return;
+    }
+    unawaited(Scrollable.ensureVisible(target, duration: IrmiaTheme.durCard, alignment: 0.08));
+  }
+
   /// 死信明细（`{inputSeq, claimCount, at}`），来自 `GET /api/projection`——本页为了磁贴与
   /// 「待确认」本来就在取它（见 [load]）。
   ///
@@ -250,21 +316,38 @@ class _OverviewPageState extends State<OverviewPage> {
     return out;
   }
 
+  /// 她还排着的定时器（投影 `timers`，由 `timer/set` 折出、`timer/cancelled`/`timer/fired` 收掉）。
+  ///
+  /// 认不出 `timerId` 的条目一律丢掉：撤销按钮得有一个**确定**的号才敢发（与 [_deadLetters]
+  /// 丢掉认不出 seq 的那条同一姿势）。
+  List<Map<String, dynamic>> get _timers {
+    final raw = proj?['timers'];
+    if (raw is! List) return const [];
+    return [
+      for (final item in raw.whereType<Map>())
+        if ((item['timerId']?.toString() ?? '').isNotEmpty) item.cast<String, dynamic>(),
+    ];
+  }
+
   /// **重启前后端**（用户 2026-10-04：原来这里是"立即唤醒"，那个功能已经没用了）。
   ///
   /// 界面把自己的可执行路径一起发过去——脚本不该猜界面装在哪；给了路径它就连界面一起重启。
-  /// 服务端会用 WMI 起一个**分离的** pwsh 去跑 tools/restart-agent.ps1（本进程不能自己重启
-  /// 自己），并延迟两秒动手，好让这次回执先发回来。
+  /// 服务端会用 WMI 起一个**分离的**进程去跑 tools/restart-agent.ps1（本进程不能自己重启
+  /// 自己），并延迟到"回执已经能说清楚"之后才动手。
   ///
   /// **反馈要说实话**（用户 2026-10-05：「点了没有反馈」+「所谓的'重启前后端'也没有重启
-  /// 前端」）：服务端的响应里有 `gui`（这次带没带界面路径）与 `scriptStarted`（脚本有没有
-  /// 真的起来，判据是它自己写的回执），三种结局的 toast **各不相同**：
-  ///   · 没读回执 ⇒ "没能确认：脚本没有留下回执"——**不说**"正在重启"；
-  ///   · 只重启后端 ⇒ 如实说"只重启了后端"；
-  ///   · 带路径且读了回执 ⇒ "正在重启前后端（界面会先关掉再起来）"。
+  /// 前端」；2026-10-07：「界面文案不许撒谎」「不许用猜的确认」）：
+  /// 服务端那句 `note` 是**唯一一处**判据（`restartNote`），三种结局的话**各不相同**，
+  /// 而且都带凭据（真实新 pid、端口那一档）：
+  ///   · `scriptStarted == false` ⇒ "重启未能执行"——脚本根本没跑起来，**后端没有被重启**；
+  ///   · `scriptOk == false`      ⇒ "重启失败"（进程没起 / 端口没就绪，附真 pid 与端口）；
+  ///   · `scriptOk == true`       ⇒ 成功，附"真实新 pid … · 端口已就绪"；
+  ///   · `scriptOk == null`       ⇒ "已发出但结局还没确认"（说不知道，不冒充成功）。
+  /// 所以这里**原样贴服务端那句话**，只按结局挑图标；界面不自己另算一份结论
+  /// （同一件事有两份判据，迟早会有两种说法）。
   ///
-  /// 回执先给一条**正在重启**的即时反馈，等后端回来之后再补一条"已就绪"——
-  /// 否则那 20 秒里人不知道点没点上（这正是"点了没有反馈"的现场）。
+  /// 回执先给一条**如实的**即时反馈，等后端回来之后再补一条"已就绪"——
+  /// 否则那段时间里人不知道点没点上（这正是"点了没有反馈"的现场）。
   Future<void> _restart() async {
     try {
       final result = await widget.state.api.post(
@@ -275,19 +358,37 @@ class _OverviewPageState extends State<OverviewPage> {
       if (!mounted) return;
       final map = result is Map ? result : const {};
       final gui = map['gui'] == true;
-      final started = map['scriptStarted'] != false; // 老服务端没有这个字段 ⇒ 按"启动了"读
-      if (!started) {
-        // 服务端那句话本身就是给人读的（`restartNote`），原样贴出来
-        IrmiaToast.show(context, map['note']?.toString() ?? '重启没能确认：脚本没有留下回执。',
-            kind: ToastKind.error);
+      // 老服务端没有这三个字段 ⇒ 按"结局未确认"读：那时确实什么也确认不了
+      final started = map['scriptStarted'] != false;
+      final scriptOk = map['scriptOk'] == true
+          ? true
+          : (map['scriptOk'] == false ? false : null);
+      final note = map['note']?.toString() ??
+          (started ? '重启已发出，但服务端没有给出结论' : '重启未能执行：脚本没有留下回执。');
+      if (!started || scriptOk == false) {
+        // 这两档是**失败**：脚本没跑起来 / 跑了但某一环失败。服务端那句话本身就是给人读的
+        IrmiaToast.show(context, note, kind: ToastKind.error);
         return;
       }
+      if (scriptOk == null) {
+        // 结局未确认：不许说"正在重启"（那是过去那种"屏幕上说在重启、实际什么都没发生"）
+        IrmiaToast.show(context, note);
+        unawaited(_announceReady());
+        return;
+      }
+      final pid = map['backendPid'];
+      final port = map['port']?.toString() ?? '';
+      final evidence = <String>[
+        if (pid is int && pid > 0) '真实新 pid $pid',
+        if (port == 'ready') '端口已就绪',
+      ].join(' · ');
       IrmiaToast.show(
         context,
+        // toast 是纯文本，没有加粗：这里别写 Markdown 记号（`**…**` 会原样显示出来）
         gui
-            ? '正在重启前后端（后端 + 界面，约 20 秒）：界面会先关掉，随后自己起来'
-            // toast 是纯文本，没有加粗：这里别写 Markdown 记号（`**…**` 会原样显示出来）
-            : '正在重启后端（约 20 秒）：界面不在本次动作范围内，它只是重连回来',
+            ? '正在重启前后端（后端 + 界面，约 20 秒）${evidence.isEmpty ? '' : '：$evidence'}'
+            : '正在重启后端（约 20 秒）${evidence.isEmpty ? '' : '：$evidence'}'
+                '：界面不在本次动作范围内，它只是重连回来',
       );
       // 等它回来：`state.online` 在后端断开时转 false、回来后转 true（同一个心跳）。
       // 只等一次"回来"，最多约 90 秒——超时也如实说，不假装"已就绪"。
@@ -318,6 +419,48 @@ class _OverviewPageState extends State<OverviewPage> {
       sawOffline ? '后端还没回来（等了 90 秒）：看一眼 data/restart-trace.log' : '后端没有断开过：这次请求可能没生效',
       kind: ToastKind.error,
     );
+  }
+
+  // ──────────────── 定时器卡片上那颗「撤销」 ────────────────
+
+  /// 撤销一个还没触发的定时器 → `POST /api/commands/timer-cancel {timerId}`。
+  ///
+  /// 服务端的语义（src/web/server.ts:4964）：先写 `timer/cancelled`（真相源）再取消内存里的布防，
+  /// 所以撤销之后日志里留得下"这次是谁撤的、撤的是哪一个"；投影里那条随之消失，界面重读就把
+  /// 这一行去掉。**先确认一次**：定时器是她自己排的（或人让她排的），误点撤销等于让她少醒一次。
+  ///
+  /// 它是误排之后**唯一**的撤销出口（design §4.18 论证过"零调用 ≠ 没用"：`cancel` 只是还没到
+  /// 那个场景），所以入口必须摆在看得见的地方，而不是只留在 CLI/工具通道里。
+  Future<void> _cancelTimer(String timerId) async {
+    if (timerId.isEmpty || cancellingTimer != null) return;
+    final yes = await confirm(
+      context,
+      title: '撤销这个定时器？',
+      body: '定时器 $timerId 会被取消：它到点不会再把她叫起来。\n'
+          '这次撤销写进日志（timer/cancelled），撤错了只能让她重新排一个。',
+      confirmLabel: '撤销',
+      danger: true,
+    );
+    if (!yes || !mounted) return; // 取消 = 什么都没决定：一个请求都不发
+
+    setState(() {
+      cancellingTimer = timerId;
+      timerActionError = null;
+    });
+    try {
+      await widget.state.api.post('/api/commands/timer-cancel', {'timerId': timerId});
+      if (!mounted) return;
+      setState(() => cancellingTimer = null);
+      IrmiaToast.show(context, '已撤销定时器 $timerId：到点不会再醒', kind: ToastKind.success);
+      await load();
+    } catch (err) {
+      if (!mounted) return;
+      setState(() {
+        cancellingTimer = null;
+        timerActionError = '撤销 $timerId 失败：$err';
+      });
+      IrmiaToast.show(context, '撤销失败：$err', kind: ToastKind.error);
+    }
   }
 
   Future<void> _resolve(String callId, String outcome) async {
@@ -502,7 +645,7 @@ class _HeroCard extends StatelessWidget {
 }
 
 class _ReviewCard extends StatelessWidget {
-  const _ReviewCard({required this.items, required this.onResolve});
+  const _ReviewCard({super.key, required this.items, required this.onResolve});
   final List<Map<String, dynamic>> items;
   final void Function(String callId, String outcome) onResolve;
 
@@ -713,7 +856,13 @@ class _SectionTitle extends StatelessWidget {
 /// 界面上却没有那两颗按钮（用户 2026-10-05："我在哪里重投？"）。这里原样留住结构，
 /// 由 [_AdviceCard] 决定摆成什么样。
 class _Advice {
-  const _Advice({required this.id, required this.title, this.body = ''});
+  const _Advice({
+    required this.id,
+    required this.title,
+    this.body = '',
+    this.act = '',
+    this.actLabel = '',
+  });
 
   /// 服务端给的稳定标识（如 `dead-letters`）：界面对某一条做特殊渲染时认它，不认正文措辞
   final String id;
@@ -724,13 +873,30 @@ class _Advice {
   /// 次行（细节与下一步）
   final String body;
 
+  /// 服务端给的**动作 id**（`Suggestion.act`：`goto-review` / `open-budget` / `goto-tools` /
+  /// `goto-persona`，见 src/web/server.ts:564 的注释）；空 = 这条建议没有配套动作。
+  ///
+  /// 为什么要它：服务端一直在产出这两个字段（五处 `push({... act, actLabel})`），而界面从前**只取
+  /// id/title/body**——四个动作因此全是死的，"去处理"只能靠人自己去猜去哪一页
+  /// （docs/repo-cleanliness-audit.md 总表 D1）。
+  final String act;
+
+  /// 按钮上那三个字（`Suggestion.actLabel`，由服务端定，界面不自己编）
+  final String actLabel;
+
   /// 落在卡面上的那一行：`标题：细节`（没有细节时就只有标题）
   String get text => body.isEmpty ? title : '$title：$body';
 
   static _Advice from(Object? raw) {
     final map = raw is Map ? raw.cast<String, dynamic>() : const <String, dynamic>{};
     String text(String key) => map[key] == null ? '' : '${map[key]}';
-    return _Advice(id: text('id'), title: text('title'), body: text('body'));
+    return _Advice(
+      id: text('id'),
+      title: text('title'),
+      body: text('body'),
+      act: text('act'),
+      actLabel: text('actLabel'),
+    );
   }
 }
 
@@ -769,6 +935,7 @@ class _AdviceCard extends StatelessWidget {
     this.error,
     this.onRequeue,
     this.onDiscard,
+    this.onAct,
     this.onTap,
   });
 
@@ -782,6 +949,9 @@ class _AdviceCard extends StatelessWidget {
 
   final void Function(int inputSeq)? onRequeue;
   final void Function(int inputSeq)? onDiscard;
+
+  /// 按 `act` 分派的动作（文案取 `actLabel`）；null = 这条没有可做的动作，不摆按钮。
+  final VoidCallback? onAct;
 
   /// 卡面点击的去处；null = 这张卡不是链接（死信那条自己有按钮）
   final VoidCallback? onTap;
@@ -804,6 +974,24 @@ class _AdviceCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(advice.text, style: const TextStyle(fontSize: 13.5)),
+          if (onAct != null) ...[
+            const SizedBox(height: 6),
+            // 按钮文案是**服务端给的**（`actLabel`）：四个动作的名字由产出建议的那一侧定，
+            // 界面不另起一套措辞（否则同一件事在日志与卡面上会叫两个名字）。
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                key: ValueKey('advice-act-${advice.id}'),
+                onPressed: onAct,
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  minimumSize: const Size(0, 30),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(advice.actLabel.isEmpty ? '去处理' : advice.actLabel),
+              ),
+            ),
+          ],
           if (_isDeadLetters) ..._deadRows(context),
         ],
       ),
@@ -1486,6 +1674,171 @@ Widget _hintLine(String text) => HintLine(text);
 
 /// 卡内三态块的内边距：`StateBlock` 默认左右各 26 是给整页用的，卡里再留一次就缩成一条
 const _inCardBlockPadding = EdgeInsets.symmetric(vertical: 6);
+
+/// 定时器卡片：她排着的唤醒 + 每行的「撤销」。
+///
+/// 为什么需要这张卡（2026-10-06）：`timer-cancel` 的后端实现与用例都在
+/// （src/web/server.ts:4964，`{timerId}`），而界面**从来没有入口**——误排一个定时器之后，
+/// 除了等它到点、或者去改盘上的 `timers.json`，没有第三条路。design §4.18 早就论证过
+/// "`cancel` 是误排之后唯一的撤销出口，零调用 ≠ 没用"（docs/design.md:965-969）。
+///
+/// 数据与状态卡同源（同一份 `GET /api/projection`），所以**不另设三态**：整页读失败时
+/// 这张卡根本不会出现（上面已经换成错误块）；空态是"她眼下没排任何定时器"，那是常态。
+class _TimersCard extends StatelessWidget {
+  const _TimersCard({
+    required this.timers,
+    required this.busyId,
+    required this.actionError,
+    required this.onCancel,
+  });
+
+  final List<Map<String, dynamic>> timers;
+
+  /// 正在撤销的那一条（非 null 时所有行的按钮都禁用）
+  final String? busyId;
+
+  /// 上一次撤销失败的原因（null = 没有失败要报）
+  final String? actionError;
+
+  final void Function(String timerId) onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final error = actionError;
+    return _Card(
+      title: '定时器',
+      note: '她自己布防的唤醒（timer 工具的 action=set）。到点会把她叫起来，撤销只对还没触发的那些有效。',
+      children: [
+        if (timers.isEmpty)
+          _hintLine('眼下没有排着的定时器。')
+        else ...[
+          Text(
+            '${timers.length} 个在等',
+            style: TextStyle(
+              fontSize: 12,
+              color: scheme.onSurfaceVariant,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
+          if (error != null) ...[
+            const SizedBox(height: 6),
+            StateBlock.error(
+              message: error,
+              hint: '可能是它已经触发或已经被撤掉了；刷新一次看最新清单。',
+              padding: _inCardBlockPadding,
+            ),
+          ],
+          const SizedBox(height: 6),
+          CappedChildren(children: [
+            for (var i = 0; i < timers.length; i += 1)
+              _TimerLine(
+                // 按 timerId 上键：用例与"连点两下撤的是不是同一条"都靠它定位
+                key: ValueKey('timer-${timers[i]['timerId'] ?? ''}'),
+                timer: timers[i],
+                divider: i > 0,
+                // 一条在飞时其余也禁用：服务端按 timerId 逐个处理，连点只会得到一串同义请求
+                onCancel: busyId == null ? () => onCancel('${timers[i]['timerId'] ?? ''}') : null,
+              ),
+          ]),
+        ],
+      ],
+    );
+  }
+}
+
+/// 一行定时器：什么时候醒（`at` / `cron`）+ 它的 id + 唤醒内容 + 「撤销」。
+///
+/// 时刻走 [_noteStamp]（今天只给 HH:mm、隔天带 MM-DD）——她排的常常是"明天早上"，
+/// 只给钟点会被读成"今天"。
+class _TimerLine extends StatelessWidget {
+  const _TimerLine({super.key, required this.timer, required this.divider, required this.onCancel});
+
+  final Map<String, dynamic> timer;
+  final bool divider;
+  final VoidCallback? onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final id = '${timer['timerId'] ?? ''}';
+    final at = '${timer['at'] ?? ''}';
+    final cron = '${timer['cron'] ?? ''}';
+    // 周期条（cron）没有 `at`：它的到期时刻由 TimerStore 每次触发后重排，投影里只有表达式。
+    final when = at.isNotEmpty ? _noteStamp(at) : (cron.isNotEmpty ? '周期 $cron' : '时刻未知');
+    final payload = _timerPayloadText(timer['payload']);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      decoration: BoxDecoration(
+        border: divider ? Border(top: BorderSide(color: scheme.outlineVariant)) : null,
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: [
+                  Flexible(
+                    child: Text(
+                      when,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  if (at.isNotEmpty && cron.isNotEmpty) ...[
+                    const SizedBox(width: 8),
+                    _Badge('周期', tone: scheme.onSurfaceVariant),
+                  ],
+                ]),
+                const SizedBox(height: 2),
+                Text(
+                  id,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: scheme.onSurfaceVariant),
+                ),
+                if (payload.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      '唤醒内容：$payload',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 12, height: 1.5, color: scheme.onSurfaceVariant),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          TextButton(
+            key: ValueKey('timer-cancel-$id'),
+            onPressed: onCancel,
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              minimumSize: const Size(0, 30),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: const Text('撤销'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 唤醒内容的一行摘要：字符串直接用，别的形状走 `toString()`，过长截断。
+/// **不做 JSON 美化**：这里只要"她当时写了什么"的一眼，完整内容在日志里查得到。
+String _timerPayloadText(Object? payload) {
+  if (payload == null) return '';
+  final text = payload is String ? payload : '$payload';
+  final flat = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+  return flat.length <= 80 ? flat : '${flat.substring(0, 79)}…';
+}
 
 /// 时刻：今天只给 HH:mm，隔天补上 MM-DD。
 /// 框架提示不像"最近事件"那样都在眼前——三天前那条只给钟点会被读成"刚刚"。

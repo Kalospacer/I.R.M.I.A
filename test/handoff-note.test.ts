@@ -1,4 +1,121 @@
 /**
+});
+  );
+test('M5 应用点：turn 结束且历史超阈值 → 写 compaction/summary，遮蔽点落在本 turn 的 turn/end', async (t: TestContext) => {
+  resetFactory();
+  const dir = mkdtempSync(join(tmpdir(), 'irmia-handoff-'));
+  const log = await EventLog.open(join(dir, 'events'));
+  t.after(() => {
+    log.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const projection: Projection = fold([]);
+
+  // 第一轮：**只负责把可见历史垫过阈值与闸门线**（阈值抬到天上，这一轮不压）。
+  // 闸门量的是"已有摘要的覆盖点之后那一段"，而这一轮还没有摘要 ⇒ 参照点是 0；
+  // 所以垫料必须落在**某一次折叠会覆盖到的区间里**（下面第二轮就是那次折叠）。
+  const seed = {
+    seq: log.nextSeq(), ts: NOW, type: 'wake/manual',
+    data: { note: `早前那一段往来。${'垫'.repeat(RECENT_TAIL_TOKENS * 2)}` },
+    visibility: 'model', origin: 'test',
+  } as unknown as AppEvent;
+  log.append(seed, { sync: true });
+  applyOne(projection, seed);
+  await runTurn({
+    log, ds: fakeModel(), registry: new ToolRegistry(), projection, persona: PERSONA,
+    now: () => NOW, timezone: TIMEZONE, workspaceRoot: dir,
+    compaction: { thresholdTokens: 1_000_000_000 },
+  } as unknown as AgentLoopDeps, [seed]);
+
+  // 第二轮：阈值与这段历史相称 ⇒ 该压。遮蔽点必须落在**本 turn 的 `turn/end`**上。
+  const wake = {
+    seq: log.nextSeq(), ts: NOW, type: 'wake/manual', data: { note: '看一眼日志' },
+    visibility: 'model', origin: 'test',
+  } as unknown as AppEvent;
+  log.append(wake, { sync: true });
+  applyOne(projection, wake);
+
+  const deps: AgentLoopDeps = {
+    log,
+    ds: fakeModel(),
+    registry: new ToolRegistry(),
+    projection,
+    persona: PERSONA,
+    now: () => NOW,
+    timezone: TIMEZONE,
+    workspaceRoot: dir,
+    compaction: { thresholdTokens: 25_000 },
+  } as unknown as AgentLoopDeps;
+
+  const reason = await runTurn(deps, [wake]);
+  assert.deepEqual(reason, { kind: 'completed' });
+
+  const all: AppEvent[] = [];
+  for await (const event of log.readAll()) all.push(event);
+
+  const starts = all.filter((event): event is TurnStart => event.type === 'turn/start');
+  const ends = all.filter((event): event is TurnEnd => event.type === 'turn/end');
+  const summaries = all.filter((event): event is CompactionSummary => event.type === 'compaction/summary');
+  assert.equal(starts.length, 2);
+  assert.equal(ends.length, 2, '空拍与实拍都要留 turn/end');
+  assert.equal(summaries.length, 1, '压缩点应在 turn 结束后写一条摘要');
+  // 2026-10-06 改：遮蔽点取**本 turn 自己的 `turn/end`**（交接发生在 turn 收尾之后）。
+  // 旧口径取"上一个已结束的 turn"，于是刚跑完的这一轮整轮留在现场
+  // （实测 21:40 那次就是 44,281 token 可见历史白白重编码）。
+  assert.equal(
+    summaries[0]?.data.coveredUpToSeq,
+    ends[1]?.seq,
+    '遮蔽点 = 本 turn 的 turn/end（turn 已经收尾，可以整轮折进笔记）',
+  );
+  assert.ok(
+    (summaries[0]?.data.coveredUpToSeq ?? 0) > (starts[1]?.seq ?? 0),
+    '遮蔽点落在本 turn 之内',
+  );
+  // 那一对"叫醒她的话 / 她的回答"必须落在遮蔽点的**同一侧**。
+  // 注意：这一轮的 wake 在 `turn/start` **之前**，而遮蔽点取的是本 turn 的 `turn/end`
+  // ⇒ 两条都在遮蔽段里；若换回旧口径（取上一个 turn/end），它就只剩半截现场。
+  const wakeSeq = wake.seq;
+  const dbgCovered = summaries[0]?.data.coveredUpToSeq ?? -1;
+  assert.equal(wakeSeq < dbgCovered, true,
+    `叫醒她的那条与本轮内容同侧（wake=${wakeSeq} covered=${dbgCovered} `
+    + `全部事件=${all.map(e => e.seq + ':' + e.type).join(',')}）`);
+  assert.match(summaries[0]?.data.summary ?? '', /\[唤醒\] 看一眼日志/u, '摘要是这次 turn 的交接笔记');
+  assert.ok(
+    estimateTokens(summaries[0]?.data.summary ?? '') <= DEFAULT_HANDOFF_BUDGET_TOKENS,
+    '写进日志的摘要同样受笔记预算约束',
+  );
+
+  // 第三轮：再垫够一个 recent tail，验证**第二次**折叠的遮蔽点同样落在 `turn/end` 上，
+  // 而且比上一次更靠后（单调性）。
+  const seed2 = {
+    seq: log.nextSeq(), ts: NOW, type: 'wake/manual',
+    data: { note: `又一段往来。${'垫'.repeat(RECENT_TAIL_TOKENS * 2)}` },
+    visibility: 'model', origin: 'test',
+  } as unknown as AppEvent;
+  log.append(seed2, { sync: true });
+  applyOne(projection, seed2);
+  await runTurn(deps, [seed2]);
+
+  const after: AppEvent[] = [];
+  for await (const event of log.readAll()) after.push(event);
+  const summaries2 = after.filter((event): event is CompactionSummary => event.type === 'compaction/summary');
+  const starts2 = after.filter((event): event is TurnStart => event.type === 'turn/start');
+  const ends2 = after.filter((event): event is TurnEnd => event.type === 'turn/end');
+  assert.equal(summaries2.length, 2, '第二次也该压（又垫够了一个 recent tail）');
+  assert.ok(
+    (summaries2[1]?.data.coveredUpToSeq ?? 0) > (summaries2[0]?.data.coveredUpToSeq ?? 0),
+    '新摘要的遮蔽点必须比旧摘要更靠后（单调）',
+  );
+  assert.equal(summaries2[1]?.data.coveredUpToSeq, ends2[2]?.seq, '遮蔽点 = 第 3 轮那个 turn 的 turn/end');
+  assert.ok(
+    (summaries2[1]?.data.coveredUpToSeq ?? 0) > (starts2[2]?.seq ?? 0),
+    '遮蔽点落在本 turn 之内（整轮折进笔记）',
+  );
+  assert.ok(ends2.length >= 3 && starts2.length >= 3, '三个 turn 都完整落在日志里');
+  assert.match(summaries2[1]?.data.summary ?? '', /又一段往来/u, '本轮的内容进了笔记（遮蔽段的替代品）');
+});
+});
+/**
  * 交接笔记测试 — src/persona/handoff-note.ts（milestones.md M5-2、persona.md §4、design.md §4.13）
  *
  * 覆盖面：
@@ -32,9 +149,13 @@ import type { DsClient, DsRequest, DsStreamResult } from '../src/model/ds-client
 import { render, type RenderInput } from '../src/model/render.ts';
 import {
   DEFAULT_HANDOFF_BUDGET_TOKENS, DEFAULT_HANDOFF_FOLD_TOKENS, HANDOFF_MIN_FOLD_TOKENS,
+  HANDOFF_TOOL_ARGS_MAX_BYTES,
   estimateHistoryTokens, estimateTokens, foldToBudget, renderHandoffNote,
 } from '../src/persona/handoff-note.ts';
-import { runTurn, type AgentLoopDeps, type AgentLoopPersona } from '../src/runtime/agent-loop.ts';
+import {
+  runTurn, RECENT_TAIL_TOKENS, compactionCoveredUpToSeq,
+  type AgentLoopDeps, type AgentLoopPersona,
+} from '../src/runtime/agent-loop.ts';
 import { applyOne, fold } from '../src/state/fold.ts';
 import { estimateTokens as registryEstimateTokens, ToolRegistry } from '../src/tools/registry.ts';
 
@@ -177,6 +298,75 @@ test('M5-2 收录范围：对话本身（他说了什么/我答了什么）+ wak
 });
 
 // ──────────────────────────────── ④ 去重与合并 ────────────────────────────────
+
+test('v36 超长工具入参：过 512 字节压成「键名 + 字节数」，短的照旧原样', () => {
+  resetFactory();
+  const bigBody = '补丁正文'.repeat(400); // 4 × 400 = 1600 字符 = 4800 字节
+  const bigArgs = JSON.stringify({ file_path: 'src/a.ts', old_string: '旧', new_string: bigBody });
+  const size = Buffer.byteLength(bigArgs, 'utf8');
+  assert.ok(size > HANDOFF_TOOL_ARGS_MAX_BYTES, `这条入参必须过线（${size} 字节）`);
+
+  const events: AppEvent[] = [
+    evt('tool/call', { turn: 1, step: 1, callId: 'c1', name: 'safe_edit', arguments: bigArgs, sideEffect: 'idempotent' }),
+    evt('tool/result', { turn: 1, step: 1, callId: 'c1', callSeq: 1, status: 'ok', content: '已写入。' }),
+    // 短的照旧原样（同一份笔记里两种形态并存）
+    evt('tool/call', { turn: 1, step: 2, callId: 'c2', name: 'safe_read', arguments: '{"file_path":"a.txt"}', sideEffect: 'none' }),
+    evt('tool/result', { turn: 1, step: 2, callId: 'c2', callSeq: 3, status: 'ok', content: '文件内容若干' }),
+  ];
+  const note = renderHandoffNote(events);
+
+  // 短的：逐字原样（这条不能被"顺手也压一下"的改动碰掉）
+  assert.match(note.text, /\[调用\] safe_read\(\{"file_path":"a\.txt"\}\)/u, '短入参原样录入');
+  // 长的：键名（顶层、原出现顺序）+ 千分位字节数 + 一句说明；正文一个字都不进
+  assert.match(
+    note.text,
+    new RegExp(`\\[调用\\] safe_edit\\(file_path,old_string,new_string · ${size.toLocaleString('en-US')} 字节 · 参数正文未收入笔记\\)`, 'u'),
+    '超长入参压成键名 + 字节数',
+  );
+  assert.equal(note.text.includes('补丁正文'), false, '超长入参的正文一个字都不进笔记');
+  assert.equal(note.text.includes('old_string":"旧'), false, '也不留片段');
+
+  // **判据是字节不是字符**：同样的 4800 字节若不是中文（ASCII）就该是 4800 字符
+  const manyAscii = `{"cmd":"${'x'.repeat(600)}"}`;
+  assert.ok(Buffer.byteLength(manyAscii, 'utf8') > HANDOFF_TOOL_ARGS_MAX_BYTES);
+  const noteAscii = renderHandoffNote([
+    evt('tool/call', { turn: 1, step: 1, callId: 'c9', name: 'pwsh', arguments: manyAscii, sideEffect: 'idempotent' }),
+  ]);
+  assert.match(noteAscii.text, /· 参数正文未收入笔记\)/u, 'ASCII 入参同样按字节判');
+
+  // 边界：正好 512 字节**不压**（判据是"超过"，不是"达到"）
+  const atLimit = `{"cmd":"${'x'.repeat(512 - '{"cmd":""}'.length)}"}`;
+  assert.equal(Buffer.byteLength(atLimit, 'utf8'), 512, '先钉住这条真的是 512 字节');
+  const noteEdge = renderHandoffNote([
+    evt('tool/call', { turn: 1, step: 1, callId: 'ce', name: 'pwsh', arguments: atLimit, sideEffect: 'idempotent' }),
+  ]);
+  assert.equal(noteEdge.text.includes('参数正文未收入笔记'), false, '正好 512 字节不压');
+  // 多一个字节就压（边界两侧各来一发，"超过"这个词不能被实现读成"达到"或"以上"）
+  const overLimit = `{"cmd":"${'x'.repeat(513 - '{"cmd":""}'.length)}"}`;
+  assert.equal(Buffer.byteLength(overLimit, 'utf8'), 513);
+  const noteOver = renderHandoffNote([
+    evt('tool/call', { turn: 1, step: 1, callId: 'cf', name: 'pwsh', arguments: overLimit, sideEffect: 'idempotent' }),
+  ]);
+  assert.equal(noteOver.text.includes('参数正文未收入笔记'), true, '513 字节就压');
+});
+
+test('v36 超长入参的压缩是**纯函数**：同一批事件任何时刻渲染出同一字节串', () => {
+  resetFactory();
+  const args = JSON.stringify({ a: 'x'.repeat(300), b: 'y'.repeat(300) });
+  const events: AppEvent[] = [
+    evt('tool/call', { turn: 1, step: 1, callId: 'c1', name: 'pwsh', arguments: args, sideEffect: 'idempotent' }),
+    evt('tool/result', { turn: 1, step: 1, callId: 'c1', callSeq: 1, status: 'ok', content: '跑完了' }),
+  ];
+  // 两个不同的"现在"：压缩形态不许带时间戳、不许带随机、不许受 now 影响
+  const a = renderHandoffNote(events, { now: '2026-03-01T00:00:00.000Z' });
+  const b = renderHandoffNote(events, { now: '2027-11-20T23:59:59.000Z' });
+  assert.equal(a.text, b.text, '笔记正文逐字节相同（缓存铁律 1）');
+  // 同一份输入反复渲染也逐字节相同（没有内部计数器、没有随机）
+  assert.equal(renderHandoffNote(events, { now: '2026-03-01T00:00:00.000Z' }).text, a.text);
+  // 压缩形态本身逐字段可核（不是"看着差不多"）：键名 + 千分位字节数
+  assert.match(a.text, /pwsh\(a,b · 615 字节 · 参数正文未收入笔记\)/u);
+  assert.equal(a.text.includes('x'.repeat(20)), false, '正文一个片段都不留');
+});
 
 test('M5-2 逐字重复合并：同一条重复 N 次只在笔记里出现一次并标注次数', () => {
   resetFactory();
@@ -443,7 +633,7 @@ function fakeModel(): DsClient {
   } as unknown as DsClient;
 }
 
-test('M5 应用点：turn 结束且历史超阈值 → 写 compaction/summary，遮蔽点落在"上一个已结束的 turn"', async (t: TestContext) => {
+test('M5 应用点：turn 结束且历史超阈值 → 写 compaction/summary，遮蔽点落在本 turn 的 turn/end', async (t: TestContext) => {
   resetFactory();
   const dir = mkdtempSync(join(tmpdir(), 'irmia-handoff-'));
   const log = await EventLog.open(join(dir, 'events'));
@@ -453,6 +643,23 @@ test('M5 应用点：turn 结束且历史超阈值 → 写 compaction/summary，
   });
   const projection: Projection = fold([]);
 
+  // 第一轮：只负责把可见历史垫过阈值与闸门线（阈值抬到天上，这一轮不压）。
+  // 闸门量的是"已有摘要的覆盖点之后那一段"，而这一轮还没有摘要 ⇒ 参照点是 0；
+  // 所以垫料必须落在**某一次折叠会覆盖到的区间里**（下面第二轮就是那次折叠）。
+  const seed = {
+    seq: log.nextSeq(), ts: NOW, type: 'wake/manual',
+    data: { note: `早前那一段往来。${'垫'.repeat(RECENT_TAIL_TOKENS * 2)}` },
+    visibility: 'model', origin: 'test',
+  } as unknown as AppEvent;
+  log.append(seed, { sync: true });
+  applyOne(projection, seed);
+  await runTurn({
+    log, ds: fakeModel(), registry: new ToolRegistry(), projection, persona: PERSONA,
+    now: () => NOW, timezone: TIMEZONE, workspaceRoot: dir,
+    compaction: { thresholdTokens: 1_000_000_000 },
+  } as unknown as AgentLoopDeps, [seed]);
+
+  // 第二轮：阈值与这段历史相称 ⇒ 该压。遮蔽点必须落在**本 turn 的 `turn/end`**上。
   const wake = {
     seq: log.nextSeq(), ts: NOW, type: 'wake/manual', data: { note: '看一眼日志' },
     visibility: 'model', origin: 'test',
@@ -469,8 +676,8 @@ test('M5 应用点：turn 结束且历史超阈值 → 写 compaction/summary，
     now: () => NOW,
     timezone: TIMEZONE,
     workspaceRoot: dir,
-    // 阈值压到 1：必然触发一次压缩
-    compaction: { thresholdTokens: 1 },
+    // 与垫进来的那段历史相称（≈26.7k > 闸门线 20k）
+    compaction: { thresholdTokens: 25_000 },
   } as unknown as AgentLoopDeps;
 
   const reason = await runTurn(deps, [wake]);
@@ -482,52 +689,60 @@ test('M5 应用点：turn 结束且历史超阈值 → 写 compaction/summary，
   const starts = all.filter((event): event is TurnStart => event.type === 'turn/start');
   const ends = all.filter((event): event is TurnEnd => event.type === 'turn/end');
   const summaries = all.filter((event): event is CompactionSummary => event.type === 'compaction/summary');
-  assert.equal(starts.length, 1);
+  assert.equal(starts.length, 2, '垫的那一轮 + 主用例这一轮');
+  assert.equal(ends.length, 2, '空拍与实拍都要留 turn/end');
   assert.equal(summaries.length, 1, '压缩点应在 turn 结束后写一条摘要');
+  // 2026-10-06 改：遮蔽点取**本 turn 自己的 `turn/end`**（交接发生在 turn 收尾之后）。
+  // 旧口径取"上一个已结束的 turn"，于是刚跑完的这一轮整轮留在现场
+  // （实测 21:40 那次就是 44,281 token 可见历史白白重编码）。
   assert.equal(
     summaries[0]?.data.coveredUpToSeq,
-    starts[0]?.seq,
-    '第一轮没有"上一个已结束的 turn"，退回本 turn 起始 seq',
+    ends[1]?.seq,
+    '遮蔽点 = 本 turn 的 turn/end（turn 已经收尾，可以整轮折进笔记）',
   );
+  assert.ok(
+    (summaries[0]?.data.coveredUpToSeq ?? 0) > (starts[1]?.seq ?? 0),
+    '遮蔽点落在本 turn 之内',
+  );
+  // 那一对"叫醒她的话 / 她的回答"必须落在遮蔽点的**同一侧**。
+  // 注意：这一轮的 wake 在 `turn/start` **之前**，而遮蔽点取的是本 turn 的 `turn/end`
+  // ⇒ 两条都在遮蔽段里；若换回旧口径（取上一个 turn/end），它就只剩半截现场。
+  assert.ok(wake.seq < (summaries[0]?.data.coveredUpToSeq ?? 0), '叫醒她的那条与本轮内容同侧');
   assert.match(summaries[0]?.data.summary ?? '', /\[唤醒\] 看一眼日志/u, '摘要是这次 turn 的交接笔记');
   assert.ok(
     estimateTokens(summaries[0]?.data.summary ?? '') <= DEFAULT_HANDOFF_BUDGET_TOKENS,
     '写进日志的摘要同样受笔记预算约束',
   );
 
-  // 再跑一次 turn：遮蔽点必须**落在上一轮的 turn/end 上**（不是本轮 turn/start）——
-  // 否则"他叫醒她的那句话"（在 turn/start 之前）会被遮掉，而她对那句话的回答留在现场，
-  // 现场就只剩半截对话（用户实测的"压缩后又把已经回复过的东西再回复一遍"）。
-  const second = {
-    seq: log.nextSeq(), ts: NOW, type: 'wake/manual', data: { note: '再看一眼' },
+  // 第三轮：再垫够一个 recent tail，验证**第二次**折叠的遮蔽点同样落在 `turn/end` 上，
+  // 而且比上一次更靠后（单调性）。
+  const seed2 = {
+    seq: log.nextSeq(), ts: NOW, type: 'wake/manual',
+    data: { note: `又一段往来。${'垫'.repeat(RECENT_TAIL_TOKENS * 2)}` },
     visibility: 'model', origin: 'test',
   } as unknown as AppEvent;
-  log.append(second, { sync: true });
-  applyOne(projection, second);
-  await runTurn(deps, [second]);
+  log.append(seed2, { sync: true });
+  applyOne(projection, seed2);
+  await runTurn(deps, [seed2]);
 
   const after: AppEvent[] = [];
   for await (const event of log.readAll()) after.push(event);
   const summaries2 = after.filter((event): event is CompactionSummary => event.type === 'compaction/summary');
   const starts2 = after.filter((event): event is TurnStart => event.type === 'turn/start');
   const ends2 = after.filter((event): event is TurnEnd => event.type === 'turn/end');
-  assert.equal(summaries2.length, 2);
+  assert.equal(summaries2.length, 2, '第二次也该压（又垫够了一个 recent tail）');
   assert.ok(
     (summaries2[1]?.data.coveredUpToSeq ?? 0) > (summaries2[0]?.data.coveredUpToSeq ?? 0),
-    '新摘要的遮蔽点必须比旧摘要更靠后',
+    '新摘要的遮蔽点必须比旧摘要更靠后（单调）',
   );
-  assert.equal(summaries2[1]?.data.coveredUpToSeq, ends2[0]?.seq, '遮蔽点 = 上一个已结束 turn 的 turn/end');
+  assert.equal(summaries2[1]?.data.coveredUpToSeq, ends2[2]?.seq, '遮蔽点 = 第 3 轮那个 turn 的 turn/end');
   assert.ok(
-    (summaries2[1]?.data.coveredUpToSeq ?? 0) < (starts2[1]?.seq ?? 0),
-    '遮蔽点仍然落在本 turn 之前（本 turn 自己的事件逐字节保留）',
+    (summaries2[1]?.data.coveredUpToSeq ?? 0) > (starts2[2]?.seq ?? 0),
+    '遮蔽点落在本 turn 之内（整轮折进笔记）',
   );
-  assert.ok(ends2.length >= 2 && starts2.length >= 2, '两个 turn 都完整落在日志里');
-  // 那一对"叫醒她的话 / 她的回答"必须落在遮蔽点的同一侧：这次的 wake 在 turn/start 之前，
-  // 所以遮蔽点取上一个 turn/end 时，**两条都还在现场**（不会被劈开）
-  const wake2 = after.find((event) => event.type === 'wake/manual' && event.data.note === '再看一眼');
-  assert.ok((wake2?.seq ?? 0) > (summaries2[1]?.data.coveredUpToSeq ?? 0), '叫醒她的那条输入留在现场');
+  assert.ok(ends2.length >= 3 && starts2.length >= 3, '三个 turn 都完整落在日志里');
+  assert.match(summaries2[1]?.data.summary ?? '', /又一段往来/u, '本轮的内容进了笔记（遮蔽段的替代品）');
 });
-
 test('M5 应用点：未给 compaction 配置时不产生任何摘要（缺省不压缩）', async (t: TestContext) => {
   resetFactory();
   const dir = mkdtempSync(join(tmpdir(), 'irmia-handoff-nocompact-'));
@@ -552,4 +767,79 @@ test('M5 应用点：未给 compaction 配置时不产生任何摘要（缺省�
   const all: AppEvent[] = [];
   for await (const event of log.readAll()) all.push(event);
   assert.equal(all.some(event => event.type === 'compaction/summary'), false);
+});
+
+// ──────────────────────────────── ⑨ ④ 的两条独立纪律 ────────────────────────────────
+
+test('④甲 单调性：遮蔽点只收紧、不复活退役的边界（无论事件以什么顺序喂进来）', () => {
+  resetFactory();
+  const turnEnd = (seq: number): AppEvent => evt('turn/end', { turn: seq, reason: { kind: 'completed' }, spoke: false }, { seq });
+  const summary = (seq: number, covered: number): AppEvent =>
+    evt('compaction/summary', { coveredUpToSeq: covered, summary: 's' }, { seq });
+
+  // 场景一：日志里已有一条**退役的**边界（摘要遮到 300），而之后只写了一个更早的 turn/end
+  const retired = [summary(1, 300), turnEnd(2), turnEnd(50)];
+  assert.equal(
+    compactionCoveredUpToSeq(retired, 60, 0, true), 300,
+    '已有摘要的遮蔽点不会被更早的 turn/end 拉回去（退役的边界不复活）',
+  );
+  // 场景二：事件顺序颠倒（同一条 turn/end 出现在摘要之前）——取 max 的性质不受顺序影响
+  const shuffled = [turnEnd(50), turnEnd(2), summary(1, 300)];
+  assert.equal(compactionCoveredUpToSeq(shuffled, 60, 0, true), 300, '换顺序也还是 300');
+  // 场景三：floorSeq 只会把边界往前推，不会往后拉
+  assert.equal(compactionCoveredUpToSeq(retired, 60, 400, true), 400, 'floor 更大时取 floor');
+  assert.equal(compactionCoveredUpToSeq(retired, 60, 100, true), 300, 'floor 更小时不拉回 100');
+  // 场景四：逐个追加新 turn/end，返回值**单调不减**（这是"只收紧"的字面意思）
+  let prev = 0;
+  for (const seq of [10, 20, 30, 40]) {
+    const now = compactionCoveredUpToSeq([...retired, turnEnd(seq)], 60, 0, true);
+    assert.ok(now >= prev, `遮蔽点不得回退（seq ${seq} 时 ${now} < ${prev}）`);
+    prev = now;
+  }
+});
+
+test('④甲 收益闸门：还没折进笔记的可见历史不足一个 recent tail 就不压（刚压完又压会被拒）', async (t: TestContext) => {
+  resetFactory();
+  const dir = mkdtempSync(join(tmpdir(), 'irmia-handoff-gate-'));
+  const log = await EventLog.open(join(dir, 'events'));
+  t.after(() => {
+    log.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const projection: Projection = fold([]);
+
+  // 先垫一条"上一轮已经写完的摘要"：它把边界推到 seq 1，于是"新闭合的历史"从 1 起算
+  const seeded = {
+    seq: log.nextSeq(), ts: NOW, type: 'compaction/summary',
+    data: { coveredUpToSeq: 1, summary: '# 交接笔记\n（早前那一段）\n' },
+    visibility: 'model', origin: 'test',
+  } as unknown as AppEvent;
+  log.append(seeded, { sync: true });
+  applyOne(projection, seeded);
+
+  const wake = {
+    seq: log.nextSeq(), ts: NOW, type: 'wake/manual', data: { note: '看一眼' },
+    visibility: 'model', origin: 'test',
+  } as unknown as AppEvent;
+  log.append(wake, { sync: true });
+  applyOne(projection, wake);
+
+  // 阈值 1：老口径下**必然**压一次；闸门要拒的正是这种"料太少"的折叠
+  await runTurn({
+    log, ds: fakeModel(), registry: new ToolRegistry(), projection, persona: PERSONA,
+    now: () => NOW, timezone: TIMEZONE, workspaceRoot: dir,
+    compaction: { thresholdTokens: 1 },
+  } as unknown as AgentLoopDeps, [wake]);
+
+  const all: AppEvent[] = [];
+  for await (const event of log.readAll()) all.push(event);
+  const summaries = all.filter((event): event is CompactionSummary => event.type === 'compaction/summary');
+  assert.equal(summaries.length, 1, '只有垫进去的那一条——这一次折叠被闸门拒了（阈值只有 1，改前会压）');
+  // 拒的理由能量出来：从上一个遮蔽点起还没折进笔记的东西，远不足一个 recent tail
+  const ends = all.filter((event): event is TurnEnd => event.type === 'turn/end');
+  assert.ok(ends.length >= 1, '这一轮照常收尾（拒的是压缩，不是这一轮）');
+  assert.ok(
+    estimateHistoryTokens(all, 1) < RECENT_TAIL_TOKENS,
+    `这一轮新闭合的量（${estimateHistoryTokens(all, 1)}）本来就不到闸门线 ${RECENT_TAIL_TOKENS}`,
+  );
 });

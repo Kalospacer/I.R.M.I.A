@@ -16,8 +16,12 @@
  *   • 动作：`{action:'send_private_msg', params:{user_id, message}, echo}` 与
  *     `{action:'send_group_msg', params:{group_id, message}, echo}`；响应同一条连接回
  *     `{status, retcode, data, echo}`，`echo` 是配对的唯一凭据，`retcode===0` 为成。
- *   • 鉴权：NapCat 的 access_token 校验在**握手**上（`Authorization: Bearer <token>` 或 query
- *     `?access_token=`）。本项目的 ws-client 刻意不留"自定义握手头"的口子（它逐字校验
+ *   • 鉴权：access_token 校验在**握手**上，服务端认两种形式——`Authorization: Bearer <token>`
+ *     或 query `?access_token=`。**内置协议端 SnowLuma 的判据就是这两条**
+ *     （`data/services/snowluma/index.mjs` 的 `isAuthorized`：先比 `request.headers.authorization`
+ *     是否等于 `Bearer <token>`，再比 `new URL(request.url).searchParams.get('access_token')`；
+ *     两条都不是就回 401 `Unauthorized`）。NapCat 同样认 query 形态。
+ *     本项目的 ws-client 刻意不留"自定义握手头"的口子（它逐字校验
  *     `Sec-WebSocket-Accept`，头部白名单越窄越好），所以这里一律用 query 形态，
  *     并把 token 从日志里打码（`maskAccessToken`）。
  *
@@ -36,7 +40,9 @@
 
 import { randomUUID } from 'node:crypto';
 
-import type { WakeChannel } from '../log/types.js';
+// 值导入写 `.ts`（`--experimental-strip-types` 不重写 `.js`，而这里真的要用那个函数：
+// 附件的两个判据是**两条通道共用**的唯一实现，见 log/types.ts 那段注释）
+import { isFetchableAttachmentUrl, type WakeChannel } from '../log/types.ts';
 import {
   reconnectDelayMs,
   type ChannelAdapter,
@@ -56,8 +62,22 @@ export const ONEBOT_CHANNEL_NAME = 'onebot';
 export const DEFAULT_ONEBOT_WS_URL = 'ws://127.0.0.1:3001';
 /** access_token 所在环境变量名（配置里只写变量名，值只在建连时从进程环境读） */
 export const DEFAULT_ONEBOT_TOKEN_ENV = 'ONEBOT_ACCESS_TOKEN';
-/** 握手 query 里的 token 参数名（NapCat 认这个键） */
+/** 握手 query 里的 token 参数名（NapCat 与 SnowLuma 都认这个键） */
 export const ONEBOT_ACCESS_TOKEN_QUERY = 'access_token';
+
+/**
+ * 端点重读的**硬下限**（毫秒）：两次真正读盘之间至少隔这么久。
+ *
+ * 为什么需要它：对接点是**现读现用**的（协议端的配置可能晚于本进程物化，见下面
+ * `OneBotEndpointMemo`），而重连退避在小步长那几拍是 1s / 2s / 4s——没有下限的话，
+ * "每次建连都重读"就变成了退避期里的高频磁盘 IO，而**读到的内容在 10 秒里根本不会变**
+ * （协议端写那份配置是人登录 QQ 触发的，分钟级的事）。
+ *
+ * 10 秒这个数取的是"比退避的起步档大一档、比它写文件的节奏小一档"：
+ * 最坏情况下（1 秒一拍的抖动）每 10 秒一次 `readdir` + 一两次小文件 `readFile`；
+ * 而配置真的出现时，最多晚一拍（≤10s）被看见。
+ */
+export const DEFAULT_ONEBOT_ENDPOINT_REREAD_MS = 10_000;
 
 /** 指数退避起点：1 秒 */
 export const DEFAULT_ONEBOT_RECONNECT_BASE_MS = 1_000;
@@ -257,24 +277,34 @@ export function stripCqCodes(raw: string): string {
 /** 非文本类附件段（文本已剥离，它们是"平台上还带了什么"，供上层渲染与必要判断） */
 const ATTACHMENT_SEGMENTS: readonly string[] = ['image', 'file', 'video', 'record'];
 
-function isHttpUrl(text: string): boolean {
-  return /^https?:\/\//iu.test(text);
-}
-
+/**
+ * 段类型**就是**给上层的附件类型：OneBot 这边不发明第二种写法。
+ *
+ * 为什么不在这里把它翻成 MIME（`image` → `image/png`）：段类型是协议事实，而 MIME 是
+ * 猜的——`image` 段没有画质信息，`record` 可能是 silk / amr，翻出来的每一个 MIME 都可能是假的。
+ * 于是"这是不是一张图"这个判定交给 `isImageAttachment`（两种形态都认），
+ * 它只认形态、不认来源，两条通道因此走同一个判据。
+ */
 function attachmentsOf(segments: readonly OneBotSegment[]): WakeChannel['data']['attachments'] {
-  const out: Array<{ type: string; url?: string; name?: string }> = [];
+  const out: Array<{ type: string; url?: string; name?: string; text?: string }> = [];
   for (const segment of segments) {
     if (!ATTACHMENT_SEGMENTS.includes(segment.type)) continue;
     const rawUrl = segment.data['url'] ?? '';
     const file = segment.data['file'] ?? '';
-    // image 段的 url 常常缺席而 file 只是本地文件名：只把真正的 http(s) 地址当 URL 收下，
-    // 不然模型会拿到一个点不开的假地址
-    const url = rawUrl !== '' ? rawUrl : (isHttpUrl(file) ? file : '');
+    // image 段的 url 常常缺席而 file 只是协议端那边的本地文件名：只把**真取得到东西**的
+    // 地址当 URL 收下（http(s) / file / data），不然模型会拿到一个点不开的假地址。
+    const url = rawUrl !== '' ? rawUrl : (isFetchableAttachmentUrl(file) ? file : '');
     const name = segment.data['name'] ?? file;
+    // 语音转写：协议端若在 `record` 段里给了文字（部分实现带 `text` 字段），原样带上——
+    // 平台已经替她把这句听成字了，丢掉等于"她少一种听懂的方式"（官方通道的 `asr_refer_text` 同理）。
+    // **未核实**：SnowLuma / NapCat 是否真的下发这个字段（本机没有任何语音事件样本）；
+    // 有就带上，没有这条线是空的、不会伪造。
+    const transcript = segment.data['text'] ?? '';
     out.push({
       type: segment.type,
       ...(url === '' ? {} : { url }),
       ...(name === '' ? {} : { name }),
+      ...(transcript === '' ? {} : { text: transcript }),
     });
   }
   return out.length === 0 ? undefined : out;
@@ -286,6 +316,24 @@ export function mentionsSelf(segments: readonly OneBotSegment[], selfId: string)
   return segments.some((segment) => segment.type === 'at' && segment.data['qq'] === selfId);
 }
 
+/**
+ * 这条消息里被引用的那条是哪一条（OneBot 的 `reply` 段，`data.id` 是 message_id）。
+ *
+ * 为什么只拿得到 id：OneBot 的 reply 段**不给被引正文**（官方那条路给，所以官方能做成
+ * `[引用 原话] ` 前缀）。要拿正文得回头查本地日志里那条 message_id——那要往适配器里塞一个
+ * 日志查询口，代价与收益不成比例（见报告 §3.5 的两条路）。这里取 (b)：把"这是回复哪一条"
+ * 如实写进前缀，信息量低但零成本，而且**形状与官方一致**（`injection.ts` 的 `speakerWordsOf`
+ * 按 `[引用…]` 开头整块剥掉——被引的那句常常是她自己刚说的，用她自己的话给她定罪是另一类错）。
+ */
+export function replyIdOf(segments: readonly OneBotSegment[]): string {
+  for (const segment of segments) {
+    if (segment.type !== 'reply') continue;
+    const id = (segment.data['id'] ?? '').trim();
+    if (id !== '') return id;
+  }
+  return '';
+}
+
 // ──────────────────────────────── 事件 → wake/channel ────────────────────────────────
 
 export interface OneBotEventContext {
@@ -293,6 +341,11 @@ export interface OneBotEventContext {
   selfId?: string;
   /** 事件里写的通道名（默认 onebot；测试可用别名区分多实例） */
   channelName?: string;
+  /**
+   * 这条回复的**是不是她自己说过的话**——调用方给得出就给（判据是本地那份已发消息 id 表，
+   * 见 `OneBotChannel.sendText`）。给不出时按"不是回复她"处理（少登记一个人，比错登记好）。
+   */
+  isReplyToSelf?: (replyId: string) => boolean;
 }
 
 /**
@@ -322,12 +375,30 @@ export function mapEventToWakeChannel(
   const segments = toSegments(event['message']);
   const rawMessage = readString(event, 'raw_message');
   const fromRaw = rawMessage === '' ? '' : stripCqCodes(rawMessage).trim();
-  const text = fromRaw !== '' ? fromRaw : textOfSegments(segments).trim();
+  const body = fromRaw !== '' ? fromRaw : textOfSegments(segments).trim();
   const attachments = attachmentsOf(segments);
   const channelName = context.channelName ?? ONEBOT_CHANNEL_NAME;
 
+  /**
+   * "这一条是不是在叫她" —— **如实填**（2026-10-07 对齐官方通道时补的）。
+   *
+   * 原先这个字段**从不填**，后果不是"少一个标志"，是整条链断掉：
+   * `real-loop.ts` 的 `registerGroupMembers`（群成员档案）**唯一入口**就是
+   * `data.mentionsMe === true`——官方每条 `GROUP_AT_MESSAGE_CREATE` 都填，OneBot 一条不填，
+   * 于是 OneBot 群里 @ 过她的人在档案里**一个都不出现**，她问"甲是谁"时框架给不出名字。
+   *
+   * 判据两条，都是协议事实、不做推测：
+   *   ① `at` 段里就是她的 `self_id`（→ `group-at`）——与官方那条同一语义；
+   *   ② 这条消息**回复的是她自己发的那条**（`reply` 段的 id 在本地已发消息表里）。
+   *      为什么这条也算：@ 与"接着她那句说下去"在群里是同一件事的两种形态，而 OneBot 的 `reply`
+   *      是唯一能判出来的形态。**判不出就不填**——`self_id` 缺失时宁可当"没叫她"（少登记一个人，
+   *      比把满群闲话的人都灌进档案好）。
+   * 关键词那一层不在这里：它在 `main.ts`（`mentionsKeyword`），宿主在落库前补同一个字段。
+   */
   let chatType: WakeChannel['data']['chatType'];
   let chatId: string;
+  let mentionsMe = false;
+  let quotedPrefix = '';
   if (messageType === 'private') {
     chatType = 'c2c';
     chatId = person;
@@ -350,7 +421,18 @@ export function mapEventToWakeChannel(
      * 少叫醒她一次，比把整条消息扔掉好；而且这条消息在会话清单里仍然看得到。
      */
     const selfId = readScalar(event, 'self_id') || (context.selfId ?? '');
-    chatType = selfId !== '' && mentionsSelf(segments, selfId) ? 'group-at' : 'group';
+    const atSelf = selfId !== '' && mentionsSelf(segments, selfId);
+    const replyId = replyIdOf(segments);
+    const replyToSelf = replyId !== '' && (context.isReplyToSelf?.(replyId) ?? false);
+    // 被回复的是她自己那句：**叫她的另一种形态**，于是它从信箱提成唤醒。
+    // 这一侧是刻意的（用户 2026-10-07 的判据："被 @ / 被回复 / 群里点到她"都算在叫她）；
+    // 判不出来时（本地表里没有这个 id）什么都不改——宁可少叫一次。
+    chatType = atSelf || replyToSelf ? 'group-at' : 'group';
+    mentionsMe = atSelf || replyToSelf;
+    // 被引用的那句**只拿得到 id**（OneBot 的 reply 段不给正文）：如实写成前缀，
+    // 她至少知道"这是回复哪一条"。形状与官方的 `[引用 …] ` 同族——`speakerWordsOf` 按
+    // `[引用…]` 开头整块剥掉（被引的常是她自己刚说的那句，不许拿去给她定罪）。
+    if (replyId !== '') quotedPrefix = `[引用 #${replyId}] `;
   }
 
   return {
@@ -361,11 +443,16 @@ export function mapEventToWakeChannel(
     // **只用于显示**：身份永远按 id 判（见 self-brief"名字不是身份"那一段）。
     ...nicknameOf(event),
     chatId,
-    text,
+    text: `${quotedPrefix}${body}`,
     messageId,
-    // OneBot 没有官方那种"被动回复窗口"，msg_seq 是官方语义的字段：这里恒记 0
-    msgSeq: 0,
+    // 协议给了 `message_seq` 就照它记（那是平台自己的编号）；没给就是 0，由宿主在落库那一刻
+    // 补成事件 seq（规则见 `channel/inbox.ts` 的 `msgSeqOf`：唤醒那条与信箱那条用的是同一个数，
+    // 否则"这一条你还没看过"对唤醒那条**永远判错**——见报告 §3.4）。
+    msgSeq: readNumber(event, 'message_seq') ?? 0,
     ...(attachments === undefined ? {} : { attachments }),
+    // `mentionsMe` 只在**真的是**的时候出现：一个恒假的字段会把"给得出就填"这条纪律变成噪音，
+    // 而且它会进事件载荷——能不带就不带。
+    ...(mentionsMe ? { mentionsMe: true } : {}),
     dedupeKey: `${channelName}:${messageId}`,
   };
 }
@@ -408,6 +495,205 @@ export function oneBotIdOf(chatId: string): number | string {
   return Number.isSafeInteger(value) ? value : chatId;
 }
 
+// ──────────────────────────────── 出站媒体 ────────────────────────────────
+
+/**
+ * 要发的一个媒体：与官方通道的 `QqMediaInput` **同一套形态**
+ * （`fileType` 的四个值同源：1 图 / 2 视频 / 3 语音 / 4 文件）。
+ *
+ * 这里不 import 官方那个类型：`onebot.ts` 对 `qq-official.ts` 只取接口与工厂（见文件头），
+ * 而"媒体是什么"是工具层的产物（`MediaRequest`），两条通道各自翻译自己的那一份。
+ */
+export interface OneBotMediaInput {
+  fileType: 1 | 2 | 3 | 4;
+  /** 网络地址（与 `data` / `path` 三选一） */
+  url?: string;
+  /** 本机字节（宿主读了文件之后给）——按 `base64://` 交给协议端 */
+  data?: Uint8Array;
+  /** 本机路径（文件类走 `upload_*_file` 时需要） */
+  path?: string;
+  name?: string;
+}
+
+/** 四类媒体在 OneBot 里的两种出站形态：消息段 / 群文件上传 */
+const MEDIA_SEGMENT_TYPES: Readonly<Record<number, string>> = {
+  1: 'image',
+  2: 'video',
+  3: 'record',
+};
+
+export type OneBotMediaCall =
+  | {
+    ok: true;
+    action: string;
+    params: Record<string, unknown>;
+    /** 这条动作的响应里带不带 `message_id`（文件上传那条不带，它回 `file_id`） */
+    returnsMessageId: boolean;
+  }
+  | { ok: false; reason: string };
+
+/**
+ * 媒体 → OneBot 动作（**纯函数**：不碰网络、不读文件，所以每条形态都能单独断言）。
+ *
+ * 为什么单独拆出来：这是"OneBot 上到底发不发得出去媒体"的**全部判据**所在
+ * （动作名、参数名、段类型、来源形态）。留在 `sendMediaTo` 里就得开一条真连接才测得到，
+ * 而这条链最缺的恰恰是"构造对不对"的用例（现场那条通道此刻收不到事件，见报告 §3.1）。
+ *
+ * 两类形态的来路（**未实测**，判据读自协议端产物 `data/services/snowluma/`，见提交说明）：
+ *   • **消息段**（图 / 视频 / 语音）：`send_group_msg` / `send_private_msg` 的 `message`
+ *     收段数组，段的 `file` 可以是 `base64://` 或 http(s) 地址；
+ *   • **群文件 / 私聊文件**（`kind:'file'`）：走 `upload_group_file` / `upload_private_file`——
+ *     OneBot 11 里这两条是**独立动作**，不是消息段（协议端的 `file` 段只承接**入站**的
+ *     收文件通知）。所以文件那条**要求本机路径**：网络地址要发文件，得先下载到本地
+ *     （那是调用方的事，这里如实报"给不了路径"而不是发一个协议端认不出的段）。
+ */
+export function oneBotMediaCall(
+  isGroup: boolean,
+  chatId: string,
+  media: OneBotMediaInput,
+): OneBotMediaCall {
+  const name = (media.name ?? '').trim();
+  const url = (media.url ?? '').trim();
+  if (media.fileType === 4) {
+    const path = (media.path ?? '').trim();
+    if (path === '') {
+      return {
+        ok: false,
+        reason: 'OneBot 发文件走的是"上传文件"那条动作，要一个本机路径'
+          + '（网络来的文件请先下载到本地再发）',
+      };
+    }
+    const params: Record<string, unknown> = isGroup
+      ? { group_id: oneBotIdOf(chatId), file: path }
+      : { user_id: oneBotIdOf(chatId), file: path };
+    if (name !== '') params['name'] = name;
+    return {
+      ok: true,
+      action: isGroup ? 'upload_group_file' : 'upload_private_file',
+      params,
+      returnsMessageId: false,
+    };
+  }
+
+  const segmentType = MEDIA_SEGMENT_TYPES[media.fileType];
+  if (segmentType === undefined) {
+    return { ok: false, reason: `OneBot 不认识这种媒体类型：${String(media.fileType)}` };
+  }
+  const file = url !== '' ? url : (media.data === undefined ? '' : `base64://${Buffer.from(media.data).toString('base64')}`);
+  if (file === '') {
+    return { ok: false, reason: '这条媒体既没有网络地址也没有字节，发不出去' };
+  }
+  const segment: Record<string, unknown> = { type: segmentType, data: { file } };
+  // 视频段带个 `name`：协议端要用它给文件起名（图片/语音不需要，多给一个字段只是噪音）
+  if (name !== '' && segmentType === 'video') {
+    (segment['data'] as Record<string, unknown>)['name'] = name;
+  }
+  return {
+    ok: true,
+    action: isGroup ? 'send_group_msg' : 'send_private_msg',
+    params: isGroup
+      ? { group_id: oneBotIdOf(chatId), message: [segment] }
+      : { user_id: oneBotIdOf(chatId), message: [segment] },
+    returnsMessageId: true,
+  };
+}
+
+// ──────────────────────────────── 端点重读（缓存 + 失效） ────────────────────────────────
+
+/** 一次建连要用的对接点：地址 + 凭据（`accessToken` 空串 = 协议端没开校验） */
+export interface OneBotEndpoint {
+  wsUrl: string;
+  accessToken: string;
+}
+
+/**
+ * 对接点的缓存：**只在"要建连"这一刻读盘，两次读盘之间隔着一个硬下限**。
+ *
+ * 为什么需要"现读现用"而不是装配时读一次（这是本文件里唯一一条为了排障而存在的机制）：
+ * 内置协议端（SnowLuma）的 OneBot 配置是**人登录 QQ 之后**才物化到盘上的，而框架进程可能
+ * 比它先起（实测现场就是这样：进程 01:58 起来时 `config/onebot.json` 还不存在）。
+ * 装配时读一次、读不到就固化成"没有 token"的后果不是"晚一点连上"，而是**永远连不上**：
+ * 适配器此后每一拍都拿着空 token 去敲一个随机生成了 access_token 并开着校验的端口，
+ * 表现是 401 + 无限重连，日志里只有"升级被拒"，看不出根因是"配置读早了"。
+ *
+ * 三条规则（都在 `current()` 里，顺序就是优先级）：
+ *   ① 从来没读过 ⇒ 读一次；
+ *   ② 距上次读盘不到 `rereadMs` ⇒ **直接用缓存，哪怕它已经被判失效**（硬下限，见
+ *      `DEFAULT_ONEBOT_ENDPOINT_REREAD_MS`）；
+ *   ③ 距上次读盘够久，且**没有失效理由** ⇒ 复用（链路活着的时候一次盘都不读）。
+ *
+ * 失效理由只有一条：`invalidate()`——上一次建连失败了（连不上 / 握手被拒 / 刚连上就断）。
+ * **"读不出来"从来不是"该猜一个端口"的理由**：`read` 给 null 就如实返回 null，
+ * 由调用方回落到它自己那份配置（配置是人写的，猜不是）。
+ */
+export class OneBotEndpointMemo {
+  private readonly read: () => OneBotEndpoint | null;
+  private readonly now: () => number;
+  private readonly rereadMs: number;
+
+  /** 上一次读盘得到的结论（null = 那一刻读不出来） */
+  private value: OneBotEndpoint | null = null;
+  /** 有没有读过盘（区分"读过、结论是 null"与"还没读过"） */
+  private resolved = false;
+  private lastReadAt = 0;
+  /** 手里的结论还能不能信（true = 下次建连要重读） */
+  private dirty = true;
+  private readCount = 0;
+
+  constructor(options: {
+    /** 真去读一次（给 `readEndpointFromConfig` 这类函数；返回 null 表示这一刻读不出来） */
+    read: () => OneBotEndpoint | null;
+    /** 时钟（测试注入；默认 `Date.now`） */
+    now?: () => number;
+    /** 硬下限（毫秒，默认 `DEFAULT_ONEBOT_ENDPOINT_REREAD_MS`；0 = 不设下限，测试用） */
+    rereadMs?: number;
+  }) {
+    this.read = options.read;
+    this.now = options.now ?? ((): number => Date.now());
+    this.rereadMs = Math.max(0, options.rereadMs ?? DEFAULT_ONEBOT_ENDPOINT_REREAD_MS);
+  }
+
+  /** 建连前的问法：这一刻该用的对接点（读不出来就是 null）。可能读盘 */
+  current(): OneBotEndpoint | null {
+    if (this.resolved) {
+      const since = this.now() - this.lastReadAt;
+      if (since < this.rereadMs) return this.value;
+      if (!this.dirty) return this.value;
+    }
+    this.resolved = true;
+    this.lastReadAt = this.now();
+    this.readCount += 1;
+    this.value = this.read();
+    this.dirty = false;
+    return this.value;
+  }
+
+  /**
+   * 只报"手里这份是什么"，**绝不读盘**。
+   *
+   * 给状态查询用：界面每次轮询都会问一次"适配器想连哪儿"，而磁盘 IO 不该长在轮询路径上。
+   * 没读过盘时给 null（调用方回落到构造时那份配置，与建连时的回落同一个口径）。
+   */
+  peek(): OneBotEndpoint | null {
+    return this.resolved ? this.value : null;
+  }
+
+  /**
+   * 让手里的结论作废：**下一次建连必须重读**（仍受硬下限约束）。
+   *
+   * 调用点是"上一次尝试失败了"——那正是"手里这份可能已经过时"的唯一证据
+   * （协议端刚把配置写下来、换了端口、换了 token，或刚从重启里回来）。
+   */
+  invalidate(): void {
+    this.dirty = true;
+  }
+
+  /** 读过几次盘（观测与测试用） */
+  get reads(): number {
+    return this.readCount;
+  }
+}
+
 // ──────────────────────────────── 动作调用 ────────────────────────────────
 
 export type OneBotActionResult =
@@ -429,6 +715,16 @@ export interface OneBotClientOptions {
   wsUrl: string;
   /** access_token（空串表示协议端未开校验）；只进握手 query，不进日志 */
   accessToken?: string;
+  /**
+   * 端点重读口（可选，v37 起给内置协议端用）：给了它，**每次建连之前**都问一次
+   * "现在该连哪儿、带什么 token"，读到就压过上面那两个字段。
+   *
+   * 返回 null = "这一刻读不出来"：那时回落到 `wsUrl` / `accessToken`（人写在配置里的那份）。
+   * 实现见 `OneBotEndpointMemo`（读盘频率与失效条件都在那里）。
+   */
+  resolveEndpoint?: () => OneBotEndpoint | null;
+  /** 端点重读的硬下限（毫秒，默认 `DEFAULT_ONEBOT_ENDPOINT_REREAD_MS`；测试用） */
+  endpointRereadMs?: number;
   /** 事件里写的通道名（默认 onebot） */
   channelName?: string;
   /** 连接工厂覆盖点（测试注入本地假协议端） */
@@ -444,6 +740,13 @@ export interface OneBotClientOptions {
   log?: OneBotLogger;
   /** 收到 `wake/channel` 数据（已转成事件形状）时的落地口 */
   onWake: (data: WakeChannel['data']) => void;
+  /**
+   * 某个 message_id 是不是**她自己发出去的**那条（给了才判得出"被回复=在叫她"）。
+   *
+   * 为什么由上面那层给：这份表只有真正发过消息的一方有（`OneBotChannel.sendText` 拿回了
+   * 协议端的 `message_id`）。客户端自己不维护它——那是"她说过什么"，属于会话状态，不属于链路。
+   */
+  isSentMessageId?: (id: string) => boolean;
 }
 
 /**
@@ -474,6 +777,14 @@ export class OneBotClient {
   private incomingCount = 0;
   private actionCount = 0;
 
+  /**
+   * 端点缓存（`resolveEndpoint` 给了才有）。
+   *
+   * 它同时服务两件事：建连前"该连哪儿"（`current()`，可能读盘）与状态查询
+   * "手里这份是什么"（`peek()`，绝不读盘）。
+   */
+  private readonly endpointMemo: OneBotEndpointMemo | null;
+
   constructor(options: OneBotClientOptions) {
     this.options = options;
     this.log = options.log ?? SILENT_LOG;
@@ -483,6 +794,11 @@ export class OneBotClient {
     });
     this.connectFn = options.connect ?? wsConnect;
     this.readTimeoutMs = options.readTimeoutMs ?? DEFAULT_ONEBOT_READ_TIMEOUT_MS;
+    const resolveEndpoint = options.resolveEndpoint;
+    this.endpointMemo = resolveEndpoint === undefined ? null : new OneBotEndpointMemo({
+      read: resolveEndpoint,
+      ...(options.endpointRereadMs === undefined ? {} : { rereadMs: options.endpointRereadMs }),
+    });
   }
 
   /** 可观测状态（测试与 CLI 状态页用；不含 token） */
@@ -503,6 +819,29 @@ export class OneBotClient {
   /** 机器人 QQ 号（群 @ 判定的前提） */
   get loginId(): string {
     return this.selfId;
+  }
+
+  /**
+   * 它打算连的地址（**token 已经打过码**）。
+   *
+   * 这一条是给界面看的："适配器想连哪儿"是排障时最短的一步——而它必须与日志里那句
+   * 用同一个口径（都走 `maskAccessToken`），否则界面上看到的和日志里对不上号，
+   * 人就会开始怀疑是两个不同的东西。
+   *
+   * **只读缓存、不读盘**：界面每次轮询都会问它一次（`OneBotEndpointMemo.peek` 的注释）。
+   * 端点重读口还没被问过时（比如进程刚起来、还没建第一次连），报的是构造时那份配置——
+   * 那也是"它接下来会用的"那一份。token 有没有被带上，看这句话里有没有 `access_token=***`。
+   */
+  get maskedTarget(): string {
+    const cached = this.endpointMemo?.peek() ?? null;
+    const wsUrl = cached?.wsUrl ?? this.options.wsUrl;
+    const accessToken = cached?.accessToken ?? (this.options.accessToken ?? '');
+    try {
+      return maskAccessToken(buildConnectUrl(wsUrl, accessToken));
+    } catch {
+      // 地址本身非法（配置里写坏了）：如实报"地址非法"，不抛——状态查询不该因为坏配置而失败
+      return `（地址非法：${wsUrl}）`;
+    }
   }
 
   /** 起连。幂等：重复调用不会建第二条连接 */
@@ -563,12 +902,27 @@ export class OneBotClient {
 
   // ── 连接 ──
 
+  /**
+   * 这一刻建连该用的对接点。
+   *
+   * 端点重读口给了就问它（可能读盘，频率由 `OneBotEndpointMemo` 兜住）；它说"读不出来"
+   * 时回落到构造时那份配置——那是人写在配置里的值，**这里不猜端口、也不编凭据**。
+   */
+  private targetEndpoint(): OneBotEndpoint {
+    const resolved = this.endpointMemo?.current() ?? null;
+    if (resolved !== null) return resolved;
+    return { wsUrl: this.options.wsUrl, accessToken: this.options.accessToken ?? '' };
+  }
+
   private async openOnce(): Promise<void> {
     if (this.stopping) return;
     let url: string;
     try {
-      url = buildConnectUrl(this.options.wsUrl, this.options.accessToken ?? '');
+      const target = this.targetEndpoint();
+      url = buildConnectUrl(target.wsUrl, target.accessToken);
     } catch (err) {
+      // 地址读出来了但不可用（配置写坏了）：照样作废手里的结论，下一拍重读
+      this.endpointMemo?.invalidate();
       this.log.warn(`[OneBot] 连接地址不可用：${messageOf(err)}`);
       this.scheduleReconnect();
       return;
@@ -581,6 +935,14 @@ export class OneBotClient {
         onDebug: (line) => { this.log.info(`[OneBot/ws] ${line}`); },
       });
     } catch (err) {
+      /**
+       * 这一拍没连上：手里的端点结论作废，下一拍重读。
+       *
+       * **这就是治"配置晚于进程物化"的那一处**：进程起来时协议端还没登录 QQ、配置还没落盘，
+       * 读到的是 null ⇒ 拿配置里那份（没有 token）去连 ⇒ 401；而下一秒重连时重读一次，
+       * 那时配置已经在盘上了，token 就跟着上去了。没有这一步，空 token 会被固化到天荒地老。
+       */
+      this.endpointMemo?.invalidate();
       this.log.warn(`[OneBot] 连接失败（${maskAccessToken(url)}）：${messageOf(err)}`);
       this.scheduleReconnect();
       return;
@@ -595,6 +957,8 @@ export class OneBotClient {
       this.ready = false;
       this.failPending('OneBot 连接已断开，动作未送达');
       if (this.stopping) return;
+      // 链路断了也是"手里这份可能过时"的证据（对端可能重启并换了端口或 token）：下一拍重读
+      this.endpointMemo?.invalidate();
       this.log.warn(
         `[OneBot] 连接断开（code=${info.code ?? '无'}，${info.byLocal ? '本地发起' : '对端/超时'}`
         + `${info.reason === '' ? '' : `，${info.reason}`}），准备重连`,
@@ -706,10 +1070,29 @@ export class OneBotClient {
       this.onMetaEvent(payload);
       return;
     }
-    if (postType !== 'message') return; // notice / request 等不是"对我说的话"
+    if (postType !== 'message') {
+      /**
+       * 非 message 的事件**留一行日志**（与官方通道同一条口径，见 qq-official.ts 的
+       * `[QQ/网关] 收到分发：…`）。
+       *
+       * 为什么值得占一行：这条链路最要紧的排障问题是"协议端到底推没推、适配器认没认"——
+       * 原先这里直接 `return`，一个字都不记，于是"群里 @ 了她却没反应"只能靠翻协议端自己的
+       * 日志（另一套知识、另一份路径）。官方那条路的同类注释就是为同一个坑写的
+       * （2026-10-02 那次"群里 @ 了她却没反应"），OneBot 又踩了一遍。
+       * 只记类型与 id 前 12 位：既够定位，也不会把整条事件抄进日志。
+       */
+      const id = readScalar(payload, 'message_id') || readScalar(payload, 'notice_type')
+        || readScalar(payload, 'request_type') || readScalar(payload, 'sub_type');
+      const what = postType === '' ? '（缺 post_type）' : postType;
+      this.log.info(`[OneBot] 收到分发：${what}${id === '' ? '' : ` · ${id.slice(0, 12)}`}（不是消息事件，已忽略）`);
+      return;
+    }
     const wake = mapEventToWakeChannel(payload, {
       selfId: this.selfId,
       channelName: this.options.channelName ?? ONEBOT_CHANNEL_NAME,
+      // 回复她自己的那条 = 在叫她（见 mapEventToWakeChannel 的判据②）：表在上面那层，
+      // 因为"她发过哪些 message_id"只有真正发过消息的一方知道
+      isReplyToSelf: (id) => this.options.isSentMessageId?.(id) ?? false,
     });
     if (wake === null) return;
     this.options.onWake(wake);
@@ -765,6 +1148,10 @@ export interface OneBotChannelOptions {
   wsUrl: string;
   /** access_token；只进握手 query，不进日志 */
   accessToken?: string;
+  /** 端点重读口（内置协议端用：每次建连前现读一次它的配置；见 `OneBotClientOptions`） */
+  resolveEndpoint?: () => OneBotEndpoint | null;
+  /** 端点重读的硬下限（毫秒，默认 `DEFAULT_ONEBOT_ENDPOINT_REREAD_MS`；测试用） */
+  endpointRereadMs?: number;
   channelName?: string;
   connect?: (url: string, options: WsConnectOptions) => Promise<WsClient>;
   readTimeoutMs?: number;
@@ -796,12 +1183,28 @@ export class OneBotChannel implements ChannelAdapter {
    * **后者才是能看出静默假活的那个数**（见 `snapshot()` 的注释）。
    */
   private lastEventAtMs = 0;
+  /**
+   * **她自己发出去的那些 message_id**（最近 `SENT_ID_WINDOW` 条，先进先出）。
+   *
+   * 为什么需要它：`reply` 段只给"回复的是哪一条"，而"那条是不是我说的"是**本地才知道**的事实
+   * ——它决定这条消息算不算在叫她（`mentionsMe`、`group-at`，见 `mapEventToWakeChannel` 判据②），
+   * 而那个判据是群成员档案与唤醒的入口。没有这份表，被回复就永远判不出来。
+   *
+   * 为什么是有界窗口而不是全量：她说过的话可能上万条，而"有人在回复她刚说的那句"几乎总在
+   * 最近若干条之内；无界增长换来的只是内存账单。窗口之外的量不到就按"不是回复她"处理
+   * （少登记一个人，比错登记好）。
+   */
+  private readonly sentMessageIds = new Set<string>();
+  /** 发出去的消息 id 记多少条（窗口） */
+  private static readonly SENT_ID_WINDOW = 512;
 
   constructor(options: OneBotChannelOptions) {
     this.log = options.log ?? SILENT_LOG;
     this.client = new OneBotClient({
       wsUrl: options.wsUrl,
       ...(options.accessToken === undefined ? {} : { accessToken: options.accessToken }),
+      ...(options.resolveEndpoint === undefined ? {} : { resolveEndpoint: options.resolveEndpoint }),
+      ...(options.endpointRereadMs === undefined ? {} : { endpointRereadMs: options.endpointRereadMs }),
       ...(options.channelName === undefined ? {} : { channelName: options.channelName }),
       ...(options.connect === undefined ? {} : { connect: options.connect }),
       ...(options.readTimeoutMs === undefined ? {} : { readTimeoutMs: options.readTimeoutMs }),
@@ -812,6 +1215,8 @@ export class OneBotChannel implements ChannelAdapter {
       ...(options.setTimeoutFn === undefined ? {} : { setTimeoutFn: options.setTimeoutFn }),
       ...(options.clearTimeoutFn === undefined ? {} : { clearTimeoutFn: options.clearTimeoutFn }),
       log: this.log,
+      // "这条回复的是不是我发的那句"：表就在这一层（只有发过消息的一方有）
+      isSentMessageId: (id) => this.sentMessageIds.has(id),
       onWake: (data) => {
         this.delivered += 1;
         // 记下"最近一条消息是什么时候来的"——见 lastEventAt 的注释：协议端有一种
@@ -833,11 +1238,32 @@ export class OneBotChannel implements ChannelAdapter {
   }
 
   /**
+   * 记下自己发出去的那条：`reply` 段指的若是它，那条消息就算在叫她。
+   *
+   * 只记非空 id（协议端没给 id 时没什么可记的），并按窗口淘汰最旧的一条
+   * （`Set` 的迭代顺序就是插入顺序）。
+   */
+  private rememberSentMessage(messageId: string): void {
+    if (messageId === '') return;
+    this.sentMessageIds.add(messageId);
+    while (this.sentMessageIds.size > OneBotChannel.SENT_ID_WINDOW) {
+      const oldest = this.sentMessageIds.values().next().value;
+      if (oldest === undefined) break;
+      this.sentMessageIds.delete(oldest);
+    }
+  }
+
+  /**
    * 回投（speak 的第三路）。
    *
    * `options.msgId/msgSeq` 在 OneBot 语义下**一律忽略**：那是官方被动回复窗口的字段
    * （同一 msg_id 必须换 msg_seq，否则 40054005 去重失败），OneBot 没有这条限制——
    * 回复就是一条普通的 send_* 动作，重发也不会被去重拒绝。
+   *
+   * 但 `msgId` **照原样收下并显式丢掉**（而不是把签名缩窄成没有它）：两条通道的 poster 接口
+   * 同形，形状在这里说真话——"这条通道没有那个概念"写在实现里，不写在类型上让人猜
+   * （报告 §3.11）。发出去之后那个 `message_id` 反过来有用：它进 `sentMessageIds`，
+   * "有人回复她那句"才判得出来。
    */
   async sendText(
     chatType: OneBotChatType,
@@ -845,7 +1271,10 @@ export class OneBotChannel implements ChannelAdapter {
     text: string,
     options: SendTextOptions = {},
   ): Promise<SendOutcome> {
-    void options;
+    // OneBot 没有被动回复窗口：`msgId`（回哪一条）与 `msgSeq`（同一 msg_id 的第几次）
+    // 在本通道下都没有语义，而"引用回复"是另一个可选参数（本适配器不代劳，与她写 CQ 码同一口径）。
+    void options.msgId;
+    void options.msgSeq;
     const raw: string = chatType;
     const isGroup = raw === 'group-at' || raw === 'group';
     if (!isGroup && raw !== 'c2c') {
@@ -857,7 +1286,54 @@ export class OneBotChannel implements ChannelAdapter {
       : { user_id: oneBotIdOf(chatId), message: text };
     const result = await this.client.call(action, params);
     if (!result.ok) return { ok: false, reason: result.reason, passive: false };
-    return { ok: true, messageId: readScalar(result.data, 'message_id'), passive: false, msgSeq: 0 };
+    const messageId = readScalar(result.data, 'message_id');
+    this.rememberSentMessage(messageId);
+    // `passive` 恒 false：这条通道没有被动/主动之分（如实报，不借官方的语义）
+    return { ok: true, messageId, passive: false, msgSeq: 0 };
+  }
+
+  /**
+   * 发一个**媒体**（`send_media` 走到这条通道时的落点）：图片 / 语音 / 视频 / 文件。
+   *
+   * 与官方那条路的差别是**没有上传那一步**：OneBot 的媒体就在消息段里给协议端一个来源，
+   * 由协议端自己去取（官方要先 `uploadMedia` 换 `file_info` 再 `msg_type=7` 发）。
+   *
+   * 来源形态按 `kind` 定，**只给协议端真的认得的**（下面每条都写了它是从哪来的；判据在
+   * `data/services/snowluma` 的产物里读出来的，见提交说明的"未实测"那一段）：
+   *   • `url`（网络地址）→ 段里 `file` 直接放那个 http(s) 地址；
+   *   • 本机字节 → `base64://<base64>`。协议端的二进制来源装载器认
+   *     `base64://` / `http(s)://` / `file://` / 本地路径四种（`loadBinarySource` +
+   *     `resolveLocalFilePath`），而 base64 那一种**不依赖"适配器与协议端同机"**，
+   *     也不需要往盘上写临时文件、更不需要事后清理；
+   *   • 文件类且有本机**路径** → `file://` 地址（`upload_group_file` / `upload_private_file`
+   *     的 `file` 参数语义就是"路径或 URL"）。
+   *
+   * 语种形态的 id 与官方那套 `fileType: 1|2|3|4` **同源**（1 图 / 2 视频 / 3 语音 / 4 文件），
+   * 因为 `MediaRequest` 是工具层的产物、两条通道共用；这个函数只负责把它翻成消息段。
+   */
+  async sendMediaTo(
+    chatType: OneBotChatType,
+    chatId: string,
+    media: OneBotMediaInput,
+    options: SendTextOptions = {},
+  ): Promise<SendOutcome> {
+    // 与 sendText 同一条纪律：`msgId` / `msgSeq` 是官方被动回复窗口的字段，本通道没有这个概念。
+    // 但**不收起来假装没有**——签名留着它，这里显式说明为什么不用（报告 §3.11）。
+    void options.msgId;
+    void options.msgSeq;
+    const raw: string = chatType;
+    const isGroup = raw === 'group-at' || raw === 'group';
+    if (!isGroup && raw !== 'c2c') {
+      return { ok: false, reason: `OneBot 不支持的 chatType：${raw}`, passive: false };
+    }
+    const built = oneBotMediaCall(isGroup, chatId, media);
+    if (!built.ok) return { ok: false, reason: built.reason, passive: false };
+    const result = await this.client.call(built.action, built.params);
+    if (!result.ok) return { ok: false, reason: result.reason, passive: false };
+    const messageId = built.returnsMessageId ? readScalar(result.data, 'message_id') : '';
+    // 媒体也记：`send_media` 发出去的那条同样可能被人回复，判据与文本那条同源
+    this.rememberSentMessage(messageId);
+    return { ok: true, messageId, passive: false, msgSeq: 0 };
   }
 
   /** 状态快照（CLI/测试观测；token 值本身从不外露） */
@@ -876,6 +1352,25 @@ export class OneBotChannel implements ChannelAdapter {
       // 拿不准的事不替她决定。
       lastEventAt: this.lastEventAtMs === 0 ? null : this.lastEventAtMs,
       ...this.client.snapshot(),
+    };
+  }
+
+  /**
+   * 链路观测（第三档）：界面要回答的是"适配器到底连上没有、它想连哪儿"。
+   *
+   * 与 `snapshot()` 的分工：那个是给测试与 CLI 看的计数，这个是给**界面**看的句子——
+   * 多了一个 `target`（含 token 打码后的地址：日志里怎么打码，这里就怎么打）。
+   *
+   * token **必须打码**：这个值会进 HTTP 响应。`maskAccessToken` 是那条链上唯一的口径，
+   * 所以这里直接复用它（在 `OneBotClient.maskedTarget` 里），不另写一份替换规则。
+   */
+  linkView(): { connected: boolean; target: string; selfId: string; reconnectAttempts: number } {
+    const snapshot = this.snapshot();
+    return {
+      connected: snapshot.connected,
+      target: this.client.maskedTarget,
+      selfId: snapshot.selfId,
+      reconnectAttempts: snapshot.reconnectAttempts,
     };
   }
 }

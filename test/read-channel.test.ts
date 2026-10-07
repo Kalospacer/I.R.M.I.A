@@ -354,6 +354,40 @@ describe('read_channel · 她自己点开信箱', () => {
     assert.equal(repeat.content.includes('没有新消息'), true, '别的会话照旧去重（这条闸没被整体放开）');
   });
 
+  test('她自己刚发过凭据 → 不许回"没有新消息"（她要核对"我到底发出去没有"）', async () => {
+    // 2026-10-07 补的第四条例外（用户报的"report 老是重复发"）。她 report 出站成功之后要核对
+    // "那一篇到底到没到"，而那条凭据**不是平台消息**、不进 `latestSeq`——原来这条闸只比平台消息，
+    // 于是"刚报告过、回头核对"这个动作必然得到「没有新消息」，**她要找的那一行永远拿不到**，
+    // 她据此判"没发出去"→再发一遍。
+    const rec = recorder();
+    const messages = [message({ chatId: 'G1', chatType: 'group', text: '把结果发我', msgSeq: 7, seq: 300 })];
+    let spoken = [{ text: '第一份报告：42 个文件全过', ts: '2026-10-01T16:43:00.000Z', parts: 1, seq: 400, atMs: Date.parse('2026-10-01T16:43:00.000Z') }];
+    const tk = createAdminTools({
+      timers: new TimerStore(null),
+      emit: rec.emit as never,
+      channelReader: async () => messages,
+      channelSpokenReader: async () => spoken,
+      timezone: 'UTC',
+    });
+    const tool = tk.byName('read_channel');
+
+    const first = await tool.handler({ sid: 'qq:group:G1', limit: 8 }, CTX);
+    assert.ok(first.content.includes('第一份报告'), `第一次要读到她自己那一篇：\n${first.content}`);
+
+    // 外面没有新消息，但她**又**发了一篇（凭据 seq 更大）⇒ 这一屏必须照给，不许说"没有新消息"
+    spoken = [...spoken, { text: '第二份报告：剩下的 3 个也过完了', ts: '2026-10-01T16:45:00.000Z', parts: 1, seq: 500, atMs: Date.parse('2026-10-01T16:45:00.000Z') }];
+    const again = await tool.handler({ sid: 'qq:group:G1', limit: 8 }, CTX);
+    assert.equal(again.content.includes('没有新消息'), false,
+      `她自己刚发过东西，就不许回"没有新消息"（她找的那一行就在里面）：\n${again.content}`);
+    assert.ok(again.content.includes('第二份报告'), '新发的那一篇要读得到');
+
+    // 反向：她也**没**再发、外面也没有新的 → 照旧去重（这条闸没被整体放开），
+    // 而且措辞要点明"这个位置含你自己发出去的那些"，免得她把"没有新消息"读成"我那篇不在里面"
+    const repeat = await tool.handler({ sid: 'qq:group:G1', limit: 8 }, CTX);
+    assert.match(repeat.content, /没有新消息/u, `真的没有新东西时照旧去重：${repeat.content}`);
+    assert.match(repeat.content, /含你自己发出去的那些/u, `去重那句话要说清她的凭据在里面：${repeat.content}`);
+  });
+
   test('描述在单件 100 token 的硬线以内（工具清单是每轮常驻开销）', () => {
     const tk = toolkitWith(null, recorder());
     const tokens = estimateTokens(tk.byName('read_channel').description);

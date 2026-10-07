@@ -95,23 +95,6 @@ export {
   type SplitText,
 } from './text-codec.ts';
 
-/**
- * 本包提供的全部工具名，按注册顺序。
- *
- * 注意 `rg_search` 与 `es_search` **都在条件注册之列**（各自的引擎探测通过才有），
- * 常驻工具集的真相是 `buildFsTools` 的返回值，不是这份名单。
- */
-export const FS_TOOL_NAMES = [
-  'safe_read',
-  'list_dir',
-  'rg_search',
-  'read_blob',
-  'safe_edit',
-  'safe_write',
-  'safe_rollback',
-  'multi_edit',
-] as const;
-
 /** 描述预算口径与 tools/registry.ts 共用同一实现，不另立一套（design.md §4.18） */
 export { estimateTokens, MAX_DESCRIPTION_TOKENS };
 

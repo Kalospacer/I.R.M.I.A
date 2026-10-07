@@ -103,6 +103,8 @@ interface Harness {
   append: (type: string, data: unknown) => AppEvent;
   /** 人在界面上打了一句话（GUI 那条路写的就是这个形状） */
   say: (note: string) => AppEvent;
+  /** 垫一段够长的可见历史（≥ 一个 recent tail），让交接的收益闸门放行 */
+  seedLongHistory: () => AppEvent;
   events: () => Promise<AppEvent[]>;
   types: () => Promise<string[]>;
 }
@@ -165,6 +167,14 @@ async function makeHarness(t: TestContext, reply = '好。', budget: Partial<App
     append,
     // 与 src/web/server.ts 的 wake 动作同形状：GUI 聊天框打的话就是一条 wake/manual
     say: (note: string) => append('wake/manual', { note, person: '用户' }),
+    // 垫一段够长的可见历史：交接的收益闸门要求"新闭合的历史 ≥ 一个 recent tail"
+    // （RECENT_TAIL_TOKENS = 20,000 估算 token），否则这次折叠不划算、会被拒。
+    // 这几条用例验的是**指令接线**，所以先把料备足，再按指令。
+    // 量给足（约 3 万 token）：卡在阈值线上会让用例因估算误差忽好忽坏。
+    seedLongHistory: () => append('message/user', {
+      text: '先垫一段够长的历史。'.repeat(4_500),
+      source: 'human',
+    }),
     events: async () => {
       const out: AppEvent[] = [];
       for await (const event of log.readAll()) out.push(event);
@@ -199,7 +209,9 @@ function alarmsOf(events: AppEvent[]): Array<{ title: string; body: string }> {
 
 test('/compact：越过阈值判断，当场压一次（压缩产物真的落库）', async (t) => {
   const h = await makeHarness(t);
-  // 攒一段真实的往来：一条人话 + 她的回答（压缩要有东西可压）
+  // 攒一段真实的往来：一条人话 + 她的回答（压缩要有东西可压），
+  // 再垫够一个 recent tail 那么长的历史（收益闸门：新闭合量不足它就不压）
+  h.seedLongHistory();
   h.say('今天把那份报告写完，先列个提纲。');
   await h.loop.tickOnce();
   assert.equal(h.model.requests.length, 1, '第一轮正常跑了一次模型');
@@ -248,6 +260,7 @@ test('/compact：越过阈值判断，当场压一次（压缩产物真的落库
 
 test('/handoff：写出交接笔记，且**下一个 turn 读得到**它', async (t) => {
   const h = await makeHarness(t);
+  h.seedLongHistory();
   h.say('机器我要关了，报告还差结论那一节。');
   await h.loop.tickOnce();
 
@@ -360,6 +373,7 @@ test('群里（wake/channel）打的 /compact 不算指令：外部文字不该�
 test('撞上限（每日层暂停）时 /compact 照样能按——人恰恰在这时最需要它', async (t) => {
   // 日额度按到 1：写一条 1 token 的消耗就顶到上限
   const h = await makeHarness(t, '好。', { dailyTokens: 1 });
+  h.seedLongHistory();
   h.say('先聊一句。');
   await h.loop.tickOnce();
 
@@ -385,6 +399,7 @@ test('撞上限（每日层暂停）时 /compact 照样能按——人恰恰在�
 
 test('/compact 不吞队列里还没轮到处理的输入（遮蔽点停在它之前）', async (t) => {
   const h = await makeHarness(t);
+  h.seedLongHistory();
   h.say('先说一句正事。');
   await h.loop.tickOnce();
 
@@ -407,8 +422,8 @@ test('/compact 不吞队列里还没轮到处理的输入（遮蔽点停在它�
 
 // ──────────────────────────────── ⑦ 边界：没有可压的东西就不压 ────────────────────────────────
 
-test('没有可写进笔记的内容：不落空摘要（那会把历史遮掉却不留替代品）', async (t) => {
-  // 全新日志、只按一条指令：渲染不出任何条目
+test('日志里一条可见事件都没有：不落空摘要（没有可遮蔽的东西，也就没有替代品要写）', async (t) => {
+  // 全新日志、只按一条指令：遮蔽点还停在 0，区间里一条可见事件都没有
   const h = await makeHarness(t);
   h.say('/compact');
   await h.loop.tickOnce();
@@ -420,4 +435,31 @@ test('没有可写进笔记的内容：不落空摘要（那会把历史遮掉�
   assert.equal(ofType(events, 'compaction/summary').length, 0, '不写只有标题的空摘要');
   assert.match(trace.data.receipt, /什么都没压/u);
   assert.equal(h.model.requests.length, 0, '这一拍也不该花一次模型调用');
+});
+
+// ──────────────────────────────── ⑧ 摘要不许落空（机械替代文本） ────────────────────────────────
+
+test('笔记渲染不出来时**落机械替代文本**：遮蔽一旦发生就不许留白', async (t) => {
+  const h = await makeHarness(t);
+  // 垫一段历史：遮蔽点会前进（有东西被折进来），但把笔记预算压到 0 ⇒ 笔记渲染不出条目。
+  // 这正是 reasonix 那条教训的场景：「留白会被读成"那段时间什么都没发生"，然后她按这个
+  // 印象编下去」。所以这时候必须落一条**说清"这里折过东西"**的文本，而不是空摘要。
+  h.seedLongHistory();
+  h.say('一句要被折进去的话。');
+  await h.loop.tickOnce();
+  // 把笔记总预算改成 0（配置是注入的，这条只在测试里这么做）
+  const cfg = h.loop['deps'].config as { persona: { handoffBudgetTokens: number } };
+  cfg.persona.handoffBudgetTokens = 0;
+
+  h.say('/compact 预算被压到 0 也要有交代');
+  await h.loop.tickOnce();
+
+  const events = await h.events();
+  const summaries = ofType(events, 'compaction/summary');
+  assert.equal(summaries.length, 1, '摘要照落（不许因为"笔记渲染不出来"就不写）');
+  assert.ok(summaries[0]!.data.coveredUpToSeq > 0, '遮蔽点仍然是一个有效值');
+  assert.ok(summaries[0]!.data.summary.trim() !== '', 'summary 字段**不许空**');
+  assert.match(summaries[0]!.data.summary, /没生成出来/u, '说的就是"笔记这次没生成出来"');
+  assert.match(summaries[0]!.data.summary, /不是"这段什么都没发生"/u,
+    '必须点破那个误读：留白 ≠ 什么都没发生');
 });

@@ -352,6 +352,72 @@ export interface SpeakSentPayload {
 
 export type SpeakChannel = 'log' | 'notify' | 'reply-url';
 
+/**
+ * 「这一跳真的送到了那个会话」那一条回执的形状 —— **判据只此一处**。
+ *
+ * 三个产生点（`speak` 的整段/被打断、`report` 的正文出站、`send_media`）都走这个函数，
+ * 消费者（`real-loop.ts` 的 `readChannelSpoken`：`read_channel` 的"她自己说过什么"）读
+ * `deliveredToSid`。**两边引的是同一个实现**，所以"写凭据的"与"读凭据的"不可能各认一套。
+ *
+ * 为什么必须收成一处（2026-10-07 修的真缺陷）：原来这条判据在三处各写了一遍——
+ *   • 产生侧：`channel: 'reply-url'` 加不加 `text` 全凭手写（`report` 就漏了 `text`）；
+ *   • 消费侧：`channel !== 'reply-url' || text === undefined || sid === undefined`；
+ *   • 说明文字：`channel='reply-url'` + `sid` + **带 `text`**。
+ * `report` 漏掉 `text` 的代价不是"少一个字段"，而是**她 report 过之后读自己说过什么，
+ * 那一篇凭空不在**——日志里明明有那条事件，她一查却查不到（详见 `SENT_CREDENTIAL_NOTE`
+ * 与 `report` 里那段注释）。形状由函数返回、类型由返回标注钉住（`text` 是**必填**），
+ * 漏字段编译期就红。
+ *
+ * 为什么 `log` / `notify` 两路不在这里：`log` 是本机对话流（永远可用，不代表话到了那个会话）、
+ * `notify` 是告警出口（到她自己的手机，不是那个会话）。只有 `reply-url` 是"IM 那一路走通了"。
+ */
+export function deliverToSession(input: {
+  /** 送到了哪个会话（sid，与 `read_channel` 的 `sid`、唤醒派生的回投地址同形同源） */
+  sid: string;
+  /** 送出去的**完整文本**（切分是投递的属性：多段气泡也只写这一份整段） */
+  text: string;
+  /** 这段文本在那边被切成了几条气泡（1 = 一次说完） */
+  parts?: number;
+  /** `speak/sent.chars`：中文计字口径，与既有回执一致 */
+  chars?: number;
+  /** 哪一次工具调用发的（`read_channel` 按它归并；`tool/call.callId` 同源） */
+  callId?: string;
+  /** 产生这次投递的 turn 号（复盘用；兜住旧事件没有 callId 的情形） */
+  turn?: number;
+}): SpeakSentPayload {
+  return {
+    channel: 'reply-url',
+    chars: input.chars ?? input.text.length,
+    sid: input.sid,
+    text: input.text,
+    spokenParts: input.parts ?? 1,
+    ...(input.callId === undefined ? {} : { callId: input.callId }),
+    ...(input.turn === undefined ? {} : { turn: input.turn }),
+  };
+}
+
+/**
+ * 这一条 `speak/sent` 是不是"**真的送进了某个会话**"的凭据？是就给出那个 sid，不是给 `null`。
+ *
+ * 这是 `deliverToSession` 的**唯一**消费判据：`read_channel` 的"我自己的发言"那一折
+ * （`real-loop.ts` 的 `readChannelSpoken`）只认它。三个条件缺一不可——
+ *   • `channel === 'reply-url'`：本机对话流与告警出口那两条不代表话到了那边；
+ *   • `text !== undefined`：没有文本就回答不了"她说过什么"（旧日志里只有 `sid` 的那些回执
+ *     属于此列，读不回来是"日志只增不改"的必然，不是缺陷）；
+ *   • `sid !== undefined`：没有会话坐标就归不到任何一个会话。
+ *
+ * 收在这里的收益是**可判定**：想让一类投递进她的"我说过什么"视野，就得让它走
+ * `deliverToSession`；而写漏了字段时，这里当场返回 `null`（有 `test/read-channel-spoken.test.ts`
+ * 的用例逐条钉着），不会变成"日志里有、她读不到"这种静默的半截接线。
+ */
+export function deliveredToSid(data: SpeakSentPayload | Record<string, unknown>): string | null {
+  if (data['channel'] !== 'reply-url') return null;
+  const text = data['text'];
+  const sid = data['sid'];
+  if (typeof text !== 'string' || text === '') return null;
+  return typeof sid === 'string' && sid !== '' ? sid : null;
+}
+
 export interface TodoItem {
   content: string;
   status: 'pending' | 'in_progress' | 'completed';
@@ -735,6 +801,28 @@ export function eventSeqOf(item: ReadChannelItem): number {
 export const SELF_SPEAK_LABEL = '（我）';
 
 /**
+ * 出站到某个会话**成功之后**回执里的那一句 —— 说清"凭什么能确认它发出去了"。
+ *
+ * 用户 2026-10-07 报的现象：「report 貌似不进 channel？她老是不知道自己的 report 已经发出去了
+ * 导致重复发」。三问的答案是：**消息进了日志，但没有进她"读了能确信"的那条路**。原来只有
+ * `speak` 写那种带 `text` 的 `speak/sent`（`read_channel` 的"我说过什么"只认它），
+ * `report` 写的那条没有 `text` ⇒ 她 `report` 完去翻会话，**自己那一篇不在里面**，
+ * 于是她只能靠"工具回执里那句已送达"相信——而那正是最容易被下一拍读丢的一手信息。
+ *
+ * 这一句把判据直接摆在她眼前（她是唯一的读者），说三件事：
+ *   ① 送达的目标（会话坐标，与外部会话清单上的同一个 sid）；
+ *   ② **凭什么能确认**——`read_channel` 里会有一行 `（我）`（= 她被指向去看的那个东西）；
+ *   ③ 因此**不用再发一遍**（"重复发"这件事故的直接解药）。
+ *
+ * 为什么写成常量而不是在 `speak` / `report` 里各拼一遍：两个工具的路由不同、**判据必须同一句**
+ * ——她据这句话决定要不要再发。两处各写一遍，迟早一句改了另一句没改，而"她以为没发出去"
+ * 这种误判正是这次要修的病害本身。
+ */
+export const SENT_CREDENTIAL_NOTE =
+  '已送达凭据：这个会话的"我说过什么"里已经有这一篇了（`read_channel` 里那一行行首是 `（我）`），'
+  + '不用再发一遍';
+
+/**
  * 把"她在这个会话里说过的话"与外部消息**按时间轴交错**成一批（read_channel 唯一的合批实现）。
  *
  * 三件事在这里落定，每一条都是刻意的取舍：
@@ -743,9 +831,12 @@ export const SELF_SPEAK_LABEL = '（我）';
  *      而 read_channel 的预算是**行数**：一次 151 字的发言在 IM 上发了 13 条，读回来若也占 13 行，
  *      她翻开信箱看到的全是自己刚才说的话。所以**归并发生在宿主那一侧**（`readChannelSpoken`
  *      把一次发言的多条回执拼成一条），到这里 `spoken` 里一项就是一行。
- *   ② **只认真的送到那个会话的那些回执**（`channel='reply-url'` + `sid` 对得上 + 带 `text`）。
- *      本机对话流那条回执（`channel='log'`）不代表话到了那边；投递失败/被拒时**没有**这条回执
+ *   ② **只认真的送到那个会话的那些回执**。判据收在 `deliveredToSid` **一处**（产生侧走
+ *      `deliverToSession`，消费侧走它——两边引同一个实现）。本机对话流那条回执
+ *      （`channel='log'`）不代表话到了那边；投递失败/被拒时**没有**这条回执
  *      ——"没发出去"就不算"她说过"，否则她会以为自己答过了，而群里其实一个字都没有。
+ *      走这条判据的不止 `speak`：`report` 的正文出站与 `send_media` 也在内
+ *      （2026-10-07 修的就是 `report` 漏了 `text` 导致它读不回来）。
  *   ③ **不额外扩窗**：`limit` 是这一屏的**总行数**（她的行也算），所以最多还是 limit 行。
  *      这是"她读的是这段时间里发生了什么"的口径——时间轴只有一条，没法把她的行排除在外还保持
  *      先后可读。反过来也挡住了"她的发言把外部消息挤没"：一屏就这么多行，不会因为她说得多而变长。
@@ -1395,10 +1486,15 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         },
         to: {
           type: 'string',
+          // **这里只说"发给谁"**：平台侧的主动/被动、权限、配额那一类机制**不进描述**
+          // （2026-10-07 用户的口径：那是过时知识，"本来就不需要知道"）。理由有两层：
+          //   ① 它是**通道专属**的，而这里的话对每条通道一起说——OneBot 上"要权限、有配额"
+          //      这句是假的（那边发一条就是一条普通消息），她照它行事会少说该说的话；
+          //   ② 发不出去时**回执本来就会如实说清原因**，不需要她在动手之前先背一套平台政策。
+          // 改这里要连带看 `send_media` 的描述与 self-brief 第 ④ 段（同一件事的三处落点）。
           description:
             '发给哪个会话（sid 就在上下文的外部会话清单里）；省略 = 回到本轮叫你说话的那个会话。'
-            + '**回叫你的人**走平台回复窗口（回复他那条消息），一定发得出去；'
-            + '**发给别人**是主动消息——要权限、有配额，发不出去就是发不出去，别换措辞再试（回执会说清原因）。',
+            + '发不出去时回执会说清原因，照它就事论事就行。',
         },
         level: {
           type: 'string',
@@ -1499,6 +1595,15 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         let interrupted = false;
         /** IM 那一路的失败原因（null = 没失败）；一旦失败就不再试后面的段，但日志照落 */
         let imFailure: string | null = null;
+        /**
+         * IM 那一路**真的送成了**的那几段（原样拼起来）。
+         *
+         * 为什么要攒：这条路的凭据只有一条（"她说出去过"是一个事实，不是 N 个），所以整段/被打断
+         * 两个出口都是"发完之后写一条"（见 `deliverToSession`）。攒的是**真送成的那些段**而不是
+         * `text` 原文——与 speak"读回来的是那边实际收到的字节"那条口径一致。正常跑完时它就是
+         * 整段；中途失败/被打断时它是"收不回来的那半截"（**不补**失败之后没发的那些）。
+         */
+        const deliveredSegments: string[] = [];
         /** IM 那一路带回来的降级提醒（形态变了，但话发出去了）：要进回执 */
         let imNote: string | null = null;
         /** 一段都没开始发之前不许取消——见循环开头那段说明 */
@@ -1539,6 +1644,7 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
             const outcome = await replyPoster.post(target, segment);
             if (outcome.ok) {
               sent += 1;
+              deliveredSegments.push(segment);
               // 降级事实（例如 markdown 没权限、按纯文本发的）只在回执里说，不改投递结果
               imNote = degradeLineOf(outcome.note) ?? imNote;
             } else imFailure = outcome.reason;
@@ -1556,16 +1662,15 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
           // ——不记的话她会以为自己没说（而群里已经看到了）。只记送成的那些（`sent`），
           // 一个字都不多记；一条都没送成（本地那几段不算"发到那个会话"）就不写这条回执。
           if (target !== null && sent > 0) {
-            const delivered = segments.slice(0, sent);
-            emit('speak/sent', {
-              channel: 'reply-url',
-              // 字数按中文计字口径（与整段那条回执同一个算法：一个字算一个，emoji 也算一个）
-              chars: charCount(delivered.join('')),
+            emit('speak/sent', deliverToSession({
               sid: target.url,
-              text: delivered.join(''),
-              spokenParts: sent,
+              // 字数按中文计字口径（`charCount`：一个 emoji 算一个）——与整段那条回执同一个算法
+              chars: charCount(deliveredSegments.join('')),
+              // 攒下来的就是**真送成的那几段**（不补失败之后没发的那些）
+              text: deliveredSegments.join(''),
+              parts: sent,
               ...spokenKey,
-            } satisfies SpeakSentPayload);
+            }) satisfies SpeakSentPayload);
           }
           const said = segments.slice(0, emitted).join('／');
           const unreleased = segments.slice(emitted);
@@ -1614,17 +1719,19 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
           // ——read_channel 要回答的是"那边到底收到了什么"。代价是相邻两句之间没有标点
           //（原句的句号被摘了），读起来是连着的；宁可她读到自己那口气的原样，也不替她补一个
           // 她没打过的标点（那是往"她说过的话"里加字）。
-          emit('speak/sent', {
-            channel: 'reply-url',
-            chars,
+          emit('speak/sent', deliverToSession({
             sid: target.url,
-            text: segments.join(''),
-            spokenParts: segments.length,
+            chars,
+            text: deliveredSegments.join(''),
+            parts: segments.length,
             ...spokenKey,
-          } satisfies SpeakSentPayload);
+          }) satisfies SpeakSentPayload);
           lines.push(targetLabel === ''
             ? `投递：已送达 ${target.url}（${sent} 条）`
             : `已发往 ${targetLabel}（sid ${target.url}）：${sent} 条`);
+          // 与 `report` **逐字同一句**：她据它决定要不要再说一遍，两处口径分岔就是"同一个事实、
+          // 两种说法"（`SENT_CREDENTIAL_NOTE` 的注释里记着为什么必须同一句）。
+          lines.push(SENT_CREDENTIAL_NOTE);
         }
         // 降级提醒单独一行，且**排在投递结论之后**：先答"发没发出去"，再答"发成什么样"。
         // 它只在通道明确带回降级事实时出现（例如 markdown 被拒、按纯文本发的）——
@@ -1657,7 +1764,7 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
           type: 'string',
           description:
             '发给哪个会话（sid 见上下文的外部会话清单）；省略 = 本机对话流 + 本轮叫你说话的那个会话。'
-            + '回叫你的人 = 平台回复窗口（发得出去）；发给别人 = 主动消息，要权限与配额，失败别重试。',
+            + '发不出去时回执会说清原因。',
         },
         level: {
           type: 'string',
@@ -1708,15 +1815,44 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         } else {
           const outcome = await replyPoster.post(target, text);
           if (outcome.ok) {
-            emit('speak/sent', { channel: 'reply-url', chars, sid: target.url } satisfies SpeakSentPayload);
+            // **出站成功的凭据**，与 speak 同一个函数、同一种形状（`deliverToSession` 的注释里
+            // 记着判据为什么必须收成一处）。这一条同时解决两件事：
+            //   ① 它进 `read_channel` 的"我自己的发言"那一折 ⇒ 她下一次翻这个会话，能读到
+            //      **自己刚报告过的那一篇**（行首 `（我）`），不必靠记忆；
+            //   ② 它是"发出去了"的**凭据**，不是"我想发"的意图——所以只在 `outcome.ok` 里写。
+            //
+            // 文本给 `text` 原文（不是任何切分结果）：report 这条路**不切分**，进请求体的就是
+            // 这一整串（`test/admin-pwsh.test.ts` 里那条"逐字节进请求体"钉着）；
+            // `parts: 1` 说的正是"这一步只有一条"。
+            emit('speak/sent', deliverToSession({
+              sid: target.url,
+              text,
+              parts: 1,
+              chars,
+              callId: ctx.callId,
+              turn: ctx.turn,
+            }) satisfies SpeakSentPayload);
             lines.push(resolved.label === ''
               ? `投递：已送达 ${target.url}（HTTP ${outcome.status}）`
-              : `已发往 ${resolved.label}（sid ${target.url}）`);
+              : `已发往 ${resolved.label}（sid ${target.url}，HTTP ${outcome.status}）`);
+            // 回执的最后一句**就是她的判据**：这条已经出去了，下一轮要核对它就读那一行
+            //（SENT_CREDENTIAL_NOTE 的注释里记着三种"看不到自己发过"的失效各是什么样）。
+            lines.push(`${SENT_CREDENTIAL_NOTE}（${target.url}）`);
             const note = degradeLineOf(outcome.note);
             if (note !== null) lines.push(note);
           } else {
-            lines.push(`${resolved.label === '' ? '投递' : `发往 ${resolved.label}`}：失败——${outcome.reason}`);
+            // 失败/被拒：**不写凭据**（"没发出去"不算"她报告过"），但要把原因留痕在本行里
+            // ——她会照这条换个方式再试；而下一轮 `read_channel` 里没有那一行，正是"没出去"
+            // 的如实反映，不是"框架忘了记"。
+            lines.push(`${resolved.label === '' ? '投递' : `发往 ${resolved.label}`}：失败——${outcome.reason}。`
+              + '这条没有送达（对话流里那一段只是本机记录，不等于他收到了）。');
           }
+        }
+        // 没有可发会话时也说清"凭什么能确认"：凭据写的是**会话坐标**，这一轮没有坐标，
+        // 所以下一轮读这个会话**不会**看到这一篇——她据此知道"该往哪儿补发"，而不是以为发过了。
+        if (target === null) {
+          lines.push('这一轮没有会话坐标，所以没写"已送达某会话"的凭据：'
+            + '下一轮你翻那个会话时不会看到这一篇。要它真的到那边，带 `to` 再发一次。');
         }
         return okResult(`报告已处理：\n${lines.map((line) => `- ${line}`).join('\n')}`);
       } catch (err) {
@@ -1964,16 +2100,23 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
 
   const readChannel: ToolDefinition = {
     name: 'read_channel',
+    // 描述瘦身（2026-10-06）：原来 98/100 token —— 距硬门只剩 2 token，再顺手加半句话就会
+    // `register` 抛错、被 `buildCatalogRegistry` 记进 problems 并**跳过注册**（工具静默少一件，
+    // 只能从行为异常反推）。压到 64 的做法是**把 sid/limit 的细节挪进参数描述**
+    // （参数不进 `MAX_DESCRIPTION_TOKENS` 那份预算，而她两个都看得到：schema 与描述一起进清单）：
+    // `sid 见外部会话清单` 与 `limit 默认/上限` 本来就在参数里逐字写着，`limit` 的两条口径
+    // （她自己的发言也占行、一次回复只占一行；要看更早的给更大的值）现在跟着 `limit` 走。
+    // 留在描述里的四句都是**她据此决定行为**的：读什么、含她自己的话（怎么认）、看过即标记已读、
+    // 没有新消息时回什么（以及想接着说就走 speak）。
     description:
-      '看某个会话最近的若干条消息（sid 见外部会话清单；limit 默认 20、上限 100）。'
-      + '**也包括你自己在这个会话说过的话**（行首 `（我）`）；你的一整段回复只占一行。'
-      + '看过的会标记已读。群聊普通消息平时不推送，想知道积累了什么就用它。'
-      + '**没有新消息时只回一句"没有新消息"**：想接着说就直接 speak，想看更早的把 limit 调大。',
+      '看某个会话最近的若干条消息（**也包括你自己在这个会话说过的话**，行首 `（我）`；看过的标记已读）。'
+      + '群聊平时不推送，想知道积累了什么就用它。没有新消息时只回一句「没有新消息」，'
+      + '想接着说就直接 speak。',
     parameters: {
       type: 'object',
       properties: {
         sid: { type: 'string', description: '会话标识，形如 qq:group:<群 id>（见外部会话清单）' },
-        limit: { type: 'number', description: `这一屏最多几行（默认 ${READ_CHANNEL_DEFAULT_LIMIT}、上限 ${READ_CHANNEL_MAX_LIMIT}；你自己的发言也占行）` },
+        limit: { type: 'number', description: `这一屏最多几行（默认 ${READ_CHANNEL_DEFAULT_LIMIT}、上限 ${READ_CHANNEL_MAX_LIMIT}）；你自己的发言也占行、一次回复只占一行；要看更早的给更大的值` },
       },
       required: ['sid'],
       additionalProperties: false,
@@ -2021,37 +2164,61 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         // "这批最大的 msgSeq"还是 1 ⇒ `1 <= prev.upToSeq(=1)` ⇒ 回一句"没有新消息"，
         // 哪怕用户这中间刚发了十条。事件 seq 没有这个毛病：新消息落库必得更大的 seq。
         const latestSeq = messages.reduce((max, m) => Math.max(max, eventSeqOf(m)), 0);
+        // **她自己的凭据也要进这个数**（2026-10-07 修的缺陷，用户的原话见 `SENT_CREDENTIAL_NOTE`）。
+        //
+        // 她 report 出站成功之后，那一篇的证据是一条 `speak/sent`（`deliverToSession`）——
+        // 它**不是平台消息**，所以不进 `messages`、也就不进 `latestSeq`。原来这条闸只比
+        // `latestSeq`，于是"她刚往这个会话报告过、想回头核对一下"这个动作必然得到
+        // 「没有新消息」，**她要找的那一行永远拿不到**：她会据此判断"报告没发出去"，
+        // 再发一遍（用户报的"重复发"就是这么来的）。
+        //
+        // 口径仍是"事件 seq 有没有新东西"，只是把**她自己的那些凭据**也算进来：它们是这个会话
+        // 里真实发生过的事（时间轴只有一条）。判据用的还是 `eventSeqOf`——同一个数、同一套量纲。
+        //
+        // 注意它**不改变"未读"**：给出去的那一笔 `channel/read` 仍是 `upToSeq`（平台序号，
+        // 只由**别人**的消息决定——她自己的发言从不把自己算成未读，见 `mergeChannelSpeech` ②）。
+        // 这里只是"这一屏要不要照给"的判据，不是"有多少条未读"。
+        const spokenSeq = spoken.reduce((max, item) => Math.max(max, eventSeqOf(item)), 0);
+        const newestSeq = Math.max(latestSeq, spokenSeq);
         const prev = readState.get(sid);
-        // 没有新东西、也没要更宽的窗口 → 直接说"没有新消息"，不把同一段再摆一遍。三个例外都留着：
+        // 没有新东西、也没要更宽的窗口 → 直接说"没有新消息"，不把同一段再摆一遍。四个例外都留着：
         //   ① 她要看**更早**的（limit 比上次大）——那是有新内容的请求，不是重复调用；
         //   ② 本进程还没读过这个会话（重启后的第一次）——宁可多给一次，也别让她两手空空；
         //   ③ **这一轮就是这个会话在叫她**（提及/@）——那种情况下"没有新消息"是假的：叫她的那条是
         //      `wake/channel`，不计入未读、可能正好压在已读位之内，而 v28 之后她手里**只有通知、
         //      没有正文**。此时必须照给，否则她永远看不到那句原话（2026-10-02 用户从截图上抓到的）。
+        //   ④ **她自己的凭据比她上次读到的更新**（`speak`/`report`/`send_media` 刚发进这个会话）
+        //      ——她要核对"我到底发出去没有"，那种时候回一句"没有新消息"是最坏的答案：
+        //      她要找的那一行就在里面，而这句话让她以为它不在。这是 2026-10-07 补的那一条。
         //
         // 2026-10-05 的修复**没有动这三个例外**：① ② 判的都不是"新不新"（它们判"要不要更宽的窗口 /
         // 是不是重启后第一次"），③ 判的是"这一轮谁在叫她"——那是**另一件事**，不是"尾巴新不新"的
         // 第二处判据。改掉的是那个**数**：`latest`（平台序号）→ `latestSeq`（事件 seq）。
         const caller = mentionMessage?.() ?? null;
         const calledThisTurn = caller !== null && caller.sid === sid;
-        if (!calledThisTurn && prev !== undefined && latestSeq <= prev.seq && limit <= prev.limit) {
+        if (!calledThisTurn && prev !== undefined && newestSeq <= prev.seq && limit <= prev.limit) {
           const times = bumpReadRepeat(ctx?.turn ?? 0, sid);
+          // 措辞里点明"这个位置含你自己发出去的那些"：她刚 report/说过话、回头核对时，最怕把
+          // 「没有新消息」读成"我那一篇不在里面"——那正是"重复发"的触发条件（`SENT_CREDENTIAL_NOTE`）。
+          const mine = spoken.length === 0
+            ? ''
+            : '；这个位置含你自己发出去的那些，它们在下面那一屏里（行首 `（我）`）';
           const head = times <= 1
-            ? `${sid} 没有新消息：你已经读到最新了（停在 seq=${prev.seq}）。`
+            ? `${sid} 没有新消息：你已经读到最新了（停在 seq=${prev.seq}${mine}）。`
               + '不必再翻一遍——想接着说就直接 speak，回不回、说什么都由你。'
             : `${sid} 还是没有新消息：这一轮你已经读过它 ${times} 次，再读返回的还是同一段`
-              + `（停在 seq=${prev.seq}）。想说话直接 speak 就行；真要往前翻，`
+              + `（停在 seq=${prev.seq}${mine}）。想说话直接 speak 就行；真要往前翻，`
               + `把 limit 调到比 ${prev.limit} 大（默认 ${READ_CHANNEL_DEFAULT_LIMIT}、上限 ${READ_CHANNEL_MAX_LIMIT}）。`;
           return okResult(head);
         }
         // 读完就记账：未读归零。**先取消息、后写已读**——反过来会出现"标了已读但一条没看到"，
         // 那种状态没有任何办法自查（她自己以为看过了，日志也说看过了，只有她知道是空的）。
         //
-        // 两笔账各记各的：`channel/read` 里那个是**会话簿的位置**（未读按它算，口径不变）；
-        // readState 记的是**这批尾巴的事件 seq**（上面那条闸的判据）。同一个名字（upToSeq）不
-        // 同时担两件事——它们是两个不同的数，混用一个必然至少错一个。
+        // 两笔账各记各的：`channel/read` 里那个是**会话簿的位置**（未读按它算，口径不变，
+        // 只由**别人**的消息推进）；readState 记的是**这一屏尾巴的事件 seq**（上面那条闸的判据
+        // ——它要含她自己的凭据，否则同一篇 report 会被反复当成"新东西"照给）。
         emit('channel/read', { sid, upToSeq } satisfies ChannelReadPayload);
-        readState.set(sid, { seq: latestSeq, limit });
+        readState.set(sid, { seq: newestSeq, limit });
         bumpReadRepeat(ctx?.turn ?? 0, sid);
 
         const entry = sessionEntryOf(messages[0]!);
@@ -2133,7 +2300,11 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
     name: 'send_media',
     description:
       '把一个媒体（图片/语音/视频/文件）发给某个会话：本机文件用 path、网上的用 url。'
-      + '一次一个文件；要配说明文字就另外调一次 speak。',
+      + '一次一个文件；要配说明文字就另外调一次 speak。'
+      // **"哪条通道发得了媒体"不进描述**（2026-10-07 用户的口径）：那是通道专属的机制，
+      // 而这里的话对每条通道一起说。**做不到时不假装**——发不出去就由回执如实说清是哪条通道、
+      // 为什么不行；她据此决定要不要换个会话或换个方式，不必先背一张通道能力表。
+      + '有通道发不了媒体——回执会如实说明。',
     parameters: {
       type: 'object',
       properties: {
@@ -2187,14 +2358,20 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
       if (!outcome.ok) {
         return errorResult(`发送失败：${outcome.reason}`, TOOL_ERROR_CODES.notConfigured);
       }
-      emit('speak/sent', {
-        channel: 'reply-url',
-        chars: 0,
+      // 同一条凭据判据（`deliverToSession`）：媒体没有正文，`text` 给**这一行的可读摘要**
+      // ——它同样是"她发出去过"的事实，`read_channel` 的"我说过什么"里该有一行。
+      // 原来这里只写 `{channel,sid,chars:0}`：她发完图去翻会话，那一行不在（与 report 同款病害）。
+      emit('speak/sent', deliverToSession({
         sid: target.url,
-      } satisfies SpeakSentPayload);
+        text: `［${kind === 'image' ? '图' : kind === 'video' ? '视频' : kind === 'voice' ? '语音' : '文件'}］`,
+        parts: 1,
+        chars: 0,
+        callId: ctx.callId,
+        turn: ctx.turn,
+      }) satisfies SpeakSentPayload);
       return okResult(resolved.label === ''
-        ? `已发往 ${target.url}（${kind}）`
-        : `已发往 ${resolved.label}（${kind}，sid ${target.url}）`);
+        ? `已发往 ${target.url}（${kind}）${SENT_CREDENTIAL_NOTE}`
+        : `已发往 ${resolved.label}（${kind}，sid ${target.url}）${SENT_CREDENTIAL_NOTE}`);
     },
   };
 

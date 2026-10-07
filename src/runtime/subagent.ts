@@ -42,6 +42,7 @@ import type {
 } from '../log/types.js';
 import { defaultVisibility, emptyProjection } from '../log/types.ts';
 import { applyOne, applySubagentEvent } from '../state/fold.ts';
+import type { BlobOffloadOptions } from '../state/blob-store.ts';
 import type { IsolationConfig, ToolPlanGate } from '../tools/executor.js';
 import type { ListForModelOptions, ToolDefinition, ToolHandlerResult } from '../tools/registry.js';
 import { ToolRegistry } from '../tools/registry.ts';
@@ -169,6 +170,12 @@ export interface TaskRuntime {
   isolation?: IsolationConfig | undefined;
   /** 技能 catalog：缺省不带（那是父视角的索引，子代理按需 safe_read 更省） */
   skillCatalog?: string | null | undefined;
+  /**
+   * 单条工具回执的上限（2026-10-06 加，见 `tools/catalog.ts` 的同名格）：子代理与父循环
+   * 用同一把尺。它进的是 `AgentLoopDeps.blobOffload`（唯一写入点 `recordToolResult`），
+   * 所以"首入一次性定形、此后不再剪"的性质与父完全一致。
+   */
+  blobOffload?: BlobOffloadOptions | undefined;
   /** 外部取消（父 turn 的信号）：透传给子代理的模型请求与工具执行 */
   signal?: AbortSignal | undefined;
 }
@@ -267,6 +274,13 @@ export interface TaskToolDeps {
   isolation?: IsolationConfig;
   /** 技能 catalog：缺省不带（那是父视角的索引，子代理按需 safe_read 更省） */
   skillCatalog?: string | null;
+  /**
+   * 单条工具回执的上限（2026-10-06 加，见 [TaskRuntime.blobOffload] 与
+   * `tools/catalog.ts` 的同名格）：与父循环同一把尺。
+   *
+   * 生产装配走 [runtime]（`dataDir` 只在宿主手里）；这一格是给静态形状（测试台 / 夹具）留的。
+   */
+  blobOffload?: BlobOffloadOptions;
   /** 结局摘要的观测出口（宿主可在自己的日志里留一行） */
   onFinish?: (summary: TaskRunSummary) => void;
 }
@@ -312,6 +326,9 @@ function runtimeOf(deps: TaskToolDeps): TaskRuntime | null {
   if (isolation !== null) rt.isolation = isolation;
   const skillCatalog = pick(deps.skillCatalog, source?.skillCatalog ?? null);
   if (skillCatalog !== null) rt.skillCatalog = skillCatalog;
+  // 单条回执上限：与父同一把尺（子代理的上下文同样会被一次大回执吃掉）
+  const blobOffload = pick(deps.blobOffload, source?.blobOffload ?? null);
+  if (blobOffload !== null) rt.blobOffload = blobOffload;
   const signal = pick(deps.signal, source?.signal ?? null);
   if (signal !== null) rt.signal = signal;
   return rt;
@@ -581,6 +598,8 @@ class SubagentRun {
     if (rt.hooks !== undefined) deps.hooks = rt.hooks;
     if (rt.isolation !== undefined) deps.isolation = rt.isolation;
     if (rt.skillCatalog !== undefined) deps.skillCatalog = rt.skillCatalog;
+    // 单条回执上限与父同一把尺：不给它，子代理自己的上下文就没有这条界
+    if (rt.blobOffload !== undefined) deps.blobOffload = rt.blobOffload;
     if (this.signal !== undefined) deps.signal = this.signal;
     // 计划模式门**必须与父共用同一个实例**：子代理手里的工具与父是同一批（含 pwsh /
     // http_post / safe_write），不传它就等于"用 task 派一个子代理"能绕过事前人审——

@@ -52,6 +52,12 @@ export interface TaskCardSnapshot {
   turn: number;
   step: number;
   todoOpen: string[];
+  /**
+   * 本任务相关资产那一行（v34，可选）：**取当时那条 `memory/selected.assets`**，不从盘上重算。
+   * 空串 = 当时没有那一行（清单不存在 / 没挑出相关的 / 心跳拍）——那时字段整个不带上，
+   * 渲染结果与引入它之前逐字节相同。
+   */
+  assets?: string;
 }
 
 export interface ReplayPosition {
@@ -149,9 +155,24 @@ export function locateStep(events: readonly AppEvent[], turn: number, step: numb
       // 真正把清单填进任务卡的是 `rebuildRenderedRequest`（它手里有 persona，从 STATE 那两节读）。
       // 留一个空数组在这里，是这个快照"事件侧能确定的字段"的诚实表示。
       todoOpen: [],
+      // 本任务相关资产那一行（v34）：**在这一层就能确定**——它是轮首写下的结论
+      // （`memory/selected.assets`），不需要她的 STATE、也不需要现在那份清单文件。
+      // 从盘上重算会读到"现在这份 assets.md"，那是另一回事（"重建必须等于当时"）。
+      assets: assetsFromEvents(eventsBefore, turn),
     },
     coveredUpToSeq,
   };
+}
+
+/** 该 turn 的 `memory/selected.assets`（**最后一条**；没有就是空串） */
+function assetsFromEvents(events: readonly AppEvent[], turn: number): string {
+  let found = '';
+  for (const event of events) {
+    if (event.type !== 'memory/selected' || event.data.turn !== turn) continue;
+    const assets = (event.data as { assets?: unknown }).assets;
+    if (typeof assets === 'string' && assets.trim() !== '') found = assets;
+  }
+  return found;
 }
 
 /** timerId → 最近一条 timer/set 的 payload（与 render 内部同口径：wake/timer 自身不带 payload） */

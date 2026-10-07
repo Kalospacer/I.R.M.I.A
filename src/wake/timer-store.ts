@@ -88,12 +88,6 @@ export interface TimerStoreDeps {
   maxTimeoutMs?: number;
 }
 
-export interface ExportOptions {
-  dir?: string;
-  omitCron?: boolean;
-  omitTimerId?: boolean;
-}
-
 export interface ReconcileResult {
   /** 按 (timerId, at) 比较：日志有而盘上没有，或两者的到期时刻不一致 */
   mismatch: boolean;

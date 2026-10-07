@@ -47,6 +47,8 @@ import type { ToolRegistry } from '../tools/registry.js';
 import type { ToolDefinition, ToolExecutionMode, ToolHandlerResult } from '../tools/types.js';
 import { MAX_DESCRIPTION_TOKENS, estimateTokens } from '../tools/registry.ts';
 import { errorResult, okResult } from '../tools/types.ts';
+// 外置指针文案的**唯一实现**（与工具结果那条路共用；两处各拼一遍必然漂移）
+import { blobPointerText } from '../model/render.ts';
 import {
   DEFAULT_BLOB_PREVIEW_CHARS, DEFAULT_BLOB_THRESHOLD_TOKENS, offloadIfLarge,
 } from '../state/blob-store.ts';
@@ -67,7 +69,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = ['2025-06-18', '20
 /** clientInfo（握手时上报；server 侧日志靠它辨认调用方）。version 与 main.ts 的 AGENT_VERSION 同步 */
 export const DEFAULT_CLIENT_INFO: { readonly name: string; readonly version: string } = {
   name: 'irmia-agent',
-  version: '0.1.0-beta.4',
+  version: '0.1.0-beta.5',
 };
 
 /** 每请求软超时：progress 通知可重置这个时钟 */
@@ -1537,7 +1539,9 @@ export class McpClientPool implements McpConnectionHost {
         : '（MCP 工具没有返回内容）';
     }
 
-    // 大结果外置（design §4.12）：MCP 的 content[] 可能是一整篇文档，不能直接塞进上下文
+    // 大结果外置（design §4.12）：MCP 的 content[] 可能是一整篇文档，不能直接塞进上下文。
+    // 上限（估算 21k token / 64 KiB 取小）与父循环**同一份**（blob-store 的默认值）。
+    // 指针文案引 `blobPointerText`（唯一实现）——以前这里自己拼了一遍，改口径时两处必然漂移。
     const offloaded = await offloadIfLarge(text, {
       dataDir: this.dataDir,
       thresholdTokens: this.blobThresholdTokens,
@@ -1545,7 +1549,7 @@ export class McpClientPool implements McpConnectionHost {
     });
     const body = offloaded.contentRef === undefined
       ? offloaded.content
-      : `${offloaded.content}\n[完整结果 ${offloaded.contentRef.bytes} 字节，可用 read_blob 取：${offloaded.contentRef.blobId}]`;
+      : `${offloaded.content}\n${blobPointerText(offloaded.contentRef)}`;
 
     if (record['isError'] === true) {
       return errorResult(body, MCP_ERROR_CODES.toolError);

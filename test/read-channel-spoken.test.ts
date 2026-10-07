@@ -21,8 +21,10 @@ import { describe, test } from 'node:test';
 
 import {
   createAdminTools,
+  deliveredToSid,
   mergeChannelSpeech,
   SELF_SPEAK_LABEL,
+  SENT_CREDENTIAL_NOTE,
   type ChannelMessageView,
   type ChannelReader,
   type ChannelSpoken,
@@ -356,6 +358,106 @@ describe('speak · 投递回执里带上"她说了什么"', () => {
     assert.equal(receipts.length, 1, '打断也要留下"说出去过什么"的凭据（那几条收不回来）');
     assert.equal(receipts[0]!['text'], posted.join(''), '只记送成的那些');
     assert.equal(receipts[0]!['spokenParts'], 2);
+  });
+});
+
+// ──────────────────────────────── ②bis report · 与 speak 同一条凭据判据（2026-10-07） ────────────────
+//
+// 用户报的现象：「report 貌似不进 channel？她老是不知道自己的 report 已经发出去了导致重复发」。
+// 根因：`report` 的正文出站**落了 `speak/sent`，但没带 `text`**；而 `readChannelSpoken` 的判据是
+// "reply-url + 带文本"（没有文本就回答不了"她说过什么"）⇒ 她 report 完翻会话，自己那一篇不在。
+// 修法是把判据收成一处（`deliverToSession` / `deliveredToSid`），下面几条锁的就是那一处。
+
+describe('report · 与 speak 同一条"发出去过"的凭据', () => {
+  /** 只接线投递那一路（`to` 直接给到会话，不依赖唤醒） */
+  function reportToolkit(
+    rec: Recorder,
+    poster: (target: ReplyTarget, text: string) => Promise<ReplyOutcome>,
+    target: ReplyTarget | null = { url: 'qq:group:G1', idempotencyKey: 'turn-3' },
+  ) {
+    return createAdminTools({
+      timers: new TimerStore(null),
+      emit: rec.emit as never,
+      replyTargetOf: () => target,
+      replyPoster: { post: poster },
+    });
+  }
+
+  const REPORT = '# 汇报\n\n- 42 个文件全过\n- 3 个在排队';
+
+  test('带 to 成功 → 凭据带 sid + **完整正文** + callId/turn（与 speak 同一种形状）', async (t) => {
+    const rec = recorder();
+    const posted: string[] = [];
+    const tk = reportToolkit(rec, async (_t, text) => { posted.push(text); return { ok: true, status: 200 }; });
+    const result = await tk.byName('report').handler({ text: REPORT, to: 'qq:group:G1' }, CTX);
+    assert.equal(result.isError, undefined, result.content);
+
+    assert.equal(posted.length, 1, 'report 不切分：整篇一次出站');
+    assert.equal(posted[0], REPORT, '进请求体的就是正文原文（Markdown 原样）');
+
+    const receipts = rec.all('speak/sent').filter((data) => data['channel'] === 'reply-url');
+    assert.equal(receipts.length, 1, '一次 report 只有一条"这一跳走通了"的凭据');
+    const receipt = receipts[0]!;
+    assert.equal(receipt['sid'], 'qq:group:G1', 'sid = 发到哪个会话（read_channel 靠它归位）');
+    assert.equal(receipt['text'], REPORT,
+      '**这一条是本次修复的要害**：没有 text，read_channel 的"我说过什么"就认不出它');
+    assert.equal(receipt['spokenParts'], 1, 'report 不切分：一条就是一条');
+    assert.equal(receipt['callId'], 'call_read', '与 speak 同源：read_channel 按 callId 归并');
+    assert.equal(receipt['turn'], 3);
+    // 判据是同一个实现：把这条凭据喂回消费侧，它必须给出同一个 sid
+    assert.equal(deliveredToSid(receipt as never), 'qq:group:G1',
+      '产生侧与消费侧必须认同一个判据（这条断言就是"收成一处"的锁）');
+  });
+
+  test('投递失败 → **不落**成功凭据（失败就不算"她报告过"）', async (t) => {
+    const rec = recorder();
+    const tk = reportToolkit(rec, async () => ({ ok: false, reason: '回投被拒：HTTP 403 主动消息无权限' }));
+    const result = await tk.byName('report').handler({ text: REPORT, to: 'qq:group:G1' }, CTX);
+    assert.equal(result.isError, undefined, result.content);
+    assert.match(result.content, /失败—/u, result.content);
+    assert.match(result.content, /403/u, '原因要如实写出来（她据此换个方式再试）');
+    assert.equal(result.content.includes('不用再发一遍'), false, '没送达就不许给她"发出去了"的判据');
+
+    assert.equal(rec.all('speak/sent').some((data) => deliveredToSid(data as never) !== null), false,
+      '没有带 sid+text 的凭据——否则下一轮 read_channel 里会凭空多出一行"我说过"');
+    // 本机对话流那条照旧（那是她与人的记录，不是"到了那个会话"）
+    assert.deepEqual(rec.all('speak/sent').map((data) => data['channel']), ['log']);
+  });
+
+  test('这一轮没有可发会话 → 只落本机那条，且回执说清"下一轮看不到这一篇"', async (t) => {
+    const rec = recorder();
+    const tk = reportToolkit(rec, async () => ({ ok: true, status: 200 }), null);
+    const result = await tk.byName('report').handler({ text: REPORT }, CTX);
+    assert.match(result.content, /没有 IM 会话可发/u, result.content);
+    assert.match(result.content, /不会看到这一篇/u, `没有会话坐标时必须说清她下一轮会看到什么：${result.content}`);
+    assert.deepEqual(rec.all('speak/sent').map((data) => data['channel']), ['log'],
+      '只有本机对话流那一条（它不代表报告到了那边）');
+    assert.equal(rec.all('speak/sent').some((data) => deliveredToSid(data as never) !== null), false);
+  });
+
+  test('`deliveredToSid` 的三个条件逐条判死（判据只有这一处）', () => {
+    // 认：真的送到某个会话、且带文本
+    assert.equal(deliveredToSid({ channel: 'reply-url', chars: 3, sid: 'qq:group:G1', text: '在' }), 'qq:group:G1');
+    // 不认：本机对话流 / 告警出口（都不代表话到了那个会话）
+    assert.equal(deliveredToSid({ channel: 'log', chars: 3, sid: 'qq:group:G1', text: '在' }), null);
+    assert.equal(deliveredToSid({ channel: 'notify', chars: 3, text: '在' }), null);
+    // 不认：没有文本（旧日志里只有 sid 的那些回执——读不回来是"日志只增不改"的必然）
+    assert.equal(deliveredToSid({ channel: 'reply-url', chars: 3, sid: 'qq:group:G1' }), null);
+    assert.equal(deliveredToSid({ channel: 'reply-url', chars: 0, sid: 'qq:group:G1', text: '' }), null);
+    // 不认：没有会话坐标（归不到任何一个会话）
+    assert.equal(deliveredToSid({ channel: 'reply-url', chars: 3, text: '在' }), null);
+  });
+
+  test('回执里那句判据与 speak **逐字同一句**（她据它决定要不要再说一遍）', async (t) => {
+    const rec = recorder();
+    setSleepForTest(async () => {});
+    t.after(() => { setSleepForTest(null); });
+    const reportOut = (await reportToolkit(rec, async () => ({ ok: true, status: 200 }))
+      .byName('report').handler({ text: REPORT, to: 'qq:group:G1' }, CTX)).content;
+    const speakOut = (await reportToolkit(rec, async () => ({ ok: true, status: 200 }))
+      .byName('speak').handler({ text: '在的' }, CTX)).content;
+    assert.ok(reportOut.includes(SENT_CREDENTIAL_NOTE), `report 回执缺判据：${reportOut}`);
+    assert.ok(speakOut.includes(SENT_CREDENTIAL_NOTE), `speak 回执缺判据：${speakOut}`);
   });
 });
 

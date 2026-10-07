@@ -28,6 +28,12 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { join } from 'node:path';
 
 import type { RenderImageRef } from '../model/render.ts';
+import {
+  buildContextImage,
+  parseImageDataUrl,
+  type ContextImageChosen,
+  type ContextImageSkipReason,
+} from '../log/types.ts';
 
 /** 附件目录名（在 `<dataDir>/blobs/` 之下，与 tools/fs 的 blob 外置同域） */
 export const ATTACHMENT_DIR_NAME = 'images';
@@ -192,7 +198,7 @@ export async function ensureAttachment(
   }
   if (downloaded.outcome === 'failed' || downloaded.outcome === 'skipped') return downloaded;
 
-  // 大图先压再算：压缩失败不算错——原件还在，进不进上下文由 readAttachmentDataUrl 判断
+  // 大图先压再算：压缩失败不算错——原件还在，进不进上下文由 readAttachmentImage 那一刻的字节头判断
   const size = downloaded.bytes ?? 0;
   if (size > CONTEXT_IMAGE_COMPRESS_ABOVE_BYTES) {
     const compressed = await ensureCompressed(dataDir, key, options);
@@ -261,52 +267,105 @@ async function ensureCompressed(
 }
 
 /**
- * 把引用读成 data URL（渲染层的注入 loader 用它）。
+ * 把引用读成**能进请求体的图片**（渲染层的注入 loader 用它）。
  *
  * **优先读压缩产物**：有 `.ctx.jpg` 就用它——那份是专门为上下文准备的小图。
  * 没有就退回原件，但原件超过 `CONTEXT_IMAGE_HARD_BYTES` 时不给（压缩都压不下来的东西，
  * 塞进每一轮请求只会更糟）：那时的降级是她仍能看到地址、用 `vision_read` 转述。
  *
- * 返回 null 都表示"这张图这次不进上下文"，后果只是那条消息少一张图——
- * 比让整个请求 400 好得多。
+ * 2026-10-07（P0）：返回值从 `string | null` 改成"**拼好的一份** + 没拼出来时的**理由**"。
+ * 起因是现场那个 400——OneBot 的附件声明是段类型裸标签 `image`，旧实现直接把它当 MIME 拼成
+ * `data:image;base64,…`，模型判 unsupported image、每一拍都失败。现在型别由**字节头**说了算
+ * （见 `buildContextImage`），字节头认不出、声明又不在白名单里就**不拼**，
+ * 理由如实交出去（`real-loop` 的预热那条路会把它写进留痕）。
+ *
+ * 于是这一层是"最后一米"的守门人：**进上下文的图片，型别一定在模型认的白名单里**。
+ * 返回 null 都表示"这张图这次不进上下文"，后果只是那条消息少一张图——比让整个请求 400 好得多。
  */
-export function readAttachmentDataUrl(
+export type AttachmentImageRead =
+  | { ok: true; image: ContextImageChosen; compressed: boolean }
+  | { ok: false; reason: ContextImageSkipReason };
+
+export function readAttachmentImage(
   dataDir: string,
   ref: RenderImageRef,
   hardBytes: number = CONTEXT_IMAGE_HARD_BYTES,
-): string | null {
-  if (ref.key === '') return null;
+): AttachmentImageRead {
+  if (ref.key === '') return { ok: false, reason: 'no-local-bytes' };
+  // 内联字节那条（协议端把段里的 `base64://` 翻成 data URL）：字节就在 key 里，不必落盘。
+  // 型别以**它自己声明的**为准（那是这段字节唯一的出处），仍要过白名单。
+  if (/^data:/iu.test(ref.key.trim())) {
+    const parsed = parseImageDataUrl(ref.key);
+    if (parsed === null) return { ok: false, reason: 'data-url-unreadable' };
+    if (parsed.bytes.byteLength > hardBytes) return { ok: false, reason: 'too-large' };
+    return {
+      ok: true,
+      compressed: false,
+      image: { mediaType: parsed.mediaType, dataUrl: `data:${parsed.mediaType};base64,${parsed.bytes.toString('base64')}` },
+    };
+  }
+  // 压缩产物是我们自己用 JPEG 编出来的：它一定在白名单里，不必再嗅一遍
   const small = compressedPath(dataDir, ref.key);
   try {
-    if (existsSync(small)) {
-      const size = statSync(small).size;
-      if (size > 0) return `data:image/jpeg;base64,${readFileSync(small).toString('base64')}`;
+    if (existsSync(small) && statSync(small).size > 0) {
+      return {
+        ok: true,
+        compressed: true,
+        image: { mediaType: 'image/jpeg', dataUrl: `data:image/jpeg;base64,${readFileSync(small).toString('base64')}` },
+      };
     }
   } catch {
     // 压缩产物读不到就退回原件
   }
   try {
     const path = attachmentPath(dataDir, ref.key);
-    if (!existsSync(path)) return null;
+    if (!existsSync(path)) return { ok: false, reason: 'no-local-bytes' };
     const size = statSync(path).size;
-    if (size === 0 || size > hardBytes) return null;
-    return `data:${ref.mime};base64,${readFileSync(path).toString('base64')}`;
+    if (size === 0) return { ok: false, reason: 'no-local-bytes' };
+    if (size > hardBytes) return { ok: false, reason: 'too-large' };
+    const bytes = readFileSync(path);
+    // 型别以**字节头**为准（声明那一栏可能是 OneBot 的裸标签 `image`），拼不出来就不进
+    const image = buildContextImage(bytes, ref.mime);
+    if (image === null) return { ok: false, reason: 'unknown-media-type' };
+    return { ok: true, image, compressed: false };
   } catch {
-    return null;
+    return { ok: false, reason: 'no-local-bytes' };
   }
 }
 
+/** `readAttachmentImage` 的 data URL（渲染层的 loader 只关心这一栏）；不进上下文时给 null */
+export function readAttachmentDataUrl(
+  dataDir: string,
+  ref: RenderImageRef,
+  hardBytes: number = CONTEXT_IMAGE_HARD_BYTES,
+): string | null {
+  const read = readAttachmentImage(dataDir, ref, hardBytes);
+  return read.ok ? read.image.dataUrl : null;
+}
+
 /**
- * 把工作目录内的一个图片文件读成 data URL——给"她自己要求把这张放进上下文"用
+ * 把工作目录内的一个图片文件读成**能进请求体的图片**——给"她自己要求把这张放进上下文"用
  * （vision_read 的直通模式走 `image/attached` 事件，key 就是那个文件路径）。
+ *
+ * 与附件那条路同一个收口（`buildContextImage`）：文件名/扩展名只是线索，进请求体的型别
+ * 以**字节头**为准——同一条纪律不在两处各写一遍，就不会有一处漏掉。
  */
-export function readFileDataUrl(absPath: string, mime: string, maxBytes: number): string | null {
+export function readFileImage(absPath: string, mime: string, maxBytes: number): AttachmentImageRead {
   try {
-    if (!existsSync(absPath)) return null;
+    if (!existsSync(absPath)) return { ok: false, reason: 'no-local-bytes' };
     const size = statSync(absPath).size;
-    if (size === 0 || size > maxBytes) return null;
-    return `data:${mime};base64,${readFileSync(absPath).toString('base64')}`;
+    if (size === 0) return { ok: false, reason: 'no-local-bytes' };
+    if (size > maxBytes) return { ok: false, reason: 'too-large' };
+    const image = buildContextImage(readFileSync(absPath), mime);
+    if (image === null) return { ok: false, reason: 'unknown-media-type' };
+    return { ok: true, image, compressed: false };
   } catch {
-    return null;
+    return { ok: false, reason: 'no-local-bytes' };
   }
+}
+
+/** `readFileImage` 的 data URL；不进上下文时给 null */
+export function readFileDataUrl(absPath: string, mime: string, maxBytes: number): string | null {
+  const read = readFileImage(absPath, mime, maxBytes);
+  return read.ok ? read.image.dataUrl : null;
 }

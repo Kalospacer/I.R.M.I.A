@@ -28,6 +28,7 @@ import { defaultVisibility, type AppEvent } from '../src/log/types.ts';
 import { applyOne, fold } from '../src/state/fold.ts';
 import { RealLoop } from '../src/runtime/real-loop.ts';
 import { buildReplayReport } from '../src/runtime/replay.ts';
+import type { ToolHandlerResult } from '../src/tools/types.ts';
 import { renderExternalEvent } from '../src/model/render.ts';
 import { ToolRegistry } from '../src/tools/registry.ts';
 import type { DsClient } from '../src/model/ds-client.ts';
@@ -696,12 +697,19 @@ test('界面预览（buildReplay）与运行期对同一批事件给出相同字
   // ④ 三指纹里的版本号确实来自事件（顺带确认这条预览读的是当时的记录本身）
   assert.equal(view.renderVersion, RENDER_VERSION, '预览按事件里记的 renderVersion 报');
 
-  // ⑤ 任务卡标题是**一行人话**，不是序列化的事件（依据 agent-loop.ts 的 taskCard 注释：
-  //    "那是给她看的当前任务，不该是一坨 JSON"）。
+  // ⑤ 任务卡标题是**人写的那句话本身**——不是序列化的事件，也不是那个 `[external_event]` 包裹。
+  //    依据 agent-loop.ts 的 taskCard 注释："那是给她看的当前任务，不该是一坨 JSON"。
   //    为什么值得单独钉一条：2026-10-04 之前预览这条路正是用 `summarizeEvent` 渲染标题的，
   //    而它对 `wake/channel` 落进 default 分支、`JSON.stringify` 整个事件 data——标题变成
   //    `{"channel":"qq-official",…}`。这条锁住"标题里不许出现原始事件 JSON"，两个入口一起罩：
-  //    运行期用 `wakeTitle`（走 `renderExternalEvent`），CLI 的重建用 `wakeTitle`，预览也必须用。
+  //    运行期用 `wakeTitle`，CLI 的重建用 `wakeTitle`，预览也必须用。
+  //
+  //    **2026-10-06 按新口径收紧**（原来是 `title.startsWith('[external_event ')`）：那条只锁住
+  //    "不是 JSON"，而**把整个包裹当标题**正是后来那条真 bug 的形状——包裹头里的 `msg=` 是平台
+  //    消息 id（QQ 官方通道一百多字符），它一个人就吃满 assets 的 `TASK_TITLE_MAX_CHARS = 200`，
+  //    正文被挤出局、light 回 `{"picks":[]}`，"本任务相关资产"那一行因此永远是空的
+  //    （`data/events` 里 632 条渠道唤醒**无一条**幸免；见 `test/wake-title.test.ts`）。
+  //    所以判据改成"标题**就是**那条消息的正文"——比"不是 JSON"紧得多：连包裹、连机器标识都不许在。
   const cardTitleOf = (request: { input: unknown }): string => {
     const text = (request.input as Array<{ content?: unknown }>)
       .map(item => String(item.content ?? ''))
@@ -713,7 +721,11 @@ test('界面预览（buildReplay）与运行期对同一批事件给出相同字
     assert.ok(title !== '', `${label}的任务卡标题必须存在（否则这条断言什么也没锁）`);
     assert.equal(title.startsWith('{'), false, `${label}的任务卡标题不是一坨 JSON：${title}`);
     assert.equal(title.includes('"chatType"'), false, `${label}的任务卡标题里不许有事件字段名：${title}`);
-    assert.ok(title.startsWith('[external_event '), `${label}的任务卡标题是那行人话：${title}`);
+    assert.equal(title, SOLICIT_MEMORY, `${label}的任务卡标题该是那句人话本身：${title}`);
+    // 机器标识一个都不许进标题（包裹标签 / 来源 / 消息 id / openid）
+    for (const banned of ['[external_event', '[/external_event]', 'source=', 'msg=', 'person=', OWNER_OPENID]) {
+      assert.equal(title.includes(banned), false, `${label}的任务卡标题里不许有 ${banned}：${title}`);
+    }
   }
 });
 
@@ -981,6 +993,154 @@ test('read_channel 端到端：她的话混在外部消息里读回来，而且*
   // 事件层没多出任何新类型：她说过什么写在既有的 speak/sent 上（schema 不动的那条口径）
   assert.equal(projection.lastSeq > 0, true);
   log.close();
+});
+
+// ──────────────────────────────── ⑥ report 出站：她下一轮能确凿知道"发出去了"（2026-10-07） ────────────────
+//
+// 用户的原话：「report 貌似不进 channel？她老是不知道自己的 report 已经发出去了导致重复发」。
+// 根因不是"没落事件"，而是**落的事件缺 `text`**：`readChannelSpoken` 只认"带文本的投递回执"
+// （没有文本就回答不了"她说过什么"），于是她 report 完去翻那个会话，自己那一篇**不在** `（我）`
+// 那一行里——她能看到的只有工具回执里那句"已送达"，而下一拍她会去读会话核对，读不到就再发一遍。
+//
+// 这一条走**真链路**：真日志 → 真 admin `report`（真 QR 装配的投递口）→ 真 RealLoop 的两个读取口
+// → 真 `read_channel`。断言的落点是"她的视图里到底有没有那一篇"，不是"事件存在"。
+
+/** 真日志 + 真 RealLoop + 真 read_channel；`poster` 决定 report 那一跳成不成 */
+async function reportRig(
+  t: test.TestContext,
+  options: { ok: boolean; reason?: string } | null,
+): Promise<{
+  log: EventLog;
+  write: (type: string, data: unknown) => AppEvent;
+  report: (args: Record<string, unknown>, ctx: { callId: string; turn: number }) => Promise<ToolHandlerResult>;
+  read: (sid: string, limit: number) => Promise<ToolHandlerResult>;
+}> {
+  const { log, write, loop } = await makeReadyRig(t);
+  const real = loop(fakeDs('{}').ds);
+  const { createAdminTools } = await import('../src/tools/admin.ts');
+  const { TimerStore } = await import('../src/wake/timer-store.ts');
+  const posted: string[] = [];
+  const tk = createAdminTools({
+    timers: new TimerStore(null),
+    emit: (type, data) => { write(type, data); },
+    ...(options === null
+      ? {}
+      : {
+          replyTargetOf: () => ({ url: 'qq:group:G1', idempotencyKey: 'turn-9' }),
+          replyPoster: {
+            post: async (_target: unknown, text: string) => {
+              posted.push(text);
+              return options.ok
+                ? { ok: true as const, status: 200 }
+                : { ok: false as const, reason: options.reason ?? '被拒' };
+            },
+          },
+        }),
+    channelReader: async (sid, limit) => await real.readChannelMessages(sid, limit),
+    channelSpokenReader: async (sid) => await real.readChannelSpoken(sid),
+    timezone: TZ,
+  });
+  const toolCtx = (ctx: { callId: string; turn: number }) => ({
+    callId: ctx.callId, turn: ctx.turn, step: 1,
+    signal: new AbortController().signal, workspaceRoot: process.cwd(),
+  });
+  return {
+    log,
+    write,
+    report: async (args, ctx) => await tk.byName('report').handler(args, toolCtx(ctx)),
+    read: async (sid, limit) => await tk.byName('read_channel').handler({ sid, limit }, toolCtx({ callId: 'call_read', turn: 10 })),
+  };
+}
+
+test('report 带 to 成功：凭据落进她自己的那条折法 —— 下一轮 read_channel 里能读到那一篇', async (t) => {
+  const rig = await reportRig(t, { ok: true });
+  // 群里先有一句（不然 read_channel 会先撞"这个会话没有取到消息"那条早退）
+  rig.write('channel/message', {
+    channel: 'qq-official', chatType: 'group', person: 'OPENID_A', chatId: 'G1',
+    text: '报告跑得怎么样了', messageId: 'm1', msgSeq: 1,
+  });
+
+  const body = '# 进度\n\n- 42 个文件已处理\n- 剩下 3 个在排队';
+  const out = await rig.report({ text: body, to: 'qq:group:G1' }, { callId: 'call_report', turn: 9 });
+  assert.equal(out.isError, undefined, out.content);
+  // 回执要让她一眼看懂：送到哪儿、以及**凭什么能确认**（这句就是判据本身）
+  assert.match(out.content, /已发往|投递：已送达/u, out.content);
+  assert.match(out.content, /不用再发一遍/u, `回执没给她判据：${out.content}`);
+
+  // ① 凭据的形状与 `speak` 同一件事：带 sid + **带 text** + callId/turn。
+  //    （这里不直接断言事件本身——下面的真链路断言"她读得到"，那才是这一条要锁的东西）
+  const view = await rig.read('qq:group:G1', 10);
+  assert.equal(view.isError, undefined, view.content);
+  // ② **最要紧的那条**：她自己的视图里真的有这一篇，行首是 `（我）`
+  const mineRows = view.content.split('\n').filter((line) => line.includes('（我）'));
+  assert.equal(mineRows.length, 1, `她 report 的那一篇必须占一行：\n${view.content}`);
+  assert.ok(mineRows[0]!.includes('42 个文件已处理'), `读到的要是她发出去的原话：\n${mineRows[0]}`);
+  assert.ok(mineRows[0]!.includes('剩下 3 个在排队'), '整篇 Markdown 原样（report 不切分）');
+  // ③ 一次 report = 一行（不是一个字一行、也不是被切开的几行）
+  assert.match(view.content, /其中你自己的发言 1 行/u, `头一行要说清成分：${view.content.split('\n')[0]}`);
+  rig.log.close();
+});
+
+test('report 失败：不落"发出去过"的凭据，但她自己的视图里也不会凭空多出一行', async (t) => {
+  const rig = await reportRig(t, { ok: false, reason: '回投被拒：HTTP 403 主动消息无权限' });
+  rig.write('channel/message', {
+    channel: 'qq-official', chatType: 'group', person: 'OPENID_A', chatId: 'G1',
+    text: '报告呢', messageId: 'm1', msgSeq: 1,
+  });
+
+  const out = await rig.report({ text: '这一篇发不出去', to: 'qq:group:G1' }, { callId: 'call_denied', turn: 9 });
+  assert.equal(out.isError, undefined, out.content);
+  assert.match(out.content, /失败/u, out.content);
+  assert.match(out.content, /403/u, '原因要如实写在回执里（她据此换个方式再试）');
+  assert.equal(/不用再发一遍/u.test(out.content), false,
+    `没发出去就不许给她"已送达"的判据：${out.content}`);
+
+  const view = await rig.read('qq:group:G1', 10);
+  assert.equal(view.content.includes('（我）'), false,
+    `没发出去的东西不该出现在"她说过什么"里（否则她以为答过了、群里一个字都没有）：\n${view.content}`);
+  rig.log.close();
+});
+
+test('report 省略 to 且这一轮没有回投会话：只落本机那条，不写带会话坐标的凭据', async (t) => {
+  const rig = await reportRig(t, null);
+  rig.write('channel/message', {
+    channel: 'qq-official', chatType: 'group', person: 'OPENID_A', chatId: 'G1',
+    text: '在吗', messageId: 'm1', msgSeq: 1,
+  });
+
+  const out = await rig.report({ text: '只在对话流里' }, { callId: 'call_local', turn: 9 });
+  assert.equal(out.isError, undefined, out.content);
+  assert.match(out.content, /没有 IM 会话可发/u, out.content);
+  // 说清"凭什么没有凭据"：下一轮她不会在那里看到这一篇，要真送到就带 to 再发
+  assert.match(out.content, /不会看到这一篇/u, `没有坐标时也要说清她下一轮会看到什么：${out.content}`);
+
+  const view = await rig.read('qq:group:G1', 10);
+  assert.equal(view.content.includes('（我）'), false, '没有会话坐标就没有凭据（本机那条不代表到了那边）');
+  rig.log.close();
+});
+
+test('回归（用户报的那个现象）：report 过之后，同一会话的"她说过什么"视图里能看到它', async (t) => {
+  // 这一条锁的是**判据本身**：她 report 完去翻会话核对，必须读到自己那一篇。
+  // 修之前这里必然是 0 行 `（我）`——凭据缺 `text`，`readChannelSpoken` 当场丢掉它，
+  // 于是"她以为没发出去"→再发一遍（用户报的重复发）。
+  const rig = await reportRig(t, { ok: true });
+  rig.write('channel/message', {
+    channel: 'qq-official', chatType: 'group', person: 'OPENID_A', chatId: 'G1',
+    text: '把结果发我', messageId: 'm1', msgSeq: 1,
+  });
+  await rig.report({ text: '第一份报告：42 个文件全过。', to: 'qq:group:G1' }, { callId: 'call_r1', turn: 9 });
+
+  // 她核对了一次（这一屏里必须有自己的那一篇）
+  const first = await rig.read('qq:group:G1', 10);
+  assert.ok(first.content.includes('第一份报告'), `第一次核对就要能读到自己发的那一篇：\n${first.content}`);
+
+  // 又报告了一份：**两份都要在**（不是"只记住最后一次"）
+  await rig.report({ text: '第二份报告：剩下的 3 个也过完了。', to: 'qq:group:G1' }, { callId: 'call_r2', turn: 11 });
+  const second = await rig.read('qq:group:G1', 10);
+  assert.ok(second.content.includes('第一份报告'), `先发的那一份不许消失：\n${second.content}`);
+  assert.ok(second.content.includes('第二份报告'), `后发的那一份也要在：\n${second.content}`);
+  assert.match(second.content, /其中你自己的发言 2 行/u, `两份报告占两行：${second.content.split('\n')[0]}`);
+  rig.log.close();
 });
 
 test('重启后预警与话题从日志折回来（内存表是空的，事件还在盘上）', async (t) => {

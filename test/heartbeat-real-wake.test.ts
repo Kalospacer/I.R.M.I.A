@@ -37,6 +37,60 @@ import { heartbeatData, makeRealWakeRig, requestFingerprint } from './fixtures/r
  *
  * 指纹口径（`requestFingerprint`）：`instructions` + 工具名 + `input` 里**剥掉此刻层**的 items。
  * 剥此刻层是因为它含本机事实（磁盘剩余空间、临时工作根路径）——那是环境噪声，不是行为差异。
+ *
+ * **2026-10-06 重取（v34 数字资产）**：这条基线**有意**动了一次，不是回归。
+ * 装置自述补了第⑰段（数字资产那一段），而它在 `instructions` 里——指纹的两个数因此变了
+ * （取数过程见 `test/digital-assets.test.ts` 头部与当次报告）：
+ *   非心跳拍 `9550a4c44b930e6a` → `6d5a885df211d254`（第一版第⑰段）→ `b7e64cc98a495ef7`（收窄口径后）
+ *   混批     `d8ba95e5f40b7516` → `06622e27744d004b` → `8a98d32a8775d2ae`
+ * 重取的证据是**做了一次对照实验**：把 self-brief 那一处改动临时撤掉、其余改动全部保留，
+ * 复跑基线脚本得到的就是上面那两个旧值 ⇒ 除那个指令段之外**没有任何别的字节变化**
+ * （事件序列两条也都一字未动，见下面的断言；light 调用仍是 0 次——`assets.md` 不存在，
+ * 那一次选取在发请求之前就返回了）。
+ * 这次改动同时把 `RENDER_VERSION` 递增到 34：instructions 是冻结前缀，改它=接受一次缓存全 miss
+ * （设计如此，代价已记在 docs/digital-assets.md 与当次报告里）。
+ *
+ * **2026-10-07 重取（v37 第 ④ 段不再讲平台的主动/被动与配额）**：这条基线**有意**又动了一次。
+ * 自述第 ④ 段末尾那半句「发给本轮叫你说话之外的人会走主动消息，QQ 那边有配额」被删掉、
+ * 换成与 `to` 语义同源的行为准则（"`to` 是指向某个人用的，不是广播开关"）——它在 `instructions`
+ * 里，所以指纹的两个数变了：
+ *   非心跳拍 `b7e64cc98a495ef7` → `6ef643eb0f3a7783`
+ *   混批     `8a98d32a8775d2ae` → `50b74c932f47e69a`
+ * 重取的证据同样是**对照实验**：把 self-brief 那一处改动临时撤回（原文恢复）、其余改动全部保留，
+ * 复跑 `_research/heartbeat-real-wake-baseline.mjs` 得到的就是上面那两个旧值 ⇒ **除那一句之外
+ * 没有任何别的字节变化**；同时两条断言里的事件类型序列**一个字都没动**（本次没有增删事件）。
+ * **2026-10-07 重取（v38 第 ⑨ 段「用度」追加"整理节拍"）**：这条基线**有意**又动了一次。
+ * 装置自述第 ⑨ 段末尾多了那一段（整理 state / 记忆 / 笔记同样花 token：必要但不必每轮做，
+ * 挑用户长时间没说话 / 没人找 / 心跳那一拍做；**但该落的账照旧落**）——它在 `instructions` 里，
+ * 所以指纹的两个数变了：
+ *   非心跳拍 `6ef643eb0f3a7783` → `28eed0dd9858ed11`
+ *   混批     `50b74c932f47e69a` → `9e49e6f9e0fb41a6`
+ * 重取的证据是**对照实验**（判据未放宽：两次都是精确比对，不做容差），三件一起看：
+ *   ① 把新加的那一段**临时撤回**（其余全留，含 v38 的版本号递增），复跑
+ *      `_research/heartbeat-real-wake-baseline.mjs` 得到的就是上面那两个**旧值**
+ *      （纯心跳拍 `e4241a3b5ad3b287` 也一并复现）⇒ 除这一段外**没有任何别的字节变化**；
+ *   ② 同一状态下 `SELF_BRIEF` 与 `HEAD` 那份**逐字节相同**
+ *      （sha256 `5d440057…c634cbb`，4922 字符；装回新段后 5163 字符 / `cca3a171…d31ba3`）
+ *      ——这是"撤掉的那一刀只切了新段"的直接凭据；
+ *   ③ 两条断言里的事件类型序列**一个字都没动**（本次没有增删事件），light 调用仍是 0 次。
+ * 驱动器与那次实验的打印留在 `_tmp/v38-baseline-control/`（未跟踪）。
+ * `RENDER_VERSION` 随之递增到 38（见 `render.ts` 顶部那一篇）。
+ *
+ * **2026-10-07 v39 复核（「本任务相关资产」那一行里她的说明不再是整段）：这两个值**不该变**，
+ * 实测也确实一个字节没变——所以本次**没有重取**，`BEFORE_*` 常量保持 v38 那两个值。**
+ * 理由是口径本身：v39 动的是**此刻层**里那一行（`persona/assets.ts` 的 `renderAssetsLine`），
+ * 而 `requestFingerprint` 的口径就是**剥掉含 `NOW_LAYER_BANNER` 的那个 item**（本文件顶部第 38 行
+ * 那一段已经写明"此刻层含本机事实，是环境噪声，不是行为差异"）。所以：
+ *   ① `test/fixtures/real-wake-rig.ts` 的指纹**看不见**这一处改动 —— 两个常量照旧；
+ *   ② v39 的对照实验**换了一个对象**（不是撤回字节，而是逐字节比对"那一行"本身）：
+ *      取 `data/workspace/MEMORIES/assets.md` 里历史最长那条挑中的三条（window-dispatch /
+ *      smack-talk / anysearch，逐字抄自 `data/events` 里那条 527 字符的 `memory/selected`），
+ *      用 v38 的老口径与 v39 的新口径各渲染一次：527 → 162 字符，**只有那一行变了**；
+ *      再把两份渲染结果各自塞进同一个"此刻层 item"里算 `requestFingerprint`
+ *      ⇒ 老口径与新口径**同一个值**（`4e7a3669b7145e0e`）；而把**层外**的历史改一个字符，
+ *      指纹立刻变成 `5ed7666c43648133` ⇒ 指纹对层外敏感，所以上面那一条不是"指纹太粗"。
+ *      脚本与打印：`_tmp/probe-v39-control.mts`（未跟踪）。
+ * `RENDER_VERSION` 随之递增到 39（见 `render.ts` 顶部那一篇）。
  */
 
 /** 改动前：非心跳拍（单条 `wake/manual`） */
@@ -44,14 +98,14 @@ const BEFORE_MANUAL_TYPES = [
   'wake/manual', 'budget/rollover', 'snapshot/checkpoint', 'turn/start', 'input/claimed',
   'memory/selected', 'step/start', 'message/assistant', 'budget/consumed', 'step/end', 'turn/end',
 ];
-const BEFORE_MANUAL_FINGERPRINT = '9550a4c44b930e6a';
+const BEFORE_MANUAL_FINGERPRINT = '28eed0dd9858ed11';
 
 /** 改动前：混批（心跳 + `wake/manual`）——按"非纯心跳"处理，与改动前一致 */
 const BEFORE_MIXED_TYPES = [
   'wake/heartbeat', 'wake/manual', 'budget/rollover', 'snapshot/checkpoint', 'turn/start', 'input/claimed',
   'memory/selected', 'step/start', 'message/assistant', 'budget/consumed', 'step/end', 'turn/end',
 ];
-const BEFORE_MIXED_FINGERPRINT = 'd8ba95e5f40b7516';
+const BEFORE_MIXED_FINGERPRINT = '9e49e6f9e0fb41a6';
 
 /** 改动前：纯心跳拍 —— 事件序列里**没有任何 step**，请求数 0（这就是要修的那个形态） */
 const BEFORE_HEARTBEAT_TYPES = [

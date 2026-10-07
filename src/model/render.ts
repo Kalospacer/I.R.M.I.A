@@ -11,7 +11,8 @@
  * 5. 遮蔽点冻结：compaction/summary 之后，被覆盖区间恒渲染为摘要形态。
  */
 import type { AppEvent, ChannelMessage, ModelLane } from '../log/types.js';
-import { humanAskSourceOf } from '../log/types.ts';
+import { humanAskSourceOf, isImageAttachment, contextImageAdmission, contextImageMimeAllowed } from '../log/types.ts';
+import type { ContextImageChosen } from '../log/types.ts';
 import { noteForFlagged, ruleNoteFor, type InjectionWarnFacts } from '../channel/injection.ts';
 import type { WarnExemptJudge } from '../channel/warn-exempt.ts';
 import { SELF_BRIEF, renderAskNote, renderContactNote, renderInjectionNote, renderMentionNote, type ContactFacts, type OpenAskFacts } from './self-brief.ts';
@@ -25,6 +26,100 @@ import { estimateTokens } from '../tools/registry.ts';
 
 /**
  * 渲染模板版本：任何模板变更必须递增并接受一次缓存全 miss。
+ *
+ * v39（**「本任务相关资产」那一行里她的说明不再是整段**，2026-10-07 用户的要求）：
+ *      那一行由 `persona/assets.ts` 的 `renderAssetsLine` 渲染，进**此刻层任务卡**——
+ *      于是**每一步都发**。实测（`data/events` 全量 111 条带 assets 的 `memory/selected`）：
+ *      最长 527 字符、中位 125、均值 144。最长那条里 335 个字符是她在 `说明：` 那一格里
+ *      写的**用法与命令**（`skills/anysearch/SKILL.md` 后面那一段），本该留在 SKILL.md 正文里
+ *      由她自己读——被整段抬进上下文就是每步都付一次。
+ *      这一版做三件事，全部在**展示层**（**她的文件一个字节都没动**：`MEMORIES/assets.md`
+ *      是她的资产，框架不替她写、不替她改）：
+ *      ① 说明归一成"**一行、一句话**"，截到 60 字符（超出缀 `…`）；`说明：…` 那一格只取**指路**
+ *         那一截。判据（含换行 / 括号不闭合 / 含反引号命令 ⇒ 只取第一句）与"不按字节切坏
+ *         多字节字符""`…` 不叠在标点后"都写在 `assets.ts` 的 `clipAssetNote` 上；
+ *      ② 事实层那几条（`skill 目录里有它` / `已在 PATH → …` / `路径：…` / `未安装…`）**原样**：
+ *         它们本来就短，而且每一句都是"就绪与否"的结论，截掉半句就是误导；
+ *      ③ 行尾永远是 `——完整清单见 MEMORIES/assets.md`（v34 定的那条指路，一个字没动）。
+ *      为什么必须递增：那一行进此刻层 ⇒ 请求体的字节变了，与 v38 的记录逐字节不可比。
+ *      触发面只有"这一轮真挑出了资产"的那些轮（清单读不到 / 心跳拍 / 一条都没挑出来时，
+ *      整行不出现，字节与 v38 相同）——但此刻层每步都发，所以挨到就是一次整轮重编码。
+ *      对照实验（`test/heartbeat-real-wake.test.ts` 头部记着取数过程）：`requestFingerprint`
+ *      本来就**剥掉此刻层**，所以那两个精确指纹**不该变**——实测也确实**没有重取**
+ *      （常量仍是 v38 那两个值）。逐字节证据：同一份真实数据的老/新口径两份渲染结果，
+ *      塞进同一个"此刻层 item"算指纹**同一个值**；把层外的历史改一个字符，指纹立刻变
+ *      ⇒ 除这一处之外没有任何别的字节变化（判据未放宽，仍是精确比对）。
+ *
+ * v38（**装置自述第 ⑨ 段「用度」追加"整理节拍"**，2026-10-07 用户的要求）：
+ *      她自述里那段「拎着用度」末尾多了一层账：**整理 state / 记忆 / 各种笔记同样花 token**
+ *      ——必要，但**不必每一轮都做**；已知的事会在上下文里留很久，所以刚记下的东西不必马上
+ *      回头再理一遍；要理就挑空拍（**用户长时间没说话 / 没有人找你 / 心跳那一拍**）。
+ *      同句里**必须有的防错半句**：「**但这不是说不记**」——该落的账照旧落（结论、答应过的事、
+ *      见到的新事实，当场就写），只是别在**有人找你**的时候回头反复整理旧账。用户点名的风险
+ *      就是她把这句读成"可以偷懒不记"，那种解读会丢信息，所以正反两面一起写进去
+ *      （逐字原话与理由见 `self-brief.ts` 里那段 v38 注释）。
+ *      为什么必须递增（**判据**）：`SELF_BRIEF` 经 `renderInstructions` 进 **`instructions`**
+ *      ——它是整个请求体的**最大公共前缀**（本文件 §4.13 铁律 1 与 `self-brief.ts` 的文件头），
+ *      多一个字，之后**每一个**请求的头部字节都变 ⇒ 缓存一次全 miss、下一轮整份重编码。
+ *      与 v37（自述第 ④ 段删那半句）、v34（自述补第⑰段）、v2（插入自述）同一性质：定版本号
+ *      就是让这次全 miss **可解释、可复盘**（`replay` 的 renderVersion 三指纹会如实报
+ *      "当时的模板与当前不同"），而不是被读成"缓存坏了"。
+ *      基线的对照实验（`_research/heartbeat-real-wake-baseline.mjs`）：把这一句临时撤回、
+ *      其余全留，复跑得到的仍是 v37 那两个指纹 ⇒ **除这一句之外没有任何别的字节变化**；
+ *      新值见 `test/heartbeat-real-wake.test.ts` 头部（精确比对，判据未放宽）。
+ *
+ * v37（**装置自述第 ④ 段不再讲平台的主动/被动与配额**，2026-10-07）：
+ *      `SELF_BRIEF` 第 ④ 段末尾那半句「发给本轮叫你说话之外的人会走主动消息，QQ 那边有配额」
+ *      被删掉（保留并改写了行为准则那半："`to` 是指向某个人用的，不是广播开关"）。
+ *      为什么必须递增（**判据**）：`SELF_BRIEF` 经 `renderInstructions` 进 **`instructions`**
+ *      ——它是整个请求体的**最大公共前缀**（见本文件 §4.13 铁律 1 与 `self-brief.ts` 的文件头）。
+ *      改它一个字，之后**每一个**请求的头部字节都变，签名随之改变 ⇒ 缓存命中率归零、
+ *      下一轮整份重编码。定版本号就是为了让这次全 miss **可解释、可复盘**（`replay` 的
+ *      renderVersion 三指纹会如实报"当时的模板与当前不同"），而不是被读成"缓存坏了"。
+ *      这不是设计外的事故：与 v34（自述补第⑰段）、v2（插入自述）同一性质，改之前就想好了。
+ *
+ * v36（**交接笔记里超长工具入参不再原样进**，2026-10-06）：
+ *      笔记条目的形态变了：工具入参超过 512 字节（UTF-8）时，`[调用] name(…)` 括号里
+ *      由「入参原文」变成「顶层键名 + 字节数 + 参数正文未收入笔记」
+ *      （`persona/handoff-note.ts` 的 `noteArgsOf`）。
+ *      为什么必须递增：**新摘要的正文就是这份笔记**（`compaction/summary.summary`），
+ *      而它经 `renderMemoryLayer` 进长期记忆层——也就是说笔记的字节变了，下一个请求的
+ *      头部就变了。一条**重放**出来的摘要若按新口径渲染，会与当时盘上那条的字节不同，
+ *      `replay` 的三指纹（renderVersion）正是用来把这件事显式暴露出来的。
+ *      代价是一次缓存全 miss；本次改动的**实际触发面**是"历史里存在 >512 字节的工具入参"
+ *      的那些交接（此刻盘上一条都没有，见下面的实测），所以今天这一次 miss 只落在
+ *      下次交接的那一轮上。
+ *      实测（`data/events` 全量 3,148 条 `tool/result`，2026-10-06）：最大的入参也没过
+ *      512 字节，所以这条改动**不会改写任何已有摘要的字节**——它不是"把历史改一遍"，
+ *      而是"从此以后新写的摘要换个形态"。
+ *
+ * v35（**任务卡标题只取正文**，2026-10-06 修的真 bug）：
+ *      `wakeTitle` 对 `wake/channel` 改为"标题 = 人写的那句话"，机器标识（`source=` /
+ *      `person=` / `msg=`）不进标题。改前它退回 `renderWake`，标题是**整个包裹**，
+ *      于是发生在**此刻层任务卡的这一行**上的事是：标题被平台消息 id 吃满——
+ *      实测 631 条 `wake/channel` 的正文**无一条**活过 assets 的 200 字窗口，喂给 light 的
+ *      "马上要做的事"是一串 `ROBOT1.0_…`，light 回 `{"picks":[]}`，本任务相关资产那一行
+ *      因此**永远是空的**（`data/events` 全量 346 条 `memory/selected` 里带 assets 的 0 条）。
+ *      这是**渲染层**的改动：只动 `wakeTitle` 这一处，它的**每一个**消费者一起改口径
+ *      （此刻层任务卡 / replay 的重建 / 界面预览 / 交接笔记条目 / 宿主挑资产的标题），
+ *      因此四处仍然逐字节同源。`renderWake` 一字未动——她上下文里那个 `[external_event]`
+ *      包裹是安全语义（框里是别人说的话），必须原样在。
+ *      为什么必须递增：此刻层任务卡那一行的字节变了（只要这一轮的首条输入是 `wake/channel`），
+ *      与 v34 的记录逐字节不可比。代价是一次缓存全 miss，只落在"渠道叫醒"的那些轮上。
+ *
+ * v34（**数字资产那一行进此刻层任务卡** + 装置自述补第⑰段，2026-10-06 用户的设计）：
+ *      两处一起改，因为它们本来就是一条设计（她得先知道有这份清单，才看得懂任务旁边那一行）：
+ *      ① **此刻层**：任务卡多一行 `本任务相关资产：Obscura（D:\…\obscura.exe）· gh（已在 PATH）`
+ *         ——紧跟 `当前任务：…` 之后、`未完成计划：` 之前，**只读**（不动她的 todo、不产生任何
+ *         "已读/已选"状态）。素材是 `MEMORIES/assets.md` 里由 light 挑出的 ≤3 条，全部由宿主
+ *         渲染好递进来（`RenderInput.taskCard.assets`）——渲染层照旧不读文件系统。
+ *         缺省 / 空串 = 整行不出现（清单不存在、没挑出相关的、或这一拍不是"要干活"的一拍）。
+ *      ② **instructions**：装置自述补第⑰段（`MEMORIES/assets.md` 是她自己维护的清单；
+ *         用法说明她自己写、自己读；干活时框架会挑几条放在任务旁边）。
+ *      为什么必须递增：instructions 与此刻层都动了字节，与 v33 的记录逐字节不可比。
+ *      **调用方可以不改**：`assets` 是新可选字段，不传的调用点（重放、诊断、界面预览的老路径）
+ *      渲染结果与 v33 逐字节相同（除了版本号本身）。
+ *      代价（一次缓存全 miss）记在报告里：instructions 是冻结前缀，改它等于接受一次整轮重编码。
  *
  * v33（`用度：` 那一行按新预算口径说话，2026-10-05 用户的口径）：
  *      预算换成"**只算没命中缓存的那部分**"（原话逐字抄在 `state/fold.ts` 的 `budgetTokensOf` 里）。
@@ -227,7 +322,7 @@ import { estimateTokens } from '../tools/registry.ts';
  *
  * v2：`instructions` 尾部（人格三层之后、任务卡之前）插入装置自述（self-brief.ts 的 SELF_BRIEF）。
  */
-export const RENDER_VERSION = '33';
+export const RENDER_VERSION = '39';
 
 /**
  * 哪次工具调用没有回执时，补给它（也补给她）的那句话。
@@ -467,7 +562,24 @@ export interface RenderInput {
   /** 本轮新输入（触发本 turn 的 wake 事件），null 表示 turn 内后续 step */
   wakeEvent: AppEvent | null;
   /** 任务卡素材（openTurn 为空则 null） */
-  taskCard: { title: string; turn: number; step: number; todoOpen: string[] } | null;
+  taskCard: {
+    title: string;
+    turn: number;
+    step: number;
+    todoOpen: string[];
+    /**
+     * 本任务相关资产那一行（v34；`MEMORIES/assets.md` 里挑出来的 ≤3 条，**已渲染好的文本**）。
+     *
+     * 为什么是"渲染好的文本"而不是条目数组：条目 → 那一行要看清单文件，而渲染层不读文件
+     * （缓存铁律 1）；而且"选了哪几条"这件事只有拿得到 light 的宿主算得出来（与 contact /
+     * machine / usage 同一条纪律——渲染层只排版）。
+     *
+     * 它是**只读提示**：不改任务卡其余字段、不动她的 todo、也不产生任何"已读/已选"状态。
+     * 缺省 / 空串 = 整行不出现（与引入它之前逐字节相同：清单不存在、没挑出相关的、
+     * 或者这一拍不是"要干活"的一拍，三种情形都走这一支）。
+     */
+    assets?: string;
+  } | null;
   /**
    * `persona/STATE.md` 的**字节数**（v32 的预算提醒素材）。
    *
@@ -547,14 +659,20 @@ export interface RenderInput {
    */
   asks?: readonly OpenAskFacts[] | null;
   /**
-   * 图片取字节的能力（宿主注入）：给引用换 data URL，返回 null 表示这张不进上下文。
+   * 图片取字节的能力（宿主注入）：给引用换**一份能进请求体的图片**（型别 + data URL），
+   * 返回 null 表示这张不进上下文。
+   *
+   * 返回的不是裸 URL 串而是 {@link ContextImageChosen}：型别**必须和 data URL 前缀逐字一致**，
+   * 而拼装只该有一处实现（`log/types.ts` 的 `buildContextImage`）。2026-10-07 的 400 就是
+   * "声明是 OneBot 的段类型裸标签 `image`、却被直接当 MIME 拼进 data URL"——那种载荷
+   * 模型判 unsupported image，而那条消息永远留在历史里，于是**每一拍都失败**。
    *
    * 为什么是注入而不是渲染层自己读文件：render 是纯函数——同一事件任何时刻必须渲染成
    * 同一字节串（缓存铁律 1）。blob 是内容寻址、不可变的，所以"读它"本身是确定的；把 IO
    * 关在注入点之外，是为了让「渲染层不碰文件系统」这条实现约束继续成立，测试也能拿一个
    * 假 loader 精确断言图片到底进没进上下文。缺省/undefined = 本次渲染不带图片。
    */
-  loadImage?: ((ref: RenderImageRef) => string | null) | null;
+  loadImage?: ((ref: RenderImageRef) => ContextImageChosen | null) | null;
   /** 最多把几张图片放进上下文（默认 IMAGE_INJECT_MAX；0 = 一张都不放，全走文字与读图工具） */
   maxContextImages?: number;
   /**
@@ -998,10 +1116,19 @@ function renderNowLayer(
   // 任务卡：`已 M 步` 逐步变，所以它留在这一层（B2 唯一一件"长"的、且确实逐 step 变的东西）。
   // 它与上面那串字段之间留一个空行：字段表是"一眼扫的事实"，任务卡是"要读的一段"。
   if (taskCard) {
+    // 本任务相关资产（v34）：**排在未完成计划之前**，与任务标题同属"这一轮要做什么"那一组。
+    // 一行、只读、≤3 条（上限在 persona/assets.ts 的 renderAssetsLine 里，这里只排版）。
+    //
+    // 为什么在这一层、且在任务卡里：① 它跟着**任务**走——任务完，任务卡消失，这一行自然消失
+    //（不进历史、不受压缩影响：它每次都由任务卡现渲染）；② 一轮之内它逐字节不变（light 只在
+    // 轮首选一次，deps 每步原样转手），所以同一轮后续 step 照旧命中前缀。
+    // 空串 = 整行不出现（不写"暂无"、不写"0 条"）。
+    const assets = (taskCard.assets ?? '').trim();
+    const assetsLine = assets === '' ? '' : `\n${assets}`;
     const todo = taskCard.todoOpen.length > 0
       ? `\n未完成计划：\n${taskCard.todoOpen.map(t => `- ${t}`).join('\n')}`
       : '';
-    fields.push(`\n当前任务：${taskCard.title}（turn ${taskCard.turn}，已 ${taskCard.step} 步）${todo}`);
+    fields.push(`\n当前任务：${taskCard.title}（turn ${taskCard.turn}，已 ${taskCard.step} 步）${assetsLine}${todo}`);
   }
   // STATE 预算提醒（v32）：**排在最后**——它是这张字段表里最后一件"框架此刻要她知道的事"，
   // 而且放在尾部时，她压回预算内之前的那几行前缀一个字节都不受影响。
@@ -1374,19 +1501,35 @@ interface ImageInjector {
   partsFor(e: AppEvent): InputImagePart[];
 }
 
-/** 事件里带的图片引用：QQ 发来的附件，或她自己要求"把这张放进上下文"的那条 */
+/**
+ * 事件里带的图片引用：QQ 发来的附件，或她自己要求"把这张放进上下文"的那条。
+ *
+ * **许不许进上下文在这里先判一次**（`contextImageAdmission`，渲染层与预热层同一个结论）：
+ * 地址不是 http(s)、或型别落不进模型认的白名单时**连挑都不挑**——挑进来又注不进去，
+ * 会让"最近 N 张"的名额被一张永远注不进去的图占着，后面的好图反而被挤掉。
+ * 真正的最后一米仍在宿主注入的 loader（`buildContextImage`）：字节头认不出的照样不进。
+ */
 function imagesOf(e: AppEvent): RenderImageRef[] {
   const out: RenderImageRef[] = [];
   if (e.type === 'wake/channel') {
     for (const a of e.data.attachments ?? []) {
       if (typeof a.url !== 'string' || a.url === '') continue;
-      // 只有图片走这条路：语音、文件既不进多模态，也不该占图片窗口的名额
-      if (!a.type.startsWith('image/')) continue;
+      // 只有图片走这条路：语音、文件既不进多模态，也不该占图片窗口的名额。
+      // **判据认两种形态**（MIME `image/png` 与 OneBot 的段类型 `image`）——那个函数是唯一实现，
+      // 见 log/types.ts 的注释：原先只认 MIME 前缀，OneBot 发来的图因此一张都进不了上下文。
+      if (!isImageAttachment(a)) continue;
+      // 形态判据之后是**载荷判据**：声明不在白名单里的图片是"给地址 + vision_read"那条路的材料
+      // （`image/bmp`、`image/tiff` 这些模型一律 400，裸标签 `image` 更是连子型别都没有）
+      if (!contextImageAdmission({ url: a.url, mime: a.type }).admitted) continue;
       out.push({ source: 'remote', key: a.url, mime: a.type, ...(a.name === undefined ? {} : { name: a.name }) });
     }
     return out;
   }
   if (e.type === 'image/attached') {
+    // 她自己要求看的那张：`mime` 来自文件扩展名（vision.ts 的 imageMimeOf）。地址是工作目录内的
+    // 相对路径，本来就不是 http(s)——所以这里判的是**型别**那一条（同一份白名单，不是另一套判据）。
+    // 最后一米仍在 loader：字节头认不出的照样不进，理由写进留痕。
+    if (!contextImageMimeAllowed(e.data.mime)) return out;
     out.push({
       source: 'file',
       key: e.data.key,
@@ -1421,8 +1564,12 @@ function makeImageInjector(
       if (load === null || !picked.has(e.seq)) return [];
       const parts: InputImagePart[] = [];
       for (const ref of imagesOf(e)) {
-        const url = load(ref);
-        if (typeof url === 'string' && url !== '') parts.push({ type: 'input_image', image_url: url });
+        const chosen = load(ref);
+        // loader 是最后一米：它给不出"白名单型别 + 与之逐字一致的 data URL"就不进。
+        // 这里不再自己拼 URL（过去正是这里让 `data:${ref.mime};base64,…` 跑进了请求体）。
+        if (chosen !== null && chosen !== undefined && typeof chosen.dataUrl === 'string' && chosen.dataUrl !== '') {
+          parts.push({ type: 'input_image', image_url: chosen.dataUrl });
+        }
       }
       return parts;
     },
@@ -1585,6 +1732,30 @@ function renderEvents(
   return out;
 }
 
+/**
+ * 结果被外置时**给她看的那句指针**（v36）。
+ *
+ * 三件事必须说清，少一件都会让她做出错误推断：
+ *   1. **上面那段不是全文**（"完整结果 N 字节"）——不说，她会把预览当全文；
+ *   2. **全文不在这次对话里**（"不在本次对话里"）——这是 reasonix 那条实测教训
+ *      （`tool_output_spill.go` 的 "It is not in this conversation."）：内容被拿走了却不说，
+ *      模型会以为"就这些"，然后按这个印象编下去；
+ *   3. **怎么取、能翻页**（工具名 + blobId + offset/limit）——只给 id 不给读法，等于给了把
+ *      没有说明的钥匙。路径与 id 同源（`data/blobs/<sha256>`，内容寻址、不可变），
+ *      写出来是为了人复盘时能直接在盘上找到它。
+ *
+ * **确定性**：纯函数（`contentRef` → 字符串），不读盘、不读时钟——同一份事件永远同一串字节。
+ * 这段改过就要递增 `RENDER_VERSION`（它进的是可见历史，v36 与 v35 那一次的改动一起）。
+ *
+ * **导出**（导出名 `blobPointerText`）：MCP 那条路自己拼过同一句话（`mcp/client.ts`），
+ * 两处各写一遍必然漂移——2026-10-06 改口径时就现抓了一次（工具结果那半改了、MCP 那半没改）。
+ * 现在两处都引这一个函数。
+ */
+export function blobPointerText(ref: { blobId: string; bytes: number }): string {
+  return `[完整结果 ${ref.bytes} 字节，不在本次对话里；用 read_blob 取（offset/limit 可翻页）：`
+    + `${ref.blobId}，即 data/blobs/${ref.blobId}]`;
+}
+
 function isModelVisible(e: AppEvent): boolean {
   // 思维链也算模型可见输入（v3）：思考模式要求回传，见 renderEvents 的 reasoning 分支
   return e.visibility === 'model';
@@ -1595,7 +1766,7 @@ function renderToolOutput(e: AppEvent & { type: 'tool/result' }): string {
   switch (d.status) {
     case 'ok':
       return d.contentRef
-        ? `${d.content}\n[完整结果 ${d.contentRef.bytes} 字节，可用 read_blob 取：${d.contentRef.blobId}]`
+        ? `${d.content}\n${blobPointerText(d.contentRef)}`
         : d.content;
     case 'error':
       return `工具执行错误：${d.error?.message ?? d.content}`;
@@ -1845,16 +2016,46 @@ function requeuedSeqsOf(events: AppEvent[]): Set<number> {
 }
 
 /**
- * 唤醒输入的**标题形态**：给人看的一行摘要（任务卡标题、交接笔记条目用）。
+ * 唤醒输入的**标题形态**：给人看的一行摘要（任务卡标题、交接笔记条目、资产选取的任务描述用）。
  *
  * 为什么要与 renderWake 分开：renderWake 是给模型看的，带 `[界面消息 · 谁]` 之类的**来源标注**；
  * 把标注抄进标题会变成「当前任务：[界面消息] 看一眼日志」—— 标题该是人写的那句话本身。
  * 其余类型（定时器/文件/心跳）的渲染本身就是简短摘要，直接用。
+ *
+ * **外部包裹的标题就是正文**（2026-10-06 修的真 bug）：`wake/channel` 原先退回 renderWake，
+ * 于是"标题"是**整个包裹**，开头那一行是 `[external_event source=… person=… msg=ROBOT1.0_…]`。
+ * 那一行里的 `msg=` 是平台的消息 id，**它有多长不由我们定**（QQ 官方通道实测 117–137 字符，
+ * 包裹头整行 227 字符），它一个人就吃满 assets 那边的 `TASK_TITLE_MAX_CHARS = 200`——
+ * 正文从第 228 个字符起，永远落在窗外。实测（`data/events` 全量 631 条 `wake/channel`）
+ * **无一条**的正文活过那个窗口，喂给 light 的"马上要做的事"是一串 `ROBOT1.0_…`，
+ * light 只能回 `{"picks":[]}`——这就是「凡是从 QQ 官方通道来的任务，本任务相关资产那一行
+ * 永远是空的」的根因（私聊那 428 条**必然**走这条路：`renderMentionNote` 对 c2c 一律返回 null，
+ * 所以提及通知换标题那一支在私聊里根本不成立）。
+ * 判据因此立在这里（**一处**，不在调用点各写一遍）：**`source=` / `person=` / `msg=` 这类
+ * 机器标识不进标题，标题只取人写的那句话**。renderWake 一个字不动——她上下文里那个带边界的
+ * 包裹是**安全语义**（"框里是别人说的话"），它必须原样在。
+ *
+ * 三条分寸：
+ *   • **别抬高上限**：上限治不了"平台 id 有多长"，而"正文落在窗口之外"这件事在上限之内就已经
+ *     发生了——同一条事件只喂正文，light 立刻挑出 gh/git/rg（见 real-loop 的 assetTaskTitle）。
+ *   • **压平空白，与 `wake/manual` 同口径**：标题是**一行**摘要，多行正文会把
+ *     `当前任务：…（turn N 第 M 步）` 那一行撑断；两条 wake 路同一个形状，也就不会出现
+ *     "同一个东西两种标题"。
+ *   • **没有正文时如实说**（纯图片/表情包）：用 `userSpokeEventTextOf` 同一个说法——
+ *     `（发了 N 个附件，没写字）`。写 `（空消息）` 是假话：她确实收到了东西。
+ *
+ * 裁剪仍归调用方（`clipTaskTitle` / assets 的 `clip`）：这一层只管"标题是什么"。
  */
 export function wakeTitle(e: AppEvent, timerPayloads?: Map<string, unknown>): string {
   if (e.type === 'wake/manual') {
     const note = e.data.note.replace(/\s+/gu, ' ').trim();
     return note === '' ? '（空消息）' : note;
+  }
+  if (e.type === 'wake/channel') {
+    const text = e.data.text.replace(/\s+/gu, ' ').trim();
+    if (text !== '') return text;
+    const count = e.data.attachments?.length ?? 0;
+    return count > 0 ? `（发了 ${count} 个附件，没写字）` : '（空消息）';
   }
   return renderWake(e, timerPayloads);
 }

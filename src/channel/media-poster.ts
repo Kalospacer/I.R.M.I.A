@@ -37,11 +37,60 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { basename, resolve, sep } from 'node:path';
 
 import { createChannelMediaPoster, type ChannelAdapter } from './qq-official.ts';
+import { ONEBOT_CHANNEL_NAME, parseReplyUrl as parseOneBotReplyUrl } from './onebot.ts';
+import { parseReplyUrlAny, type MediaRequest, type ReplyOutcome, type ReplyTarget } from '../tools/admin.ts';
 import { insideAny } from '../tools/fs/path-guard.ts';
 import type { MediaPoster } from '../tools/admin.ts';
 
 /** 单个媒体的大小上限：官方软限制 200MB（文件类），我们只做一道"别把内存打爆"的粗线 */
 const MEDIA_MAX_BYTES = 200 * 1024 * 1024;
+
+/**
+ * **按回投地址分派**的媒体投递口（`send_media` 的唯一出口）。
+ *
+ * 为什么要有它（2026-10-07 对齐两条通道时补的）：在这之前，媒体投递口是**按通道名写死**的
+ * 两处——`qq-official.ts` 的工厂只认 `qq:` 前缀与 `QQ_CHANNEL_NAME`，`main.ts` 也照着写死
+ * "只有装了 QQ 官方通道才造它"。后果不是"少一个小功能"：OneBot 上 `send_media` **根本不存在**
+ * （工具在、线没接），而她的工具清单是恒定的——她只会看到那件工具报"没有接线"。
+ *
+ * 分派判据与 `speak` 那条路**同一份**（`admin.parseReplyUrlAny`：scheme → 通道名 + chatType + chatId）：
+ * 两条出口各写一份判据，迟早会出现"文本发得出去、媒体发不出去"这种只看名字看不出原因的错。
+ * 名字之外的**能力**仍由通道自己说了算：没有 `sendMediaTo` 就如实说清是哪条通道、为什么不支持。
+ */
+export function createMediaDispatcher(
+  channels: ReadonlyMap<string, ChannelAdapter>,
+  options: { timeoutMs?: number } = {},
+): MediaPoster {
+  return {
+    async post(target: ReplyTarget, media: MediaRequest): Promise<ReplyOutcome> {
+      const parsed = parseReplyUrlAny(target.url);
+      if (!parsed.ok) return { ok: false, reason: parsed.error };
+      if (parsed.channel === ONEBOT_CHANNEL_NAME) {
+        // OneBot 的媒体接口在它自己的模块里（`oneBotMediaCall` 把它翻成消息段/上传文件动作），
+        // 地址解析也用它自己的那份（`onebot:c2c:` / `onebot:group:`）
+        const poster = createChannelMediaPoster(channels, {
+          channelName: ONEBOT_CHANNEL_NAME,
+          parseUrl: (url) => {
+            const one = parseOneBotReplyUrl(url);
+            return one.ok ? { ok: true, chatType: one.chatType, chatId: one.chatId } : one;
+          },
+          ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+        });
+        return await poster.post(target, {
+          fileType: media.fileType,
+          ...(media.url === undefined ? {} : { url: media.url }),
+          ...(media.data === undefined ? {} : { data: media.data }),
+          ...(media.path === undefined ? {} : { path: media.path }),
+          ...(media.name === undefined ? {} : { name: media.name }),
+        });
+      }
+      const poster = createChannelMediaPoster(channels, {
+        ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+      });
+      return await poster.post(target, media);
+    },
+  };
+}
 
 export interface WorkspaceMediaPosterOptions {
   /** 允许读取的第一个根（数据目录）。她的既有写法（`workspace/tmp/…`）相对它 */
@@ -81,7 +130,7 @@ export function createWorkspaceMediaPoster(options: WorkspaceMediaPosterOptions)
   const maxBytes = options.maxBytes ?? MEDIA_MAX_BYTES;
   return {
     async post(target, media) {
-      const poster = createChannelMediaPoster(options.channels);
+      const poster = createMediaDispatcher(options.channels);
       // 已经是字节（宿主自己的调用方）或本来就是网络地址：直接交给通道层
       if (media.data !== undefined || media.path === undefined) {
         return await poster.post(target, media);

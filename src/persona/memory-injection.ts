@@ -321,24 +321,20 @@ export function ensureMemoryIndex(dataDir: string): 'created' | 'updated' | 'unc
 }
 
 /**
- * 读回索引文本（注入用）。文件不在就**当场建一份**再读——首启漏了那一步时，
- * 她也不该活在一个"记忆没有目录"的世界里。
- *
- * 这是**运行期**那条路（real-loop 每轮走它）。重放与诊断走下面那条只读的：
- * 重建请求时绝不能写盘（那是副作用，"只读重建"是本仓库对 replay 的承诺）。
- */
-export function readMemoryIndexText(dataDir: string): string {
-  const path = memoryIndexPath(dataDir);
-  if (!existsSync(path)) ensureMemoryIndex(dataDir);
-  return readTextIfPresent(path) ?? '';
-}
-
-/**
  * 只读地读回索引文本（重放与诊断用）：文件不在就返回空串，**绝不创建**。
  *
  * 为什么单独一条：`buildReplayReport` 的前提是"日志已关、只读重建"。
  * 在那里顺手补建索引文件，等于让一次复盘改了盘上的东西——而且会把重建结果污染成
  * "有索引"（当时的请求里可能根本没有它）。
+ *
+ * **它不是运行期那条路**（2026-10-06 把口径改准）：real-loop 每轮走的是
+ * `memoryIndexPlan`（real-loop.ts:1861）+ `ensureMemoryIndexSafely`（:2163）——自己建、
+ * 自己渲染，不经过这里。这条只读路的读者只有两个：`replay.ts`（`memoryIndex:` 那两个字段）
+ * 与 `web/server.ts` 的 `/api/replay`。
+ *
+ * 从前这里还有一条会**补建文件**的 `readMemoryIndexText`，它的注释声称"这是运行期那条路
+ * （real-loop 每轮走它）"——那句话早就不是事实了，而它全仓 0 引用，2026-10-06 随审计删掉
+ * （docs/repo-cleanliness-audit.md §2.2 A2）。别再按那个说法加回来一条"运行期读文本"的路。
  */
 export function readMemoryIndexTextReadOnly(dataDir: string): string {
   return readTextIfPresent(memoryIndexPath(dataDir)) ?? '';

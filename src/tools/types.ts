@@ -108,8 +108,6 @@ export const TOOL_ERROR_CODES = {
   sessionLost: 'E_SESSION_LOST',
 } as const;
 
-export type ToolErrorCode = (typeof TOOL_ERROR_CODES)[keyof typeof TOOL_ERROR_CODES];
-
 // ──────────────────────────────── 参数读取 ────────────────────────────────
 
 /**

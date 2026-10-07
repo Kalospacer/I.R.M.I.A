@@ -63,6 +63,9 @@ class _PersonaPageState extends State<PersonaPage> {
   String _baseText = '';
   bool saving = false;
 
+  /// 提案决定（批准 / 拒绝）正在飞：两颗按钮一起禁用，防重复提交
+  bool decidingProposal = false;
+
   /// 上一次已渲染的脏状态：只有翻转时才重建整页（逐字输入不牵动时间线）
   bool _lastDirty = false;
 
@@ -224,6 +227,113 @@ class _PersonaPageState extends State<PersonaPage> {
     _editor.text = _baseText;
   }
 
+  // ── 提案区：批准 / 拒绝（POST /api/commands/persona-approve | persona-reject） ──
+
+  /// 这份文件在门口等着的提案有几份。
+  ///
+  /// 数从**文件清单**来（`/api/persona/files` 的 `proposalCount`），不从单文件视图来：
+  /// 后者只有正文与元信息，不带提案计数（src/web/server.ts 的 readPersonaFileView）。
+  int _proposalCountOf(String path) {
+    for (final f in files) {
+      if ((f['path']?.toString() ?? '') != path) continue;
+      return (f['proposalCount'] as num?)?.toInt() ?? (f['proposals'] as num?)?.toInt() ?? 0;
+    }
+    return 0;
+  }
+
+  /// 批准 = 提案内容写进目标文件（服务端还写一条 persona/updated）；拒绝 = 只删提案文件，
+  /// 人格文件一个字不动、也不写事件（server.ts 的 `persona-reject` 注释里写着这条口径）。
+  ///
+  /// 两条都先过确认框：批准会**真的改人格资产**，拒绝会**删掉 agent 写的那份提案**——
+  /// 都是不可撤销的动作，不能让一次误点决定。批准时不带 `diffHash`（界面没有提案正文可比对），
+  /// 服务端允许留空；它只在"提案审阅期间被改写"时才需要比对。
+  Future<void> _decideProposal(String path, {required bool approve}) async {
+    if (decidingProposal) return;
+    final dirty = _dirty;
+    final ok = await confirm(
+      context,
+      title: approve ? '批准这份提案？' : '拒绝这份提案？',
+      body: approve
+          ? '提案的内容会写入 $path，并记一条 persona/updated（与你自己保存走同一条审计线）。'
+              '${dirty ? '你现在有未保存的改动，批准之后编辑区会以写入后的正文为准——那些改动会丢。' : ''}'
+          : '$path 会保留现状，只删掉那份提案文件（不写事件）。要再看到它，得等 agent 重新提一次。',
+      confirmLabel: approve ? '批准' : '拒绝',
+      danger: !approve,
+    );
+    if (!ok || !mounted) return;
+
+    setState(() => decidingProposal = true);
+    try {
+      await widget.state.api.post(
+        approve ? '/api/commands/persona-approve' : '/api/commands/persona-reject',
+        {'file': path},
+      );
+      if (!mounted) return;
+      setState(() => decidingProposal = false);
+      _toast(approve ? '已批准，提案已写入 $path' : '已拒绝，提案已删除',
+          kind: approve ? ToastKind.success : ToastKind.info);
+      // 计数要跟着变（提案没了），时间线在批准时多一条 persona/updated
+      unawaited(loadFiles());
+      if (approve) {
+        unawaited(loadHistory());
+        // 批准改的是盘上那份文件：重读正文（force = 用户已在确认框里被告知改动会丢）
+        unawaited(loadFile(path, force: true));
+        // 提案可能改的正是 IDENTITY.md 的「名字：」那一行，与保存后同一条纪律
+        unawaited(widget.state.refreshHerName());
+      }
+    } catch (err) {
+      if (!mounted) return;
+      setState(() => decidingProposal = false);
+      _toast('${approve ? '批准' : '拒绝'}失败：$err', kind: ToastKind.error);
+    }
+  }
+
+  /// 提案区那条横幅：告诉人门口有一份提案、两条出路各是什么意思。
+  ///
+  /// 放在正文**上方**（而不是塞进工具栏）：它是"这份文件现在处于待决定状态"这件事的提示，
+  /// 与"保存 / 恢复原状"（对正文的编辑动作）不是一回事。文案与 `_readOnly` 里那句
+  /// 「提案请用批准 / 拒绝处理」同一条口径——那句话说出口的按钮就在这里。
+  Widget _proposalBar(String path, int count) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 8, 12, 8),
+      decoration: BoxDecoration(
+        color: scheme.primary.withValues(alpha: 0.06),
+        border: Border(bottom: BorderSide(color: scheme.outlineVariant)),
+      ),
+      child: Row(children: [
+        Icon(Icons.rate_review_outlined, size: 16, color: scheme.primary),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            '$path 有 $count 份待确认提案：批准会把它写入这份文件，拒绝只删掉提案。',
+            style: TextStyle(fontSize: 11.5, height: 1.5, color: scheme.onSurfaceVariant),
+          ),
+        ),
+        const SizedBox(width: 10),
+        TextButton(
+          onPressed: decidingProposal ? null : () => unawaited(_decideProposal(path, approve: false)),
+          style: TextButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            minimumSize: const Size(0, 30),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          child: const Text('拒绝提案'),
+        ),
+        const SizedBox(width: 6),
+        FilledButton.tonal(
+          onPressed: decidingProposal ? null : () => unawaited(_decideProposal(path, approve: true)),
+          style: FilledButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            minimumSize: const Size(0, 30),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          child: const Text('批准提案'),
+        ),
+      ]),
+    );
+  }
+
   /// 提示条统一走 ui_kit 的全局单例 toast：同一时刻只有一条，页面里不再自己 showSnackBar
   void _toast(String text, {ToastKind kind = ToastKind.info}) {
     if (!mounted) return;
@@ -331,6 +441,15 @@ class _PersonaPageState extends State<PersonaPage> {
       4 => _readOnly(content),
       _ => _workbench(),
     };
+    // 门口有提案时，正文上方多一条横幅（两颗按钮）：提案区唯一的入口就在这里，
+    // 而 `_readOnly` 那句「提案请用批准 / 拒绝处理」说的正是它。
+    final proposals = path.isEmpty ? 0 : _proposalCountOf(path);
+    final cardBody = proposals == 0
+        ? body
+        : Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            _proposalBar(path, proposals),
+            Expanded(child: body),
+          ]);
 
     final tokens = (cur?['tokens'] as num?)?.toInt() ?? 0;
     final bytes = (cur?['bytes'] as num?)?.toInt() ?? 0;
@@ -349,7 +468,7 @@ class _PersonaPageState extends State<PersonaPage> {
       note: phase == 5 ? '可编辑' : (phase == 4 ? '只读' : null),
       subtitle: cur == null ? null : parts.join(' · '),
       trailing: phase == 5 ? _toolbar() : null,
-      child: body,
+      child: cardBody,
     );
   }
 

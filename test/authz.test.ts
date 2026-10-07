@@ -11,12 +11,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  GROUP_SCENE_REMINDER,
   MACHINE_TOOLS,
   SOCIAL_TOOLS,
   decideAuthz,
   isMachineTool,
 } from '../src/runtime/authz.ts';
+// 提醒原文住 self-brief.ts（说出口的是那边的渲染），authz.ts 里那份逐字副本 2026-10-06 已删：
+// 两份真源意味着改文案时漏一处不会红。这里 import 的是**活着的那一份**
+//（docs/repo-cleanliness-audit.md §2.2 A18）。
+import { GROUP_SCENE_REMINDER } from '../src/model/self-brief.ts';
 
 test('分类：社交类明确放行，名单外一律按本机类（从严）', () => {
   for (const tool of SOCIAL_TOOLS) assert.equal(isMachineTool(tool), false, tool);

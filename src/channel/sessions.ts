@@ -306,11 +306,6 @@ export function sessionLabelOf(entry: Pick<SessionEntry, 'channel' | 'chatType'>
   return `${channel} · ${chatType}`;
 }
 
-/** 这个会话该叫什么：有别名就用别名，否则退回 openid（不编名字） */
-export function sessionNameOf(entry: Pick<SessionEntry, 'label' | 'person'>): string {
-  return entry.label ?? entry.person;
-}
-
 /**
  * 拿一个 sid 去"人写下的表"里查时，该试哪几个键（按顺序）。
  *

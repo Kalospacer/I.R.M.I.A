@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 
 import '../app.dart';
 import '../theme.dart';
@@ -49,7 +50,7 @@ class SettingsPage extends StatefulWidget {
 /// 版本号（windows/runner/Runner.rc 的 FILEVERSION 是 4 个整数）与安装器，容不下预发布
 /// 标记——beta 只体现在这里与包名/说明里；后端那边对同一版号的口径是 `AGENT_VERSION`
 /// （不带 v，见 src/main.ts）。
-const guiVersion = 'v0.1.0-beta.4';
+const guiVersion = 'v0.1.0-beta.5';
 
 /// 锚点侧栏宽度（AstrBot 的左侧 section 导航）
 const _railWidth = 180.0;
@@ -2265,9 +2266,10 @@ class _SettingsPageState extends State<SettingsPage> {
           Text(
             '① 重启服务：运行中的协议端实例是按启动时的配置建的，重启之后它才会按刚写好的配置被拉起'
             '（框架不替你重启——重启自己失败就什么都不剩了）。\n'
-            '② 再扫码：重启后这张卡上会出现「打开登录界面」，点开在那边接入 QQ 并扫码，'
-            '把你本机的 QQ 接进来（首次登录要用它启动日志里的初始凭据，那句提示在按钮下面）。'
-            '扫码接的是你本机的 QQ 客户端，框架不代管登录态。',
+            '② 再扫码：重启后这张卡上会出现「打开面板」，点开在那边先读并同意用户协议与隐私政策'
+            '（那是法律性质的同意，要你自己按），再接入 QQ 并扫码；'
+            '首次登录要用它启动时打印的初始凭据——那句话现在就显示在按钮下面（口令打码），'
+            '旁边有「复制凭据」。扫码接的是你本机的 QQ 客户端，框架不代管登录态。',
             style: TextStyle(fontSize: 11.5, height: 1.8, color: scheme.onSurface),
           ),
         ],
@@ -2275,10 +2277,15 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 状态行：装到哪了 + detail **全文** + 三个动作（状态徽章在卡头，这里不重复第二枚）。
+  /// 状态行：装到哪了 + detail **全文** + 三档 + 三个动作（状态徽章在卡头，这里不重复第二枚）。
   ///
   /// `detail` 原样显示、不截断：它就是给人看的那句话（失败时带着原因与下一步），
   /// 截断等于把唯一的线索切掉一半。
+  ///
+  /// v36 起这句 detail **不再是唯一的那句话**：它上面多了一块三档明细
+  /// （进程 / OneBot 配置 / 适配器），各带自己的判据与证据。理由是实测出来的：
+  /// 一句话的 `state` 只能报"启动失败"，而现场的事实是"进程活着、配置缺失"——
+  /// 那句话和事实相反，人照着它去查日志会白查半天。三档明细就是"到底断在哪一环"的答案。
   Widget _protocolStatusRow(String state) {
     final scheme = Theme.of(context).colorScheme;
     final dir = _protocolField('dir');
@@ -2289,7 +2296,6 @@ class _SettingsPageState extends State<SettingsPage> {
     // 用 `== true` 会把 null 与 false 糊成同一个"没有入口"，那句判断很可能是错的
     final installed = protocolSide?['installed'];
     final attached = protocolSide?['attached'] == true;
-    final running = state == 'ready';
 
     return Container(
       margin: const EdgeInsets.only(top: 8),
@@ -2332,11 +2338,17 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 4),
             Text('对接点：$wsUrl', style: _mono(11.5, scheme.onSurfaceVariant)),
           ],
+          // 三档明细：证书那一行下面是"链条"，这里是"链条断在哪一环"
+          _protocolChainBlock(),
           const SizedBox(height: 10),
           Row(
             children: [
               FilledButton(
-                onPressed: (_protocolCardBusy || running) ? null : () => unawaited(_protocolAction('start')),
+                // 「启动」在"已经在跑"时应当按不动：那种情况下点它只会得到一句
+                // "它已经在跑了"，而按钮亮着就是在暗示"点一下会好"
+                onPressed: (_protocolCardBusy || _protocolProcessRunning == true)
+                    ? null
+                    : () => unawaited(_protocolAction('start')),
                 style: _btnStyle(context),
                 child: protocolBusy
                     ? const SizedBox(
@@ -2348,7 +2360,8 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
               const SizedBox(width: 8),
               FilledButton.tonal(
-                onPressed: (_protocolCardBusy || state == 'stopped' || state == 'not-installed')
+                // 同理：没在跑就不给「停止」（它只会回一句"它本来就没在跑"）
+                onPressed: (_protocolCardBusy || _protocolProcessRunning != true)
                     ? null
                     : () => unawaited(_protocolAction('stop')),
                 style: FilledButton.styleFrom(
@@ -2362,28 +2375,18 @@ class _SettingsPageState extends State<SettingsPage> {
               // 扫码登录是在**它的 WebUI** 里做的，框架不代管 QQ 登录态；
               // 没在跑时不给这个按钮——那个页面此刻打不开，摆一个点不出东西的按钮比不摆更糟
               if (webuiUrl.isNotEmpty)
-                TextButton(
+                FilledButton.tonal(
                   onPressed: _protocolCardBusy ? null : () => unawaited(_openUrl(webuiUrl)),
-                  style: TextButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                     minimumSize: const Size(0, 36),
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
-                  child: const Text('打开登录界面'),
+                  child: const Text('打开面板'),
                 ),
             ],
           ),
-          if (webuiUrl.isNotEmpty) ...[
-            const SizedBox(height: 2),
-            // 初始凭据这一句放在**按钮底下**而不是只写在装好之后的引导里：
-            // 真正需要它的时候是重启之后（那时引导早没了——它只是"这一次点击"的产物），
-            // 而人对着一个要密码的登录页是迈不过去的（凭据只在它首次启动时打印一次）
-            Text(
-              '扫码登录在 $webuiUrl 里做（框架不代管 QQ 登录态）。首次登录用它启动日志里的初始凭据'
-              '（形如 initial credentials: user=admin password=…，只在首次启动时打印一次）。',
-              style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
-            ),
-          ],
+          if (webuiUrl.isNotEmpty) _protocolLoginBlock(webuiUrl),
           if (!attached) ...[
             const SizedBox(height: 2),
             Text(
@@ -2392,6 +2395,245 @@ class _SettingsPageState extends State<SettingsPage> {
               style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
             ),
           ],
+        ],
+      ),
+    );
+  }
+
+  /// 第一档：进程在不在。三态——在跑 / 没在跑 / **本进程没在看**（没有实例时不许说"没在跑"）。
+  bool? get _protocolProcessRunning {
+    final process = protocolSide?['process'];
+    if (process is! Map) return null;
+    final running = process['running'];
+    return running is bool ? running : null;
+  }
+
+  /// 三档链条：一行一档，左边是档名，中间是判据，右边是证据。
+  ///
+  /// 为什么把"证据"（pid / 启动时刻 / 监听地址 / 配置路径 / 重连次数）也摆出来：
+  /// 这一版要治的就是"笼统报一句启动失败"。判据本身也要能被核对——不然换个人来看，
+  /// 他还是只能选择信不信那句话。证据摆出来，他自己就能判。
+  Widget _protocolChainBlock() {
+    final scheme = Theme.of(context).colorScheme;
+    if (protocolSide == null) return const SizedBox.shrink();
+
+    final process = protocolSide!['process'];
+    final config = protocolSide!['onebotConfig'];
+    final adapter = protocolSide!['adapter'];
+    final rows = <Widget>[
+      _protocolChainRow(
+        '① 进程',
+        _protocolChainText(process, (map) {
+          if (map['known'] != true) return ('未观测', '本进程没有实例，这一档没人在看');
+          if (map['running'] != true) return ('没在跑', '没有监听到它的面板端口');
+          final pid = map['pid'];
+          final started = map['startedAt']?.toString() ?? '';
+          final url = map['webuiUrl']?.toString() ?? '';
+          final how = map['managed'] == 'spawned'
+              ? '本次进程拉起'
+              : map['managed'] == 'discovered' ? '本次进程之前就在跑' : '只探到端口';
+          return (
+            '在跑',
+            [
+              if (pid != null) 'pid $pid',
+              if (started.isNotEmpty) '${_shortTime(started)} 起',
+              if (url.isNotEmpty) '监听 $url',
+              how,
+            ].join(' · '),
+          );
+        }),
+        ok: process is Map && process['running'] == true,
+        unknown: process is Map && process['known'] != true,
+      ),
+      _protocolChainRow(
+        '② OneBot 配置',
+        _protocolChainText(config, (map) {
+          if (map['present'] == true) {
+            final ws = map['wsUrl']?.toString() ?? '';
+            final token = map['hasToken'] == true ? '带 token' : '无 token（协议端未开校验）';
+            return ('在', [if (ws.isNotEmpty) '端点 $ws', token].join(' · '));
+          }
+          if (map['unreadable'] == true) {
+            return ('读不出', '那份文件在（${map['path'] ?? '?'}）但端点解析失败——要人去修它');
+          }
+          return ('缺失', '未登录 QQ：这一份是登录之后才生成的');
+        }),
+        ok: config is Map && config['present'] == true,
+        warn: config is Map && config['unreadable'] == true,
+        unknown: config == null,
+      ),
+      _protocolChainRow(
+        '③ 适配器',
+        _protocolChainText(adapter, (map) {
+          final state = map['state']?.toString() ?? '';
+          final target = map['target']?.toString() ?? '';
+          final attempts = map['reconnectAttempts'];
+          final delivered = map['delivered'];
+          switch (state) {
+            case 'connected':
+              return (
+                '已连上',
+                [
+                  if (target.isNotEmpty) target,
+                  if (map['selfId'] != null && '${map['selfId']}'.isNotEmpty) 'QQ ${map['selfId']}',
+                  '已收 $delivered 条',
+                ].join(' · '),
+              );
+            case 'reconnecting':
+              return ('重连中', [if (target.isNotEmpty) target, '第 $attempts 次退避'].join(' · '));
+            case 'no-endpoint':
+              return ('没端点可连', '协议端的 OneBot 配置还没出现，配置里也没有手填地址');
+            case 'disabled':
+              return ('未启用', 'config.channels.onebot.enabled=false');
+            default:
+              return ('未装配', '本进程没有 OneBot 适配器');
+          }
+        }),
+        ok: adapter is Map && adapter['state'] == 'connected',
+        warn: adapter is Map && adapter['state'] == 'reconnecting',
+        unknown: adapter == null || adapter['state'] == 'not-assembled',
+      ),
+    ];
+
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.4),
+        borderRadius: BorderRadius.circular(IrmiaTheme.radiusCtl),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: rows),
+    );
+  }
+
+  /// 三档里的一行；`unknown` 是"没人在看"（既不是好也不是坏，用中性色）
+  Widget _protocolChainRow(
+    String label,
+    (String, String) verdict, {
+    bool ok = false,
+    bool warn = false,
+    bool unknown = false,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final tone = unknown
+        ? scheme.onSurfaceVariant
+        : ok
+            ? IrmiaTheme.ok
+            : warn
+                ? IrmiaTheme.warn
+                : IrmiaTheme.danger;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 96,
+            child: Text(label, style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
+          ),
+          SizedBox(
+            width: 78,
+            child: Text(
+              verdict.$1,
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: tone),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              verdict.$2,
+              style: TextStyle(fontSize: 11.5, height: 1.5, color: scheme.onSurfaceVariant),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 从一档的 map 里取结论；map 缺失或形状不对时由调用方给"未观测"
+  (String, String) _protocolChainText(
+    Object? value,
+    (String, String) Function(Map<String, dynamic> map) read,
+  ) {
+    if (value is! Map) return ('未观测', '这一档没有数据');
+    return read(value.cast<String, dynamic>());
+  }
+
+  /// ISO 时刻 → `10-07 01:26`（本地时间；只用于显示，判据仍是原文那个 ISO）
+  String _shortTime(String iso) {
+    final parsed = DateTime.tryParse(iso);
+    if (parsed == null) return iso;
+    final local = parsed.toLocal();
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '${two(local.month)}-${two(local.day)} ${two(local.hour)}:${two(local.minute)}';
+  }
+
+  /// 面板入口那一块：凭据 + 两个门 + 接下来该做什么。
+  ///
+  /// 口令**来自服务端**（`.password`），而这里显示的是打码形态 `.passwordMasked`
+  /// ——"留头尾各两位"是为了让人能和自己手里那条核对（全遮之后两个不同的口令长得一样）。
+  /// 真要复制原文，走「复制凭据」那个按钮：它把明文放剪贴板，不在屏幕上停留。
+  Widget _protocolLoginBlock(String webuiUrl) {
+    final scheme = Theme.of(context).colorScheme;
+    final login = protocolSide?['webuiLogin'];
+    final map = login is Map ? login.cast<String, dynamic>() : const <String, dynamic>{};
+    final credential = map['credential'];
+    final cred = credential is Map ? credential.cast<String, dynamic>() : const <String, dynamic>{};
+    final source = cred['source']?.toString() ?? 'none';
+    final user = cred['user']?.toString() ?? '';
+    final masked = cred['passwordMasked']?.toString() ?? '';
+    final password = cred['password']?.toString() ?? '';
+    final consentRecorded = map['consentRecorded'] == true;
+    final mustChange = map['mustChangePassword'] == true;
+
+    final lines = <String>[
+      if (source == 'stdout')
+        '初始凭据（本次启动从它的输出里捕到，用户 $user / 口令 $masked）'
+      else if (source == 'console-log')
+        '初始凭据（从框架自己的启动留痕里捞回来的：用户 $user / 口令 $masked；'
+            '若它之后又重启过，这条就作废了）'
+      else
+        '初始凭据找不回来：它只在启动时往自己的输出里打一次（关掉程序就没了）。'
+            '要拿到一条可用的，就让框架重启它一次（那一次的输出会被捕获并显示在这里）。',
+      if (!consentRecorded) '协议与隐私政策还没同意——面板解锁之前，接入 QQ 的入口是锁着的。',
+      if (mustChange) '初始口令还没改：两个门里第一个就是改密，面板会一直要求你先改它。',
+    ];
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '扫码登录在 $webuiUrl 里做（框架不代管 QQ 登录态）。',
+            style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+          ),
+          for (final line in lines)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                line,
+                style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
+              ),
+            ),
+          if (password.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: FilledButton.tonal(
+                  onPressed: () async {
+                    await Clipboard.setData(ClipboardData(text: '$user $password'.trim()));
+                    if (mounted) _toast('凭据已复制（用户 + 口令）', kind: ToastKind.success);
+                  },
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    minimumSize: const Size(0, 36),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  child: const Text('复制凭据'),
+                ),
+              ),
+            ),
         ],
       ),
     );

@@ -11,7 +11,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -27,6 +27,7 @@ import { ToolRegistry } from '../src/tools/registry.ts';
 import type { DsClient } from '../src/model/ds-client.ts';
 import type { PersonaAssets } from '../src/persona/loader.ts';
 import { attachmentPath } from '../src/channel/attachment-store.ts';
+import { GROUP_MEMBERS_FILE } from '../src/channel/group-members.ts';
 
 const TZ = 'Asia/Shanghai';
 
@@ -241,4 +242,89 @@ test('非图片附件与没有地址的附件都不进这条通道', async (t) =
   });
   await rig.loop().tickOnce();
   assert.equal(host.hits(), 0, '文件与没有地址的附件都不该触发下载');
+});
+
+/**
+ * OneBot 的附件类型是**段类型裸标签**（`image`），不是 MIME（`image/jpeg`）。
+ *
+ * 预热这条判据与渲染层挑图那条**必须同源**：原先两处各写一遍 `startsWith('image/')`，
+ * 于是 OneBot 发来的图既没被预热、也没进上下文——她只看到一行临时地址。这条用例锁的是
+ * "预热认得出裸标签"，与 `render.test.ts` 那两条形态用例合起来才是完整的一条链。
+ */
+test('OneBot 的裸标签 `image` 也算图：照样预热落盘（与渲染层同一个判据）', async (t) => {
+  const host = await startImageHost();
+  t.after(() => host.close());
+  const rig = await makeRig(t);
+  const url = `${host.origin}/onebot.jpg`;
+  const target = attachmentPath(rig.dir, url);
+
+  rig.write('wake/channel', {
+    channel: 'onebot',
+    chatType: 'c2c',
+    person: '10001',
+    chatId: '10001',
+    text: '看这个',
+    messageId: 'm3',
+    msgSeq: 0,
+    dedupeKey: 'onebot:m3',
+    attachments: [{ type: 'image', name: 'a.jpg', url }],
+  });
+  await rig.loop().tickOnce();
+  assert.equal(existsSync(target), true, '段类型 `image` 必须触发预热，否则她那边永远是"图加载不出来"');
+  assert.equal(host.hits(), 1);
+});
+
+// ────────────────────── 群成员自动档案的唯一入口：mentionsMe（2026-10-07） ──────────────────────
+//
+// 这一段治的是报告 §3.3：`registerGroupMembers` 的**唯一入口**是 `data.mentionsMe === true`，
+// 而 OneBot 的适配器原先一条都不填（官方的 `GROUP_AT_MESSAGE_CREATE` 每条都填）。后果不是
+// "少一个标志"：OneBot 群里 @ 过她的人在 `data/group-members.json` 里一个都不出现，
+// 她问"甲是谁"时框架只能给出一串 QQ 号。下面两条把"@ 了她 ⇒ 登记"与"没 @ ⇒ 不登记"钉死。
+
+/** 群成员档案里有没有这个人（读盘，因为"档案"的产物就是那份文件） */
+function membersFileHas(dir: string, openid: string): boolean {
+  const path = join(dir, GROUP_MEMBERS_FILE);
+  if (!existsSync(path)) return false;
+  return readFileSync(path, 'utf8').includes(openid);
+}
+
+test('OneBot 群里 @ 她 ⇒ 那个群成员被登记进档案（她下次问"甲是谁"时框架答得出）', async (t) => {
+  const rig = await makeRig(t);
+  // **先空跑一拍**：这一拍跑完 `warmUp`（从日志重建会话簿，并把折的游标推到当刻水位）。
+  // 之后写进来的事件才是"运行期新到的"——那才是这条链要验的形状。
+  // （不先跑这一拍的话，事件会在 warmUp 之前落库，被游标一次性跳过：
+  //   warmUp 只折会话簿，不跑群成员注册。）
+  await rig.loop().tickOnce();
+  rig.write('wake/channel', {
+    channel: 'onebot',
+    chatType: 'group-at',
+    person: '10001',
+    chatId: '20002',
+    text: '帮我看看',
+    messageId: 'g-1',
+    msgSeq: 0,
+    mentionsMe: true,
+    dedupeKey: 'onebot:g-1',
+  });
+  // 第二拍：`foldChannelEvents` 从游标往后扫（**每拍都扫，与认不认领无关**）——
+  // 群聊攒批会把这条唤醒压在窗口里，但"登记人"这件事不等攒批。
+  await rig.loop().tickOnce();
+  assert.equal(membersFileHas(rig.dir, '10001'), true, '@ 过她的人必须进档案');
+});
+
+test('OneBot 群里的普通闲聊 ⇒ 不进档案（免得把冒过泡的人都灌进去）', async (t) => {
+  const rig = await makeRig(t);
+  await rig.loop().tickOnce();
+  rig.write('wake/channel', {
+    channel: 'onebot',
+    chatType: 'group',
+    person: '10086',
+    chatId: '20002',
+    text: '今天天气不错',
+    messageId: 'g-2',
+    msgSeq: 0,
+    dedupeKey: 'onebot:g-2',
+  });
+  await rig.loop().tickOnce();
+  assert.equal(membersFileHas(rig.dir, '10086'), false, '没叫她的人不该被登记');
 });

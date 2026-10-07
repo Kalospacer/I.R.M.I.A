@@ -18,7 +18,7 @@
 
 import type { AppEvent, Projection } from '../log/types.js';
 import type { EventLog } from '../log/event-log.ts';
-import type { DsClient, DsReasoningEffort, DsTextFormat } from '../model/ds-client.js';
+import type { DsClient, DsReasoningEffort, DsTextFormat, DsUsage } from '../model/ds-client.js';
 import { applyOne, finalizePressure } from '../state/fold.ts';
 
 /** 一次概括的成本上限：超时就放弃这一轮，下批消息来了再试 */
@@ -117,9 +117,13 @@ export class TopicSummarizer {
 
     const started = this.deps.now().getTime();
     const format: DsTextFormat = { type: 'json_schema', name: 'channel_topic', schema: TOPIC_SCHEMA };
+    // 思考强度：**用户的口径（2026-10-06）—— light 一律 `low`，不提供更改**
+    // （另一档 heavy 一律 `high`，唯一落点是 `runtime/agent-loop.ts` 的 `toDsRequest`）。
+    // **别给这里加配置项**：config.json 里没有、也不许长出能改它的字段——
+    // 判据钉在 `test/thinking-effort-invariant.test.ts`（想加旋钮，那条测试要先红）。
     const effort: DsReasoningEffort = 'low';
     let topic: string | null = null;
-    let usage: { inputTokens: number; outputTokens: number; cachedTokens: number } | null = null;
+    let usage: DsUsage | null = null;
     let model = 'channel-topic';
     let finishReason = 'completed';
     try {
@@ -156,7 +160,7 @@ export class TopicSummarizer {
   private account(
     startedMs: number,
     model: string,
-    usage: { inputTokens: number; outputTokens: number; cachedTokens: number } | null,
+    usage: DsUsage | null,
     finishReason: string,
   ): void {
     const inputTokens = usage?.inputTokens ?? 0;
@@ -176,6 +180,8 @@ export class TopicSummarizer {
         outputTokens,
         cacheHitTokens: cacheHit,
         cacheMissTokens: Math.max(0, inputTokens - cacheHit),
+        // 思维链 token：**每次都写**（没产思维链就是 0），见 log/types.ts 的字段注释
+        reasoningTokens: usage?.reasoningTokens ?? 0,
         durationMs: this.deps.now().getTime() - startedMs,
         retryCount: 0,
         finishReason,

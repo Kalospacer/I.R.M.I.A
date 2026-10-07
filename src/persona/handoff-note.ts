@@ -29,6 +29,7 @@
  */
 
 import type { AppEvent } from '../log/types.js';
+import { formatExact } from '../format/units.ts';
 import { renderExternalEvent, renderWake, wakeTitle } from '../model/render.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
@@ -77,6 +78,24 @@ export const TIMER_READ_ACTION = 'list';
 
 /** 笔记首行标题（进不了任何分段，但仍计入总预算） */
 const HEADER = '# 交接笔记';
+
+/**
+ * 单条工具入参在笔记里的**字节上限**：超过它就压成「键名 + 字节数」，不再原样录入。
+ *
+ * 为什么要有这条（2026-10-06，用户核定的第二笔）：工具入参动辄几千字符（`safe_edit` 的
+ * `old_string`/`new_string` 一次就能上万），而它们坐在笔记的**头部**、每次交接都要重编码一次。
+ * 先例：reasonix 的 `compressFoldArgsForSummary`（`compact_fold_input.go:214-239`，>512 字节
+ * 压成键名 + 大小）。
+ *
+ * 512 这个数的取舍：普通调用（`{"file_path":"a.txt"}` 这类）都在它下面，**原样保留**；
+ * 一过线就说明这条入参里装着正文、补丁、大段命令——那些内容的价值在"做过这件事"，
+ * 不在"逐字复现"，而回执那一条已经把结果说清了。判据按 **UTF-8 字节**（与 `contentRef.bytes`
+ * 同一把尺），不按字符数：中文入参一个字三字节，按字符判会放过三倍大的东西。
+ *
+ * **确定性**：这是纯函数（入参字符串 → 文本），阈值是常量、键名排序固定，所以同一批事件
+ * 在任何时刻渲染出同一字节串——重放逐字节重建这条纪律不受影响。
+ */
+export const HANDOFF_TOOL_ARGS_MAX_BYTES = 512;
 
 /** 重复合并的标注模板（persona.md §4 原文措辞） */
 function repeatLabel(times: number): string {
@@ -325,7 +344,7 @@ export function collectHandoffEntries(
       if (cls === 'flow') continue; // 纯流程调用：不收录
       const entry: HandoffEntry = {
         seq: e.seq, ts: e.ts, kind: 'tool-call', tool: e.data.name,
-        text: `[调用] ${e.data.name}(${oneLine(e.data.arguments)})`,
+        text: `[调用] ${e.data.name}(${noteArgsOf(e.data.arguments)})`,
       };
       if (cls === 'state') entry.stateKey = `tool:${e.data.name}:call`;
       out.push(entry);
@@ -347,6 +366,38 @@ export function collectHandoffEntries(
     // 其余事件类型：不收录（reasoning、compaction/summary 等）
   }
   return out;
+}
+
+/**
+ * 笔记里怎么印一条工具调用的入参（2026-10-06 第二笔）。
+ *
+ * 短的**原样**（普通调用占绝大多数，逐字留着最有用）；超过 {@link HANDOFF_TOOL_ARGS_MAX_BYTES}
+ * 的压成「顶层键名 + 字节数 + 一句说明」——键名留着是因为"她动过哪几个字段"是交接信息，
+ * 值不留是因为那几千字节的正文在笔记里既读不完也占不起（笔记总预算只有 4096 token）。
+ *
+ * 非对象/非 JSON/缺入参：只剩字节数与说明（键名那一段整段不出现），**不留空括号**。
+ * 键名按**原出现顺序**列（不排序）：JSON 的键序是入参生成时的顺序，重放时同一份字节
+ * 得到同一个顺序，确定性不靠排序来保证；排序反而会把"她先写哪个字段"这个信息抹掉。
+ */
+function noteArgsOf(args: string | undefined): string {
+  const raw = oneLine(args ?? '');
+  const bytes = Buffer.byteLength(raw, 'utf8');
+  if (bytes <= HANDOFF_TOOL_ARGS_MAX_BYTES) return raw;
+
+  const keys = topLevelKeysOf(raw);
+  const head = keys.length === 0 ? '' : `${keys.join(',')} · `;
+  return `${head}${formatExact(bytes)} 字节 · 参数正文未收入笔记`;
+}
+
+/** 顶层键名（原出现顺序）。取不到（非 JSON / 不是对象）返回空数组 */
+function topLevelKeysOf(raw: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return [];
+    return Object.keys(parsed as Record<string, unknown>);
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -589,24 +640,87 @@ function sectionMeta(
   return out;
 }
 
+/**
+ * 交接笔记的**机械替代文本**（2026-10-06 加）。
+ *
+ * 为什么不能"笔记渲染不出来就什么都不写"：先例是 reasonix 的 `mechanicalFoldDigest`
+ * ——「Saying the summary is missing is what stops the model reading the gap as
+ * 'nothing was there' and inventing what the folded turns contained.」留白会被读成
+ * "那段时间什么都没发生"，然后她会**按这个印象编下去**。所以遮蔽一旦发生，
+ * `compaction/summary` 必须落一条，而且 `summary` 字段**不许空**。
+ *
+ * 这段文本是**纯函数**（count → 字符串），不含时刻、不含随机：重放才逐字节可重建。
+ * 单独导出是为了让测试与报告都能引用同一串字面量、不必各写一遍。
+ */
+export function mechanicalSummaryText(coveredCount: number): string {
+  const n = Math.max(0, Math.trunc(coveredCount));
+  return '# 交接笔记\n'
+    + `（这一段有 ${n} 条往来被折进来了，但**自动笔记这次没生成出来**——`
+    + '不是"这段什么都没发生"。要细节请从 `events/` 或 `_research/` 的工具按 seq 回查。）\n';
+}
+
 // ──────────────────────────────── 压缩阈值口径 ────────────────────────────────
 
 /**
- * 可见历史规模（token 估算）：未被最新 `compaction/summary` 遮蔽的 model 可见事件之和。
+ * 某个遮蔽点之后**还没被折进笔记**的可见历史规模：`(fromSeq, toSeq]` 之间 model 可见事件之和。
+ *
+ * 口径与 {@link estimateHistoryTokens} **同一把尺**（同一个 `historyTextOf` + 同一个
+ * `estimateTokens`），只是把范围写成显式区间——④ 的交接闸门量的是"这次折叠的收益规模"
+ * （从上一个遮蔽点起、还没折进任何笔记的那些内容），而不是"整条历史有多长"。
+ *
+ * **为什么是"从上一个遮蔽点起"而不是"本轮新增"**（这一条我踩过一次，记在这里）：
+ * 第一版量的是"上一次 turn/end → 本次遮蔽点"那一段，于是
+ *   ① 实测 21:40 那种"一轮干了 18 步"的场景，上一轮的内容（44,281）不算数，
+ *      量出来只剩本轮新增的一点点；
+ *   ② 手工 `/compact` 那一拍量出来干脆是 0（刚跑完的那一轮落在上一个 turn/end 之后）。
+ * 真正决定"这次折叠值不值"的是**将要发生变化的那些字节**：从上一个遮蔽点起、还没进任何
+ * 笔记的全部可见历史。折叠把这一整段换成一份笔记，收益就是它的规模。
+ */
+export function estimateMaskedTokens(
+  events: readonly AppEvent[],
+  fromSeq: number,
+  toSeq: number,
+): number {
+  const payloads = timerPayloadsOf(events);
+  let tokens = 0;
+  for (const e of events) {
+    if (e.seq <= fromSeq || e.seq > toSeq) continue;
+    if (e.visibility !== 'model') continue;
+    // 摘要自身不计（与 estimateHistoryTokens 同一条）：它遮蔽别的段，不该被算进被遮蔽量
+    if (e.type === 'compaction/summary') continue;
+    tokens += estimateTokens(historyTextOf(e, payloads));
+  }
+  return tokens;
+}
+
+/**
+ * 可见历史规模（token 估算）：未被 `compaction/summary` 遮蔽的 model 可见事件之和。
  * 运行期用它判定"要不要压缩"——阈值一过就写摘要，写完历史立刻变短（遮蔽生效），
  * 于是自然形成"积累到阈值才压一次"的节奏，而不是每轮都压。
+ *
+ * @param coveredUpToSeq **显式遮蔽点覆盖**（2026-10-06 加）：给了它就按它算，不看日志里
+ *   已有的摘要。运行期需要这个覆盖，因为它在"这条摘要还没写下去"的时刻就要知道
+ *   "写完之后历史还剩多少"——那正是阈值判定的对象（压缩点从 turn/start 改成本 turn 的
+ *   turn/end 之后，两者会差一整轮）。不给则与从前逐值相同：取日志里最大的 coveredUpToSeq。
  */
-export function estimateHistoryTokens(events: readonly AppEvent[]): number {
-  let coveredUpToSeq = 0;
-  for (const e of events) {
-    if (e.type === 'compaction/summary' && e.data.coveredUpToSeq > coveredUpToSeq) {
-      coveredUpToSeq = e.data.coveredUpToSeq;
+export function estimateHistoryTokens(
+  events: readonly AppEvent[],
+  coveredUpToSeq?: number,
+): number {
+  let covered = 0;
+  if (coveredUpToSeq === undefined) {
+    for (const e of events) {
+      if (e.type === 'compaction/summary' && e.data.coveredUpToSeq > covered) {
+        covered = e.data.coveredUpToSeq;
+      }
     }
+  } else {
+    covered = coveredUpToSeq;
   }
   const payloads = timerPayloadsOf(events);
   let tokens = 0;
   for (const e of events) {
-    if (e.seq <= coveredUpToSeq) continue;
+    if (e.seq <= covered) continue;
     // 遮蔽段不进请求，不计入。
     // v3 起**思维链也进请求**（思考模式要求回传 reasoning_text），所以它必须计入历史规模：
     // 这一条曾经把 reasoning 排除在外，与渲染口径不一致，后果是历史被低估、压缩迟迟不触发——

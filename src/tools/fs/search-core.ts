@@ -59,8 +59,6 @@ export interface WalkStats {
   aborted: boolean;
 }
 
-export type SearchEngine = 'ripgrep' | 'everything' | 'fallback';
-
 export interface DirEntryInfo {
   name: string;
   path: string;

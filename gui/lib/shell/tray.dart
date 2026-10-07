@@ -23,9 +23,12 @@ class IrmiaTray with TrayListener {
 
   static final IrmiaTray instance = IrmiaTray._();
 
-  /// 宿主注入的"发命令"能力（复用界面已有的 api 客户端；不注入就只能显示/隐藏）
-  Future<void> Function(String command, Map<String, dynamic> payload)? _post;
+  /// 宿主注入的"发命令"能力（复用界面已有的 api 客户端；不注入就只能显示/隐藏）。
+  /// 返回的是服务端回执（`Map`），重启那条路要用它来说清楚结局。
+  Future<Object?> Function(String command, Map<String, dynamic> payload)? _post;
   VoidCallback? _onQuitRequested;
+  /// 服务端对「重启前后端」的回执（见 [install] 的 `onRestartResult`）
+  void Function(Object? result)? _onRestartResult;
   bool _installed = false;
 
   /// **托盘提示里的名字**（悬停时那行字）。
@@ -44,12 +47,17 @@ class IrmiaTray with TrayListener {
   /// 装托盘。`post` 给的是 `/api/commands/<name>` 的发送函数（带确认短语）；
   /// `displayName` 是当前已知的她的名字（拿不到就传 [IrmiaTray] 的默认回退值）。
   Future<void> install({
-    Future<void> Function(String command, Map<String, dynamic> payload)? post,
+    Future<Object?> Function(String command, Map<String, dynamic> payload)? post,
     VoidCallback? onQuitRequested,
     String? displayName,
+    /// 「重启前后端」的服务端回执（那句话是**唯一一处**判据：成功带真实新 pid 与端口、
+    /// 失败带原因、未确认就说未确认）。托盘自己不显示它，交给宿主按同一口径处理——
+    /// 但绝不能丢：丢了就退回"点了没反应"那种最糟的反馈。
+    void Function(Object? result)? onRestartResult,
   }) async {
     _post = post;
     _onQuitRequested = onQuitRequested;
+    _onRestartResult = onRestartResult;
     if (displayName != null && displayName.trim().isNotEmpty) _displayName = displayName.trim();
     if (_installed) return;
 
@@ -124,8 +132,15 @@ class IrmiaTray with TrayListener {
       case 'restart':
         final post = _post;
         if (post == null) break;
-        // 与运行情况页那颗按钮同一条路：界面把自己的可执行路径带过去，脚本连界面一起重启
-        unawaited(post('restart', {'guiExe': Platform.resolvedExecutable}));
+        // 与运行情况页那颗按钮**同一条路**：界面把自己的可执行路径带过去，脚本连界面一起重启。
+        //
+        // 这里不弹 toast（托盘点击时窗口可能收着，弹在哪儿都没有意义），但**那句结论不能丢**：
+        // 服务端回来的 `note` 是唯一一处判据（成功带真实新 pid 与端口、失败带原因、
+        // 未确认就说未确认），所以转交给 `_onRestartResult` 由宿主按同一口径显示
+        // （见 main.dart：窗口在就显示，收在托盘里就只写进日志——不假装"点了没反应"，
+        // 也不在看不见的地方撒谎）。
+        unawaited(post('restart', {'guiExe': Platform.resolvedExecutable})
+            .then((Object? result) => _onRestartResult?.call(result)));
         break;
       case 'quit':
         _onQuitRequested?.call();

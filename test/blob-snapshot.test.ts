@@ -28,19 +28,20 @@ import type { AppEvent, Projection, SnapshotCheckpoint, ToolResult } from '../sr
 import { defaultVisibility } from '../src/log/types.ts';
 import { EventLog } from '../src/log/event-log.ts';
 import type { DsClient, DsRequest, DsStreamResult } from '../src/model/ds-client.js';
+import { inputContentText, render } from '../src/model/render.ts';
 import type { PersonaAssets } from '../src/persona/loader.js';
 import { runTurn, type AgentLoopDeps } from '../src/runtime/agent-loop.ts';
 import { RealLoop } from '../src/runtime/real-loop.ts';
 import { recover, timersOf } from '../src/runtime/recover.ts';
 import {
-  blobDirOf, blobIdOf, estimateTokens, readBlob, writeBlob, type BlobOffloadOptions,
+  blobDirOf, blobIdOf, estimateTokens, offloadIfLarge, readBlob, writeBlob, type BlobOffloadOptions,
 } from '../src/state/blob-store.ts';
 import { applyOne, finalizePressure, fold } from '../src/state/fold.ts';
 import { PROJECTION_CACHE_FILE } from '../src/state/projection-cache.ts';
 import {
   foldFromSnapshot, loadLatestSnapshot, snapshotDirOf, snapshotFileName, writeSnapshot,
 } from '../src/state/snapshot.ts';
-import { ToolRegistry, type ToolDefinition } from '../src/tools/registry.ts';
+import { estimateTokens as registryEstimateTokens, ToolRegistry, type ToolDefinition } from '../src/tools/registry.ts';
 
 // ──────────────────────────────── 脚手架 ────────────────────────────────
 
@@ -64,12 +65,18 @@ function tsAt(offsetSec: number): string {
   return new Date(EPOCH_MS + offsetSec * 1000).toISOString();
 }
 
-/** 可编程模型替身：按脚本顺序返回流式结果（这里只用来驱动一轮工具调用） */
-function fakeModel(script: Array<Partial<DsStreamResult>>): DsClient {
+/**
+ * 可编程模型替身：按脚本顺序返回流式结果（这里只用来驱动一轮工具调用）。
+ *
+ * `seen` 收下**每一次真实下发**的请求文本——"首入定形之后永不再剪"那条用例要拿它比对
+ * 第一轮与第二轮请求里的同一段字节（比对重建出来的请求没有意义：要证的正是"下发的没变"）。
+ */
+function fakeModel(script: Array<Partial<DsStreamResult>>, seen?: string[]): DsClient {
   const queue = [...script];
   return {
     modelFor: (lane: string): string => (lane === 'light' ? 'fake-light' : 'fake-heavy'),
     stream: async (request: DsRequest): Promise<DsStreamResult> => {
+      seen?.push(JSON.stringify(request.input));
       const next = queue.shift();
       if (next === undefined) throw new Error('mock 模型没有更多脚本项：调用次数超出预期');
       const base: DsStreamResult = {
@@ -191,12 +198,89 @@ test('① 重复内容寻址去重：同内容第二次不写盘，目录里只�
   assert.deepEqual(readdirSync(blobDir), [first.blobId]);
 });
 
-test('① token 估算走字符启发式：ASCII 4 字符/token，非 ASCII 1 字符/token', () => {
+test('① token 估算与 tools/registry.ts 同源（2026-10-06 收口，不再各写一份）', () => {
+  // 以前这里有一套"ASCII 4 字符/token + 非 ASCII 1 字符/token"的独立启发式，
+  // 于是同一个结果在"要不要外置"与"交接笔记预算"两条路上量出两个数。现在转发同一份实现。
+  assert.equal(estimateTokens, registryEstimateTokens, '必须是同一个函数（不是复制一份同值实现）');
   assert.equal(estimateTokens(''), 0);
   assert.equal(estimateTokens('abcd'), 1);
   assert.equal(estimateTokens('a'.repeat(9)), 3); // ceil(9/4)
-  assert.equal(estimateTokens('中文两个字'), 5);
-  assert.equal(estimateTokens('ab中文'), 3); // ceil(2/4) + 2
+  assert.equal(estimateTokens('中文两个字'), 4); // ceil(5/1.5)
+  assert.equal(estimateTokens('ab中文'), 2); // ceil(0.5 + 1.333)
+});
+
+test('① 字节上限：中文长结果被 64 KiB 那条线兜住（token 估算对中文低估最大）', async (t) => {
+  const h = await makeHarness(t, 'irmia-blob-maxbytes-');
+  // 纯中文：估算 token 只有字符数的 2/3，于是"估算 21k"能到 3.1 万字符 ≈ 9.4 万字节。
+  // maxBytes 先到 ⇒ 按字节定形（这就是它存在的理由）。
+  const content = '浆'.repeat(40_000); // 120,000 字节
+  const outcome = await offloadIfLarge(content, {
+    dataDir: h.dir, thresholdTokens: 100_000, maxBytes: 64 * 1024, previewChars: 1_000_000,
+  });
+  assert.notEqual(outcome.contentRef, undefined, '过了字节上限就该外置');
+  assert.equal(Buffer.byteLength(outcome.content, 'utf8') <= 64 * 1024, true, '可见形态不超过 64 KiB');
+  assert.equal(outcome.contentRef!.bytes, 120_000, 'contentRef.bytes 是全文的字节数');
+  // 全文完整落在 blob 里（可见形态是切片，不是丢内容）
+  assert.equal((await readBlob(h.dir, outcome.contentRef!.blobId)).toString('utf8'), content);
+
+  // 两个上限**取小**：token 先到也外置
+  const byTokens = await offloadIfLarge('x'.repeat(400), {
+    dataDir: h.dir, thresholdTokens: 10, maxBytes: 10_000_000, previewChars: 1000,
+  });
+  assert.notEqual(byTokens.contentRef, undefined, 'token 过线同样外置');
+
+  // 都不越线：一个字节都不动
+  const untouched = await offloadIfLarge('短结果', {
+    dataDir: h.dir, thresholdTokens: 10_000, maxBytes: 64 * 1024, previewChars: 1000,
+  });
+  assert.equal(untouched.content, '短结果');
+  assert.equal(untouched.contentRef, undefined);
+});
+
+test('① 外置是**纯函数**：同内容任何时候定形成同一字节串（重放逐字节重建的前提）', async (t) => {
+  const h = await makeHarness(t, 'irmia-blob-pure-');
+  const content = '中文正文'.repeat(500);
+  const opts = { dataDir: h.dir, thresholdTokens: 100, maxBytes: 64 * 1024, previewChars: 200 };
+  const first = await offloadIfLarge(content, opts);
+  const second = await offloadIfLarge(content, opts);
+  assert.equal(second.content, first.content, '两次外置的可见字节逐字相同');
+  assert.equal(second.contentRef!.blobId, first.contentRef!.blobId, '内容寻址 ⇒ 同一个 blobId');
+  assert.equal(second.contentRef!.bytes, first.contentRef!.bytes);
+});
+
+test('① 定形只发生在**首入那一刻**：外置之后不再回来剪（事件写下即冻结）', async (t) => {
+  const h = await makeHarness(t, 'irmia-blob-once-');
+  const full = 'A'.repeat(50_000);
+  const result = await runDumpTurn(h, full, { dataDir: h.dir, thresholdTokens: 10, previewChars: 100 });
+
+  // 事件里的可见形态：头部 100 字符 + contentRef。**此后没有任何维护路径会回来改它**——
+  // 判据：把这份事件反复走一遍 render（渲染层是唯一把事件变成请求字节的地方），
+  // 每次得到**逐字节相同**的文本；且渲染**不写回**事件。
+  const preview = result.data.content;
+  assert.equal(preview.length, 100);
+  // 渲染要一对配对完整的 call + output（铁律 4），所以把同一轮里的 tool/call 一起给它
+  const call = (await readAll(h.log)).find(e => e.type === 'tool/call');
+  assert.notEqual(call, undefined, '这一轮写下了 tool/call');
+  const asText = (): string => render({
+    events: [call!, result], persona: PERSONA, tools: [], wakeEvent: null, taskCard: null,
+    now: TS0, timezone: TIMEZONE, model: 'm', lane: 'heavy', contact: null,
+    mentionNotice: null, machine: null, usage: null, asks: null, injection: null,
+    loadImage: null, softHint: null, memoryIndex: null, skillCatalog: null,
+    turnBlock: null, stateBytes: null, stateBudgetBytes: null,
+  }).input.map((item) => {
+    if (item.type === 'function_call_output') return item.output;
+    if (item.type === 'function_call') return item.arguments;
+    return inputContentText(item.content);
+  }).join('\n');
+
+  const firstRead = asText();
+  assert.equal(firstRead.includes('不在本次对话里'), true, '指针照着已定形的 contentRef 打印，并明说全文不在上下文里');
+  assert.equal(asText(), firstRead, '同一事件反复渲染逐字节相同');
+  assert.equal(result.data.content, preview, '渲染不写回事件——事件的字节一个都没变');
+
+  // 挪走 blob 再渲染：可见形态仍然相同（渲染路径**不读盘**、不重算截断、不因外部状态变化而改口）
+  rmSync(blobDirOf(h.dir), { recursive: true, force: true });
+  assert.equal(asText(), firstRead, 'blob 不在了也不改变已定形的可见字节');
 });
 
 // ──────────────────────────────── ② agent-loop 接入 ────────────────────────────────
@@ -206,12 +290,13 @@ async function runDumpTurn(
   h: Harness,
   content: string,
   blobOffload?: BlobOffloadOptions,
+  seen?: string[],
 ): Promise<ToolResult> {
   const wake = h.append('wake/manual', { note: '看看这份输出' }, 'model', 1);
   const ds = fakeModel([
     { toolCalls: [{ callId: 'call_dump', name: 'dump', arguments: '{}' }] },
     { text: '看完了。' },
-  ]);
+  ], seen);
   const deps: AgentLoopDeps = {
     log: h.log,
     ds,
@@ -231,6 +316,40 @@ async function runDumpTurn(
   assert.equal(results.length, 1);
   return results[0]!;
 }
+
+test('① **首入定形之后永不再剪**：第二轮（后续维护）看到的是与第一轮逐字节相同的可见形态', async (t) => {
+  const h = await makeHarness(t, 'irmia-blob-never-retruncate-');
+  const full = 'A'.repeat(50_000);
+  const opts = { dataDir: h.dir, thresholdTokens: 10, previewChars: 100 };
+
+  // 第一轮：外置（定形）
+  const seen: string[] = [];
+  const first = await runDumpTurn(h, full, opts, seen);
+  const visible = first.data.content;
+  const firstRequest = seen.at(-1) ?? '';
+
+  // 第二轮：另一条唤醒、另一次请求。之前那条回执现在只是"历史"。
+  const wake2 = h.append('wake/manual', { note: '再干一件别的事' }, 'model', 1);
+  const ds2 = fakeModel([{ text: '好。' }], seen);
+  const deps2: AgentLoopDeps = {
+    log: h.log, ds: ds2, registry: registryWithDump(full), projection: h.projection,
+    persona: PERSONA, now: () => TS0, timezone: TIMEZONE, workspaceRoot: h.dir,
+    blobOffload: opts,
+  };
+  await runTurn(deps2, [wake2]);
+  const secondRequest = seen.at(-1) ?? '';
+
+  // 判据（比"截断到 21k"更重要的一条）：
+  //   ① 那条回执的可见字节**一个都没变**（没有"维护期再剪一次"）
+  const reread = (await readAll(h.log)).filter((e): e is ToolResult => e.type === 'tool/result')[0]!;
+  assert.equal(reread.data.content, visible, '事件里的可见形态与第一轮逐字节相同');
+  assert.equal(reread.data.contentRef?.blobId, first.data.contentRef?.blobId, 'blobId 也没变');
+  //   ② 第二轮请求里出现的是**同一串**可见字节（不是被再剪过的版本）
+  assert.equal(secondRequest.includes(JSON.stringify(visible).slice(1, -1)), true,
+    '第二轮请求里那段历史与第一轮下发的逐字节相同');
+  assert.equal(secondRequest.includes('不在本次对话里'), true, '指针行仍在（不是被二次处理掉的形态）');
+  assert.equal(firstRequest.includes('不在本次对话里'), true);
+});
 
 test('② 大结果外置：content 截断为头部预览，contentRef 指向已落盘的 blob', async (t) => {
   const h = await makeHarness(t, 'irmia-offload-');

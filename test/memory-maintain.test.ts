@@ -129,7 +129,8 @@ describe('memory-maintain 种子与结构', () => {
 
     const created = ensureMemorySeeds(dataDir);
     assert.deepEqual(created.sort(), [
-      'MEMORIES/aliases.md', 'MEMORIES/facts.md', 'MEMORIES/jargon.md', 'MEMORIES/style-notes.md',
+      'MEMORIES/aliases.md', 'MEMORIES/assets.md', 'MEMORIES/facts.md',
+      'MEMORIES/jargon.md', 'MEMORIES/style-notes.md',
     ]);
     const memDir = memoriesDir(dataDir);
     assert.equal(existsSync(join(memDir, 'episodes')), true, 'episodes/ 必须存在（agent 自主写流水账的落点）');

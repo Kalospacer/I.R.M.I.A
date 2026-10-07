@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show SystemChannels;
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:irmia_gui/api.dart';
@@ -27,8 +28,11 @@ import 'package:irmia_gui/ui_state.dart';
 /// 「记忆」卡（`persona.memoryEnabled`）三条锁在最后：开关读盘上那份、点一下走 config-update、
 /// **关掉时那句代价必须在**（它是一句"什么都不会报错、代价过几天才显形"的话）。
 void main() {
-  /// GET /api/protocol-side 的样例（v34）：配置齐备、已就绪、正在跑。
-  /// 各用例按需改其中几个键（没配置 / 读失败 / 需重启 / 已停止）。
+  /// GET /api/protocol-side 的样例（v34；v36 起带三档）。
+  /// 各用例按需改其中几个键（没配置 / 读失败 / 需重启 / 已停止 / 进程在跑而配置缺失）。
+  ///
+  /// **三档的样例必须与真服务端同形**：界面直接读 `process` / `onebotConfig` / `adapter`
+  /// 这三块，少一个键就会出现一块假的"未观测"——那种 red 会让人去查一个没坏的东西。
   Map<String, dynamic> protocolView() => <String, dynamic>{
         'configured': true,
         'enabled': true,
@@ -42,9 +46,88 @@ void main() {
         'detail': '已就绪，OneBot 在 ws://127.0.0.1:3001/',
         'restartRequired': false,
         'endpoint': {'wsUrl': 'ws://127.0.0.1:3001/', 'hasToken': true, 'source': 'live'},
-        'webuiUrl': 'http://localhost:5099',
+        'webuiUrl': 'http://127.0.0.1:5099',
         'installed': true,
         'entryPath': 'D:/SnowLuma/dist/index.mjs',
+        // 三档（v36）
+        'summary': '进程在跑 · OneBot 配置在 · 适配器已连上',
+        'process': {
+          'known': true,
+          'running': true,
+          'pid': 34552,
+          'managed': 'spawned',
+          'startedAt': '2026-02-14T10:00:00.000Z',
+          'webuiUrl': 'http://127.0.0.1:5099',
+          'detail': '在跑（pid 34552）；实际监听 http://127.0.0.1:5099',
+        },
+        'onebotConfig': {
+          'present': true,
+          'wsUrl': 'ws://127.0.0.1:3001/',
+          'hasToken': true,
+          'path': 'D:/SnowLuma/config/onebot.json',
+          'detail': '在（D:/SnowLuma/config/onebot.json），端点 ws://127.0.0.1:3001/',
+        },
+        'adapter': {
+          'state': 'connected',
+          'connected': true,
+          'hasEndpoint': true,
+          'target': 'ws://127.0.0.1:3001/',
+          'selfId': '10001',
+          'reconnectAttempts': 0,
+          'lastEventAt': null,
+          'delivered': 0,
+          'detail': '已连上 ws://127.0.0.1:3001/',
+        },
+        // 面板的登录口（v36 的第 2 步）
+        'webuiLogin': {
+          'url': 'http://127.0.0.1:5099',
+          'open': true,
+          'consentRecorded': true,
+          'mustChangePassword': false,
+          'credential': {
+            'source': 'stdout',
+            'user': 'admin',
+            'password': 'd198b971dd2b7b03',
+            'passwordMasked': 'd1…03',
+          },
+        },
+      };
+
+  /// 现场那一档（实测）：**进程在跑、OneBot 配置缺失**——三档必须分开说，不能笼统报"启动失败"
+  Map<String, dynamic> protocolViewBrokenChain() => <String, dynamic>{
+        ...protocolView(),
+        'state': 'failed',
+        'stateText': '启动失败',
+        'detail': '等 30 秒仍没等到 OneBot 端口——协议端进程在跑（pid 34552，面板在 http://127.0.0.1:5099），'
+            '而 OneBot 配置缺失（config/onebot.json 还没有）——这一份是它登录 QQ 之后才物化的。',
+        'endpoint': null,
+        'webuiUrl': 'http://127.0.0.1:5099',
+        'summary': '进程在跑 · OneBot 配置缺失 · 适配器没端点可连',
+        'process': {
+          'known': true,
+          'running': true,
+          'pid': 34552,
+          'managed': 'discovered',
+          'startedAt': '2026-02-14T10:00:00.000Z',
+          'webuiUrl': 'http://127.0.0.1:5099',
+        },
+        'onebotConfig': {'present': false, 'detail': '缺失（它登录 QQ 之后才会生成这一份）'},
+        'adapter': {
+          'state': 'no-endpoint',
+          'connected': false,
+          'hasEndpoint': false,
+          'reconnectAttempts': 0,
+          'lastEventAt': null,
+          'delivered': 0,
+          'detail': '没有可连的端点（协议端的 OneBot 配置还没出现，配置里也没有手填地址）',
+        },
+        'webuiLogin': {
+          'url': 'http://127.0.0.1:5099',
+          'open': true,
+          'consentRecorded': false,
+          'mustChangePassword': true,
+          'credential': {'source': 'none'},
+        },
       };
 
   /// GET /api/deps 的样例：rg 就绪、es 可一键装、pwsh 只能人工装（三态各一）
@@ -816,13 +899,66 @@ void main() {
         reason: '装在哪要摆两处：状态行（事实）与目录输入框（可改的那个）');
     expect(find.text('已找到可执行入口'), findsOneWidget, reason: '装没装是实测的（entryPath 找得到）');
 
-    // 三个动作：启动 / 停止 / 打开登录界面（已在跑时「启动」禁用）
+    // 三个动作：启动 / 停止 / 打开面板（已在跑时「启动」禁用）
     expect(find.widgetWithText(FilledButton, '启动'), findsOneWidget);
     expect(find.widgetWithText(FilledButton, '停止'), findsOneWidget);
-    expect(find.widgetWithText(TextButton, '打开登录界面'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '打开面板'), findsOneWidget);
     final start = tester.widget<FilledButton>(find.widgetWithText(FilledButton, '启动'));
     expect(start.onPressed, isNull, reason: '已经在跑：再点「启动」没有意义');
-    expect(find.textContaining('扫码登录在 http://localhost:5099'), findsOneWidget);
+    expect(find.textContaining('扫码登录在 http://127.0.0.1:5099'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  /// v36 的落点：**进程活着、OneBot 配置缺失**必须显示成
+  /// "进程在跑 · OneBot 配置缺失"，而不是笼统一句"启动失败"。
+  ///
+  /// 这条用例锁的是"三档分开显示"这件事本身：三行各带判据与证据，
+  /// 人一眼看得出断在第二环（他还没登录 QQ），而不是去查一个活着的进程。
+  testWidgets('协议端卡片：三档分开显示——进程在跑 · OneBot 配置缺失（不是一句"启动失败"）', (tester) async {
+    protocolSide = protocolViewBrokenChain();
+    await pumpSettings(tester, size: const Size(1350, 4000));
+
+    // 三行的档名必须在
+    expect(find.text('① 进程'), findsOneWidget);
+    expect(find.text('② OneBot 配置'), findsOneWidget);
+    expect(find.text('③ 适配器'), findsOneWidget);
+    // 第一档：在跑（这是旧口径丢掉的那个事实）
+    expect(find.text('在跑'), findsOneWidget);
+    expect(find.textContaining('pid 34552'), findsWidgets);
+    expect(find.textContaining('监听 http://127.0.0.1:5099'), findsOneWidget);
+    // 第二档：缺失 + 说清"为什么"
+    expect(find.text('缺失'), findsOneWidget);
+    expect(find.textContaining('未登录 QQ'), findsOneWidget);
+    // 第三档：没端点可连（而不是"连不上"——那是两句不同的话）
+    expect(find.text('没端点可连'), findsOneWidget);
+    // 面板地址照给：state 是 failed，但面板确实开着（旧口径会把按钮一起藏掉）
+    expect(find.widgetWithText(FilledButton, '打开面板'), findsOneWidget);
+    // 没有口令可用时如实说"找不回来"，并给出唯一的出路
+    expect(find.textContaining('初始凭据找不回来'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  /// 凭据显示的分寸：屏幕上只出现**打码**形态，明文只走「复制凭据」那一下。
+  testWidgets('协议端卡片：凭据只以打码形态出现在屏幕上（明文进剪贴板）', (tester) async {
+    final copied = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform,
+        (call) async {
+      if (call.method == 'Clipboard.setData') {
+        copied.add((call.arguments as Map)['text'] as String);
+      }
+      return null;
+    });
+    addTearDown(() => tester.binding.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform, null));
+
+    await pumpSettings(tester, size: const Size(1350, 4000));
+
+    expect(find.textContaining('d1…03'), findsOneWidget, reason: '屏幕上给的是打码形态');
+    expect(find.textContaining('d198b971dd2b7b03'), findsNothing, reason: '明文不许出现在界面上');
+
+    await tester.tap(find.widgetWithText(FilledButton, '复制凭据'));
+    await drain(tester);
+    expect(copied, ['admin d198b971dd2b7b03'], reason: '真要明文时走剪贴板（它不在屏幕上停留）');
     expect(tester.takeException(), isNull);
   });
 
@@ -880,11 +1016,24 @@ void main() {
       'detail': '已停止（本次没有自动拉起：autoStart=false，或者还没点过「启动」）。',
       'endpoint': null,
       'webuiUrl': null,
+      'summary': '进程没在跑 · OneBot 配置在 · 适配器没端点可连',
+      // 没在跑：第一档如实说"没在跑"，面板地址不给（那个页面此刻打不开）
+      'process': {'known': true, 'running': false, 'detail': '没在跑'},
+      'adapter': {
+        'state': 'no-endpoint',
+        'connected': false,
+        'hasEndpoint': false,
+        'reconnectAttempts': 0,
+        'lastEventAt': null,
+        'delivered': 0,
+      },
+      'webuiLogin': null,
     };
     await pumpSettings(tester, size: const Size(1350, 3400));
 
-    // 没在跑：不给「打开登录界面」（那个页面此刻打不开），「启动」可用、「停止」禁用
-    expect(find.widgetWithText(TextButton, '打开登录界面'), findsNothing);
+    // 没在跑：不给「打开面板」（那个页面此刻打不开），「启动」可用、「停止」禁用
+    expect(find.widgetWithText(FilledButton, '打开面板'), findsNothing);
+    expect(find.text('没在跑'), findsWidgets);
     expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, '启动')).onPressed, isNotNull);
     expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, '停止')).onPressed, isNull);
 
@@ -920,6 +1069,14 @@ void main() {
       'detail': '这段配置是本次进程启动之后才写下的：重启进程后框架才会接管它的拉起与对接。',
       'endpoint': null,
       'webuiUrl': null,
+      // 没有实例：第一档如实报"未观测"（**不是**"没在跑"——那两句话不一样）
+      'summary': '进程未观测 · OneBot 配置在 · 适配器没端点可连',
+      'process': {
+        'known': false,
+        'running': null,
+        'detail': '本进程没有装配协议端实例，这一档没人在看（重启进程后才看得到）。',
+      },
+      'webuiLogin': null,
     };
     await pumpSettings(tester, size: const Size(1350, 3400));
 
@@ -929,6 +1086,9 @@ void main() {
     expect(find.textContaining('本次进程启动时还没读到这段配置'), findsOneWidget);
     // installed 的三态要分开：null 不是 false——"不知道"不该被说成"这个目录里没有入口"
     expect(find.text('入口要重启后才核对'), findsOneWidget);
+    // 第一档的三态同理：没有实例 ≠ 没在跑（实测现场正是"进程在跑、只是本次框架没管它"）
+    expect(find.text('未观测'), findsOneWidget);
+    expect(find.text('没在跑'), findsNothing, reason: '没人在看的时候不许替它下"没在跑"这个结论');
     expect(find.text('目录里没有可执行入口'), findsNothing);
   });
 
@@ -1043,6 +1203,13 @@ void main() {
       'detail': '这段配置是本次进程启动之后才写下的：重启进程后框架才会接管它的拉起与对接。',
       'endpoint': null,
       'webuiUrl': null,
+      'summary': '进程未观测 · OneBot 配置在 · 适配器没端点可连',
+      'process': {
+        'known': false,
+        'running': null,
+        'detail': '本进程没有装配协议端实例，这一档没人在看（重启进程后才看得到）。',
+      },
+      'webuiLogin': null,
       // 没有实例去核对那个目录："不知道"就报 null，不能说成"这个目录里没有入口"
       'installed': null,
       'entryPath': null,
@@ -1069,7 +1236,7 @@ void main() {
     // 装好之后的引导：先重启、再扫码、扫码是接入 QQ 客户端
     expect(find.textContaining('已经装好了。下一步'), findsOneWidget);
     expect(find.textContaining('先重启服务'), findsOneWidget);
-    expect(find.textContaining('打开登录界面'), findsWidgets);
+    expect(find.textContaining('打开面板'), findsWidgets);
     expect(find.textContaining('扫码接的是你本机的 QQ 客户端'), findsOneWidget);
 
     // 目录与开关都替人写好了：目录框回填的是**服务端存下来的那个**，开关是开的，且没有未保存改动

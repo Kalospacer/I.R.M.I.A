@@ -31,6 +31,7 @@ import type { BudgetConsumed, MemoryMaintained, Projection } from '../log/types.
 import type { EventLog } from '../log/event-log.js';
 import type { DsClient, DsRequest, DsResponse, DsTextFormat } from '../model/ds-client.js';
 import { applyOne, finalizePressure } from '../state/fold.ts';
+import { ensureAssetsSeed, ASSETS_FILE_NAME } from './assets.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
@@ -179,6 +180,11 @@ export function diaryDir(dataDir: string): string {
  * 首启初始化 MEMORIES/ 结构：`facts.md`（分区模板）/ `jargon.md` / `style-notes.md` / `episodes/`。
  * 幂等：已存在的文件一个字节都不动（记忆是 agent 自主资产，机制只负责保证结构存在）。
  * 返回相对 `workspace/` 的创建记录，供启动摘要与测试断言。
+ *
+ * `assets.md`（数字资产清单）也在这里落种子，但它**不进记忆索引**（见 `persona/assets.ts`：
+ * 那份清单要的是"不主动进入"，只在她被叫去干活时由 light 挑几条露一次面）。
+ * 种子逻辑在 assets 模块里（与它自己的说明放在一起），这里只调一次——**只在文件不存在时写**，
+ * 所以既有工作区不会因为这次改动凭空多出一个文件。
  */
 export function ensureMemorySeeds(dataDir: string): string[] {
   const memDir = memoriesDir(dataDir);
@@ -198,6 +204,8 @@ export function ensureMemorySeeds(dataDir: string): string[] {
       created.push(`${MEMORY_DIR_NAME}/${name}`);
     }
   }
+  // 数字资产清单：种子文本住在 assets 模块（那里同时是解析与选取的实现）
+  if (ensureAssetsSeed(dataDir)) created.push(`${MEMORY_DIR_NAME}/${ASSETS_FILE_NAME}`);
   return created;
 }
 
@@ -703,6 +711,8 @@ function accountLight(
       outputTokens,
       cacheHitTokens,
       cacheMissTokens: Math.max(0, inputTokens - cacheHitTokens),
+      // 思维链 token：**每次都写**（没产思维链就是 0），见 log/types.ts 的字段注释
+      reasoningTokens: usage?.reasoningTokens ?? 0,
       durationMs,
       retryCount: 0,
       finishReason,
@@ -798,6 +808,10 @@ export async function maintainMemory(dataDir: string, opts: MaintainMemoryOption
         lane: 'light',
         input: prompt,
         text,
+        // 思考强度：**用户的口径（2026-10-06）—— light 一律 `low`，不提供更改**
+        // （另一档 heavy 一律 `high`，唯一落点是 `runtime/agent-loop.ts` 的 `toDsRequest`）。
+        // **别给这里加配置项**：config.json 里没有、也不许长出能改它的字段——
+        // 判据钉在 `test/thinking-effort-invariant.test.ts`（想加旋钮，那条测试要先红）。
         reasoning: { effort: 'low' },
       }, counters);
       const payload = extractJson(textFromOutputs(response as DsResponse));
@@ -928,6 +942,8 @@ async function writeDiary(
       lane: 'light',
       input: prompt,
       text: { type: 'json_schema', name: 'diary_entry', schema: DIARY_SCHEMA },
+      // 思考强度：用户的口径—— light 一律 `low`，不提供更改（判据与上面那次合并同一条：
+      // `test/thinking-effort-invariant.test.ts`；两处都写死，不要加配置项）。
       reasoning: { effort: 'low' },
     }, ctx.counters);
     const payload = extractJson(textFromOutputs(response as DsResponse));

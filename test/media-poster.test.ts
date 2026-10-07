@@ -8,11 +8,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync as writeFile } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import test from 'node:test';
+import test, { describe } from 'node:test';
 
 import { createWorkspaceMediaPoster } from '../src/channel/media-poster.ts';
 import type { ChannelAdapter } from '../src/channel/qq-official.ts';
 import { QQ_CHANNEL_NAME, QqMessageSender } from '../src/channel/qq-official.ts';
+import { ONEBOT_CHANNEL_NAME, oneBotMediaCall } from '../src/channel/onebot.ts';
 
 /** 假的平台 HTTP：上传给 file_info、发送给 id；记下每一次请求 */
 function fakePlatform() {
@@ -315,5 +316,118 @@ test('目录联接指向凭据目录：绕不过去（判定读的是 realpath�
   assert.equal(outcome.ok, false);
   assert.ok(outcome.ok === false && outcome.reason.includes('本机凭据文件'), outcome.reason);
   assert.equal(http.requests.length, 0);
+});
+
+// ──────────────────────── OneBot 也能发媒体（2026-10-07 对齐两条通道） ────────────────────────
+//
+// 这一段治的是报告 §3.1/§1.2 的那条：`send_media` 在 OneBot 上**根本不存在**
+// （`main.ts` 只在 `qqChannel !== null` 时装配 mediaPoster，`qq-official.ts` 的工厂只认
+// `qq:` 前缀与 `QQ_CHANNEL_NAME`）。现在分派按**回投地址的 scheme** 走，而"发不发得了"
+// 由通道自己声明（有没有 `sendMediaTo`）。
+//
+// 注意这几条只验**构造**（动作名、参数名、段类型、来源形态）——没有真的协议端可连，
+// 见提交说明的"未实测"。
+
+describe('媒体投递 · OneBot 那条路（段构造与分派）', () => {
+  test('图片：网络地址走消息段（send_group_msg + type:image，不构造 CQ 码数组）', () => {
+    const call = oneBotMediaCall(true, '20002', { fileType: 1, url: 'https://example.invalid/a.png' });
+    assert.equal(call.ok, true);
+    assert.ok(call.ok);
+    assert.equal(call.action, 'send_group_msg');
+    assert.deepEqual(call.params, {
+      group_id: 20002,
+      message: [{ type: 'image', data: { file: 'https://example.invalid/a.png' } }],
+    });
+    assert.equal(call.returnsMessageId, true, '消息段那条会回 message_id');
+  });
+
+  test('本机字节：`base64://` 交给协议端（它认这种来源），不往盘上写临时文件', () => {
+    const call = oneBotMediaCall(false, '10001', { fileType: 1, data: new Uint8Array([1, 2, 3]) });
+    assert.ok(call.ok);
+    assert.equal(call.action, 'send_private_msg');
+    const segment = (call.params['message'] as Array<Record<string, unknown>>)[0]!;
+    assert.deepEqual(segment, { type: 'image', data: { file: 'base64://AQID' } });
+  });
+
+  test('四类媒体各自映到 OneBot 的形态：图/视频/语音是消息段，文件是上传动作', () => {
+    const video = oneBotMediaCall(true, '20002', { fileType: 2, url: 'https://x/v.mp4', name: 'v.mp4' });
+    assert.ok(video.ok);
+    assert.deepEqual(video.params['message'], [{ type: 'video', data: { file: 'https://x/v.mp4', name: 'v.mp4' } }]);
+    const voice = oneBotMediaCall(true, '20002', { fileType: 3, url: 'https://x/v.silk' });
+    assert.ok(voice.ok);
+    assert.deepEqual(voice.params['message'], [{ type: 'record', data: { file: 'https://x/v.silk' } }]);
+    // 文件：OneBot 11 里这是**独立动作**，不是消息段（协议端的 `file` 段只承接入站）
+    const file = oneBotMediaCall(true, '20002', { fileType: 4, path: 'D:/tmp/report.pdf', name: '报告.pdf' });
+    assert.ok(file.ok);
+    assert.equal(file.action, 'upload_group_file');
+    assert.deepEqual(file.params, { group_id: 20002, file: 'D:/tmp/report.pdf', name: '报告.pdf' });
+    assert.equal(file.returnsMessageId, false, '上传文件那条回的是 file_id，不是 message_id');
+    const privateFile = oneBotMediaCall(false, '10001', { fileType: 4, path: 'D:/tmp/a.zip' });
+    assert.ok(privateFile.ok);
+    assert.equal(privateFile.action, 'upload_private_file');
+  });
+
+  test('发不出去的两条如实说：文件类没有本机路径、媒体什么都没有', () => {
+    const noPath = oneBotMediaCall(true, '20002', { fileType: 4, url: 'https://x/a.zip' });
+    assert.equal(noPath.ok, false);
+    assert.ok(noPath.ok === false && noPath.reason.includes('本机路径'), noPath.reason);
+    const empty = oneBotMediaCall(true, '20002', { fileType: 1 });
+    assert.equal(empty.ok, false);
+    assert.ok(empty.ok === false && empty.reason.includes('发不出去'));
+  });
+
+  test('分派：`onebot:` 地址交给 OneBot 通道的 sendMediaTo（不再按通道名写死）', async () => {
+    const root = workspace();
+    const seen: Array<{ chatType: string; chatId: string; media: unknown }> = [];
+    const onebot = {
+      name: ONEBOT_CHANNEL_NAME, start: () => {}, stop: () => {},
+      sendText: async () => ({ ok: true as const, messageId: 'S', passive: false, msgSeq: 0 }),
+      sendMediaTo: async (chatType: string, chatId: string, media: unknown) => {
+        seen.push({ chatType, chatId, media });
+        return { ok: true as const, messageId: 'M-1', passive: false, msgSeq: 0 };
+      },
+    } as unknown as ChannelAdapter;
+    const channels = new Map<string, ChannelAdapter>([[ONEBOT_CHANNEL_NAME, onebot]]);
+    const poster = createWorkspaceMediaPoster({ dataDir: root, channels });
+    const outcome = await poster.post(
+      { url: 'onebot:group:20002', idempotencyKey: 't1' },
+      { fileType: 1, path: 'pics/a.png' },
+    );
+    assert.equal(outcome.ok, true, JSON.stringify(outcome));
+    assert.deepEqual(seen.map((s) => [s.chatType, s.chatId]), [['group', '20002']]);
+    // 字节是宿主读的（工具层只递路径）——OneBot 那条路把它变成 base64，见上面那条用例
+    const media = seen[0]?.media as { data?: Uint8Array; name?: string };
+    assert.deepEqual([...(media.data ?? [])], [1, 2, 3, 4]);
+    assert.equal(media.name, 'a.png');
+  });
+
+  test('通道没有 sendMediaTo：如实说清是哪条通道，不假装发过', async () => {
+    const root = workspace();
+    const mute = {
+      name: ONEBOT_CHANNEL_NAME, start: () => {}, stop: () => {},
+      sendText: async () => ({ ok: true as const, messageId: 'S', passive: false, msgSeq: 0 }),
+    } as unknown as ChannelAdapter;
+    const poster = createWorkspaceMediaPoster({
+      dataDir: root,
+      channels: new Map<string, ChannelAdapter>([[ONEBOT_CHANNEL_NAME, mute]]),
+    });
+    const outcome = await poster.post({ url: 'onebot:c2c:10001', idempotencyKey: 't1' },
+      { fileType: 1, url: 'https://example.invalid/a.png' });
+    assert.equal(outcome.ok, false);
+    assert.ok(outcome.ok === false && outcome.reason.includes(ONEBOT_CHANNEL_NAME), outcome.reason);
+    assert.ok(outcome.ok === false && outcome.reason.includes('不支持发媒体'));
+  });
+
+  test('回投地址不是回投地址：如实报错，不去猜通道', async () => {
+    const root = workspace();
+    const poster = createWorkspaceMediaPoster({
+      dataDir: root,
+      channels: new Map<string, ChannelAdapter>([[ONEBOT_CHANNEL_NAME,
+        { name: ONEBOT_CHANNEL_NAME, start: () => {}, stop: () => {},
+          sendText: async () => ({ ok: true as const, messageId: 'S', passive: false, msgSeq: 0 }) } as unknown as ChannelAdapter]]),
+    });
+    const outcome = await poster.post({ url: 'nonsense', idempotencyKey: 't1' }, { fileType: 1, path: 'pics/a.png' });
+    assert.equal(outcome.ok, false);
+  });
 });
 

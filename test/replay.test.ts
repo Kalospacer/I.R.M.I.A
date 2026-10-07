@@ -160,7 +160,7 @@ async function makeHarness(t: TestContext): Promise<Harness> {
     registry: makeRegistry(),
     persona,
     append,
-    depsOf: (ds) => ({
+    depsOf: (ds, extra: { assetsLine?: string } = {}) => ({
       log,
       ds,
       registry: makeRegistry(),
@@ -190,6 +190,22 @@ async function makeHarness(t: TestContext): Promise<Harness> {
       // 记忆索引（v30 起在固定块里）：运行期那一侧读盘给文本（真循环里由 agentDeps 在轮首读一次），
       // 重放那一侧由 `buildReplayReport` 走只读那条路读同一个文件。两边同源，正是这条要钉的。
       memoryIndex: readMemoryIndexTextReadOnly(dir),
+      // 本任务相关资产那一行（v34）：运行期由 real-loop 在轮首挑好（`assetsLine`），
+      // 重放侧从 `memory/selected.assets` 取回——这一格只在 v34 那条用例里给（其余用例
+      // 不传 = 与引入它之前逐字节相同）。
+      ...(extra.assetsLine === undefined ? {} : { assetsLine: extra.assetsLine }),
+      // 记忆索引注入账（v34 起顺带带那一行）：**运行期由 real-loop 提供**（`planMemorySelection`），
+      // 重放要逐字节重建就得有这条账——所以 v34 那条用例按生产的形状给一份。
+      ...(extra.assetsLine === undefined
+        ? {}
+        : {
+          memorySelector: () => ({
+            injection: 'human' as const,
+            indexHash: 'test-index-hash',
+            entries: 2,
+            assets: extra.assetsLine,
+          }),
+        }),
     }),
   };
 }
@@ -207,6 +223,50 @@ async function appendSessionStart(h: Harness): Promise<void> {
 }
 
 // ──────────────────────────────── ① 单步一致 ────────────────────────────────
+
+test('v34 数字资产：那一行进过请求，重放也重建得回来（逐字节一致）', async (t) => {
+  // 为什么必须有这条：那一行**只能**来自事件（盘上的 `assets.md` 是她随时会改的文件，
+  // 从盘上重算就不是"当时那个请求"了）。所以它搭 `memory/selected` 一起落库，重放从那里取回。
+  const h = await makeHarness(t);
+  await appendSessionStart(h);
+  const wake = h.append('wake/manual', { note: '抓一篇正文' });
+  const model = fakeModel([{ text: '好。' }]);
+  const line = '本任务相关资产：Obscura（路径：D:\\Tools\\obscura\\obscura.exe）——完整清单见 MEMORIES/assets.md';
+
+  const reason = await runTurn(h.depsOf(model.ds, { assetsLine: line }), [wake]);
+  assert.deepEqual(reason, { kind: 'completed' });
+  assert.equal(model.requests.length, 1);
+  // 账目侧（关日志前读）：事件里记的就是当时那一行（不是清单全文）——重放正是靠它重建
+  const written: AppEvent[] = [];
+  for await (const event of h.log.readAll()) {
+    if (event.type === 'memory/selected') written.push(event);
+  }
+  assert.equal(
+    (written[0]?.data as { assets?: string } | undefined)?.assets,
+    line,
+    'memory/selected 里必须带着当时那一行（v34 起这条账顺带承担它）',
+  );
+  h.log.close(); // 之后全部走只读路径
+
+  const built = await buildReplayReport(h.dir, 1, 1, {
+    cwd: h.dir,
+    tools: h.registry.listForModel({}),
+    timezone: TIMEZONE,
+  });
+  assert.equal(built.ok, true);
+  if (!built.ok) return;
+  const rebuilt = built.report.request;
+  const actual = model.requests[0]!;
+  assert.equal(
+    JSON.stringify(rebuilt.input),
+    JSON.stringify(actual.input),
+    'input 列表必须逐字节一致（含任务卡上那一行）',
+  );
+  const nowLayer = rebuilt.input
+    .map(item => (typeof (item as { content?: unknown }).content === 'string' ? (item as { content: string }).content : ''))
+    .find(text => text.includes(NOW_LAYER_BANNER)) ?? '';
+  assert.ok(nowLayer.includes(line), `重建出来的此刻层里必须有那一行（实际：${nowLayer}）`);
+});
 
 test('M6-5 单步：replay 重建的请求体与当时真实下发的逐字段一致', async (t) => {
   const h = await makeHarness(t);

@@ -642,7 +642,10 @@ test('网关：Hello → Identify → Ready → 心跳 ACK → C2C 事件转 wak
   assert.equal(wake.text, '你好，帮我看看今天的安排');
   assert.equal(wake.messageId, 'ROBOT1.0_MSG_C2C');
   assert.equal(wake.msgSeq, 1);
-  assert.equal(wake.dedupeKey, 'ROBOT1.0_MSG_C2C');
+  // 幂等键带**通道命名空间**（`<通道>:<平台消息 id>`，与 OneBot 那条 `onebot:<id>` 同形）。
+  // 原先这里是裸 id——两平台的 id 形状不同所以今天没出故障，但 `state/fold.ts` 把两条通道的
+  // 键放进**同一个扁平数组**去重：一旦形状出现交集，一条通道的消息会被另一条静默丢掉。
+  assert.equal(wake.dedupeKey, 'qq-official:ROBOT1.0_MSG_C2C');
 
   // 群 @ 消息：person 取 member_openid，chatId 取 group_openid
   const groupEvent = {
@@ -662,7 +665,7 @@ test('网关：Hello → Identify → Ready → 心跳 ACK → C2C 事件转 wak
   assert.equal(groupWake.chatType, 'group-at');
   assert.equal(groupWake.person, 'MEMBER-OPENID');
   assert.equal(groupWake.chatId, 'GROUP-OPENID');
-  assert.equal(groupWake.dedupeKey, 'ROBOT1.0_MSG_GROUP');
+  assert.equal(groupWake.dedupeKey, 'qq-official:ROBOT1.0_MSG_GROUP');
   assert.deepEqual(groupWake.attachments, [
     { type: 'image/jpeg', url: 'https://example.invalid/a.jpg', name: 'photo.jpg' },
   ]);
@@ -1457,7 +1460,7 @@ test('事件映射：全量群消息（GROUP_MESSAGE_CREATE）不再被丢掉', 
   assert.equal(group?.chatId, 'G1');
   assert.equal(group?.person, 'P1');
   assert.equal(group?.text, '大家早上好呀');
-  assert.equal(group?.dedupeKey, 'M1');
+  assert.equal(group?.dedupeKey, 'qq-official:M1');
   assert.equal(group?.mentionsMe, undefined, '没人被 @ 时不填这一笔');
   assert.equal(group?.msgSeq, 0,
     '0 = 平台没给序号（官方事件体里没有这个字段）；信箱落库时会补成事件 seq，未读才算得对');
