@@ -117,7 +117,7 @@ test('默认配置生成：空目录写出带注释的 config.json，字段齐�
   assert.equal(c.schemaVersion, CONFIG_VERSION);
   assert.equal(c.dataDir, join(dir, 'data'));
   assert.deepEqual(c.budget, {
-    stepTools: 20, turnSteps: 30, taskTokens: 500_000_000,
+    stepTools: 20, turnSteps: 60, taskTokens: 500_000_000,
     dailyTokens: 50_000_000, softRatio: 0.8, failStreakMax: 20,
   });
   assert.deepEqual(c.wake, {

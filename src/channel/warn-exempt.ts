@@ -21,6 +21,10 @@ import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'n
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+// 命名空间判据**只有一处**（`onebot.ts` 的 `isOneBotFamilyChannel`，覆盖别名实例 `onebot-*`）：
+// 这里原来写死 `event.channel === 'onebot'`，别名实例的会话会被算进 `qq:` 命名空间，
+// 于是"按会话豁免"对别名实例**永远不生效**（用户以为豁免了，实际每条都还在过判定）。
+import { isOneBotFamilyChannel } from './onebot.ts';
 
 export const WARN_EXEMPT_FILE = 'warn-exempt.json';
 
@@ -148,7 +152,7 @@ export class WarnExemptBook {
    * 用户定的口径是"群里只能按人豁免"。所以这里按 chatType 分流，而不是看 sid 在不在名单里。
    */
   isExempt(event: WarnExemptSubject): boolean {
-    const namespace = event.channel === 'onebot' ? 'onebot' : 'qq';
+    const namespace = isOneBotFamilyChannel(event.channel) ? 'onebot' : 'qq';
     if (event.chatType === 'c2c') {
       if (event.chatId === undefined) return false;
       return this.sessions.has(`${namespace}:c2c:${event.chatId}`);

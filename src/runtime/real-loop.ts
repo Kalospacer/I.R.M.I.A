@@ -351,11 +351,31 @@ type GroupCallingEvent = AppEvent & {
   data: { person: string; nickname?: string; mentionsMe?: boolean };
 };
 
+/**
+ * 这条通道消息**是不是在点她**——群成员登记、`read_channel` 的默认那一屏共用这一处。
+ *
+ * 两个判据都是事件里写着的事实，**顺序无所谓，且都不看通道名**（两条通道同一份）：
+ * `chatType === 'group-at'`（平台给的那条消息形态就是"@ 了我"）或 `mentionsMe === true`
+ * （适配器如实填的，或宿主按关键词判成的——见 `channel/inbox.ts` 的唤醒判据）。
+ *
+ * 为什么收成一处（2026-10-08）：`read_channel` 的默认口径是"**只给点了她的那些**"，
+ * 而"点了她"这件事在仓库里原先只有一个消费者（`groupMemberCandidateOf`）。
+ * 两处各写一遍 `group-at || mentionsMe`，迟早一边改了另一边没改——那时的症状是
+ * "档案里登记了这个人、可她读群时看不到那句 @ 她的话"（或反过来），
+ * 而这两种偏差从行为上都看不出来。
+ *
+ * ⚠️ 它**不是**唤醒判据：唤醒还多一条关键词/私聊的分支（`shouldWakeForChannelMessage`）。
+ * 这里回答的只是"这条消息指不指向她"，调用方各自接自己那半。
+ */
+export function mentionedInMessage(data: { chatType?: string; mentionsMe?: boolean }): boolean {
+  return data.chatType === 'group-at' || data.mentionsMe === true;
+}
+
 function groupMemberCandidateOf(event: AppEvent): GroupCallingEvent | null {
   if (event.type !== 'wake/channel') return null;
   const data = event.data;
   if (data.chatType !== 'group' && data.chatType !== 'group-at') return null;
-  if (data.mentionsMe !== true) return null;
+  if (!mentionedInMessage(data)) return null;
   return event;
 }
 
@@ -2845,10 +2865,16 @@ export class RealLoop {
   }
 
   /**
-   * `read_channel` 的读取口：取某个会话最近的若干条消息（时间正序）。
+   * `read_channel` 的读取口：取某个会话的消息（时间正序）。
    *
    * 两种事件都算这个会话的消息——`wake/channel` 是"叫她"的那条、`channel/message` 是只记账的
    * 那条，但对"这个会话里都说过什么"来说它们是同一件事。漏掉前者会让她读到一段缺了 @ 的对话。
+   *
+   * **两种取法，判据只有 `before` 一个**（与工具层同一条口径，见 tools/admin.ts 的 `ReadCursor`）：
+   *   • 不给 `before` ⇒ 取最近 `limit` 条（"现在这儿有什么"）；
+   *   • 给了 `before` ⇒ 取**事件 seq 严格小于它**的最近 `limit` 条（往回翻一页）。
+   *     判据用事件 seq 而不是平台序号：平台序号**答不了"这一条在这段历史里的位置"**
+   *     （官方单聊恒为 1、OneBot 没 @ 的群消息也没有），拿它当游标必然错页。
    *
    * 全量扫日志（不是只扫尾部）：`readTailEvents` 的早停对"按类型过滤"是安全的，但在她读一个
    * 冷清会话时会白读一大片别人的消息。这里取的是**每轮至多一次**的交互式调用（她主动点开），
@@ -2857,12 +2883,15 @@ export class RealLoop {
   // 公开（不是 private）：这两个是**宿主接口**——main.ts 装配 catalog 时把它们递给
   // `read_channel`（工具层不读日志、不读别名表）。写成 private 就没法从 main 接线，
   // 而在 main 里另写一份"取最近 N 条"等于让同一件事有两份实现（v27/v30 记过同款坑）。
-  async readChannelMessages(sid: string, limit: number): Promise<ChannelMessageView[]> {
+  async readChannelMessages(sid: string, limit: number, before?: number): Promise<ChannelMessageView[]> {
     const hits: ChannelMessageView[] = [];
     for await (const event of this.deps.log.readAll()) {
       if (event.type !== 'wake/channel' && event.type !== 'channel/message') continue;
       const d = event.data;
       if (sidOf(d.channel, d.chatType, d.chatId) !== sid) continue;
+      // 游标那一刀在**读完这一条的全部字段之前**：往回翻时绝大多数事件都落在游标之后，
+      // 提前跳过它们省下的是每条都要算的预警查表（`flaggedNoteFor`）
+      if (before !== undefined && event.seq >= before) continue;
       const flagged = this.flaggedNoteFor(d.messageId);
       hits.push({
         sid,
@@ -2875,11 +2904,16 @@ export class RealLoop {
         text: d.text,
         messageId: d.messageId,
         msgSeq: d.msgSeq,
-        // 落库时分配的事件 seq：`read_channel` 判"这个会话有没有新东西"用的就是它
-        //（平台序号答不了这个问题——官方单聊恒为 1，见 tools/admin.ts 的 ChannelMessageView.seq）
+        // 落库时分配的事件 seq：`read_channel` 判"这个会话有没有新东西"与翻页游标用的都是它
+        //（平台序号答不了这两个问题——官方单聊恒为 1，见 tools/admin.ts 的 ChannelMessageView.seq）
         seq: event.seq,
         ts: event.ts,
         ...(d.attachments === undefined ? {} : { attachments: d.attachments }),
+        // "这条是不是在点她"：判据与唤醒那条路**同一个**（`group-at` 是平台 @、
+        // `mentionsMe` 是适配器/关键词判定如实填的），收进唯一的 `mentionedInMessage`。
+        // 为什么要在读的时候就算出来：`read_channel` 默认那一屏**只给提及**，
+        // 而工具层拿不到宿主的关键词表（判定是宿主的事，见 channel/inbox.ts）。
+        ...(mentionedInMessage(d) ? { mentionsMe: true } : {}),
         // 判过的消息**回放时也要带预警**：那句话她可能正是在"翻旧账"这一刻才看到的，
         // 而预警落在事件里、与她翻不翻无关——这正是把预警落成事件、而不是只在唤醒那一次
         // 渲染里拼一句的理由（换个时刻看同一条消息，结论不该变）。

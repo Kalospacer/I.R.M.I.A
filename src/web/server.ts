@@ -49,8 +49,8 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
-  closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync,
-  statSync, unlinkSync, writeFileSync, writeSync,
+  closeSync, existsSync, appendFileSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, readdirSync,
+  renameSync, statSync, unlinkSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -62,6 +62,7 @@ import type { AppConfig, JsonObject, JsonValue } from '../config/config.js';
 import { CONFIG_FILE_NAME, MENTION_KEYWORD_LEN_MAX, MENTION_KEYWORD_MAX, configHash, loadConfig } from '../config/config.ts';
 import { diffConfigFields } from '../config/watcher.ts';
 import { resolveRestartShell } from '../runtime/restart-shell.ts';
+import { chooseRestartPath, parseRestartPath, restartReasonText, restartTraceLine, backendEntry, BUNDLED_NODE_REL, RESTART_FAILURE_REASONS, type RestartPath } from '../runtime/restart-chain.ts';
 import { deriveRequest } from '../runtime/agent-loop.ts';
 import { contactFactsForReplay, turnBlockFactsForReplay, warnExemptJudgeOf } from '../runtime/replay.ts';
 import { GroupMemberBook } from '../channel/group-members.ts';
@@ -596,6 +597,14 @@ export interface WebServerDeps {
    * 不注入时照旧工作（只是没人被通报），CLI 与测试里那种装配不受影响。
    */
   noteUserSpoke?: ((seq: number, type: string, data: unknown) => void) | undefined;
+  /**
+   * `self-restart` 走到"旧实例该让位了"时的那一下（缺省见 `WebServer.requestGracefulRestartExit`）。
+   *
+   * 为什么不默认交给宿主：宿主（`main.ts`）本来就有那条优雅退出路径，只是它的入口是信号
+   * （`SIGTERM`/`SIGINT`）而不是"某个 HTTP 命令"。这里**不新增一条退出路径**——
+   * 缺省就是触发既有那条信号路径（见实现里的注释），注入点只是为了让测试能断言"退的是哪条路"。
+   */
+  onRestartExit?: ((path: RestartPath) => void) | undefined;
 }
 
 export interface WebServer {
@@ -618,6 +627,20 @@ export interface WebServer {
   url(): string;
   listen(): Promise<void>;
   close(): Promise<void>;
+  /**
+   * **让位**（`self-restart` 那一条的收尾，路径链第 ③ 条）。
+   *
+   * 为什么它得是"优雅退出"而不是 `process.exit()`：新实例等的是**本进程真的消失**
+   * （单实例锁与监听端口都只允许一个用户），而 `process.exit()` 会把锁留在盘上、
+   * 跳过 `session/end` 与收尾——那正是"重启之后日志断成两截、下次启动还得靠接管陈旧锁"的形状。
+   * 所以这里走的是进程**既有的**退出路径（`main.ts` 的 `stop()`：停源 → 关 web → `session/end`
+   * → 落缓存 → 停定时器 → 关日志 → **放锁**），一处都不另写。
+   *
+   * 暴露成接口上的一条，是为了让宿主（以及测试）能**注入**那一下：
+   * 生产环境里宿主不接它（缺省走 `SIGTERM` 那条既有信号路径），测试里接一个假的就能
+   * 断言"回执发出之后才退、而且退的是既有路径"，而不必真的把测试进程结束掉。
+   */
+  requestGracefulRestartExit(path: RestartPath): void;
 }
 
 /** 统一错误体（design §4.15：`{ "error": { "code", "message" } }`） */
@@ -1558,17 +1581,23 @@ export function restartCommandLine(input: {
  */
 export function parseRestartTrace(text: string): {
   receipt: boolean;
+  /** 这次走的是哪一条（`路径=` / `path=` 那两栏；读不到 = null，绝不猜） */
+  path: RestartPath | null;
   backendPid: number;
   port: 'ready' | 'timeout' | 'waiting' | 'unknown';
   guiPid: number;
   ok: boolean | null;
+  /** `[结束]` 里 `reason=` 那一栏：**失败坏在哪一环**（机器可读 token；空 = 没读到） */
+  reason: string;
 } {
   const out = {
     receipt: text.includes('[回执]'),
+    path: parseRestartPath(text),
     backendPid: 0,
     port: 'unknown' as 'ready' | 'timeout' | 'waiting' | 'unknown',
     guiPid: 0,
     ok: null as boolean | null,
+    reason: '',
   };
   const pid = /\[实例\][^\r\n]*?pid=(\d+)/u.exec(text);
   if (pid !== null) out.backendPid = Number(pid[1]);
@@ -1582,6 +1611,8 @@ export function parseRestartTrace(text: string): {
     if (port !== null) out.port = port[1] as 'ready' | 'timeout' | 'waiting' | 'unknown';
     const gui = /\bguiPid=(\d+)/u.exec(line);
     if (gui !== null) out.guiPid = Number(gui[1]);
+    const reason = /\breason=([0-9A-Za-z-]+)/u.exec(line);
+    if (reason !== null && reason[1] !== undefined) out.reason = reason[1];
   }
   return out;
 }
@@ -1607,29 +1638,52 @@ export function restartNote(outcome: {
   backendPid?: number | undefined;
   /** 端口那一档 */
   port?: 'ready' | 'timeout' | 'waiting' | 'unknown' | undefined;
-  /** 脚本报的失败原因（可选） */
+  /** 脚本报的失败原因（可选；`[结束]` 的 `reason=` 那一栏优先） */
   reason?: string | undefined;
+  /**
+   * 这次走的是哪一条（`restart-chain.ts` 的优先级链）。
+   *
+   * 为什么必须写进这句话：三条路径的**失败症状长得一样**（后端没换 pid），
+   * 而"它当时想走哪条"是事后第一个要回答的问题——不写，就只能靠现场复现（这次就是这么过来的）。
+   * 缺省 null = 老调用方（老脚本、旧事件）不写这一栏，文案里也就不提它。
+   */
+  path?: RestartPath | null | undefined;
 }): string {
   const scope = outcome.gui ? '主进程与界面' : '主进程（界面不在本次动作范围内，它只是重连回来）';
+  const where = outcome.path === undefined || outcome.path === null ? '' : `（路径=${outcome.path}）`;
   if (!outcome.scriptStarted) {
-    return '重启未能执行：脚本没有留下回执（它根本没跑起来）。**后端没有被重启**——'
-      + '请手动跑一次 tools/restart-agent.ps1，或看 data/restart-trace.log';
+    // **哪一环坏的**要有名有姓：self-restart 这一条没有"脚本"，说"没跑脚本"会把人指错方向
+    const why = outcome.path === 'self-restart'
+      ? restartReasonText('worker-not-started')
+      : '脚本没有留下回执（它根本没跑起来）';
+    const hint = outcome.path === 'self-restart'
+      ? '看 data/restart-script.log（拉起器的输出）与 data/restart-trace.log'
+      : '请手动跑一次 restart.ps1（装出来的那份在包根）或 tools/restart-agent.ps1（开发仓库里），'
+        + '或看 data/restart-trace.log';
+    return `重启未能执行${where}：${why}。**后端没有被重启**——${hint}`;
   }
   if (outcome.ok === false) {
-    const why = outcome.reason === undefined || outcome.reason === '' ? '' : `（${outcome.reason}）`;
+    // 失败也要说清**坏在哪一环**：`reason=` 是机器可读的那一栏，这里翻成人话
+    const token = (outcome.reason ?? '').trim();
+    const why = token === '' ? '' : `（${restartReasonText(token) === '' ? token : restartReasonText(token)}）`;
     const pid = outcome.backendPid === undefined || outcome.backendPid === 0
       ? '没有拿到新进程 pid'
       : `新进程 pid ${outcome.backendPid}`;
     const port = outcome.port === 'ready' ? '端口已就绪' : `端口未就绪（${outcome.port ?? 'unknown'}）`;
-    return `重启失败${why}：${pid} · ${port}——详见 data/restart-trace.log`;
+    return `重启失败${where}${why}：${pid} · ${port}——详见 data/restart-trace.log`;
   }
   if (outcome.ok === true) {
     const pid = outcome.backendPid === undefined || outcome.backendPid === 0
       ? '（pid 未读到）'
       : `真实新 pid ${outcome.backendPid}`;
-    return `正在重启${scope}：${pid} · 端口已就绪`;
+    return `正在重启${scope}${where}：${pid} · 端口已就绪`;
   }
-  return `重启已发出${outcome.gui ? '（含界面）' : ''}，但结局还没确认——`
+  // self-restart 这一条的结局**天然晚于回执**：新实例要等旧实例退出才起得来，
+  // 所以这里要把"链条已经armed"这件事说出口，而不是只说一句"还没确认"。
+  const armed = outcome.path === 'self-restart'
+    ? '：拉起器已经在跑了，它会等旧实例退出后拉起新实例'
+    : '';
+  return `重启已发出${outcome.gui ? '（含界面）' : ''}${where}${armed}，但结局还没确认——`
     + '看 data/restart-trace.log 里这次的 `[结束]` 那行';
 }
 
@@ -1685,10 +1739,10 @@ const RESTART_RECEIPT_STEP_MS = 50;
 function waitForScriptReceipt(
   traceLog: string,
   sizeBefore: number,
-  wantEnd: boolean,
+  /** 等到其中**任意一行**出现就算这一档到了（`[实例]` 几秒内必到；`[结束]` 是收尾那行） */
+  markers: readonly string[],
 ): { started: boolean; text: string } {
   const deadline = Date.now() + RESTART_RECEIPT_WAIT_MS;
-  const marker = wantEnd ? '[结束]' : '[实例]';
   for (;;) {
     let text = '';
     try {
@@ -1708,7 +1762,7 @@ function waitForScriptReceipt(
     } catch {
       // 读不到就当"还没有"：这一路只问"有没有新内容"，不把读失败当证据
     }
-    if (text.includes(marker)) return { started: true, text };
+    if (markers.some((marker) => text.includes(marker))) return { started: true, text };
     if (Date.now() >= deadline) return { started: text.includes('[回执]'), text };
     // 忙等 50ms：这条路上不能 await（回执要在这一个请求里给出去）
     const until = Date.now() + RESTART_RECEIPT_STEP_MS;
@@ -1790,8 +1844,18 @@ function confirmRestart(input: {
   host: string;
   port: number;
   dataDir: string;
+  /** 等哪一行（见 `waitForScriptReceipt`） */
+  markers: readonly string[];
+  /**
+   * 要不要由服务端自己探一次端口。
+   *
+   * **`self-restart` 必须关掉它**：那时旧实例（就是本进程）还在监听，
+   * 探到的"端口有人在服务"是**旧实例自己**——把它当成"新实例已就绪"就是编事实
+   * （用户 2026-10-07：「不许用'猜'的确认」）。这一档的端口结论只能由拉起器写进 `[结束]`。
+   */
+  probePort: boolean;
 }): { receipt: { started: boolean; text: string }; parsed: ReturnType<typeof parseRestartTrace>; confirm: RestartConfirmation } {
-  const receipt = waitForScriptReceipt(input.traceLog, input.sizeBefore, !input.guiOnly);
+  const receipt = waitForScriptReceipt(input.traceLog, input.sizeBefore, input.markers);
   const parsed = parseRestartTrace(receipt.text);
   // 真实新 pid：脚本那两行优先，退到 lock.json（只重启界面时不比基线：那个 pid 本来就该一样）
   let backendPid = parsed.backendPid;
@@ -1800,7 +1864,10 @@ function confirmRestart(input: {
     if (fromLock !== 0 && (input.guiOnly || fromLock !== input.previousBackendPid)) backendPid = fromLock;
   }
   let port: RestartConfirmation['port'] = parsed.port;
-  if (input.guiOnly) {
+  if (!input.probePort) {
+    // 不探：这一档的端口结论只能来自 `[结束]`（读不到就是 unknown，绝不用"我们自己还听着"顶替）
+    port = port === 'ready' ? 'ready' : 'waiting';
+  } else if (input.guiOnly) {
     // 只重启界面：后端本来就该在服务，端口那一档由服务端自己看
     port = portListening(input.host, input.port) ? 'ready' : 'timeout';
   } else if (port !== 'ready' && backendPid !== 0 && portListening(input.host, input.port)) {
@@ -2358,7 +2425,8 @@ export function buildReplay(input: {
   step: number;
   personaRoot: string;
   config: AppConfig;
-  registry: ToolRegistry | null;}): ReplayView {
+  registry: ToolRegistry | null;
+}): ReplayView {
   const stepStart = input.events.find(
     (event) => event.type === 'step/start' && event.data.turn === input.turn && event.data.step === input.step,
   );
@@ -2714,6 +2782,44 @@ class WebServerImpl implements WebServer {
   }
 
   // ── 生命周期 ──
+
+  /**
+   * 让位：`self-restart` 那一条走到"旧实例该退出了"时的那一下。
+   *
+   * 这条路径上**只有本进程能证明"它已经让位了"**：单实例锁与监听端口都只允许一个用户，
+   * 而新实例是拉起器在本进程**真的消失之后**才拉起来的（见 `runtime/restart-worker.ts`）。
+   * 所以这里要的是"走既有退出路径"，而不是任何形式的硬杀：
+   *
+   *   ① 宿主注入了 `onRestartExit` ⇒ 用它（测试用；生产环境的宿主没接）；
+   *   ② 否则有 `SIGTERM` 监听者（`main.ts` 在 `runMain` 里一定装了）⇒ 触发那一条既有信号路径：
+   *      `stop('signal','SIGTERM')` —— 停源 → 关 web → 落 `session/end` → 收尾 → **放锁**；
+   *   ③ 两条都没有（比如 CLI/测试里没装信号处理器）⇒ 如实说一声再退：
+   *      留痕里写清"没有优雅退出路径可走"，锁会由下一次启动按 `pid-gone` 接管——
+   *      **不假装自己优雅退出了**（这一条与"不许用猜的确认"是同一条纪律）。
+   */
+  requestGracefulRestartExit(path: RestartPath): void {
+    const injected = this.deps.onRestartExit;
+    if (injected !== undefined) {
+      try {
+        injected(path);
+      } catch (err) {
+        this.write(`[重启] 让位回调抛错（${path}）：${describeError(err)}`);
+      }
+      return;
+    }
+    const emitter = process as unknown as {
+      listenerCount: (event: string) => number;
+      emit: (event: string) => boolean;
+    };
+    if (emitter.listenerCount('SIGTERM') > 0) {
+      this.write('[重启] self-restart：让位——走既有退出路径（SIGTERM → 停源/关 web/session:end/放锁）');
+      emitter.emit('SIGTERM');
+      return;
+    }
+    this.write('[重启] self-restart：让位——这个进程没有优雅退出路径可走（没有 SIGTERM 监听者），'
+      + '直接退出；单实例锁会由下一次启动按 pid-gone 接管');
+    process.exit(0);
+  }
 
   async listen(): Promise<void> {
     if (this.listening) return;
@@ -3799,7 +3905,8 @@ class WebServerImpl implements WebServer {
       step,
       personaRoot: this.deps.personaRoot,
       config: this.deps.config,
-      registry: this.deps.registry ?? null,    });
+      registry: this.deps.registry ?? null,
+    });
   }
 
   // ── SSE ──
@@ -4550,7 +4657,14 @@ class WebServerImpl implements WebServer {
           );
         }
         const repo = dirname(this.configPath);
-        const script = join(repo, 'tools', 'restart-agent.ps1');
+        // ── 走哪一条：`restart-chain.ts` 的优先级链（**唯一一处判据**）────────────────
+        //
+        // 用户 2026-10-07 报的「beta5 内测包重启不了」就出在这一行上：过去这里写死
+        // `join(repo, 'tools', 'restart-agent.ps1')`，而**装出来的那份根本没有 `tools\`**
+        // ——于是重启必然失败（隔离复现的 pwsh 原话见 `restart-chain.ts` 的文件头）。
+        // 现在按"仓库脚本 → 随包脚本 → 自重启"三级挑，**装出来的那份不依赖仓库里才有的东西**。
+        const choice = chooseRestartPath(repo, { fileExists: existsSync });
+        const selfRestart = choice.path === 'self-restart';
         // 留痕文件：**脚本与这里约定同一个路径**（`<dataDir>/restart-trace.log`）。
         // 为什么由服务端显式传：脚本的默认值只能靠 `-Repo` 推，而 `-Repo` 本身也是别人给的；
         // 两处各推一次就会出现"服务端读 A、脚本写 B"的分岔，而这条留痕的全部意义就是"能对上"。
@@ -4593,20 +4707,36 @@ class WebServerImpl implements WebServer {
           if (Number.isFinite(raw) && raw > 0) return Math.round(raw / 1000);
           return Math.ceil(RESTART_RECEIPT_WAIT_MS / 1000) + 4;
         })();
-        const argv: string[] = [
-          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', q(script),
+        // **绝对路径的入口**：她起不来的一半原因曾经是"相对路径 + 指望工作目录"。
+        // 本机实测（2026-10-07）：`Win32_Process.Create` 出来的进程里，`cmd /c cd` 回显的
+        // 是传进去的那个目录，而 `node dist/main.js` 就是找不到文件、悄无声息退出——
+        // 症状与"按钮点了什么都没发生"一模一样。凡是能被绝对化的路径全部绝对化。
+        const nodeEntry = backendEntry(repo);
+        // 探回环地址：服务端可能只听 `0.0.0.0` / `::`（那时这两个不是能直接连的地址）。
+        // 与 `tools\restart-agent.ps1` 里那段同一个口径（同一件事不写两份判据）。
+        const host = this.host === '0.0.0.0' || this.host === '::' ? '127.0.0.1' : this.host;
+        const scriptArgv: string[] = [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', q(choice.file),
           '-Repo', q(repo),
-          // **绝对路径的入口**：她起不来的一半原因曾经是"相对路径 + 指望工作目录"。
-          // 本机实测（2026-10-07）：`Win32_Process.Create` 出来的进程里，`cmd /c cd` 回显的
-          // 是传进去的那个目录，而 `node dist/main.js` 就是找不到文件、悄无声息退出——
-          // 症状与"按钮点了什么都没发生"一模一样。凡是能被绝对化的路径全部绝对化。
-          '-NodeEntry', q(join(repo, 'dist', 'main.js')),
+          '-NodeEntry', q(nodeEntry),
           ...(guiExe === '' ? [] : ['-GuiExe', q(guiExe)]),
           ...(guiOnly ? ['-GuiOnly'] : []),
           '-TraceLog', q(traceLog),
           '-ScriptLog', q(scriptLog),
           '-DelaySeconds', String(delaySeconds),
         ];
+        // 随包脚本多收三条：它要自己探端口（`-Port`/`-ProbeHost`）与新实例输出的落点（`-OutLog`）。
+        // **不把这些塞给仓库脚本**：`tools\restart-agent.ps1` 没有这三个参数，
+        // 多送一个就会以"找不到参数"直接失败——开发机这条路上不许有任何行为变化。
+        //
+        // 参数名是 `-ProbeHost` 而不是 `-Host`：`$Host` 是 PowerShell 的**只读自动变量**，
+        // 参数名撞上它时脚本在**参数绑定阶段**就退出（正文一个字都不执行，症状与"脚本没起来"
+        // 一模一样）——2026-10-08 的隔离端到端就是这么抓到它的。
+        if (choice.path === 'packaged-script') {
+          scriptArgv.push('-Port', String(this.portWanted));
+          scriptArgv.push('-ProbeHost', q(host));
+          scriptArgv.push('-OutLog', q(join(this.deps.dataDir, 'restart-backend.log')));
+        }
         // 谁来跑这个脚本：`resolveRestartShell` 按"显式指定 → PATH → 标准安装目录 → 系统自带"
         // 四级探测（见 `runtime/restart-shell.ts` 的文件头）。
         //
@@ -4614,8 +4744,66 @@ class WebServerImpl implements WebServer {
         // 它在开发机上永远命中、在任何别人机器上永远不命中——而"WMI 建进程的环境里没有 PATH"
         // 这件事要求我们**给出一个真的存在的绝对路径**，不能靠猜；探测失败时用
         // `powershell.exe`（在 System32 里，WMI 环境也找得到；脚本按 5.1 兼容写，兜底是安全的）。
-        const shellExe = resolveRestartShell({ env: process.env, fileExists: existsSync });
-        const command = restartCommandLine({ shellExe, argv, scriptLog });
+        //
+        // `self-restart` 这一条**不用 shell**：它拉起的是 `runtime\node\node.exe` 跑框架自己的
+        // 拉起器（`dist\runtime\restart-worker.js`）——于是"没有 pwsh / 没有脚本"的机器上
+        // 这条路照样成立（这正是它存在的理由），而 `cmd.exe /s /c "…"` 那一层照旧不变。
+        const workerLog = join(this.deps.dataDir, 'restart-worker.log');
+        let command: string;
+        if (selfRestart) {
+          // 拉起器是随 dist 装配的框架产物：**没有它就不能假装自重启能用**（如实拒绝，见下）。
+          if (!existsSync(choice.file)) {
+            this.appendSync(
+              'config/changed',
+              {
+                fields: ['restart'], configHash: 'restart-self-worker-missing',
+                guiExe, guiExeExists, path: choice.path, worker: choice.file,
+              },
+              'internal',
+            );
+            this.write(`[重启] 拒绝：两条脚本都不在（${choice.why}），而自重启的拉起器也没装进来`
+              + `（${choice.file}）——一个进程都没动`);
+            throw badRequest(
+              `这份安装里既没有仓库脚本（tools\\restart-agent.ps1）也没有随包脚本（restart.ps1），`
+              + `而自重启的拉起器也不在：${choice.file}。没有重启任何东西`
+              + '（这份 dist\\ 不是本版编出来的：拉起器随 dist\\ 一起装配）。',
+              'restart-self-worker-missing',
+            );
+          }
+          const nodeExe = existsSync(join(repo, BUNDLED_NODE_REL))
+            ? join(repo, BUNDLED_NODE_REL)
+            : process.execPath;
+          // **发起**这一行先落进留痕（它不是 `[回执]`：回执只能由真的跑起来的那一方写，
+          // 所以这一行故意不含 `[回执]`——否则"拉起器到底起没起来"就再也证明不了了）。
+          try {
+            appendFileSync(traceLog, restartTraceLine('发起',
+              `路径=${choice.path} · 由服务端发起 pid=${process.pid} · 拉起器=${choice.file}`
+              + ` · 出口=${nodeEntry} · node=${nodeExe}`), 'utf8');
+          } catch {
+            // 留痕写不下去不算错（重启本身比留痕重要）
+          }
+          const workerArgv: string[] = [
+            q(choice.file),
+            '--old-pid', [process.pid, previousBackendPid]
+              .filter((pid, index, all) => pid > 0 && all.indexOf(pid) === index).join(','),
+            '--root', q(repo),
+            '--node', q(nodeExe),
+            '--entry', q(nodeEntry),
+            '--trace', q(traceLog),
+            '--out', q(join(this.deps.dataDir, 'restart-backend.log')),
+            '--data-dir', q(this.deps.dataDir),
+            '--host', q(host),
+            '--port', String(this.portWanted),
+            ...(guiExe === '' ? [] : ['--gui-exe', q(guiExe)]),
+            ...(guiOnly ? ['--gui-only'] : []),
+            '--wait-ms', String(RESTART_RECEIPT_WAIT_MS * 4),
+            '--port-wait-ms', String(RESTART_RECEIPT_WAIT_MS * 4),
+          ];
+          command = restartCommandLine({ shellExe: nodeExe, argv: workerArgv, scriptLog: workerLog });
+        } else {
+          const shellExe = resolveRestartShell({ env: process.env, fileExists: existsSync });
+          command = restartCommandLine({ shellExe, argv: scriptArgv, scriptLog });
+        }
         const wmi = `$si = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); $si.ShowWindow = 0; `
           + `$c = ([wmiclass]'Win32_Process').Create('${command.replace(/'/gu, "''")}', '${repo.replace(/'/gu, "''")}', $si); exit $c.ReturnValue`;
         // ── 留痕（2026-10-05 加，用户报"按钮那条路没有任何日志痕迹"）──
@@ -4629,8 +4817,9 @@ class WebServerImpl implements WebServer {
         // ② WMI 实际要执行的**完整命令行**；③ spawn 的结果（WMI 返回码 + stderr）；
         // ④ **脚本有没有真的跑起来**——由脚本自己写的那行 `[回执]` 判定。
         // 一处进事件日志（可查询、可回放），一处进服务端 stdout（本机 console 日志）。
-        const trace = (): string => `guiExe=${guiExe === '' ? '（空：只重启后端）' : guiExe}`
-          + ` · 盘上存在=${guiExeExists} · shell=${shellExe} · 命令行=${command}`;
+        const trace = (): string => `路径=${choice.path}（${choice.why}）`
+          + ` · guiExe=${guiExe === '' ? '（空：只重启后端）' : guiExe}`
+          + ` · 盘上存在=${guiExeExists} · 命令行=${command}`;
         const created = spawnSync('powershell.exe', ['-NoProfile', '-Command', wmi], { encoding: 'utf8' });
         const createdDetail = `status=${created.status === null ? '未知' : created.status}`
           + ` stderr=${(created.stderr ?? '').trim()}`;
@@ -4640,12 +4829,14 @@ class WebServerImpl implements WebServer {
             'config/changed',
             {
               fields: ['restart'], configHash: 'restart-failed',
-              guiExe, guiExeExists, command, wmiStatus: created.status, wmiError: (created.stderr ?? '').trim(),
+              guiExe, guiExeExists, command, path: choice.path, wmiStatus: created.status,
+              wmiError: (created.stderr ?? '').trim(), reason: RESTART_FAILURE_REASONS.wmiFailed,
             },
             'internal',
           );
           throw badRequest(
-            `重启没能启动（WMI 返回码 ${created.status === null ? '未知' : created.status}）：${(created.stderr ?? '').trim()}`,
+            `重启没能启动（${choice.path}：WMI 返回码 ${created.status === null ? '未知' : created.status}）：`
+            + `${(created.stderr ?? '').trim()}`,
             'restart-failed',
           );
         }
@@ -4658,19 +4849,29 @@ class WebServerImpl implements WebServer {
         // 直接送 `"…pwsh.exe" -File …` 必失败、套 `cmd.exe /c "…"` 才真的跑起来
         // （见 `restartCommandLine` 的文件头）。
         //
-        // 所以这里多问一句**脚本自己**：它第一件事写 `[回执]`，后端换了 pid 时写 `[实例]`，
-        // 收尾写 `[结束]`（带真 pid 与端口那一档）。读到哪一行就说到哪一步——
+        // 所以这里多问一句**链条自己**：脚本/拉起器第一件事写 `[回执]`，后端换了 pid 时写 `[实例]`，
+        // 收尾写 `[结束]`（带真 pid、端口那一档、**走的哪条路径**与失败是哪一环）。读到哪一行就说到哪一步——
         // **三态不许互相冒充**（用户 2026-10-07：「不许用'猜'的确认」）。
-        // 后端要被重启时等 `[实例]`（几秒内必到），否则等 `[结束]`（那时不会去杀后端，
-        // 结尾很快）。等不到就如实说"结局还没确认"，而不是编一个"成功"。
+        //
+        // 等哪一行按路径分：
+        //   · 脚本那两条（repo-script / packaged-script）：`[实例]`（后端换了 pid，几秒内必到）
+        //     或 `[结束]`（收尾那行），谁先到算谁；
+        //   · self-restart：只等拉起器的 `[回执]`——它**必然**比新实例先出现（新实例要等旧实例退出），
+        //     所以这一档的响应说的是"已发出、结局未确认"，而 `[实例]`/`[结束]` 由拉起器在
+        //     服务端退出之后写进同一份留痕（那时没有 HTTP 连接可用了，但**证据还在盘上**）。
+        // 等不到就如实说"结局还没确认"（或"没能执行"），而不是编一个"成功"。
         const { parsed, confirm } = confirmRestart({
           traceLog, sizeBefore: traceLogAt, guiOnly,
           previousBackendPid,
           // 探回环地址：服务端可能只听 `0.0.0.0` / `::`（那时这两个不是能直接连的地址）。
           // 与 `tools/restart-agent.ps1` 里那段同一个口径（同一件事不写两份判据）。
-          host: this.host === '0.0.0.0' || this.host === '::' ? '127.0.0.1' : this.host,
+          host,
           port: this.portWanted,
           dataDir: this.deps.dataDir,
+          markers: selfRestart ? ['[回执]'] : ['[实例]', '[结束]'],
+          // self-restart 时探到的"端口有人在服务"是**旧实例（本进程）自己**——
+          // 把它算成"新实例已就绪"就是编事实，所以这一档不探（结论只能来自拉起器的 `[结束]`）。
+          probePort: !selfRestart,
         });
         const scriptStarted = confirm.scriptStarted;
         // 真实新 pid：脚本那行 `[实例]`/`[结束]` 是首选；还没有时退到 `data/lock.json`
@@ -4679,12 +4880,17 @@ class WebServerImpl implements WebServer {
         const outcome = {
           gui: guiExe !== '', scriptStarted,
           ok: confirm.ok, backendPid, port: confirm.port,
+          reason: parsed.reason, path: choice.path,
         };
         const note = restartNote(outcome);
+        const chainName = selfRestart ? '拉起器' : '脚本';
+        const receiptText = scriptStarted ? '已确认' : `**没读到**（${chainName}没起来）`;
+        const reasonText = parsed.reason === '' ? '' : ` · 坏在=${parsed.reason}`;
         this.write(`[重启] 已发出：${trace()} · ${createdDetail}`
-          + ` · 脚本回执=${scriptStarted ? '已确认' : '**没读到**（脚本没起来）'}`
+          + ` · 链条回执=${receiptText}`
           + ` · 真 pid=${backendPid === 0 ? '未读到' : backendPid} · 端口=${confirm.port}`
-          + ` · 结尾=${parsed.ok === null ? '未读到' : String(parsed.ok)}（${traceLog}）`);
+          + ` · 结尾=${parsed.ok === null ? '未读到' : String(parsed.ok)}`
+          + `${reasonText}（${traceLog}）`);
         const event = this.appendSync(
           'config/changed',
           {
@@ -4694,9 +4900,29 @@ class WebServerImpl implements WebServer {
             // 老字段一个不动（`fields` 仍是 `['restart']`），只多几列。
             guiExe, guiExeExists, command, traceLog, scriptStarted,
             backendPid, port: confirm.port, scriptOk: parsed.ok, note,
+            // 2026-10-07 加：**这次走的是哪一条**（repo-script / packaged-script / self-restart）。
+            // 三条路径的失败症状长得一样（后端没换 pid），而"它当时想走哪条"是事后第一个要回答的
+            // 问题——不写，就只能靠现场复现（beta.5 那颗按钮就是这么过来的）。
+            restartPath: choice.path, restartFile: choice.file, restartWhy: choice.why,
+            ...(parsed.reason === '' ? {} : { restartReason: parsed.reason }),
           },
           'internal',
         );
+        // ── self-restart 的收尾：**这个进程现在要优雅退出了** ──────────────────────
+        //
+        // 三条路径里只有这一条要"旧实例自己让位"：新实例（由拉起器拉起）等的是**本进程消失**
+        // （单实例锁与监听端口都只允许一个用户），所以这里必须走**既有退出路径**——
+        // 落事件 → `session/end` → 收尾 → **让锁释放**，而不是 `process.exit()` 把锁留在盘上。
+        //
+        // 延迟与脚本那两条同一个口径（`IRMIA_RESTART_DELAY_MS`）：这次 HTTP 响应必须先回到界面，
+        // 否则界面拿到的是一个断掉的连接，人看到的就是"点了没反馈"。
+        // 定时器 `unref()`：它不该成为进程继续活着的理由（那正是"锁不释放"的形状）。
+        if (selfRestart) {
+          const timer = setTimeout(() => {
+            this.requestGracefulRestartExit(choice.path);
+          }, Math.max(1, delaySeconds) * 1000);
+          timer.unref();
+        }
         sendJson(res, 200, {
           ok: true,
           seq: event.seq,
@@ -4705,13 +4931,16 @@ class WebServerImpl implements WebServer {
           gui: guiExe !== '',
           guiExe,
           // `scriptStarted` 也下发给界面：读到 `false` 时界面说的那句是"**重启未能执行**"
-          // （脚本根本没跑起来 ⇒ 后端没有被重启），而不是"正在重启"。
+          // （链条根本没跑起来 ⇒ 后端没有被重启），而不是"正在重启"。
           scriptStarted,
           // 三态证据一起下发：真 pid、端口那一档、脚本结尾那行的 ok。界面据此说
           // "成功（真实新 pid …· 端口已就绪）" / "失败（为什么）" / "已发出但结局未确认"。
           backendPid,
           port: confirm.port,
           scriptOk: confirm.ok,
+          // 走的哪一条 + 坏在哪一环（界面要能把它显示出来；不写下来就只能靠现场复现）
+          path: choice.path,
+          ...(parsed.reason === '' ? {} : { reason: parsed.reason }),
           traceLog,
           note,
         });

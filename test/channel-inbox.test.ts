@@ -4,9 +4,10 @@
  * 这一轮改的是**她跟外面的关系**：QQ 从"推给她的消息流"变成"手边一个可以点开的软件"。
  * 分流器就是那条线上的闸：
  *
- *   • **@ 她 / 提到她** → 进消息流并唤醒她（唯一一条"别人能直接叫到她"的路）；
- *   • **用户 / 她关注的会话** → 唤醒；
- *   • **其余一律进信箱** → 框架照收照留（写一条 `channel/message`），只记账、不打断她。
+ *   • **@ 她 / 提到她**（群）→ 进消息流并唤醒她（群里唯一一条"别人能直接叫到她"的路）；
+ *   • **私聊**（谁的都一样）→ 唤醒（2026-10-08 收敛：私聊里没有"@ 不 @"这回事，
+ *     正文直接进"本轮新输入"，不是什么"要她自己 read_channel"的东西）；
+ *   • **其余群消息** → 进信箱 → 框架照收照留（写一条 `channel/message`），只记账、不打断她。
  *
  * 判据必须是纯函数、**顺序即优先级**——"要不要打断她"是件有后果的事，靠断言钉住才敢改。
  * 文件只 import `inbox.ts`（不碰 admin/render）：这样回退实现时红的是**断言**，
@@ -106,11 +107,10 @@ describe('通道消息分流 · 什么该叫她、什么只进信箱', () => {
     );
   });
 
-  test('其余一律进信箱（不唤醒）——群里的普通发言与陌生人的私聊', () => {
+  test('群里的普通发言进信箱（不唤醒）——不 @、不喊名字', () => {
     const watched = criteria(new Set(['qq:c2c:OWNER']));
     for (const data of [
       { channel: 'qq-official', chatType: 'group' as const, person: '甲', chatId: 'G9', text: '闲聊', messageId: 'm4', msgSeq: 1 },
-      { channel: 'qq-official', chatType: 'c2c' as const, person: '陌生人', chatId: 'STRANGER', text: '在吗', messageId: 'm5', msgSeq: 1 },
       { channel: 'onebot', chatType: 'group' as const, person: '乙', chatId: '12345', text: '水群', messageId: 'm6', msgSeq: 1 },
     ]) {
       assert.equal(
@@ -119,6 +119,62 @@ describe('通道消息分流 · 什么该叫她、什么只进信箱', () => {
         `${data.chatType}:${data.chatId} 不该叫醒她（QQ 是手边的软件，不是推给她的消息流）`,
       );
     }
+  });
+
+  test('**私聊一律唤醒**——认不认识、在不在关注名单里，都一样（2026-10-08）', () => {
+    // 用户 2026-10-08 报的现象：「onebot 被私聊……变成和群聊类似的 read channel 了」。
+    // 根因是这条判据原来对私聊多问了一句"这个 sid 在不在 watchedSids 里"，
+    // 而那份名单是**联系人表 ∪ 她的别名表**——于是"给这个人起个名字"事实上变成了
+    // "订阅这个人的每句话"：官 Bot 那个人的 sid 早在配置里（照样唤醒），
+    // OneBot 那个人的 sid 晚填一行（**静默进信箱**，她得自己 read_channel 才看得见）。
+    // 私聊里没有"@ 不 @"这回事，所以判据里**不许**再出现名单——两种通道、认不认识，四条全唤醒。
+    const nobodyWatched = criteria(new Set());
+    const ownerWatched = criteria(new Set(['qq:c2c:OWNER']));
+    const cases: Array<[string, Parameters<typeof shouldWakeForChannelMessage>[0], WakeCriteria]> = [
+      ['官Bot·用户（表里有）', { channel: 'qq-official', chatType: 'c2c', person: '用户', chatId: 'OWNER', text: '在吗', messageId: 'p1', msgSeq: 1 }, ownerWatched],
+      ['OneBot·用户（表里有）', { channel: 'onebot', chatType: 'c2c', person: '10001', chatId: '10001', text: '在吗', messageId: 'p2', msgSeq: 1 }, ownerWatched],
+      ['官Bot·陌生人（表里没有）', { channel: 'qq-official', chatType: 'c2c', person: '路人', chatId: 'STRANGER', text: '在吗', messageId: 'p3', msgSeq: 1 }, ownerWatched],
+      ['OneBot·陌生人（表里没有）', { channel: 'onebot', chatType: 'c2c', person: '10009', chatId: '10009', text: '在吗', messageId: 'p4', msgSeq: 1 }, ownerWatched],
+      ['OneBot·陌生人 + **空**名单', { channel: 'onebot', chatType: 'c2c', person: '10009', chatId: '10009', text: '在吗', messageId: 'p5', msgSeq: 1 }, nobodyWatched],
+    ];
+    for (const [label, data, watched] of cases) {
+      assert.equal(
+        shouldWakeForChannelMessage(data, watched),
+        true,
+        `${label}：私聊必须唤醒——正文要直接进"本轮新输入"，不是丢进外部会话等她 read_channel`,
+      );
+    }
+    // 反向：私聊上**不该**因为"文案里没有关键词"而改变结论（关键词从来不是私聊的判据），
+    // 而且它不该需要 mentionsMe —— 适配器在私聊上压根不填那个字段。
+    assert.equal(
+      shouldWakeForChannelMessage(
+        { channel: 'onebot', chatType: 'c2c', person: '10009', chatId: '10009', text: '随便一句话', messageId: 'p6', msgSeq: 1 },
+        criteria(new Set(), []),
+      ),
+      true,
+    );
+  });
+
+  test('关注名单**不再**参与唤醒判据：给会话起名字 ≠ 订阅它的每句话', () => {
+    // 这条锁的是"判据里没有那份名单"这个事实本身：名单里放什么都不该改变群聊的结论
+    //（私聊的结论与名单无关，见上一条）。**别把名单当成"放宽群聊"的开关**——
+    // 群聊只有"叫到她"才进对话流。
+    const weird = criteria(new Set(['qq:group:G9', 'onebot:group:12345', 'qq:c2c:OWNER']));
+    assert.equal(
+      shouldWakeForChannelMessage(
+        { channel: 'qq-official', chatType: 'group', person: '甲', chatId: 'G9', text: '闲聊', messageId: 'm4', msgSeq: 1 },
+        weird,
+      ),
+      false,
+      '群被"关注"了也不唤醒：给群起名字只是让她认得这个会话',
+    );
+    assert.equal(
+      shouldWakeForChannelMessage(
+        { channel: 'onebot', chatType: 'group', person: '乙', chatId: '12345', text: '水群', messageId: 'm6', msgSeq: 1 },
+        weird,
+      ),
+      false,
+    );
   });
 
   test('顺序即优先级：@ 优先于"没被关注"这个事实', () => {

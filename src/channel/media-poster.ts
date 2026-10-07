@@ -37,7 +37,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { basename, resolve, sep } from 'node:path';
 
 import { createChannelMediaPoster, type ChannelAdapter } from './qq-official.ts';
-import { ONEBOT_CHANNEL_NAME, parseReplyUrl as parseOneBotReplyUrl } from './onebot.ts';
+import { ONEBOT_CHANNEL_NAME, isOneBotFamilyChannel, parseReplyUrl as parseOneBotReplyUrl } from './onebot.ts';
 import { parseReplyUrlAny, type MediaRequest, type ReplyOutcome, type ReplyTarget } from '../tools/admin.ts';
 import { insideAny } from '../tools/fs/path-guard.ts';
 import type { MediaPoster } from '../tools/admin.ts';
@@ -65,7 +65,12 @@ export function createMediaDispatcher(
     async post(target: ReplyTarget, media: MediaRequest): Promise<ReplyOutcome> {
       const parsed = parseReplyUrlAny(target.url);
       if (!parsed.ok) return { ok: false, reason: parsed.error };
-      if (parsed.channel === ONEBOT_CHANNEL_NAME) {
+      // ⚠️ 判据与 `admin.replyUrlForWake` **同一处**（`isOneBotFamilyChannel`，覆盖别名实例）。
+      // 这一处**今天**其实不会出错：`parseReplyUrlAny` 认的是 URL 的 scheme（`onebot:`），
+      // 它返回的 `parsed.channel` 已经归一了。但它与 `replyUrlForWake` 是**同一件事的两份写法**——
+      // 哪天 `parseReplyUrlAny` 改成把别名原样带出来（那才是更忠实的做法），这里就会立刻漏判。
+      // 所以两处共用同一个谓词：一处改、另一处跟着对，不再"只改了一处"。
+      if (isOneBotFamilyChannel(parsed.channel)) {
         // OneBot 的媒体接口在它自己的模块里（`oneBotMediaCall` 把它翻成消息段/上传文件动作），
         // 地址解析也用它自己的那份（`onebot:c2c:` / `onebot:group:`）
         const poster = createChannelMediaPoster(channels, {

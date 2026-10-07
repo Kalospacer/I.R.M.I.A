@@ -46,6 +46,10 @@ function message(patch: Partial<ChannelMessageView> & { chatId: string }): Chann
     text: '你好',
     messageId: `m-${patch.chatId}`,
     msgSeq: 1,
+    // 事件 seq（落库时分配的那个数）：**宿主取消息时一定会带上它**（`real-loop.readChannelMessages`
+    // 填的是 `event.seq`），而 2026-10-08 起它是**唯一的新旧/游标判据**——夹具不给它，
+    // 就等于在测一个真实链路上不存在的形状（`eventSeqOf` 会退回 0 ⇒ 每条都"看着像已经读过"）
+    seq: 1,
     ts: '2026-10-01T16:42:00.000Z',
     ...patch,
     ...(patch.sid === undefined ? { sid: `qq:${chatType}:${patch.chatId}` } : {}),
@@ -176,7 +180,8 @@ describe('read_channel · 她自己点开信箱', () => {
     const first = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
     assert.ok(first.content.includes('第一句'), '第一次照给');
 
-    // 他在这中间又发了十条（同一个进程、同一个 readState）
+    // 他在这中间又发了十条（同一个进程、同一个 readState）。**每条一个不同的事件 seq**：
+    // 那是"新不新"的唯一判据（c2c 的 `msgSeq` 恒为 1），夹具让它们相同就等于每条都"看着像已经读过"
     messages = [
       ...messages,
       ...Array.from({ length: 10 }, (_, i) =>
@@ -185,7 +190,7 @@ describe('read_channel · 她自己点开信箱', () => {
     const second = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
     assert.equal(second.content.includes('没有新消息'), false,
       `新消息必须看得见（这正是修之前必错的场景）：${second.content}`);
-    assert.ok(second.content.includes('第十一句的后半 9'), '十条新消息都在这一屏里');
+    assert.ok(second.content.includes('第十一句的后半 9'), `十条新消息都在这一屏里：\n${second.content}`);
     assert.equal(rec.count('channel/read'), 2, '真有新消息 → 照常记一笔已读');
   });
 
@@ -194,24 +199,40 @@ describe('read_channel · 她自己点开信箱', () => {
     // 第二、第三次读仍然必须是"没有新消息"——否则一次修 bug 会顺手把 2026-10-02 那个
     // "一轮连读五遍、白花四个 step"的教训放回来。
     const rec = recorder();
+    // 会话里除了最后那条，**还有更早的 45 句**——于是"想更早的"有一条真实的路（见下面那个游标断言）
     const same = [
+      ...Array.from({ length: 45 }, (_, i) =>
+        message({ chatId: 'U1', chatType: 'c2c', person: '用户', text: `更早的第 ${i + 1} 句`, msgSeq: 1, seq: 100 + i })),
       message({ chatId: 'U1', chatType: 'c2c', person: '用户', text: '就这一句', msgSeq: 1, seq: 300 }),
     ];
     const tk = toolkitWith(async (sid, limit) => same.slice(-limit), rec);
     const tool = tk.byName('read_channel');
 
-    const first = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
-    assert.ok(first.content.includes('就这一句'));
+    const first = await tool.handler({ sid: 'qq:c2c:U1', limit: 3 }, CTX);
+    // 第一屏走"重启后第一次"那条：取最近 limit 条（第 9、10 句与最后那条）
+    assert.ok(first.content.includes('就这一句'), `第一屏照给（宁可多给一次）：${first.content}`);
 
-    const same1 = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
-    assert.match(same1.content, /没有新消息/u, '同一批、窗口没放宽 → 照旧去重');
-    const same2 = await tool.handler({ sid: 'qq:c2c:U1', limit: 20 }, CTX);
+    const same1 = await tool.handler({ sid: 'qq:c2c:U1', limit: 3 }, CTX);
+    assert.match(same1.content, /没有新消息/u, '同一批、同一条窗口 → 照旧去重');
+    const same2 = await tool.handler({ sid: 'qq:c2c:U1', limit: 3 }, CTX);
     assert.match(same2.content, /还是\s*没有新消息/u, '第三次把话说得更直白');
     assert.equal(rec.count('channel/read'), 1, '没有新东西就不该再记一笔已读');
 
-    // 窗口放宽 = 她要往前翻，那是合法的（这条例外没被上面那条修复波及）
+    // 【2026-10-08 口径收窄】"要看更早的就把 limit 调大"这条老出路**没有了**：
+    // 默认那一屏现在只给未读里点她的那些，调大 limit 不会把旧话再倒一遍（旧话早进过上下文，
+    // 再倒就是白花 token）。**但出路必须还在**，而且更要紧——它现在只有一条：
+    // `before` 游标（翻页模式）。所以这里正着断言"想更早的内容仍然拿得到"，
+    // 免得这条口径被实现成"看不到更早的了"。
     const wider = await tool.handler({ sid: 'qq:c2c:U1', limit: 40 }, CTX);
-    assert.ok(wider.content.includes('就这一句'), 'limit 比上次大 → 照给');
+    assert.match(wider.content, /没有新消息/u, '调大 limit 不再等于"往前看"（旧话不重倒）');
+    assert.match(wider.content, /翻页/u, '要给一条出路（这里确实还有更早的）');
+    const cursor = /before=(\d+)/u.exec(wider.content);
+    assert.ok(cursor !== null, `去重那句话必须给出翻页的出路（不然她以为这里什么都没有）：${wider.content}`);
+    assert.ok(Number(cursor[1]) <= 300, '游标要落在"还没给过她的那一段"上');
+    const paged = await tool.handler({ sid: 'qq:c2c:U1', before: Number(cursor[1]), limit: 20 }, CTX);
+    assert.match(paged.content, /更早的第 \d+ 句/u,
+      `翻页那一条路必须真能读到更早的：${paged.content}`);
+    assert.equal(rec.count('channel/read'), 1, '往回翻不改已读位置（一笔都不许多）');
   });
 
   test('limit 缺省 20、上限 100（超上限夹住而不是报错）', async () => {
@@ -258,19 +279,33 @@ describe('read_channel · 她自己点开信箱', () => {
     assert.match(third.content, /3 次/u, '数得清这是第几次（她自己看得见这个数）');
   });
 
-  test('要看**更早**的（limit 比上次大）照旧给：那不是"重复调用"', async () => {
+  test('想看更早的**不再靠调大 limit**，而是靠 `before` 游标（翻页那一条路）', async () => {
+    // 2026-10-08 的口径：默认那一屏只给"未读里点她的那些"，而"已读的旧消息再倒一遍"正是
+    // 用户要避免的。所以老的出路（把 limit 调大 ⇒ 窗口往后拉 ⇒ 看到更早的）**换了一条路**：
+    // 显式给 `before`。这一条钉的就是"换路之后更早的内容仍然拿得到"，而不是"能调大 limit"。
     const rec = recorder();
-    let calls = 0;
-    const tk = toolkitWith(async (sid) => {
-      calls += 1;
-      return [message({ chatId: 'G1', chatType: 'group', sid, msgSeq: 9 })];
+    const calls: Array<{ limit: number; before: number | undefined }> = [];
+    const tk = toolkitWith(async (sid, limit, before) => {
+      calls.push({ limit, before });
+      // 宿主那一跳的语义：给了 before 就只回"比它更早的"
+      return [
+        message({ chatId: 'G1', chatType: 'group', sid, msgSeq: 9, seq: 900, text: '那一句' }),
+        message({ chatId: 'G1', chatType: 'group', sid, msgSeq: 10, seq: 950, text: '这一句' }),
+      ].filter((item) => before === undefined || (item.seq ?? 0) < before).slice(-limit);
     }, rec);
     const tool = tk.byName('read_channel');
 
     await tool.handler({ sid: 'qq:group:G1', limit: 5 }, CTX);
     const wider = await tool.handler({ sid: 'qq:group:G1', limit: 40 }, CTX);
-    assert.equal(calls, 2, '窗口要得更宽 = 想看更早的，这条请求合法');
-    assert.ok(wider.content.includes('最近 1 条'));
+    assert.equal(calls.length, 2, '两次都问了宿主（判据是"有没有新的"，那本来就该问）');
+    assert.match(wider.content, /没有新消息/u, '窗口要得更宽**不再是**"想看更早的"：旧话不重倒');
+
+    // 真正的翻页：带上页脚给的那个游标，读到更早的一条，而且已读位一动不动
+    const paged = await tool.handler({ sid: 'qq:group:G1', before: 950 }, CTX);
+    assert.equal(paged.isError, undefined, paged.content);
+    assert.ok(paged.content.includes('那一句'), `游标要真的往回读到更早那条：${paged.content}`);
+    assert.equal(paged.content.includes('这一句'), false, '游标本身那一条不该重复出现（严格小于）');
+    assert.equal(rec.count('channel/read'), 1, '翻页不改已读位置');
   });
 
   test('非法 sid / limit 当场拒绝，一个字不读', async () => {

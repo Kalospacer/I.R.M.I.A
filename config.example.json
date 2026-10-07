@@ -66,7 +66,7 @@
       "  这四项都是**启动参数：改完要重启进程才生效**。"
     ],
     "stepTools": 20,
-    "turnSteps": 30,
+    "turnSteps": 60,
     "taskTokens": 500000000,
     "dailyTokens": 50000000,
     "softRatio": 0.8,
@@ -123,9 +123,10 @@
       "  越过它时框架在**此刻层**（每步都发的那一段）多一行「[STATE.md] …——预算超限，记得维护，将过时内容移入记忆文件或删除」，让她自己去把过时内容搬进记忆文件或删掉。",
       "  为什么是 8 KB：够放「当前任务 + 接着干 + 几条边界」这三样（下一拍真的要用）的那点状态；出厂的 STATE.md 实测 17007 字节 ≈ 3.8k token/次，而且是**每轮都在重发**。",
       "  只提醒、不截断：框架不动她的文件，也不替她搬内容。她压回预算内之后那一行自动消失（不需要\"已读\"）。单位是字节；改完要重启进程才接管。",
-      "compactionThresholdTokens：可见历史估算超过它就压一次。用代码默认值起步，觉得压得太勤再往上调。"
+      "compactionThresholdTokens：可见历史估算超过它就压一次。默认 100000——这个量级够一段完整工作留在可见历史里，",
+      "  又远在上下文上限之下；调小会压得更勤，而每次压缩自己也要花一次调用。"
     ],
-    "compactionThresholdTokens": 32000,
+    "compactionThresholdTokens": 100000,
     "handoffBudgetTokens": 4096,
     "handoffFoldTokens": 1024,
     "owner": "owner",

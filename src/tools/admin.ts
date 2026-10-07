@@ -45,7 +45,7 @@ import { DEFAULT_ASK_HUMAN_TIMEOUT_MIN } from '../config/config.ts';
 // 不在这里另造一套：多通道并存时按 wake.channel 选各自命名空间
 import { QQ_CHANNEL_NAME, parseReplyUrl as parseQqReplyUrl, replyUrlOf as qqReplyUrlOf } from '../channel/qq-official.ts';
 import {
-  ONEBOT_CHANNEL_NAME, ONEBOT_REPLY_SCHEME,
+  ONEBOT_CHANNEL_NAME, ONEBOT_REPLY_SCHEME, isOneBotFamilyChannel,
   parseReplyUrl as parseOneBotReplyUrl, replyUrlOf as oneBotReplyUrlOf,
 } from '../channel/onebot.ts';
 import { CHAT_TYPE_LABELS, channelForNamespace, normalizeSid, parseSid, sessionLabelOf, type SessionEntry } from '../channel/sessions.ts';
@@ -439,11 +439,16 @@ export interface Notifier {
 /**
  * 当前会话 → 回投 URL（M9）：按 `wake.channel` 选通道自己的命名空间（`qq:` / `onebot:`）。
  * 通道名认不出来时退回 QQ 口径（既有行为，也是缺省通道）。
+ *
+ * ⚠️ 判据是 `isOneBotFamilyChannel`（**覆盖别名实例** `onebot-*`），不是
+ * `wake.channel === ONEBOT_CHANNEL_NAME`：通道名可以是别名（`OneBotClientOptions.channelName`），
+ * 过去那样写会把别名实例当成非 OneBot ⇒ 造出 `qq:` 命名空间的地址 ⇒ **静默回投不出去**。
+ * 与 `channel/media-poster.ts`、`channel/sessions.ts`、`channel/warn-exempt.ts` 共用同一处判据。
  */
 export function replyUrlForWake(
   wake: Pick<WakeChannel['data'], 'channel' | 'chatType' | 'chatId'>,
 ): string {
-  if (wake.channel === ONEBOT_CHANNEL_NAME) return oneBotReplyUrlOf(wake);
+  if (isOneBotFamilyChannel(wake.channel)) return oneBotReplyUrlOf(wake);
   return qqReplyUrlOf(wake);
 }
 
@@ -727,6 +732,19 @@ export interface ChannelMessageView {
   messageId: string;
   msgSeq: number;
   /**
+   * 这条消息**在点她**（平台 @ 了她，或适配器/关键词判定如实填的"提到了你"）。
+   *
+   * 为什么它随读回来的每一条一起给（2026-10-08）：`read_channel` 的默认那一屏是
+   * **"只给点了她的那些 + 每条之前十条"**（用户的口径：群里刷几百条，全倒出来就是白烧 token）。
+   * 而"点没点她"的判据在**宿主**手里——`chatType === 'group-at'` 或 `mentionsMe`，
+   * 关键词表也只有宿主有（见 `runtime/real-loop.ts` 的 `mentionedInMessage` 与
+   * `channel/inbox.ts` 的分流判据）。工具层**绝不自己重判一遍**：两处各判一次，
+   * 迟早"唤醒她的那条"与"她读回来标成提及的那条"不是同一条。
+   *
+   * 缺席 = 这条不是提及（不是"未知"）：判据只有一条，给不出 true 就是 false。
+   */
+  mentionsMe?: boolean;
+  /**
    * 这条消息**落进日志时的 seq**（`EventLog.nextSeq` 分配，严格单调；宿主不会填别的数）。
    *
    * 为什么视图里需要它、而不是用上面的 `msgSeq`："这个会话自上次读到之后**又来没来过**新消息"
@@ -801,6 +819,17 @@ export function eventSeqOf(item: ReadChannelItem): number {
 export const SELF_SPEAK_LABEL = '（我）';
 
 /**
+ * "这一行在点你"的行首标记（默认那一屏里用；往回翻页那一屏不加）。
+ *
+ * 为什么是 `▶ `（一个半角箭头 + 一个空格）：① 它必须**在行首、与时间同一列之前**——
+ * "谁"那一格已经被 `（我）` 占了，标记不能去抢那一格；② 它是**标注不是内容**，
+ * 与正文之间隔一个空格，扫一眼就知道"这一行是冲我来的"；③ 不能是 `@`（正文里本来就有
+ * 平台的 `@` 前缀，会分不清哪个是框架标的）；④ 别的行一个字都不加，于是
+ * "有标记 = 提及"这条判据在整屏里是**单调**的（她不必去数第几列）。
+ */
+export const MENTION_ROW_MARK = '▶ ';
+
+/**
  * 出站到某个会话**成功之后**回执里的那一句 —— 说清"凭什么能确认它发出去了"。
  *
  * 用户 2026-10-07 报的现象：「report 貌似不进 channel？她老是不知道自己的 report 已经发出去了
@@ -849,38 +878,67 @@ export function mergeChannelSpeech(
   spoken: readonly ChannelSpoken[],
   limit: number,
 ): ReadChannelItem[] {
-  const merged: ReadChannelItem[] = [...hits, ...spoken];
-  // 排序：主键时间（ISO 8601 同带时区，字典序即时间序），同一毫秒按投递那一刻的毫秒、
-  // 再按事件 seq —— 事件日志的先后就是真相，不能让"同一毫秒"变成随机顺序
-  //（她读到的因果不该随实现变：自己刚说的话排在自己被叫醒那条之后）。
-  //
-  // 两个键都过一遍 `Number.isFinite` 兜底：`Date.parse` 认不出的时间戳会给出 NaN，
-  // 而比较函数返回 NaN 等于把顺序交给实现——宁可退回"按日志先后排"，也不让她读到随机的因果。
-  const orderKeyOf = (item: ReadChannelItem): number => {
-    const raw = isChannelSpoken(item) ? item.atMs : (item as ChannelMessageView).msgSeq;
-    return Number.isFinite(raw) ? raw : 0;
-  };
-  merged.sort((a, b) => {
-    if (a.ts !== b.ts) return a.ts < b.ts ? -1 : 1;
-    const ka = orderKeyOf(a);
-    const kb = orderKeyOf(b);
-    if (ka !== kb) return ka - kb;
-    // 第三个键（事件 seq，见 eventSeqOf 的注释）：平台序号相同的一批——官方单聊恒为 1——
-    // 靠它才有确定的先后，否则这一屏的顺序就交给实现了
-    return eventSeqOf(a) - eventSeqOf(b);
-  });
-  return merged.slice(-limit);
+  return sortByTimeline([...hits, ...spoken]).slice(-limit);
 }
 
 /**
- * 取某个会话最近的消息（时间正序）。**宿主注入**：工具层不读日志、不认识 EventLog。
+ * 同一毫秒里排先后的那个键（`sortByTimeline` 里用；抽出来只为一处实现）。
+ *
+ * 外部消息用它自己的平台序号（"这条是会话里第几条"，最贴近人的直觉），她的发言用投递那一刻的
+ * 毫秒。两个键都过一遍 `Number.isFinite` 兜底：`Date.parse` 认不出的时间戳会给出 NaN，
+ * 而比较函数返回 NaN 等于把顺序交给实现——宁可退回"按日志先后排"，也不让她读到随机的因果。
+ */
+function timelineOrderKeyOf(item: ReadChannelItem): number {
+  const raw = isChannelSpoken(item) ? item.atMs : (item as ChannelMessageView).msgSeq;
+  return Number.isFinite(raw) ? raw : 0;
+}
+
+/**
+ * 按时间轴排序的**唯一实现**（合批、以及"未读那一段怎么排"都走它）。
+ *
+ * 三个键，依次收窄：
+ *   ① 时间（ISO 8601 同带时区，字典序即时间序）；
+ *   ② 同一毫秒按 `timelineOrderKeyOf`（她自己刚说的话排在自己被叫醒那条之后）；
+ *   ③ 再按**事件 seq**——事件日志的先后就是真相。官方单聊的 `msgSeq` **恒为 1**，一批单聊消息
+ *      在主键与次序键上全部相等，少了它，同毫秒的顺序就"由实现决定"，而她读到的因果不该随实现变。
+ *
+ * 为什么翻页与"未读窗口"也要用它（2026-10-08）：那两处都要在"这一段时间里发生了什么"上切片，
+ * 若各自用一套排序，同一批消息在"翻页里的先后"与"合批里的先后"可能不一致——
+ * 那是读起来完全正常、因果却反了的错。
+ */
+export function sortByTimeline(batch: readonly ReadChannelItem[]): ReadChannelItem[] {
+  const merged = [...batch];
+  merged.sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts < b.ts ? -1 : 1;
+    const ka = timelineOrderKeyOf(a);
+    const kb = timelineOrderKeyOf(b);
+    if (ka !== kb) return ka - kb;
+    return eventSeqOf(a) - eventSeqOf(b);
+  });
+  return merged;
+}
+
+/**
+ * 取某个会话的消息（时间正序，最多 `limit` 条）。**宿主注入**：工具层不读日志、不认识 EventLog。
  *
  * `limit` 已由调用点夹到合法区间（1..上限），实现不必再判一次。
+ *
+ * `before`（可选）是**往回翻页的游标**（事件 seq）：
+ *   • 不给 ⇒ 取"现在这儿有什么"（最近 limit 条）——默认那一屏走这条路；
+ *   • 给了 ⇒ 取**事件 seq 严格小于它**的最近 limit 条。
+ * 两种取法在宿主侧只差一刀 `event.seq >= before`，**没有第二种实现在别处**
+ *（`real-loop.readChannelMessages`）。为什么游标是事件 seq 而不是平台序号：
+ * 平台序号答不了"这一条在这段历史里的位置"（官方单聊恒为 1、OneBot 没 @ 的群消息也没有），
+ * 拿它当游标必然错页——而事件 seq 单调、稳定、跨重启不变，且她上下文里本来就有它。
  *
  * 返回的窗口是"外部消息"的上界：她自己的发言由宿主另外取（`channelSpokenReader`），
  * 工具层负责把两股按时间轴合起来并压回 limit——**合批只有一处实现**（见 `mergeChannelSpeech`）。
  */
-export type ChannelReader = (sid: string, limit: number) => Promise<readonly ChannelMessageView[]>;
+export type ChannelReader = (
+  sid: string,
+  limit: number,
+  before?: number,
+) => Promise<readonly ChannelMessageView[]>;
 
 /**
  * 她在这个会话里说过的话（宿主注入；只含真的送到这个会话的那些）。
@@ -911,9 +969,56 @@ export type ExternalEventRenderer = (
  */
 export type ChannelNameResolver = (sid: string) => string | null;
 
-/** `read_channel` 的条数上限（她要的是"最近几条"，不是"全部历史"；默认给 20） */
+/** `read_channel` 的条数上限（默认一屏 20 行；上限 100 是"别一次把整段上下文挤掉"那道闸） */
 export const READ_CHANNEL_DEFAULT_LIMIT = 20;
 export const READ_CHANNEL_MAX_LIMIT = 100;
+
+/**
+ * 翻页模式**一页 50 条**（用户 2026-10-08 的口径：「如果开启翻页模式，就可以读到全部消息。
+ * 每页 50 条」）。
+ *
+ * 它与 `limit` 的分工（别把两个数混起来）：
+ *   • `READ_CHANNEL_MAX_LIMIT` 是**硬上限**（100）——她显式要更多的行时夹到它，防的是
+ *     "一次拉几千条回来把上下文撑爆"；
+ *   • 这个 50 是**一页的默认与建议**（`limit` 缺省时就用它，页脚也照它指路）：翻页是
+ *     "一屏一屏往回走"，50 行是用户定的一屏；她要更窄（只看几句）或更宽（最多 100）都由
+ *     `limit` 说了算，而**页脚永远照本页实际用的那个数**告诉她下一页怎么翻（口径只有一处）。
+ */
+export const READ_CHANNEL_PAGE_SIZE = 50;
+
+/**
+ * 默认那一屏：**每条提及之前带几条上下文**（用户 2026-10-08 的口径：「未读也是只读提及和
+ * 之前十条」——群里刷几百条，全倒出来就是白烧 token，所以她只被给"点了她的那些"以及
+ * 每条提及**之前十条**，好让那句话读得懂在说什么）。
+ *
+ * 数的是**这一批里它之前的件**（外部消息与她自己说过的都算——时间轴只有一条，
+ * 上下文窗口按时间排才对得上"他这句话是在接什么"）。多提要之间**去重**：同一件不会
+ * 因为落在两条提及的窗口里而出现两次。
+ */
+export const READ_CHANNEL_MENTION_CONTEXT = 10;
+
+/**
+ * 往回翻页的游标：**事件 seq**（`ChannelMessageView.seq` / `ChannelSpoken.seq`，
+ * 落库时由 `EventLog.nextSeq` 分配，严格单调、重放稳定、跨重启不变）。
+ *
+ * 语义只有一句：**"这一屏之前"= 事件 seq 严格小于该值的那一段**。于是
+ *   • **无重复、无空洞**：seq 严格单调且唯一，`< cursor` 切出来的两页必然不重叠、也不漏；
+ *   • **不漂移**：新消息落库只会拿到更大的 seq，改不了"更早那一段"的成员
+ *     ——这正是它不能是"页码"的原因（页码会随新消息整体平移，翻第二页时会重读第一页）；
+ *   • **跨重启有效**：它写在日志里，不靠进程内存。
+ *
+ * 给不出来 / 过期（旧日志被裁掉、或者她转抄错了一位）时**必须明确报参数错并指路**，
+ * 不许静默给一屏空的——"空"与"到头了"是两件完全不同的事（见 handler 里那两个分支）。
+ */
+export interface ReadCursor {
+  /** 读**事件 seq 小于**它的那些（不含它自己） */
+  before: number;
+}
+
+/** 翻页游标变成她读得懂的那个数：`before=1234`。写进页脚与参数错误里，**一处实现** */
+export function cursorText(before: number): string {
+  return `before=${before}`;
+}
 
 export interface AdminToolkit {
   readonly tools: readonly ToolDefinition[];
@@ -2008,7 +2113,27 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
    * 它是缓存，不是账：账在日志的 `channel/read` 里。进程重启后是空的，于是第一次调用照旧
    * 正常返回消息（宁可多给一次，也不能因为"我记不清"就什么都不给）。
    */
-  const readState = new Map<string, { seq: number; limit: number }>();
+  const readState = new Map<string, {
+    /** "她已经看到哪了"：上一屏给她看过的**最大事件 seq**（未读与"有没有新东西"的唯一判据） */
+    seq: number;
+    /** 上一屏要了多宽的窗口（只用于"这一轮读了第几次"那句措辞，不参与任何判定） */
+    limit: number;
+    /**
+     * 上一屏之后**还有多少条没给她的未读**（"另有 N 条你还没看"那句话的判据）。
+     *
+     * 为什么要记它：同一批未读连读两次，那句话一个字都没变——重复说一遍就是白花她的注意力
+     * （与"没有新消息"那条闸同一个理由）。N 变了说明又来了她没看到的新话，那时**要**照说。
+     */
+    pending: number;
+    /**
+     * 页脚那个落点：**"这一屏之前、一条都还没给她看过"的那一段的下界**（＝下一页的 `before`）。
+     *
+     * 为什么必须记在状态里：默认那一屏只挑提及，而"取数下界"与"给过她哪儿"是两件事。
+     * 不记它就只能拿"看到的"或"取到的"去猜，两种猜法都会出错——前者会**跳过取数窗口里
+     * 没给她的那几条**（空洞），后者会把已给过的再摆一遍（重复）。
+     */
+    pageBelow: number;
+  }>();
   /**
    * 同一轮里同一个会话被读了几次：`${turn}\u0000${sid}` → 次数。
    *
@@ -2055,6 +2180,15 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
     entry: SessionEntry | null,
     /** 框头那几个键取自**外部消息**（她自己的行没有 channel/chatType 坐标）。调用点保证非空 */
     anchor: ChannelMessageView,
+    /**
+     * 这一屏里**点了她**的那几条（按事件 seq 认，`ChannelMessageView.mentionsMe`）。
+     *
+     * 标记用行首的 `▶ `（在框**内**、在那一行开头）：默认那一屏是"提及 + 每条之前十条"，
+     * 她必须一眼分得出"哪一句是冲我来的、哪几句只是它的前文"——否则她会把十条上下文
+     * 读成"这些都在跟我说"。它也**不与 `（我）` 抢位置**：那个在"谁"那一格，这个在最左边。
+     * 缺席 = 这不是提及屏（往回翻页那一屏），一个字都不加——判据只有一处。
+     */
+    mentioned: ReadonlySet<number> = new Set(),
   ): string[] => {
     // 框的**开头与会话那一份同形**（`[external_event source=… chat=…`）：她认"这是别人说的话"
     // 靠的就是这个开头（装置自述里写着）。整批一个框，所以只写一次；`count=` 说明批里几条
@@ -2071,11 +2205,13 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
     const notes: string[] = [];
     for (const item of batch) {
       const when = shortLocalTime(item.ts, timezone);
+      // "点了她的那条"的标记：加在整行最左边（见上面 `mentioned` 的说明）
+      const at = mentioned.has(eventSeqOf(item)) ? MENTION_ROW_MARK : '';
       if (isChannelSpoken(item)) {
         // 她的行：`（我）` 占"谁"那一格，后面是她说的完整文本（一次 speak 的所有气泡拼在一起，
         // 不论几十条都只占这一行）。正文同样压成一行——换行会把"一行一条"这条预算结构打破。
         const spoken = item.text.replace(/\s+/gu, ' ').trim();
-        lines.push(`${when} ${SELF_SPEAK_LABEL}：${spoken}`);
+        lines.push(`${at}${when} ${SELF_SPEAK_LABEL}：${spoken}`);
         continue;
       }
       const label = alias(item.person, item.nickname);
@@ -2083,7 +2219,7 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         .map((a) => (a.type === 'image' ? '［图］' : `［文件${a.name === undefined ? '' : ` ${a.name}`}］`))
         .join('');
       const text = item.text.replace(/\s+/gu, ' ').trim();
-      lines.push(`${when} ${label}：${attach}${text}`);
+      lines.push(`${at}${when} ${label}：${attach}${text}`);
       // 判过注入的那条：框架那句话**留在框外**（框里是别人的话，框外才是框架说的话）。
       // 原来每条一个框、预警就挂在各自框外；现在整批一个框，所以它们统一排在框后，
       // 各自带上"哪一条"的坐标——归属没丢，字数省下来了。
@@ -2100,23 +2236,34 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
 
   const readChannel: ToolDefinition = {
     name: 'read_channel',
-    // 描述瘦身（2026-10-06）：原来 98/100 token —— 距硬门只剩 2 token，再顺手加半句话就会
+    // 描述瘦身（2026-10-06）：当时 98/100 token —— 距硬门只剩 2 token，再顺手加半句话就会
     // `register` 抛错、被 `buildCatalogRegistry` 记进 problems 并**跳过注册**（工具静默少一件，
     // 只能从行为异常反推）。压到 64 的做法是**把 sid/limit 的细节挪进参数描述**
-    // （参数不进 `MAX_DESCRIPTION_TOKENS` 那份预算，而她两个都看得到：schema 与描述一起进清单）：
-    // `sid 见外部会话清单` 与 `limit 默认/上限` 本来就在参数里逐字写着，`limit` 的两条口径
-    // （她自己的发言也占行、一次回复只占一行；要看更早的给更大的值）现在跟着 `limit` 走。
-    // 留在描述里的四句都是**她据此决定行为**的：读什么、含她自己的话（怎么认）、看过即标记已读、
-    // 没有新消息时回什么（以及想接着说就走 speak）。
+    // （参数不进 `MAX_DESCRIPTION_TOKENS` 那份预算，而她两个都看得到：schema 与描述一起进清单）。
+    //
+    // 2026-10-08 两条口径改在这里，**细节一律进参数描述**（同一条纪律）：
+    //   • 默认那一屏 = **未读里只给"点了她的那些"+每条之前十条**（用户的原话：「未读也是只读提及
+    //     和之前十条」）——描述里只说结论（"只给点你的那些和它们之前十条"），
+    //     "之前十条""未读装得下就全给""她自己发的那条也带上下文"这三条边界跟着回执与代码注释走
+    //     （判据在 handler 里那份"五个分支"上，逐条写清了为什么）；
+    //   • 往回翻页 = 给 `before` 游标、每页 50 条、**不改已读位**——细节全在 `before` 的参数描述里。
+    // 留在描述里的每一句都仍然是**她据此决定行为**的：读什么、含她自己的话（怎么认）、
+    // 已读只按她真看过的那些推进、没有新消息时回什么（并给她出路）。
     description:
-      '看某个会话最近的若干条消息（**也包括你自己在这个会话说过的话**，行首 `（我）`；看过的标记已读）。'
-      + '群聊平时不推送，想知道积累了什么就用它。没有新消息时只回一句「没有新消息」，'
+      '看某个会话的消息（**也包括你自己在这个会话说过的话**，行首 `（我）`）。'
+      + '默认只给未读里**点你的那些**和它们之前十条，看过的那几条标记已读。'
+      + '想看更早的给 before 往回翻（每页 50 条，不动已读）。没有新消息时明说，'
       + '想接着说就直接 speak。',
     parameters: {
       type: 'object',
       properties: {
         sid: { type: 'string', description: '会话标识，形如 qq:group:<群 id>（见外部会话清单）' },
-        limit: { type: 'number', description: `这一屏最多几行（默认 ${READ_CHANNEL_DEFAULT_LIMIT}、上限 ${READ_CHANNEL_MAX_LIMIT}）；你自己的发言也占行、一次回复只占一行；要看更早的给更大的值` },
+        before: {
+          type: 'number',
+          description: '翻页游标：取**比它更早**的那些（seq，从上一屏页脚抄）。'
+            + `给了就进翻页模式：一页 ${READ_CHANNEL_PAGE_SIZE} 条、读全部历史、**不改已读**；不给就是上面那个默认`,
+        },
+        limit: { type: 'number', description: `这一屏最多几行（缺省 ${READ_CHANNEL_DEFAULT_LIMIT}、翻页一页 ${READ_CHANNEL_PAGE_SIZE}、上限 ${READ_CHANNEL_MAX_LIMIT}）；你自己的发言也占行、一次回复只占一行` },
       },
       required: ['sid'],
       additionalProperties: false,
@@ -2142,6 +2289,52 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
           );
         }
         const limit = readLimit(args['limit']);
+        const cursor = readCursor(args['before']);
+        // ── ① 翻页模式：给游标 ⇒ 读**全部历史**，一页 50 条、**一个字都不动已读** ──
+        if (cursor !== null) {
+          const messages = await channelReader(sid, limit, cursor.before);
+          // 游标是**记在日志里的事实**（事件 seq），但"这个会话里没有比它更早的了"与
+          // "这个游标根本不属于这个会话/已经过期"从这一侧看不出区别——所以两句话一起给，
+          // 并**明确指路**：空结果与"到头了"是两件完全不同的事，不许让它静默地看起来像后者。
+          if (messages.length === 0) {
+            return okResult(
+              `${sid} 里没有比 ${cursorText(cursor.before)} 更早的了。`
+              + '——要么你已经翻到头（最早那条就在前面那一屏），要么这个游标不属于这个会话/已经过期。'
+              + `想确认现在有什么，就不带 before 读一次（默认那一屏给未读里点你的那些）。`,
+            );
+          }
+          const spoken = channelSpokenReader === null ? [] : await channelSpokenReader(sid);
+          // 她自己的行也按**同一个游标**切：翻页翻的是"这段历史"，不是"别人说的话"
+          //（时间轴只有一条，见 mergeChannelSpeech）
+          const pool = sortByTimeline([
+            ...messages,
+            ...spoken.filter((item) => eventSeqOf(item) < cursor.before),
+          ]);
+          const batch = mergeChannelSpeech(
+            pool.filter((item): item is ChannelMessageView => !isChannelSpoken(item)),
+            pool.filter(isChannelSpoken),
+            limit,
+          );
+          // ⚠️ **这里不 emit `channel/read`、也不动 readState**：往回翻旧消息既不能把已读位置
+          // 退回去、也不能把旧消息重新标成未读（"已读"只按"读到最新"推进，见 sessions.ts 的
+          // applyChannelRead）。这是用户 2026-10-08 那条口径的落点，也是本工具唯一的"只读"路径。
+          return okResult([
+            `${sid} 从 ${cursorText(cursor.before)} 往前 ${batch.length} 条`
+            + `（本机时间，正序；**翻页不改已读**）· ${whereOf(messages[0]!)}`,
+            ...renderReadBatch(batch, sessionEntryOf(messages[0]!), messages[0]!),
+            // 这一屏之后还有没有更早的？宿主只回"最近 limit 条"，**它不回"是不是到日志开头了"**
+            // （`readChannelMessages` 的窗口语义），所以判据取保守的那一侧：这一屏**装满了**
+            // （`pool` 有 limit 条以上）就照实说"想接着往回翻"——多说一句的代价是白翻一次，
+            // 而少说一句的代价是**她以为到头了**，那一段就再也看不见了。
+            pagingFooter({
+              nextBefore: eventSeqOf(batch[0]!),
+              more: pool.length >= limit,
+              // "装不下了"就如实提醒她把 limit 调大——一页 50 条是**默认**，上限是 100
+              truncated: pool.length > limit,
+              limit,
+            }),
+          ].join('\n'));
+        }
         const messages = await channelReader(sid, limit);
         if (messages.length === 0) {
           return okResult(
@@ -2153,84 +2346,240 @@ export function createAdminTools(options: AdminToolsOptions): AdminToolkit {
         // **它不扩窗**：下面按时间轴插进去之后再压回 limit，所以这一屏最多还是 limit 行
         //（她的发言也占行——见 mergeChannelSpeech 的取舍说明）。
         const spoken = channelSpokenReader === null ? [] : await channelSpokenReader(sid);
-        // 未读的判据（写进 `channel/read`）：平台序号，"这条是这个会话里的第几条"。
-        // 平台给不出时宿主填的就是事件 seq（`channel/inbox.ts` 的 `inboxMsgSeqOf`）。
-        const upToSeq = messages.reduce((max, m) => Math.max(max, m.msgSeq), 0);
-        // **"有没有新东西"的判据（唯一一处）：事件 seq**。它是这次取回的这批里最大的一条的落库 seq
-        // ——严格单调、重放稳定，且**无论哪个平台都拿得到**。
-        //
-        // 为什么不能用上面那个 `upToSeq` 判新（2026-10-05 修的真缺陷）：官方**单聊的 msgSeq 恒为 1**
-        // （平台不给会话内序号，见 `channel/qq-official.ts` 的实证结论）。同一个进程里第二次读单聊，
-        // "这批最大的 msgSeq"还是 1 ⇒ `1 <= prev.upToSeq(=1)` ⇒ 回一句"没有新消息"，
-        // 哪怕用户这中间刚发了十条。事件 seq 没有这个毛病：新消息落库必得更大的 seq。
-        const latestSeq = messages.reduce((max, m) => Math.max(max, eventSeqOf(m)), 0);
-        // **她自己的凭据也要进这个数**（2026-10-07 修的缺陷，用户的原话见 `SENT_CREDENTIAL_NOTE`）。
-        //
-        // 她 report 出站成功之后，那一篇的证据是一条 `speak/sent`（`deliverToSession`）——
-        // 它**不是平台消息**，所以不进 `messages`、也就不进 `latestSeq`。原来这条闸只比
-        // `latestSeq`，于是"她刚往这个会话报告过、想回头核对一下"这个动作必然得到
-        // 「没有新消息」，**她要找的那一行永远拿不到**：她会据此判断"报告没发出去"，
-        // 再发一遍（用户报的"重复发"就是这么来的）。
-        //
-        // 口径仍是"事件 seq 有没有新东西"，只是把**她自己的那些凭据**也算进来：它们是这个会话
-        // 里真实发生过的事（时间轴只有一条）。判据用的还是 `eventSeqOf`——同一个数、同一套量纲。
-        //
-        // 注意它**不改变"未读"**：给出去的那一笔 `channel/read` 仍是 `upToSeq`（平台序号，
-        // 只由**别人**的消息决定——她自己的发言从不把自己算成未读，见 `mergeChannelSpeech` ②）。
-        // 这里只是"这一屏要不要照给"的判据，不是"有多少条未读"。
-        const spokenSeq = spoken.reduce((max, item) => Math.max(max, eventSeqOf(item)), 0);
-        const newestSeq = Math.max(latestSeq, spokenSeq);
+        // 这一屏的候选池：外部消息 + 她的行，按时间轴（**与合批同一套排序**，见 sortByTimeline）
+        const pool = sortByTimeline([...messages, ...spoken]);
         const prev = readState.get(sid);
-        // 没有新东西、也没要更宽的窗口 → 直接说"没有新消息"，不把同一段再摆一遍。四个例外都留着：
-        //   ① 她要看**更早**的（limit 比上次大）——那是有新内容的请求，不是重复调用；
-        //   ② 本进程还没读过这个会话（重启后的第一次）——宁可多给一次，也别让她两手空空；
-        //   ③ **这一轮就是这个会话在叫她**（提及/@）——那种情况下"没有新消息"是假的：叫她的那条是
-        //      `wake/channel`，不计入未读、可能正好压在已读位之内，而 v28 之后她手里**只有通知、
-        //      没有正文**。此时必须照给，否则她永远看不到那句原话（2026-10-02 用户从截图上抓到的）。
-        //   ④ **她自己的凭据比她上次读到的更新**（`speak`/`report`/`send_media` 刚发进这个会话）
-        //      ——她要核对"我到底发出去没有"，那种时候回一句"没有新消息"是最坏的答案：
-        //      她要找的那一行就在里面，而这句话让她以为它不在。这是 2026-10-07 补的那一条。
+        // "她已经看到哪了"的判据（唯一一处）：**上一屏给她看过的最大事件 seq**。
         //
-        // 2026-10-05 的修复**没有动这三个例外**：① ② 判的都不是"新不新"（它们判"要不要更宽的窗口 /
-        // 是不是重启后第一次"），③ 判的是"这一轮谁在叫她"——那是**另一件事**，不是"尾巴新不新"的
-        // 第二处判据。改掉的是那个**数**：`latest`（平台序号）→ `latestSeq`（事件 seq）。
+        // 为什么是事件 seq 而不是 `msgSeq`（2026-10-05 修的真缺陷）：官方**单聊的 msgSeq 恒为 1**
+        // （平台不给会话内序号，见 `channel/qq-official.ts` 的实证结论）。同一个进程里第二次读单聊，
+        // "这批最大的 msgSeq"还是 1 ⇒ 回一句"没有新消息"，哪怕用户这中间刚发了十条。
+        // 事件 seq 没有这个毛病：新消息落库必得更大的 seq。
+        //
+        // 这个数**含她自己的凭据**（2026-10-07 修的缺陷，见 `SENT_CREDENTIAL_NOTE`）：她 report
+        // 出站成功后的那一篇是一条 `speak/sent`，不是平台消息、原先不进这个数，于是"刚报告过、
+        // 回头核对"必然得到「没有新消息」——她要找的那一行永远拿不到，她会据此再发一遍。
+        const prevSeq = prev?.seq ?? 0;
+        /**
+         * 这一屏取数的下界（宿主返回的最旧那一条的 seq）——**页脚那个游标的两个来源之一**。
+         *
+         * `< 取数下界` 恰好是"这一屏没覆盖到的那一段"：给过她的一条不重复，没给过的一条不落。
+         * 为什么不拿"她看到的最旧那一条"当游标（先写成那样，实测踩到）：默认那一屏只挑提及，
+         * "看到的"常常比"取到的"新——按它往回翻会**跳过取数窗口里没给她的那几条**
+         * （它们既不在这一屏里、也不在下一页里）。
+         */
+        const fetchFloor = eventSeqOf(messages[0]!);
+        /**
+         * 这一批里**最新**的那一条的 seq（含她自己发出去的凭据）——"她是不是已经读到最新了"的判据。
+         *
+         * 为什么不能用 `fetchFloor` 判这件事（写下这条注释时刚踩到）：取数窗口由 `limit` 决定，
+         * 而 `limit` 比整个待读区间窄是常态（默认 20）。这一屏只覆盖"最近 20 条"时，下界**必然**
+         * 低于已读位——拿它去比，会把"窗口之外还有没读的旧话"误判成"她没有新消息"
+         * （她会得到一句"没有新消息"，而这句话是假的）。
+         */
+        const newestSeq = pool.reduce((max, item) => Math.max(max, eventSeqOf(item)), 0);
+        /**
+         * 这一屏的候选：**她还没看过的东西**。
+         *
+         * 判据两条，都是刻意的：
+         *   • **本进程第一次读这个会话**（`prev === undefined`）⇒ 全部算候选。这与"重启后第一次"
+         *     那条既有口径同源（宁可多给一次，也别让她两手空空），也是老日志（事件没有 seq 字段、
+         *     `eventSeqOf` 退回 0）唯一读得出来的路径；
+         *   • 否则按**事件 seq > `prevSeq`** 取——严格单调、重放稳定，且**无论哪个平台都拿得到**
+         *     （`msgSeq` 在官方单聊恒为 1，判不了"新不新"，见上面 `prevSeq` 那段）。
+         *
+         * `prevSeq` 里**含她自己的凭据**（2026-10-07 修的缺陷，见 `SENT_CREDENTIAL_NOTE`）：
+         * 她 report 出站后那一篇是一条 `speak/sent`、不是平台消息；不含它的话，"刚报告过、
+         * 回头核对"必然得到「没有新消息」——她要找的那一行永远拿不到，她会据此再发一遍。
+         */
+        const unread = prev === undefined ? pool : pool.filter((item) => eventSeqOf(item) > prevSeq);
+        /**
+         * 这一批未读**装得下这一屏**吗——判据是"它比 `limit` 少"。
+         *
+         * 为什么要这个数（2026-10-08 与用户的两条口径合起来想清楚的一点）：
+         * 「未读也是只读提及和之前十条」要解决的是**刷屏**（群里几百条，全倒出来就是白烧 token），
+         * 而不是"没点她的话一律不给看"。所以：
+         *   • 未读**装得下**（少于一屏）⇒ 照给全部——那几条就是"最近发生了什么"，挑不出提及不是
+         *     不给看的理由（私聊里根本没有"提及"这回事，按提及挑会把用户的整段话吞掉）；
+         *   • 未读**装不下** ⇒ 只给"点了她的那些 + 每条之前十条"，其余如实说"另有 N 条你还没看"并指路翻页。
+         */
+        const unreadFitsOneScreen = unread.length < limit;
+        /**
+         * 往回翻的落点（＝页脚或"没有新消息"那句话里让她填进 `before` 的那个数）。
+         *
+         * 规则一句话：**"还没给她看过的那一段"从哪里开始**——取"取数下界"与"最旧那条没给她的"
+         * 里更早的那个。两者都要，因为两种错都很贵：
+         *   • 只看"她看到的最旧那一条" ⇒ 会**跳过取数窗口里没给她的那几条**（既不在这一屏、
+         *     也不在下一页 ⇒ 空洞）；
+         *   • 只看"最旧那条没给她的" ⇒ 在"全给过了"时会指到自己那条上（下一页把同一批再摆一遍）。
+         * 取更早的那个只会让她在下一页**多看几条已经看过的**（无害）；两种错里任何一种都会让她
+         * **看不到**那一段（有害）。所以宁可重复，也不许漏。
+         */
+        const unreadFloor = unread.reduce(
+          (min, item) => Math.min(min, eventSeqOf(item)),
+          Number.POSITIVE_INFINITY,
+        );
+        const pageBelow = Math.min(fetchFloor, Number.isFinite(unreadFloor) ? unreadFloor : fetchFloor);
+        /**
+         * 这一屏之后**还有没有更早的**（页脚照它说"想接着往回翻"还是"到头了"）。
+         *
+         * 判据取保守的那一侧：取数窗口**装满了**（`limit` 条）就说还有——宿主只回"最近 limit 条"，
+         * 它**不回"是不是到日志开头了"**，所以取满时不能替她断言"到头了"。多说一句的代价是白翻一次，
+         * 少说一句的代价是**她以为到头了**——那一段就再也看不见了。
+         */
+        const moreBelow = pool.length >= limit;
         const caller = mentionMessage?.() ?? null;
         const calledThisTurn = caller !== null && caller.sid === sid;
-        if (!calledThisTurn && prev !== undefined && newestSeq <= prev.seq && limit <= prev.limit) {
+        // ② 真的没有新东西 ⇒ 一句话打发，不把同一段再摆一遍（2026-10-02 用户报的实测：她在一轮里
+        //    把同一个信箱连读了五遍、白花四个 step）。**但必须给她出路**（2026-10-08）：
+        //    "没有新消息"若不带指路，她会读成"这里什么都没有"，而她要的旧话其实翻得到。
+        //
+        //    判据是 `unread`（＝"比已读位更新的那些"），**不是** `fetchFloor`：两者在窗口比待读区间
+        //    窄时会分道扬镳，而那时"没有新消息"是假的（她会以为外面没人说话）。只有真的
+        //    "这一批里最新那条也在已读位之内"才算读到最新——`newestSeq` 就是判它的那个数。
+        if (unread.length === 0 && !calledThisTurn) {
           const times = bumpReadRepeat(ctx?.turn ?? 0, sid);
           // 措辞里点明"这个位置含你自己发出去的那些"：她刚 report/说过话、回头核对时，最怕把
           // 「没有新消息」读成"我那一篇不在里面"——那正是"重复发"的触发条件（`SENT_CREDENTIAL_NOTE`）。
           const mine = spoken.length === 0
             ? ''
             : '；这个位置含你自己发出去的那些，它们在下面那一屏里（行首 `（我）`）';
+          const way = moreBelow
+            ? `要看更早的（连没点你的那些）就翻页：带上 ${cursorText(pageBelow)} 重读一次`
+              + `（每页 ${READ_CHANNEL_PAGE_SIZE} 条，翻页不改已读）。`
+            : '想看更早的没有了——这个会话能看到的就这些。';
           const head = times <= 1
-            ? `${sid} 没有新消息：你已经读到最新了（停在 seq=${prev.seq}${mine}）。`
-              + '不必再翻一遍——想接着说就直接 speak，回不回、说什么都由你。'
+            ? `${sid} 没有新消息：你已经读到最新了（停在 seq=${newestSeq}${mine}）。`
+              + `不必再翻一遍——${way}想接着说就直接 speak，回不回、说什么都由你。`
             : `${sid} 还是没有新消息：这一轮你已经读过它 ${times} 次，再读返回的还是同一段`
-              + `（停在 seq=${prev.seq}${mine}）。想说话直接 speak 就行；真要往前翻，`
-              + `把 limit 调到比 ${prev.limit} 大（默认 ${READ_CHANNEL_DEFAULT_LIMIT}、上限 ${READ_CHANNEL_MAX_LIMIT}）。`;
+              + `（停在 seq=${newestSeq}${mine}）。${way}想说话直接 speak 就行。`;
           return okResult(head);
         }
-        // 读完就记账：未读归零。**先取消息、后写已读**——反过来会出现"标了已读但一条没看到"，
-        // 那种状态没有任何办法自查（她自己以为看过了，日志也说看过了，只有她知道是空的）。
-        //
-        // 两笔账各记各的：`channel/read` 里那个是**会话簿的位置**（未读按它算，口径不变，
-        // 只由**别人**的消息推进）；readState 记的是**这一屏尾巴的事件 seq**（上面那条闸的判据
-        // ——它要含她自己的凭据，否则同一篇 report 会被反复当成"新东西"照给）。
-        emit('channel/read', { sid, upToSeq } satisfies ChannelReadPayload);
-        readState.set(sid, { seq: newestSeq, limit });
+        // ③ 默认那一屏：**只给未读里"点了她的那些" + 每条之前十条**（用户 2026-10-08 的口径：
+        //    「未读也是只读提及和之前十条」——群里刷几百条，全倒出来就是白烧 token）。
+        /**
+         * 这一屏给她什么，**四个分支，判据都写在这里**（她与事后读日志的人都按这几条核对）：
+         *
+         *   ① **本进程第一次读这个会话**（重启后第一次，`prev === undefined`）⇒ 把最近一屏照给她。
+         *      这一条是"宁可多给一次、也别让她两手空空"那条既有取舍的落点，也是**已读位的起点**。
+         *   ② **这一轮就是它在叫她**（提及/@），而候选里没有新东西：v28 之后她手里只有通知、
+         *      没有正文，而叫她的那条（`wake/channel`）不计入未读、常常压在已读位之内
+         *      ⇒ 把"叫她那条为止的最近一屏"给她（2026-10-02 用户从截图上抓到的原病害就是它）。
+         *   ③ 候选里有**她自己刚发出去的行**（`speak`/`report`/`send_media` 的凭据）：窗口取到
+         *      "最新那一行为止的最近 limit 件"——她要核对"我到底发出去没有"，而那句话只有这一条路
+         *      能读到（`SENT_CREDENTIAL_NOTE` 指的就是这一屏）。
+         *   ④ 未读**装得下一屏** ⇒ 照给全部（挑不出提及不是不给看的理由，见 `unreadFitsOneScreen`）。
+         *   ⑤ 其余（未读装不下）⇒ **只给提及 + 每条之前十条**（用户 2026-10-08 的刷屏口径）。
+         *      一条提及都没有时得到空屏，走下面那个"如实说 + 指路"的分支。
+         */
+        const newestOwn = unread.filter(isChannelSpoken).at(-1);
+        // "她自己刚发出去的那一条"＝一个触发点（与提及同一套上下文规则，见 `mentionDigest`）
+        const ownTrigger = newestOwn === undefined ? Number.POSITIVE_INFINITY : eventSeqOf(newestOwn);
+        const triggered = mentionDigest(pool, prevSeq, limit, ownTrigger);
+        /**
+         * 这一屏给她什么，**五个分支，判据都写在这里**（她与事后读日志的人都按这几条核对）：
+         *
+         *   ① **本进程第一次读这个会话**（重启后第一次，`prev === undefined`）⇒ 把最近一屏照给她。
+         *      这是"宁可多给一次、也别让她两手空空"那条既有取舍的落点，也是**已读位的起点**。
+         *   ② **这一轮就是它在叫她**（提及/@），而候选里没有新东西：v28 之后她手里只有通知、
+         *      没有正文，而叫她的那条（`wake/channel`）不计入未读、常常压在已读位之内
+         *      ⇒ 把"叫她那条为止的最近一屏"给她（2026-10-02 用户从截图上抓到的原病害就是它）。
+         *   ③ 有**触发点**（提及 / 她自己刚发出去的那条）且有东西可摆 ⇒ 那一屏：
+         *      「触发点 + 每条之前十条」。触发点为什么把"她自己的行"也算进来，见 `mentionDigest`
+         *      的入参说明（她 report 完核对时，先发那一份不许在视图里消失）。
+         *   ④ 没有触发点、而未读**装得下一屏**（`unreadFitsOneScreen`）⇒ 全给她。
+         *      「未读也是只读提及和之前十条」要治的是**刷屏**（几百条全倒出来白烧 token），
+         *      不是"没点她的话一律不给看"：一屏装得下时那几条就是"最近发生了什么"，
+         *      而私聊里根本没有"提及"这回事——按提及挑会把用户的整段话吞掉。
+         *   ⑤ 其余（没有触发点、未读又装不下）⇒ 空屏，走下面那个"如实说 + 指路"的分支。
+         */
+        const digest: DigestView = prev === undefined
+          ? tailWindow(pool, limit, null)
+          : unread.length === 0
+            ? tailWindow(pool, limit, caller?.messageId ?? null)
+            : triggered.items.length > 0
+              ? triggered
+              : unreadFitsOneScreen
+                ? tailWindow(unread, limit, null)
+                : triggered;
+        const display = digest.items;
+        // ④ **已读只推进到"确实给她看过的那几条"**（用户 2026-10-08 的第二条口径原话：
+        //    「不视作已处理。提示她还有没看到的，往上翻页」）。判据是这一屏里最大的一条的事件 seq：
+        //      · 没给她的那些（没提及、没落在上下文窗口里）**保持未读**，于是下一次读
+        //        她**仍然会被告诉"还有没看到的"**——这正是用户要的；
+        //      · 往回翻的那条路上面已经 return 了，碰不到这两行。
+        const shownUpTo = display.reduce((max, item) => Math.max(max, eventSeqOf(item)), prevSeq);
+        // 没给她的那些里，**比这一屏更新的**那些条数（"还有多少你没看到"）。按事件 seq 数
+        // 而不是按 `msgSeq`：与"未读"那套口径同源（`msgSeq` 在官方单聊恒为 1，数不出东西）。
+        const notShown = pool.filter((item) =>
+          !isChannelSpoken(item) && eventSeqOf(item) > shownUpTo).length;
+        if (display.length > 0) {
+          // 已读那笔账的**唯一一处**写入：平台序号（"这条是这个会话里的第几条"），只由**别人**的
+          // 消息推进——她自己的发言从不把自己算成未读（见 mergeChannelSpeech ②）。
+          // 平台给不出时宿主填的就是事件 seq（`channel/inbox.ts` 的 `msgSeqOf`）。
+          //
+          // **只推到"这一屏里真的出现过的那几条"**：没给她的那些保持未读（用户 2026-10-08 的
+          // 第二条口径）。她自己的行不参与（`isChannelSpoken` 那一支直接跳过）——那从来不是"未读"。
+          const upToSeq = display.reduce(
+            (max, item) => (isChannelSpoken(item) ? max : Math.max(max, item.msgSeq)),
+            0,
+          );
+          if (upToSeq > 0) emit('channel/read', { sid, upToSeq } satisfies ChannelReadPayload);
+        }
+        readState.set(sid, {
+          seq: Math.max(shownUpTo, prevSeq),
+          limit,
+          // "还有 N 条没看到"那句的判据：N 没变就不再重复说一遍（同一批连读两次不该把同一句
+          // 提示摆两遍）。N 变了（又来了没提及的新话）就照说——那句提示是**新的信息**。
+          pending: notShown,
+          // 页脚那个落点（见上面 `pageBelow` 的口径说明）：只用于"她下次翻页该填哪个数"，
+          // 与判"新不新"的 `seq` 是两件事，所以分开记、只增不减地往前推。
+          pageBelow,
+        });
         bumpReadRepeat(ctx?.turn ?? 0, sid);
 
-        const entry = sessionEntryOf(messages[0]!);
-        const where = sessionLabelOf({ channel: messages[0]!.channel, chatType: messages[0]!.chatType });
-        // 按时间轴合批（她的行插在外部消息中间），再压回 limit —— 一屏就是这么多行
-        const batch = mergeChannelSpeech(messages, spoken, limit);
-        const mine = batch.filter(isChannelSpoken).length;
-        // 头一行把两件事都说清：这一屏几行、其中她自己的几行——她据此决定要不要把 limit 调大
+        if (display.length === 0) {
+          // 走到这里只有一种情形：这个会话里**只剩"没点她"的新话**（提及一条都没有，
+          // 她自己也没在里头说过新的）。**不改已读位**（一条都没给她看，凭什么说看过了），
+          // 但**必须指路**——"没有点你的新消息"不带出路，她会以为这里什么都没有。
+          const asked = pool.filter((item) => !isChannelSpoken(item)).length;
+          return okResult(
+            `${sid} 没有点了你的新消息`
+            + `（这里攒着 ${asked} 条没点你的新话，先不摆出来）。`
+            + `想看就翻页：带上 ${cursorText(pageBelow)} 重读一次`
+            + `（每页 ${READ_CHANNEL_PAGE_SIZE} 条，翻页不改已读），`,
+          );
+        }
+
+        const anchor = display.find((item): item is ChannelMessageView => !isChannelSpoken(item))
+          ?? messages[0]!;
+        const mineCount = display.filter(isChannelSpoken).length;
+        const atCount = display.filter((item) => digest.mentioned.has(eventSeqOf(item))).length;
+        // 头一行把这一屏的成分说清：几条在点她、其中她自己的几行——她据此决定要不要接着翻
         //（不报的话，"我说过的话怎么不见了"在下一次读更窄的窗口时会变成一次误判）。
-        const composition = mine === 0 ? '' : `，其中你自己的发言 ${mine} 行`;
-        const head = `${sid} 最近 ${batch.length} 条${composition}（本机时间，正序；已标记读过 seq=${latestSeq}）· ${where}`;
-        return okResult(`${head}\n${renderReadBatch(batch, entry, messages[0]!).join('\n')}`);
+        const composition = (atCount === 0 ? '' : `，其中点你的 ${atCount} 条`)
+          + (mineCount === 0 ? '' : `，其中你自己的发言 ${mineCount} 行`);
+        // 「还有 N 条你还没看」只在"确实有没给她的未读"时出现（判据只有 `notShown` 一个）；
+        // 与上一屏同一个数就不重复说（除非这一轮是它在叫她——她正要回那句话，这个数有用）。
+        const pending = notShown > 0 && (notShown !== prev?.pending || calledThisTurn)
+          ? `另有 ${notShown} 条你还没看——往上翻页：带上 ${cursorText(pageBelow)} 重读一次`
+            + `（每页 ${READ_CHANNEL_PAGE_SIZE} 条，翻页不改已读）`
+          : null;
+        return okResult([
+          `${sid} 最近 ${display.length} 条${composition}（本机时间，正序；已标记读过 seq=${shownUpTo}）`
+          + ` · ${whereOf(anchor)}`,
+          ...renderReadBatch(display, sessionEntryOf(anchor), anchor, digest.mentioned),
+          // 默认那一屏**也要给"下一页怎么翻"**（2026-10-08：返回里必须告诉她还有没有更多、
+          // 下一页怎么翻；不给的话她只能反复拉同一屏）。游标是这一屏取数的下界：
+          // 翻过去正好接上"这一屏之前"的那一段，不重不漏；上面真的没有更早的了就如实说。
+          pagingFooter({
+            nextBefore: pageBelow,
+            more: moreBelow,
+            truncated: false,
+            limit: READ_CHANNEL_PAGE_SIZE,
+          }),
+          ...(pending === null ? [] : [pending]),
+        ].join('\n'));
       } catch (err) {
         return errorResultFromThrown(err, TOOL_ERROR_CODES.invalidArgs);
       }
@@ -2406,7 +2755,12 @@ interface ChannelReadPayload {
 }
 
 /**
- * `read_channel` 的 limit：缺省 20、上限 100。
+ * `read_channel` 的 limit：缺省 20（`READ_CHANNEL_DEFAULT_LIMIT`）、上限 100。
+ *
+ * **两个数各管一件事**（2026-10-08 的补充，别把它们混起来）：
+ *   • 这里的 20 是**默认那一屏**的行数（未读里点她的那些 + 每条之前十条，再压到 20 行）；
+ *   • 翻页那一页是 `READ_CHANNEL_PAGE_SIZE`（50）——**缺省值只有一个**，翻页那页也走这里，
+ *     由页脚照本页实际的行数告诉她下一页怎么翻（口径只有一处，见 `pagingFooter`）。
  *
  * 上限不是"省 token"那么简单：她要是给个 100000，这一条工具结果就会把整段上下文挤掉——
  * 而工具结果是要**逐轮重发**的（不像日志读一次就完了）。宁可让她多调几次，
@@ -2422,6 +2776,213 @@ function readLimit(raw: unknown): number {
     throw new ToolArgumentError('limit', `limit 至少是 1，收到 ${value}（要清空未读也一样：读一条就标记读了）`);
   }
   return Math.min(value, READ_CHANNEL_MAX_LIMIT);
+}
+
+/**
+ * 解那个翻页游标（`before`）：**给不出来就当场报参数错并指路**，不静默给空。
+ *
+ * 为什么这里对字符串也宽容（与 `limit` 那种"非数字就拒"不同）：页脚印给她的正是
+ * `before=1234` 这个形态，她原样抄回来是最自然的动作——`"1234"` 与 `1234` 对她来说是同一个
+ * 意思，为这个把调用打回去只是白花一个 step。但**只认整串是正整数的**：`"12abc"`、`"1.5"`、
+ * 负数、`"0"` 一律拒——它们都不是事件 seq，猜一个值比报错坏得多（猜错就是静默给了另一段历史）。
+ */
+function readCursor(raw: unknown): ReadCursor | null {
+  if (raw === undefined || raw === null) return null;
+  const text: unknown = typeof raw === 'string' ? raw.trim() : raw;
+  // 空串当"没给"（有些调用方会顺手填一个空字符串）
+  if (text === '') return null;
+  const numeric = typeof text === 'number' ? text : typeof text === 'string' && /^[0-9]+$/u.test(text) ? Number(text) : Number.NaN;
+  if (!Number.isFinite(numeric) || Math.floor(numeric) !== numeric || numeric < 1) {
+    throw new ToolArgumentError(
+      'before',
+      `before 是翻页游标，只认你在上一屏页脚看到的那个正整数的 seq：收到 ${JSON.stringify(raw)}。`
+      + '页脚那一行长这样：`（想接着往回翻就带上 before=1234 重读，或者 limit 更大再看远一点）`'
+      + '——把那个数原样填进 before 就行。不翻页就别给这个参数（默认那一屏就够了）。',
+    );
+  }
+  return { before: numeric };
+}
+
+/** 一屏的**形状**：给她看的那些行、以及其中哪几条是"点了她"的（渲染只认这两样） */
+interface DigestView {
+  items: ReadChannelItem[];
+  /** 这一屏里**点了她**的那些（按事件 seq）；渲染时行首加标记，判据只有这一份 */
+  mentioned: ReadonlySet<number>;
+}
+
+/** `mentionDigest` 的结论：一屏之外还多两句"如实说"的素材（还有几条提及、有没有被上限挤掉） */
+interface MentionDigest extends DigestView {
+  /** 这一批未读里一共挑出了几条提及（可能多于这一屏装下的——那时如实说还有几条） */
+  allMentions: number;
+  /** 有没有东西因为行数上限被挤掉（true = 页脚要如实说她还能看更远） */
+  truncated: boolean;
+}
+
+/**
+ * 默认那一屏的取法：**未读里只挑"点了她的那些"，每条之前带十条上下文**（用户 2026-10-08 的口径
+ * 原话：「未读也是只读提及和之前十条」——群里刷几百条，全倒出来就是白烧 token）。
+ *
+ * 规则逐条写在这里（她与事后读日志的人都按这几条核对）：
+ *   ① **候选**：事件 seq **大于 `prevSeq`** 的那些（`prevSeq` = 上一屏给她看过的最大事件 seq，
+ *      含她自己的凭据）——已读过的不再倒一遍，那是用户要避免的白花 token；
+ *   ② **提及**：候选里 `mentionsMe === true` 的那些（`group-at` 或适配器/关键词判定，判据在宿主，
+ *      见 `ChannelMessageView.mentionsMe`）；**私聊里没有"提及"这回事**，所以私聊默认只走
+ *      "没有点你的新消息"那一支（她的私聊一律唤醒，正文当场就进了上下文）；
+ *   ③ **上下文**：每条提及**之前最多 `READ_CHANNEL_MENTION_CONTEXT` 件**（同池、按时间正序，
+ *      含她自己说过的行——时间轴只有一条，"他这句话是在接什么"要按时间去读）。
+ *      **多提要之间去重**：同一件不会因为落在两条提及的窗口里出现两次；
+ *   ④ **上限**：整屏最多 `limit` 件。装不下时**从最旧的一头整条整条地丢**（不切开一条提及的
+ *      上下文窗口），并在页脚如实说"还有几条提及没列出来"。丢最旧的而不是最新的：最新的那句
+ *      才是"现在在叫她"的那句。
+ *
+ * 返回值里的 `truncated` 是**"有东西被上限挤掉"的判据**，页脚照它说话（不另算一遍）。
+ */
+function mentionDigest(
+  pool: readonly ReadChannelItem[],
+  prevSeq: number,
+  limit: number,
+  /**
+   * **她自己在窗口里说过新的**那条（事件 seq）——它算一个"触发点"，与提及同一套待遇。
+   *
+   * 为什么要它（2026-10-08 真链路用例抓到的形状）：她连着 report 两份、第二份刚到，
+   * 只给她"最新的那一行"时**先发那一份在视图里消失了**——她会以为那一份没发出去，于是再发一遍，
+   * 而那正是 `SENT_CREDENTIAL_NOTE` 要治的病。带上它之前十条上下文，两份就都在同一屏里。
+   *
+   * `Number.POSITIVE_INFINITY` = 没有她自己的新行（那时它一个触发点都不加）。
+   */
+  ownTriggerSeq: number = Number.POSITIVE_INFINITY,
+): MentionDigest {
+  /**
+   * **触发点从"未读"里挑**：只有她还没看过的东西才值得开一屏。
+   *
+   * 为什么触发点收得这么紧：`wake/channel` 那种"已经进过上下文"的消息再触发一次，她就会
+   * 反复看到同一段（2026-10-02 报的"一轮连读五遍"就是这个形状）。
+   */
+  const unread = pool.filter((item) => eventSeqOf(item) > prevSeq);
+  const spoken = unread.filter(isChannelSpoken);
+  const unreadMessages = unread.filter((item): item is ChannelMessageView => !isChannelSpoken(item));
+  const mentionAt = new Set(
+    unreadMessages.filter((item) => item.mentionsMe === true).map((item) => eventSeqOf(item)),
+  );
+  // 触发点＝"点了她的那些" ∪ "她自己刚发出去的那一条"（两者同一套上下文规则）
+  const triggers = new Set(mentionAt);
+  if (Number.isFinite(ownTriggerSeq)) triggers.add(ownTriggerSeq);
+  if (triggers.size === 0) {
+    return { items: [], mentioned: new Set(), allMentions: 0, truncated: false };
+  }
+  /**
+   * **上下文从哪里取**——两个来源，判据是"在这个会话里，那段历史是不是她自己的"：
+   *
+   *   • **提及**：上下文取"未读那一段"（`unread`）。别人早说过的话她当初就在上下文里，
+   *     再倒一遍正是用户要避免的白花 token；
+   *   • **她自己发出去的行**：上下文取**整个取数窗口**（`pool`）。因为"我这一篇发出去没有"
+   *     这个动作只有这一条路能回答，而她**看不到自己刚发出去的东西**时会怎么想是固定的
+   *     ——"没发出去"⇒ 再发一遍（2026-10-07 报的重复发就是这么来的，见 `SENT_CREDENTIAL_NOTE`）。
+   *     实测形状（`test/channel-wire.test.ts` 那条回归用例）：她连着报两份，第二份刚到；
+   *     若上下文只从未读取，第一份那条**不在未读里**（她刚看过），于是视图里只剩最后一行——
+   *     她会以为第一份丢了。取整窗口时"她这一段话"就连着摆出来了。
+   *
+   * 两者**不会**让已读的旧话重新倒一遍：窗口只有"触发点之前那十件"这么窄，
+   * 而"要不要开这一屏"仍然由未读里的触发点决定（见上）。
+   */
+  const at = new Map<number, number>(); // 事件 seq → 它在某个窗口里的下标
+  pool.forEach((item, index) => at.set(eventSeqOf(item), index));
+  const unreadAt = new Map<number, number>();
+  unread.forEach((item, index) => unreadAt.set(eventSeqOf(item), index));
+  // 从**最新的一个触发点**往回走，一条一条地攒它和它之前那十件；攒到装不下就停。
+  // 这样丢掉的永远是**最旧**的那几条（与"先看最近的"这条口径一致）。
+  //
+  // 两条提及挨得近时它们的窗口会重叠：**按事件 seq 去重**（重叠段只给一次）。
+  // 这一条踩过（2026-10-08 实测）：不去重时同一句会在几行之内出现两次——她读到的是一段
+  // 自己重复了的对话，而"重复"正是这一屏最该避免的东西（她会以为那边说了两遍）。
+  const kept = new Map<number, ReadChannelItem>();
+  const order = [...triggers].sort((a, b) => b - a); // 最新的触发点排前面
+  let used = 0;
+  let total = 0;
+  for (const seq of order) {
+    const own = seq === ownTriggerSeq;
+    const source = own ? pool : unread;
+    const index = (own ? at : unreadAt).get(seq);
+    if (index === undefined) continue;
+    const from = Math.max(0, index - READ_CHANNEL_MENTION_CONTEXT);
+    const window = source.slice(from, index + 1);
+    total += window.length;
+    // 与已留下的窗口重叠时，**整屏的净增**是"这一窗里还没有的那些件"
+    const fresh = window.filter((item) => !kept.has(eventSeqOf(item))).length;
+    if (used + fresh > limit && kept.size > 0) break;
+    for (const item of window) kept.set(eventSeqOf(item), item);
+    used += fresh;
+    if (used >= limit) break;
+  }
+  // 按时间正序交出去（Map 的插入顺序是"从新到旧"，不能直接用）
+  const items = sortByTimeline([...kept.values()]);
+  const shown = new Set(items.map((item) => eventSeqOf(item)));
+  return {
+    items,
+    mentioned: new Set([...mentionAt].filter((seq) => shown.has(seq))),
+    allMentions: mentionAt.size,
+    truncated: total > items.length || spoken.length + unreadMessages.length > items.length,
+  };
+}
+
+
+/**
+ * "这一轮就是它在叫她"时的那一屏：**取到叫她那条为止的最近 `limit` 件**（含她的行）。
+ *
+ * 为什么需要它（2026-10-08 的取舍）：v28 之后群里被 @ 的那一轮，她手里**只有通知、没有正文**
+ * （正文要她自己 `read_channel` 取）；而"默认只给提及 + 前十条"这条口径下，叫她的那条
+ * （`wake/channel`）可能**压在已读位之内**（不计入未读）或比取回来的窗口更早 ⇒ 一条提及都挑不出来，
+ * 她会得到一屏与那句原话无关的旧话（2026-10-02 用户从截图上抓到的正是这个形状）。
+ *
+ * `callerMessageId` 是叫她那条消息的平台 id（`mentionMessage()` 给的）：窗口**从它开始往回数**，
+ * 于是"那句原话"必然在这一屏里。认不出它时退回"最近 limit 件"——那仍是她此刻最该看到的几行。
+ */
+function tailWindow(
+  pool: readonly ReadChannelItem[],
+  limit: number,
+  callerMessageId: string | null,
+): DigestView {
+  const at = callerMessageId === null
+    ? -1
+    : pool.findIndex((item) => !isChannelSpoken(item) && item.messageId === callerMessageId);
+  return {
+    items: at < 0 ? pool.slice(-limit) : pool.slice(Math.max(0, at + 1 - limit), at + 1),
+    mentioned: new Set(),
+  };
+}
+
+/**
+ * 翻页页脚：**"还有没有更多 + 下一页怎么翻"**（用户 2026-10-08：「返回里必须给"还有没有更多 +
+ * 下一页怎么翻"」）。
+ *
+ * 形态固定一行，`before=` 后面那个数就是**下一页的游标**——取法只有一条：这一屏**最旧那一件**的
+ * 事件 seq（`<` 是严格比较，所以它自己不会在下一页重复出现）。她只要抄那个数就够了，
+ * 不必理解 seq 是什么。
+ *
+ * 为什么游标是"最旧那一件的事件 seq"而不是页码：新消息落库只会拿到更大的 seq，
+ * 改不了"更早那一段"的成员——页码会随新消息整体平移，翻第二页时会重读第一页。
+ */
+function pagingFooter(input: {
+  /** 下一页的游标 */
+  nextBefore: number;
+  /** 这一屏之前还有没有更早的 */
+  more: boolean;
+  /** 有没有因为行数上限被截断（截断了就提醒她把 limit 调大） */
+  truncated: boolean;
+  /** 本页实际用的行数上限（**照它指路**，别拿一个别的数糊弄她） */
+  limit: number;
+}): string {
+  if (!input.more) {
+    return `（本机时间；已经翻到头了——${cursorText(input.nextBefore)} 之前没有更早的消息。`
+      + '想回到现在就不带 before 读一次。）';
+  }
+  const wider = input.truncated ? `，或者 limit 更大再看远一点（上限 ${READ_CHANNEL_MAX_LIMIT}）` : '';
+  return `（想接着往回翻就带上 ${cursorText(input.nextBefore)} 重读一次，一页 ${input.limit} 条${wider}）`;
+}
+
+/** 会话那一份人读标签（"QQ 官方 Bot API · 群聊"）——头一行与页脚共用这一处 */
+function whereOf(message: ChannelMessageView): string {
+  return sessionLabelOf({ channel: message.channel, chatType: message.chatType });
 }
 
 /**

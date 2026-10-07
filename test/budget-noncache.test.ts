@@ -197,15 +197,23 @@ test('④ 回归：step / turn 两层数的是次数，与 token 口径无关（
   assert.equal(p.budget.stepsThisTurn, 20);
   assert.equal(p.budget.toolCallsThisStep, 1);
   assert.equal(p.budget.tokensToday, 10, 'token 那边只加了输出');
-  assert.equal(guard.checkBeforeStep(p), null, '20 步 / 1 次调用都没到线（30 / 20）');
+  assert.equal(
+    guard.checkBeforeStep(p), null,
+    `20 步 / 1 次调用都没到线（turn ${budget.turnSteps} / step ${budget.stepTools}）`,
+  );
 
   // 单步超限：第 21 次工具调用才越线（`>` 语义，与改口径前一致）
   assert.deepEqual(guard.limitStepCalls(Array.from({ length: 23 }, (_, i) => `c${i}`)), {
     allowed: Array.from({ length: 20 }, (_, i) => `c${i}`),
     over: ['c20', 'c21', 'c22'],
   });
-  // 单轮达上限即停（`>=` 语义）
-  applyOne(p, evt('step/start', { turn: 1, step: 30, model: 'm', lane: 'heavy', renderVersion: 'v', personaHash: 'h' }));
+  // 单轮达上限即停（`>=` 语义）。
+  // 步数**按出厂值取**（不是写死 30）：这条用例判的是"turn 那一层数的是次数、与 token 口径无关"，
+  // 不是"出厂 turnSteps 等于多少"——那个数字由 test/config.test.ts 的地板那条钉着。
+  // 写死的话，出厂值一改这条就变成"什么都没测"（而不是失败），那是最坏的一种测试。
+  applyOne(p, evt('step/start', {
+    turn: 1, step: budget.turnSteps, model: 'm', lane: 'heavy', renderVersion: 'v', personaHash: 'h',
+  }));
   assert.deepEqual(guard.checkBeforeStep(p), { kind: 'budget-exhausted', layer: 'turn' });
 });
 

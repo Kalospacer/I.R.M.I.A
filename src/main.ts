@@ -579,7 +579,8 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       // read_channel 的两个注入点（v32）：消息要现读日志、名字要现读她的别名表与联系人表，
       // 两样都在循环层手里（它持有 EventLog 与会话簿）。catalog 先于 RealLoop 就位，
       // 所以同样走惰性取值——调用发生在 turn 里，那一刻的循环才是要用的那个。
-      channelReader: async (sid, limit) => await realLoopRef.current?.readChannelMessages(sid, limit) ?? [],
+      channelReader: async (sid, limit, before) =>
+        await realLoopRef.current?.readChannelMessages(sid, limit, before) ?? [],
       // 她自己在这个会话里说过的话（2026-10-04 用户："read channel 返回的结果里应该包含 bot
       // 自己的 speak"）。同一个循环层的口——它读的是 speak 的投递回执，工具层不碰日志。
       channelSpokenReader: async (sid) => await realLoopRef.current?.readChannelSpoken(sid) ?? [],

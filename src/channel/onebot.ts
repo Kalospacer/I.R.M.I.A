@@ -1380,6 +1380,31 @@ export class OneBotChannel implements ChannelAdapter {
 /** 回投地址的 scheme：`onebot:<chatType>:<chatId>`（与普通通道的 `qq:` 并行，各占自己的命名空间） */
 export const ONEBOT_REPLY_SCHEME = 'onebot:';
 
+/**
+ * 这个通道名**是不是 OneBot 家族**（默认名 `onebot` 与它的别名实例 `onebot-*` 都算）。
+ *
+ * 为什么需要它（2026-10-08）：这条判据过去在仓库里**被硬编码写了四遍**
+ * （`tools/admin.ts` 的 `replyUrlForWake`、`channel/media-poster.ts`、
+ *   `channel/sessions.ts` 的命名空间、`channel/warn-exempt.ts` 的豁免名单），
+ * 每处都是 `x === 'onebot'`。而**通道名可以是别名**——`OneBotClientOptions.channelName`
+ * 明摆着允许（本仓测试用的就是 `'onebot-b'`），于是别名实例：
+ *   · `replyUrlForWake` 把它当非 OneBot ⇒ 回投地址造错命名空间 ⇒ **静默回投不出去**
+ *     （比投错地址更坏：没有任何报错）；
+ *   · `sidNamespaceOf` 把它的会话**塞进 `qq:` 命名空间** ⇒ 别名实例的会话与官方 QQ 的会话
+ *     混在一起（本机没开别名实例，所以这个一直没露过面）。
+ *
+ * 收成**一处**，四边共用：一处改、四处跟着对，不再出现"只改了一处"。
+ *
+ * 判据的**依据**：OneBot 家族的回投地址 scheme 是 `onebot:`（见上面那个常量），
+ * 而这个 scheme 是**适配器自己**在造地址时写下的（携带别名实例的 `chatType`/`chatId`），
+ * 所以"是 OneBot 家族"这件事在 URL 上本来就是确凿的。名字这一层则按
+ * `onebot` 或 `onebot-<后缀>` 认——与 `channelName` 的既有用法一致（`onebot-b`）。
+ */
+export function isOneBotFamilyChannel(channel: string | undefined): boolean {
+  if (channel === undefined) return false;
+  return channel === ONEBOT_CHANNEL_NAME || channel.startsWith(`${ONEBOT_CHANNEL_NAME}-`);
+}
+
 /** 把 wake/channel 数据编成回投 URL（**归一形态**：群聊一律 `group`，与 sid 同一个口径） */
 export function replyUrlOf(data: Pick<WakeChannel['data'], 'chatType' | 'chatId'>): string {
   return `${ONEBOT_REPLY_SCHEME}${sidKindOf(data.chatType)}:${data.chatId}`;

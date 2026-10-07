@@ -731,7 +731,12 @@ function buildDefaults(dir: string): AppConfig {
     },
     budget: {
       stepTools: 20,
-      turnSteps: 30,
+      // 出厂单 turn 步数上限 = 60（**次数**，与 token 口径无关）：对齐现场 config.json 的实测值
+      //（`budget.turnSteps: 60`）。
+      //
+      // ⚠️ 写**十进制字面量**（不写 `6e1`、也不写算式）：出包脚本 Read-CodeDefaults 按正则抓字段
+      // 默认值，算式抓不到就当场拒绝出包（"字段改名了？"）。理由与下面 taskTokens 那条同源。
+      turnSteps: 60,
       // 出厂单任务额度 = 5e8 —— **非缓存口径**。
       //
       // 口径 = `(inputTokens − cacheHitTokens) + outputTokens`：**输入里没命中缓存的那部分 + 输出**，
@@ -800,7 +805,15 @@ function buildDefaults(dir: string): AppConfig {
       charsPerMinute: 90,
     },
     persona: {
-      compactionThresholdTokens: 32_000,
+      // 出厂压缩阈值 = 100000（可见历史估算超过它就压一次）：对齐现场 config.json 的实测值
+      //（`persona.compactionThresholdTokens: 100000`）。
+      //
+      // 为什么现场从 32000 抬到了 100000：32000 太勤——可见历史刚过 3 万 token 就压一次，
+      // 摘要本身也要花一次 light 调用，压得太勤反而把"省上下文"变成"多花钱"。
+      //
+      // ⚠️ 写**十进制字面量**（不写 `1e5`、也不写算式）：出包脚本 Read-CodeDefaults 按正则抓字段
+      // 默认值，算式抓不到就当场拒绝出包（"字段改名了？"）。理由与 budget.taskTokens 那条同源。
+      compactionThresholdTokens: 100_000,
       handoffBudgetTokens: 4_096,
       handoffFoldTokens: 1_024,
       owner: 'owner',
@@ -971,6 +984,8 @@ function defaultDocument(dir: string): JsonObject {
       $comment: [
         '三层刹车 + 每日额度 + 软阈值（design.md §4.6）。全部跨重启累计。',
         'softRatio：达到 上限×ratio 时先提示模型收尾，越过才硬停。',
+        'stepTools 默认 20 / turnSteps 默认 60：这两层数的是**次数**（不是 token）。单 step 最多 20 次工具调用、',
+        '  单 turn 最多 60 个 step；它们是防跑飞的兜底，正常任务离它们很远。改完要重启进程才生效。',
         'taskTokens / dailyTokens 的口径是**非缓存**的 token 数 = (input − cacheHit) + output：',
         '  只算输入里没命中缓存的那部分 + 输出，也就是"真花钱的那部分"。命中缓存的那一大截不算，',
         '  因为心跳每拍约 97% 的输入都是缓存命中，按未扣缓存的口径算，计数器会飞快见顶。',
@@ -1029,7 +1044,7 @@ function defaultDocument(dir: string): JsonObject {
     persona: {
       $comment: [
         '人格连续性与上下文压缩（design.md §4.11/§4.13、persona.md §4）。',
-        'compactionThresholdTokens：可见历史估算超过它就在 turn 结束时压缩（写 compaction/summary，历史只遮蔽不重写）。',
+        'compactionThresholdTokens：可见历史估算超过它就在 turn 结束时压缩（写 compaction/summary，历史只遮蔽不重写）。默认 100000：这个量级够一段完整工作留在可见历史里，又远在上下文上限之下；调小会压得更勤（每次压缩自己也要花一次调用）。',
         'handoffBudgetTokens / handoffFoldTokens：交接笔记的总预算与最近条目的单条满预算。',
         'owner：本机用户的档案标识。你在聊天框说话时它会作为 person 注入，于是 persona/RELATIONSHIPS/<owner>.md 自动生效——文件名必须和这里一致（默认 owner）。',
         'memoryEnabled：**框架代管记忆**的总开关，默认 true（框架生成 MEMORIES/INDEX.md、每轮注入索引、每日 4 点整理、并维护 !pinned 与条目 TTL）。',

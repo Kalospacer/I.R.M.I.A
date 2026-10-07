@@ -21,6 +21,7 @@
  *   不同的记忆，而"她以为群里只来过三条"这种错在界面上看不出来。
  */
 import type { AppEvent, ChannelMessage, ChannelRead, WakeChannel } from '../log/types.js';
+import { isOneBotFamilyChannel } from './onebot.ts';
 
 /** 通道显示名：与 GUI 频道页、web/pages/channels.js 同一套词 */
 export const CHANNEL_LABELS: Record<string, string> = {
@@ -37,9 +38,15 @@ export const CHAT_TYPE_LABELS: Record<string, string> = {
   dm: '频道私信',
 };
 
-/** 会话标识的命名空间：与回投 scheme 共用一套（qq: / onebot:） */
+/**
+ * 会话标识的命名空间：与回投 scheme 共用一套（qq: / onebot:）。
+ *
+ * ⚠️ 判据走 `isOneBotFamilyChannel`（**覆盖别名实例** `onebot-*`）。原来写的是
+ * `channel === 'onebot'`，于是别名实例（`channelName: 'onebot-b'`）的会话被塞进
+ * **`qq:` 命名空间**，与官方 QQ 的会话混在一起——同一处硬编码在仓库里的第三份。
+ */
 export function sidNamespaceOf(channel: string): string {
-  return channel === 'onebot' ? 'onebot' : 'qq';
+  return isOneBotFamilyChannel(channel) ? 'onebot' : 'qq';
 }
 
 /**
