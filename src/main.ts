@@ -857,6 +857,16 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
    * 遇上恒 0 永远为假，她会把它读成"又是上一次那条"而不回（报告 §3.4）。
    */
   const onChannelMessage = (data: WakeChannel['data']): void => {
+    // 群聊开关（本地补丁 2026-10-08）：黑名单 / 白名单之外的群消息直接丢弃，
+    // 不落库、不进信箱——群多了之后连信箱都是噪音（用户 2026-10-08 拍板）。
+    // 注意 chatId 在这里是群 openid（qq-official 的群消息），不是群号。
+    if (data.chatType === 'group' || data.chatType === 'group-at') {
+      const g = config.channels.qqOfficial;
+      const dropped =
+        g.blockedGroups.includes(data.chatId) ||
+        (g.allowedGroups.length > 0 && !g.allowedGroups.includes(data.chatId));
+      if (dropped) return;
+    }
     // 文本提及（关键词）也算"在叫她"：判据在分流器里，这里只把**结论**记进事件
     // （`mentionsMe` 让渲染层说出"提到了你"而不是"@ 了你"——她据此判断该怎么接）。
     // **只有群聊才有"提及"这回事**：私聊里人家本来就在跟她说话，句子里带上名字是常事，

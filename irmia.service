@@ -1,0 +1,28 @@
+[Unit]
+Description=IRMIA Resident Agent (Node backend)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/irmia
+ExecStart=/usr/bin/node dist/main.js
+Restart=on-failure
+RestartSec=15
+# ── 密钥（部署时由重装脚本从环境变量注入，不要写进这个备份文件）──
+# Environment=IRMIA_API_KEY=
+# Environment=QQ_BOT_APP_ID=
+# Environment=QQ_BOT_CLIENT_SECRET=
+# ── 沙箱代理（无密码版，稳定配置，ws-client 的 CONNECT 补丁依赖它）──
+Environment=http_proxy=http://hatch-egress-proxy:3128
+Environment=https_proxy=http://hatch-egress-proxy:3128
+Environment=all_proxy=http://hatch-egress-proxy:3128
+Environment=HTTP_PROXY=http://hatch-egress-proxy:3128
+Environment=HTTPS_PROXY=http://hatch-egress-proxy:3128
+Environment=ALL_PROXY=http://hatch-egress-proxy:3128
+Environment=no_proxy=localhost,127.0.0.1,::1,[::1],198.19.0.1,198.19.0.2
+Environment=NO_PROXY=localhost,127.0.0.1,::1,[::1],198.19.0.1,198.19.0.2
+Environment=NODE_USE_ENV_PROXY=1
+Environment=NODE_EXTRA_CA_CERTS=/run/hatch/egress-tls/ca-bundle.pem
+
+[Install]
+WantedBy=multi-user.target

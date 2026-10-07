@@ -595,6 +595,13 @@ export interface ChannelsConfig {
      * 一起看——看了也不一定说话（要不要发言由她自己定）。0 = 不攒，每条都唤醒。
      */
     groupBatchMinutes: number;
+    /**
+     * 群聊开关（本地补丁 2026-10-08）：群 openid 白名单 / 黑名单。
+     * allowedGroups 非空 → 只有名单里的群能唤醒她；blockedGroups 里的群永远无视（黑名单优先）。
+     * 被挡掉的群消息直接丢弃，不落库、不进信箱；都空 = 不限制（任何群 @ 她都回）。
+     */
+    allowedGroups: string[];
+    blockedGroups: string[];
   };
   /**
    * OneBot 11 通道（NapCat / go-cqhttp 等协议端的正向 WebSocket）。默认关闭。
@@ -834,6 +841,8 @@ function buildDefaults(dir: string): AppConfig {
         useMarkdown: true,
         clientSecretEnv: DEFAULT_QQ_CLIENT_SECRET_ENV,
         groupBatchMinutes: DEFAULT_QQ_GROUP_BATCH_MINUTES,
+        allowedGroups: [],
+        blockedGroups: [],
       },
       onebot: {
         enabled: false,
@@ -1417,6 +1426,9 @@ function parseQqOfficialChannel(raw: JsonValue | undefined, base: ChannelsConfig
     clientSecretEnv: pickEnvName(obj['clientSecretEnv'], 'channels.qqOfficial.clientSecretEnv', base.clientSecretEnv),
     // 0 合法（= 不攒批，每条都唤醒），所以下限是 0；上限 1440（一天）——再大就不是「攒一会儿」了
     groupBatchMinutes: pickInt(obj['groupBatchMinutes'], 'channels.qqOfficial.groupBatchMinutes', base.groupBatchMinutes, 0, 1440),
+    // 群聊开关（本地补丁）：白名单 / 黑名单，群 openid 数组
+    allowedGroups: pickToolNameList(obj['allowedGroups'], 'channels.qqOfficial.allowedGroups', base.allowedGroups),
+    blockedGroups: pickToolNameList(obj['blockedGroups'], 'channels.qqOfficial.blockedGroups', base.blockedGroups),
   };
   const apiBase = pickHttpUrlOptional(obj['apiBase'], 'channels.qqOfficial.apiBase');
   if (apiBase !== undefined) out.apiBase = apiBase;

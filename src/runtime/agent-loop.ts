@@ -645,6 +645,13 @@ class TurnRunner {
   private turn = 0;
   private step = 0;
   private spoke = false;
+  /**
+   * 兜底补丁（本地，2026-10-08）：本 turn 是否调过 speak/report。
+   * 模型有时直接输出文字不调工具，话就发不出去——endTurn 时检查这个标记。
+   */
+  private spokeViaTool = false;
+  /** 本 turn 模型最后一次输出的非空文本（兜底发言用） */
+  private lastAssistantText: string | null = null;
   /** 本 turn 的 turn/start 事件 seq：压缩事件（compaction/summary）的闸蔽点 */
   private turnStartSeq = 0;
   /**
@@ -693,10 +700,14 @@ class TurnRunner {
     this.turnStartSeq = start.seq;
     // 上一轮中途插入的唤醒记在集合里；新的一轮重新开始记（它只用来防同一轮重复落账）
     this.claimedMidTurn.clear();
+    // 兜底补丁：每轮重置发言标记
+    this.spoke = false;
+    this.spokeViaTool = false;
+    this.lastAssistantText = null;
 
     const claimed = this.claimInput();
     // 没有输入可认领：无事可做。仍写 turn/start + turn/end，让"空拍"在日志里有据可查
-    if (claimed.wakeSeqs.length === 0) return this.endTurn({ kind: 'completed' });
+    if (claimed.wakeSeqs.length === 0) return await this.endTurn({ kind: 'completed' });
 
     // Wake 钩子（design §4.19）：唤醒时注入附加输入，排进本 turn 的尾部 developer 通道。
     //
@@ -718,13 +729,13 @@ class TurnRunner {
     for (;;) {
       // 刹车优先于智能：每 step 边界重新判定（§4.6）
       const verdict = this.deps.budget?.checkBeforeStep(this.projection) ?? null;
-      if (verdict !== null) return this.endTurn(verdict);
-      if (this.deps.signal?.aborted === true) return this.endTurn({ kind: 'aborted', cause: 'signal' });
+      if (verdict !== null) return await this.endTurn(verdict);
+      if (this.deps.signal?.aborted === true) return await this.endTurn({ kind: 'aborted', cause: 'signal' });
 
       this.step += 1;
       const outcome = await this.runStep(firstStep);
       firstStep = false;
-      if (outcome !== null) return this.endTurn(outcome);
+      if (outcome !== null) return await this.endTurn(outcome);
     }
   }
 
@@ -772,7 +783,10 @@ class TurnRunner {
     };
     if (interrupted) assistant['interrupted'] = true;
     this.write('message/assistant', assistant, { sync: true });
-    if (text !== null && text.trim() !== '') this.spoke = true;
+    if (text !== null && text.trim() !== '') {
+      this.spoke = true;
+      this.lastAssistantText = text; // 兜底用：记住最后一段话
+    }
 
     if (result.reasoning.length > 0) {
       // 思维链只供复盘（渲染层剥离，缓存铁律 3），丢了不影响正确性：按观测类写入
@@ -988,6 +1002,8 @@ class TurnRunner {
   }
 
   private recordToolCall(step: number, call: ToolCallRequest, def: ToolDefinition | null): number {
+    // 兜底补丁：记下本 turn 调过 speak/report，后面 endTurn 就不用兜底了
+    if (call.name === 'speak' || call.name === 'report') this.spokeViaTool = true;
     const event = this.write('tool/call', {
       turn: this.turn,
       step,
@@ -1205,16 +1221,42 @@ class TurnRunner {
     return { kind: 'error', message, code };
   }
 
-  private endTurn(reason: TurnEndReason): TurnEndReason {
+  private async endTurn(reason: TurnEndReason): Promise<TurnEndReason> {
     // **整轮失败时把输入退回去**（2026-10-02 补，用户报的一处洞）：模型/服务端拒了请求
     //（例如缺配对的 tool_call 被 400 打回），这一轮认领的输入不该就此消失——她连"有人叫过我"
     // 都看不到第二次。退回去是"还有一次完整机会"，与崩溃恢复走同一条路（`input/requeued`），
     // 认领次数照样累计；到 MAX_CLAIM_COUNT 就进死信（毒消息保护：一条必然失败的输入
     // 不该把守护进程拖进"拉起→失败→拉起"的循环）。
     if (reason.kind === 'error') this.requeueOnTurnError();
+    // 兜底补丁（本地，2026-10-08）：模型写了字但没调 speak/report——直接替她发出去。
+    // 不这么做的话，那段字只落在日志里，人一个字也看不到（实测 2026-10-08 04:10 后多轮如此）。
+    // 只在 completed 时兜底；error/aborted 不碰。
+    if (reason.kind === 'completed' && this.spoke && !this.spokeViaTool && this.lastAssistantText !== null) {
+      await this.fallbackSpeak(this.lastAssistantText);
+    }
     this.write('turn/end', { turn: this.turn, reason, spoke: this.spoke }, { sync: true });
     this.log.flush();
     return reason;
+  }
+
+  /**
+   * 兜底发言（本地补丁）：把模型直接输出的文字走一遍 speak 工具。
+   * 用合成的 tool/call 调用已有逻辑（分段、打字节奏、投递、回执），不复制实现。
+   */
+  private async fallbackSpeak(text: string): Promise<void> {
+    const call: ToolCallRequest = {
+      // callId 标明这是框架兜底，不是模型调的
+      callId: `fallback-speak-turn${this.turn}-${Date.now()}`,
+      name: 'speak',
+      arguments: JSON.stringify({ text }),
+    };
+    this.step += 1;
+    try {
+      await this.executeCalls(this.step, [call]);
+      this.spokeViaTool = true; // 兜底也算"说了"，避免重复
+    } catch {
+      // 兜底失败不炸 turn：tool/result 里已有记录，由下一轮或人工处理
+    }
   }
 
   /**

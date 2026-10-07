@@ -294,9 +294,138 @@ interface HandshakeResult {
  * 不这么做的话，握手响应的尾部字节会在"收帧解析器还没就位"时被丢掉——
  * 而那一小段很可能正是 READY 事件的前半帧（实测网关节奏就是握手响应 + 第一帧同包）。
  */
+/**
+ * Irmia Agent — WebSocket 经 HTTP 代理的 CONNECT 隧道（本地补丁，2026-10-08）
+ *
+ * 为什么需要：在有出站代理的环境里（如本机的沙箱代理），直接 TCP/TLS 连外网会被掐；
+ * HTTPS 请求走的是 fetch/undici（认 NODE_USE_ENV_PROXY），但这个手写 ws 客户端用的是
+ * node:net/node:tls 直连，所以 wss:// 建连会报 "wrong version number"。
+ *
+ * 做法：wss:// 先 TCP 连代理 → 发 `CONNECT host:443` → 收到 200 后在隧道上做 TLS 握手；
+ * ws:// 同理，只是 CONNECT 后直接用裸隧道。只在环境变量配了代理且目标不在 no_proxy
+ * 时走这条路，否则保持原来的直连行为。
+ */
+function proxyEnvFor(tls: boolean): string | null {
+  const names = tls ? ['HTTPS_PROXY', 'https_proxy'] : ['HTTP_PROXY', 'http_proxy'];
+  for (const n of names) {
+    const v = (process.env[n] ?? '').trim();
+    if (v) return v;
+  }
+  return null;
+}
+
+function isNoProxy(host: string): boolean {
+  const raw = (process.env['NO_PROXY'] ?? process.env['no_proxy'] ?? '').trim();
+  if (!raw) return false;
+  const h = host.toLowerCase();
+  for (const part of raw.split(',')) {
+    const p = part.trim().toLowerCase();
+    if (!p) continue;
+    if (p === '*' || h === p || h.endsWith(`.${p}`)) return true;
+  }
+  return false;
+}
+
+/** 经 HTTP 代理 CONNECT 建一条到目标的 TCP 隧道；返回已完成 CONNECT 的裸 socket */
+function connectViaProxy(proxyUrl: string, targetHost: string, targetPort: number, timeoutMs: number): Promise<Socket> {
+  return new Promise<Socket>((resolve, reject) => {
+    let proxy: URL;
+    try {
+      proxy = new URL(proxyUrl);
+    } catch {
+      reject(new Error(`代理地址非法：${proxyUrl}`));
+      return;
+    }
+    const proxyPort = proxy.port === '' ? 80 : Number(proxy.port);
+    const socket: Socket = netConnect({ host: proxy.hostname, port: proxyPort });
+    socket.setNoDelay(true);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`代理 CONNECT 超时（${proxy.hostname}:${proxyPort}）`));
+    }, timeoutMs);
+
+    let settled = false;
+    const done = (err: Error | null, sock?: Socket): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.off('data', onData);
+      socket.off('error', onError);
+      socket.off('close', onClose);
+      if (err || !sock) {
+        socket.destroy();
+        reject(err ?? new Error('代理隧道建立失败'));
+      } else {
+        resolve(sock);
+      }
+    };
+    const onError = (err: Error): void => {
+      done(new Error(`代理连接失败（${proxy.hostname}:${proxyPort}）：${err.message}`));
+    };
+    const onClose = (): void => {
+      done(new Error('代理在 CONNECT 完成前关闭了连接'));
+    };
+
+    let buffer = Buffer.alloc(0);
+    const onData = (chunk: Buffer): void => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length > 65536) {
+        done(new Error('代理响应头超过 64KB'));
+        return;
+      }
+      const end = buffer.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      const head = buffer.subarray(0, end).toString('latin1');
+      const statusLine = head.split('\r\n', 1)[0] ?? '';
+      const m = /^HTTP\/\d(?:\.\d)?\s+(\d{3})/.exec(statusLine);
+      const code = m ? Number(m[1]) : 0;
+      if (code !== 200) {
+        done(new Error(`代理 CONNECT 被拒（HTTP ${code}）：${statusLine.slice(0, 120)}`));
+        return;
+      }
+      const rest = buffer.subarray(end + 4);
+      if (rest.length > 0) {
+        done(new Error('代理在 CONNECT 200 后有多余字节，无法继续'));
+        return;
+      }
+      done(null, socket);
+    };
+
+    socket.on('data', onData);
+    socket.on('error', onError);
+    socket.on('close', onClose);
+
+    const lines = [`CONNECT ${targetHost}:${targetPort} HTTP/1.1`, `Host: ${targetHost}:${targetPort}`];
+    if (proxy.username !== '') {
+      const auth = Buffer.from(
+        `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`,
+      ).toString('base64');
+      lines.push(`Proxy-Authorization: Basic ${auth}`);
+    }
+    lines.push('', '');
+    socket.write(lines.join('\r\n'));
+  });
+}
+
 function openSocket(url: UpgradeTarget, options: WsConnectOptions): Promise<HandshakeResult> {
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
-  return new Promise<HandshakeResult>((resolve, reject) => {
+  // 建连前置：需要代理时先打出 CONNECT 隧道（本地补丁）；失败直接 reject
+  const readySocket: Promise<Socket> = (async (): Promise<Socket> => {
+    const proxyUrl = !isNoProxy(url.host) ? proxyEnvFor(url.tls) : null;
+    if (!proxyUrl) {
+      return url.tls
+        ? tlsConnect({ host: url.host, port: url.port, servername: url.host })
+        : netConnect({ host: url.host, port: url.port });
+    }
+    const tunnel = await connectViaProxy(proxyUrl, url.host, url.port, handshakeTimeoutMs);
+    return url.tls ? tlsConnect({ socket: tunnel, servername: url.host }) : tunnel;
+  })();
+
+  // 等隧道/直连就绪后再进升级握手（本地补丁）：把原 Promise 包一层先 await
+  return (async (): Promise<HandshakeResult> => {
+    const socket = await readySocket;
+    socket.setNoDelay(true);
+    return new Promise<HandshakeResult>((resolve, reject) => {
     const key = randomBytes(16).toString('base64');
     const expected = acceptKeyOf(key);
     const hostHeader = url.port === (url.tls ? 443 : 80) ? url.host : `${url.host}:${url.port}`;
@@ -311,11 +440,6 @@ function openSocket(url: UpgradeTarget, options: WsConnectOptions): Promise<Hand
       '',
     ].join('\r\n');
     const requestBytes = Buffer.from(request, 'utf8');
-
-    const socket: Socket = url.tls
-      ? tlsConnect({ host: url.host, port: url.port, servername: url.host })
-      : netConnect({ host: url.host, port: url.port });
-    socket.setNoDelay(true);
 
     let buffer = Buffer.alloc(0);
     let settled = false;
@@ -374,7 +498,8 @@ function openSocket(url: UpgradeTarget, options: WsConnectOptions): Promise<Hand
     socket.on('data', onData);
     socket.once('error', onError);
     socket.once('close', onCloseBeforeOpen);
-  });
+    });
+  })();
 }
 
 /** 校验升级响应。返回 null 表示通过，否则返回拒因（人类可读，含对端实际给了什么） */
