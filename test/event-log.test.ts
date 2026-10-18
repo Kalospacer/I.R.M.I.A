@@ -6,12 +6,14 @@
  */
 
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync, closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import test, { type TestContext } from 'node:test';
-import { EventLog, type EventLogOpenOptions } from '../src/log/event-log.ts';
+import { EventLog, writeShardLine, type EventLogOpenOptions } from '../src/log/event-log.ts';
 import type { AppEvent } from '../src/log/types.ts';
 
 const FIRST_SHARD = '000000000001.jsonl';
@@ -377,8 +379,7 @@ test('get(seq) 随机访问正确，且从检查点定位（平均 < 1ms）', as
   for (const seq of sample) assert.equal(log.get(seq)!.seq, seq);
 });
 
-test('readRange 从任意 seq 起流式返回，跨分片不重不漏', async (t) => {
-  const fx = setup(t);
+test('readRange 从任意 seq 起流式返回，跨分片不重不漏', async (t) => {  const fx = setup(t);
   const log = await fx.open({ shardMaxBytes: 2000 });
   writeMany(log, 30);
   assert.ok(log.shardFiles.length >= 3);
@@ -403,4 +404,165 @@ test('readRange 从任意 seq 起流式返回，跨分片不重不漏', async (t
   await assert.rejects(async () => {
     for await (const _ of log.readRange(0)) break;
   }, /fromSeq/);
+});
+
+// ───────────────────── 半行（REVIEW P1-18）：写侧回滚 + 读侧自愈 ─────────────────────
+
+test('P1-18 写失败：writeShardLine 抛错、文件一个字节都不许长出来（半个行不许留）', async (t) => {
+  // 这条钉的是"写失败会把半个行留在分片中间"的**写侧**那一半。
+  // 真实世界里它由磁盘满 / EIO 触发（本机造不出来），所以判据放在那个唯一写入口上：
+  // 抛错之前必须把这次写进去的半截截掉（回滚到写前长度）。
+  const fx = setup(t);
+  const log = await fx.open();
+  log.append(makeEvent(1), { sync: true });
+  log.close();
+  const path = fx.pathOf();
+  const size = statSync(path).size;
+
+  // 反：只读 fd ⇒ 写必然失败；失败之后文件长度必须还是原来那个数
+  const readOnlyFd = openSync(path, 'r');
+  try {
+    assert.throws(
+      () => writeShardLine(readOnlyFd, '{"seq":2,"ts":"x","type":"y"}\n', size),
+      /分片写入失败/,
+      '写失败要抛（不许静默吞掉）',
+    );
+  } finally {
+    closeSync(readOnlyFd);
+  }
+  assert.equal(statSync(path).size, size, '失败之后文件长度不许变（半行 = 下次启动拒绝启动）');
+
+  // 正：同一个入口在可写 fd 上写成功，且总是**整行**
+  const appendFd = openSync(path, 'a');
+  const line = '{"seq":2,"ts":"2026-09-29T14:02:11.000Z","type":"message/user"}\n';
+  try {
+    writeShardLine(appendFd, line, size);
+  } finally {
+    closeSync(appendFd);
+  }
+  assert.equal(statSync(path).size, size + Buffer.byteLength(line));
+  assert.equal(readFileSync(path, 'utf8').endsWith(line), true);
+});
+
+test('P1-18 半行拼接（写失败后进程继续写）：启动自愈——可继续、有 repair 读数、好行一个不丢', async (t) => {
+  // 形状：第 6 条只写了半个 JSON，进程没死，第 7 条接在它后面 ⇒ 这一"行"以换行结尾却解析不出来。
+  // 改动前：`scanShard` 把它当坏行**拒绝启动**。改动后：认出接缝（尾部是一条完整事件）、
+  // 只删那半个行，并留一条 repair 记录（recover.ts 据此写 `log/repaired` 与告警）。
+  const fx = setup(t);
+  const log = await fx.open();
+  for (let seq = 1; seq <= 5; seq++) log.append(makeEvent(seq), { sync: true });
+  log.close();
+
+  const path = fx.pathOf();
+  const goodSize = statSync(path).size;
+  const half = '{"seq":6,"ts":"2026-09-29T14:02:11.482+08:00","type":"message/user"';
+  const seventh = `${JSON.stringify(makeEvent(7))}\n`;
+  appendFileSync(path, half);
+  appendFileSync(path, seventh);
+  assert.equal(statSync(path).size, goodSize + Buffer.byteLength(half) + Buffer.byteLength(seventh));
+
+  const healed = await fx.open();
+  // 告警那一侧：`repair` 就是"修过什么"的读数（recover.ts 拿它写 log/repaired + 告警行）
+  assert.notEqual(healed.repair, null, '修了就必须报（不许静默自愈）');
+  assert.equal(healed.repair?.file, FIRST_SHARD);
+  assert.equal(healed.repair?.truncatedBytes, Buffer.byteLength(half), '报的就是那半个行的字节数');
+  assert.equal(healed.repair?.lastGoodSeq, 7, '最后一条完整事件是 seq 7（被接在后面的那条）');
+  assert.equal(
+    statSync(path).size,
+    goodSize + Buffer.byteLength(seventh),
+    '只删那半个行：后面那条好事件一个字节都不许丢',
+  );
+  assert.equal(healed.latestSeq(), 7);
+  assert.equal(healed.nextSeq(), 8);
+  const read = await collect(healed.readAll());
+  assert.deepEqual(read.map((event) => event.seq), [1, 2, 3, 4, 5, 7]);
+
+  // 续写不粘连：修完之后新事件照样整行落盘、再启动一次干净
+  healed.append(makeEvent(8), { sync: true });
+  healed.close();
+  const again = await fx.open();
+  assert.equal(again.repair, null, '自愈是幂等的：第二次启动没有什么可修');
+  assert.deepEqual((await collect(again.readAll())).map((event) => event.seq), [1, 2, 3, 4, 5, 7, 8]);
+});
+
+test('P1-18 中间分片的末行也只写了一半：同样自愈（不拒启动），且报得出是哪一片', async (t) => {
+  // 另一种真实形态：写失败留下半行、下一次轮转先发生 ⇒ 那半行落在**不是最后一个**的分片末尾。
+  // 改动前它是"真故障"（拒绝启动）；改动后与末片同一条自愈路径。
+  const fx = setup(t);
+  const log = await fx.open({ shardMaxBytes: 600 });
+  writeMany(log, 12);
+  const files = log.shardFiles;
+  assert.ok(files.length >= 2, `夹具要至少两个分片，实际 ${files.length}`);
+  log.close();
+
+  const first = fx.pathOf(files[0]!);
+  const goodSize = statSync(first).size;
+  const half = '{"seq":9999,"ts":"2026-09-29T14:02:11.482+08:00","type":"message/user"';
+  appendFileSync(first, half);
+
+  const reopened = await fx.open({ shardMaxBytes: 600 });
+  assert.equal(reopened.repair?.file, files[0], '报的就是那一片（不是"最后一个分片"）');
+  assert.equal(reopened.repair?.truncatedBytes, Buffer.byteLength(half));
+  assert.equal(reopened.repair?.lastGoodSeq, 12, '给的是整份日志最后一条完整事件');
+  assert.equal(statSync(first).size, goodSize, '只截那半截');
+  assert.equal((await collect(reopened.readAll())).length, 12, '全部好行照旧读得回来');
+  assert.equal(reopened.nextSeq(), 13);
+});
+
+test('P1-18 反：坏行不"看起来像半行"就照旧拒绝启动（判据没被放宽）', async (t) => {
+  const fx = setup(t);
+  const build = async (): Promise<string> => {
+    const log = await fx.open();
+    for (let seq = 1; seq <= 5; seq++) log.append(makeEvent(seq), { sync: true });
+    log.close();
+    return readFileSync(fx.pathOf(), 'utf8');
+  };
+  const content = await build();
+  const lines = content.split('\n').filter((line) => line.length > 0);
+
+  // ① 尾部不是完整事件的坏行（接缝不存在）：老判据不许放宽
+  lines.splice(2, 0, '{"seq":6,"ts":"2026-09-29T14:02:11.482+08:00","ty');
+  writeFileSync(fx.pathOf(), `${lines.join('\n')}\n`);
+  await assert.rejects(fx.open(), /不是合法 JSON/);
+
+  // ② "半行 + 一条**旧**事件"：恢复出来的 seq 不大于本片已收下的 ⇒ 不是写失败的接缝，拒绝
+  const stale = readFileSync(fx.pathOf(), 'utf8').split('\n').filter((line) => line.length > 0);
+  const half = '{"seq":6,"ts":"2026-09-29T14:02:11.482+08:00","type":"message/user"';
+  stale.splice(3, 0, `${half}${JSON.stringify(makeEvent(2))}`);
+  writeFileSync(fx.pathOf(), `${stale.join('\n')}\n`);
+  await assert.rejects(fx.open(), /不是合法 JSON/);
+
+  // ③ 末行残行（写一半就崩、后面没有别的事件）仍走"截断"那条老路，不误删好行
+  writeFileSync(fx.pathOf(), content);
+  appendFileSync(fx.pathOf(), half);
+  const truncated = await fx.open();
+  assert.equal(truncated.repair?.truncatedBytes, Buffer.byteLength(half));
+  assert.deepEqual((await collect(truncated.readAll())).map((event) => event.seq), [1, 2, 3, 4, 5]);
+});
+
+test('P1-18 半行拼接后接的那条也是"写了一半"：删半行 + 补尾换行两步都走，好行仍保住', async (t) => {
+  // 两个写失败叠在一起：第 6 条半个行 + 第 7 条也没写完换行（但它本身是完整 JSON）。
+  // 这两种自愈在同一次启动里都要生效：删掉那半个行，再给缺换行的尾行补一个换行。
+  const fx = setup(t);
+  const log = await fx.open();
+  for (let seq = 1; seq <= 5; seq++) log.append(makeEvent(seq), { sync: true });
+  log.close();
+
+  const path = fx.pathOf();
+  const half = '{"seq":6,"ts":"2026-09-29T14:02:11.482+08:00","type":"message/user"';
+  appendFileSync(path, half);
+  appendFileSync(path, JSON.stringify(makeEvent(7))); // 完整 JSON，但没有换行
+
+  const healed = await fx.open();
+  assert.equal(healed.repair?.truncatedBytes, Buffer.byteLength(half));
+  assert.equal(healed.latestSeq(), 7);
+  assert.deepEqual((await collect(healed.readAll())).map((event) => event.seq), [1, 2, 3, 4, 5, 7]);
+  healed.close();
+  // 补的那一个换行也在：再启动一次不修复、能续写
+  const again = await fx.open();
+  assert.equal(again.repair, null);
+  again.append(makeEvent(8), { sync: true });
+  again.close();
+  const fin = await fx.open();
+  assert.deepEqual((await collect(fin.readAll())).map((event) => event.seq), [1, 2, 3, 4, 5, 7, 8]);
 });

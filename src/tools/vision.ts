@@ -29,8 +29,9 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/p
 import { basename, isAbsolute, join, relative } from 'node:path';
 import type { Dirent } from 'node:fs';
 
-import { PATH_BOUNDARY_HINT } from './boundary.ts';
-import { resolveInsideRoot } from './fs/path-guard.ts';
+import { PATH_HINT } from './boundary.ts';
+import { expandAliases, resolveInsideRoot } from './fs/path-guard.ts';
+import { pathAliasesFor } from './fs/env.ts';
 import { FS_ERROR_CODES } from './fs/types.ts';
 // 进上下文的图片型别白名单：**只有一处**（`log/types.ts`）。inline 这条路的准入判据与渲染层
 // 挑图用的是同一个函数——两处各抄一份名单，必然漂成"回执说进了、请求体里没有"（2026-10-11 修）
@@ -543,18 +544,22 @@ export function createVisionTools(options: VisionToolsOptions): ToolDefinition[]
     ctx: ToolContext,
     raw: string,
   ): Promise<{ ok: true; path: string; isDirectory: boolean } | { ok: false; result: ToolHandlerResult }> {
-    const probe = isAbsolute(raw) ? raw : join(ctx.workspaceRoot, raw);
+    // v64：先过**与 fs 族同一张别名表**（`MEMORIES/`、`diary/` 落记忆目录）——用户 2026-10-13
+    // 的裁决要求"具名根在所有工具里语义一致"，所以这件不再是"只按仓库根 join"。
+    const aliased = expandAliases(raw, pathAliasesFor(ctx), ctx.workspaceRoot);
+    const probe = isAbsolute(aliased) ? aliased : join(ctx.workspaceRoot, aliased);
     let kind: 'file' | 'directory' | 'missing' = 'missing';
     try {
       kind = (await stat(probe)).isDirectory() ? 'directory' : 'file';
     } catch {
       kind = 'missing';
     }
-    // 边界与 fs 工具族同一份（`ctx.boundaryRoot` 三态原样传，判读只归 boundary.ts）
+    // 边界与 fs 工具族同一份；**v64 起读类不设边界**（`access: 'read'` ⇒ `trust.mode` 不管读）
     const guard = await resolveInsideRoot(
       ctx.workspaceRoot,
       raw,
       {
+        access: 'read',
         ...(kind === 'directory'
           ? { requireDirectory: true, purpose: 'vision_read' }
           : { allowMissing: true, purpose: 'vision_read' }),
@@ -580,7 +585,7 @@ export function createVisionTools(options: VisionToolsOptions): ToolDefinition[]
         paths: {
           type: 'array',
           items: { type: 'string' },
-          description: '图片文件或目录路径（相对工作根），目录会递归收集图片；GIF 只取首帧',
+          description: '图片文件或目录路径（相对仓库根），目录会递归收集图片；GIF 只取首帧',
         },
         question: { type: 'string', description: '针对这批图片的问题；不传则用通用描述要求' },
         inline: {

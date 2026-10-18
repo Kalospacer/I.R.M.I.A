@@ -18,8 +18,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 
-import { ALERT_DIR_NAME, createNotifier, fingerprintOf } from '../src/alert/notifier.ts';
-import { interruptedRepairs, notifyStartupRecovery } from '../src/alert/startup.ts';
+import { ALERT_DIR_NAME, createNotifier, fingerprintOf, type AlertNotifier } from '../src/alert/notifier.ts';
+import {
+  interruptedRepairs, notifyStartupRecovery, notifyStartupRecoveryDetailed, restoreStartupAlertWindow,
+} from '../src/alert/startup.ts';
 import { buildReviewList, runCli, summarizeEvent, type CliContext, type CliIO } from '../src/cli.ts';
 import { defaultConfig } from '../src/config/config.ts';
 import { EventLog } from '../src/log/event-log.ts';
@@ -179,6 +181,29 @@ test('summarizeEvent：未知形状也不抛，退化成 JSON 摘要', () => {
     data: { a: 1 }, visibility: 'internal',
   } as unknown as AppEvent;
   assert.equal(summarizeEvent(fake), '{"a":1}');
+});
+
+test('summarizeEvent：turn/end 的 reasoningEcho 多一格，其余格式一字不动（v68）', () => {
+  const turnEnd = (reason: Record<string, unknown>): AppEvent => ({
+    seq: 9, ts: T0.toISOString(), type: 'turn/end',
+    data: { turn: 3, reason, spoke: false }, visibility: 'internal', origin: 'test/cli',
+  } as unknown as AppEvent);
+
+  // 没有指纹时：与 v68 之前逐字相同（既有格式不许被这一格改掉）
+  assert.equal(
+    summarizeEvent(turnEnd({ kind: 'error', message: '请求被拒绝', code: 'http_400' })),
+    'turn 3 · error(http_400: 请求被拒绝) · 未发言',
+  );
+  // 有指纹时：只多 ` · 思维链未回传` 这一格
+  assert.equal(
+    summarizeEvent(turnEnd({ kind: 'error', message: '请求被拒绝', code: 'http_400', reasoningEcho: true })),
+    'turn 3 · error(http_400 · 思维链未回传: 请求被拒绝) · 未发言',
+  );
+  // 别的 400（图片格式一类）没有这一格 ⇒ 输出照旧
+  assert.equal(
+    summarizeEvent(turnEnd({ kind: 'error', message: '图片格式不被接受', code: 'http_400' })),
+    'turn 3 · error(http_400: 图片格式不被接受) · 未发言',
+  );
 });
 
 // ──────────────────────────────── review ────────────────────────────────
@@ -420,4 +445,75 @@ test('启动告警：正常退出的恢复清单（无 interrupted）不发任�
   assert.equal(await notifyStartupRecovery(notifier, { repairs: recovery.repairs, dataDir: fx.dir }), null);
   assert.equal(emitted.length, 0);
   assert.equal(existsSync(join(fx.dir, ALERT_DIR_NAME, `${DAY}.log`)), false, '不该产生告警文件');
+});
+
+// ──────────────────────────────── 启动告警与限流窗口的顺序（P1-20） ────────────────────────────────
+
+/**
+ * 一次"进程启动"的告警出口。
+ *
+ * 关键是**每次启动都是新实例**：`Notifier` 的限流窗口是内存里的（`windowsMap`），
+ * 进程一重启就空了——跨重启的那一份只能从日志折回来。这正是 P1-20 被测的那条路：
+ * 重启后先 `restoreStartupAlertWindow(日志)`，再发启动告警。
+ */
+function startupNotifier(log: EventLog, dataDir: string, now: () => Date): AlertNotifier {
+  return createNotifier({
+    config: { rateLimitMin: 30 },
+    dataDir,
+    emit: (type, data, visibility) => {
+      log.append({
+        seq: log.nextSeq(), ts: now().toISOString(), type, data, visibility, origin: 'test/cli-observe',
+      } as unknown as AppEvent, { sync: true });
+    },
+    now,
+  });
+}
+
+/** 日志里现有的 `alarm/sent`（限流窗口的唯一来源） */
+async function alarmSent(log: EventLog): Promise<AppEvent[]> {
+  const out: AppEvent[] = [];
+  for await (const event of log.readAll()) {
+    if (event.type === 'alarm/sent') out.push(event);
+  }
+  return out;
+}
+
+/** 一次崩溃留下的补偿清单（`recover` 的文本契约已由上面那条用例锁住，这里只要形状） */
+const CRASH_REPAIRS = ['上一次运行异常退出：turn 1 补写 turn/end{interrupted}'];
+
+test('启动告警：连续两次启动只留一条（P1-20：窗口先恢复，再发告警）', async (t) => {
+  const fx = await setup(t);
+
+  // ── 启动 #1：日志里一条 alarm/sent 都没有 ⇒ 窗口空 ⇒ 这条必须真的发出去 ──
+  const first = startupNotifier(fx.log, fx.dir, () => T0);
+  assert.equal(await restoreStartupAlertWindow(first, fx.log), 0, '第一次启动时日志里还没有告警可折');
+  const firstReceipt = await notifyStartupRecoveryDetailed(first, { repairs: CRASH_REPAIRS, dataDir: fx.dir, pid: 111 });
+  assert.equal(firstReceipt.outcome?.ok, true);
+  assert.equal(firstReceipt.suppressed, false, '第一条不该被限流');
+  assert.equal((await alarmSent(fx.log)).length, 1);
+
+  // ── 重启：**新的**告警出口（内存窗口空了）+ 同一份日志 ──
+  // 这正是崩溃循环的形状：进程反复被拉起，而日志一直留着。
+  const second = startupNotifier(fx.log, fx.dir, () => T0);
+  assert.equal(await restoreStartupAlertWindow(second, fx.log), 1, '第二次启动前，日志里那一条要折回窗口');
+  const secondReceipt = await notifyStartupRecoveryDetailed(second, { repairs: CRASH_REPAIRS, dataDir: fx.dir, pid: 222 });
+  assert.equal(secondReceipt.outcome?.ok, true, '被限流不是失败');
+  assert.equal(secondReceipt.suppressed, true, '第二次必须被限流窗口压掉');
+  // 判据是**日志与文件里的条数**，不是内存计数：崩溃循环里人只该收到一条
+  assert.equal((await alarmSent(fx.log)).length, 1, '重启之后不许再写一条 alarm/sent');
+  const lines = readFileSync(join(fx.dir, ALERT_DIR_NAME, `${DAY}.log`), 'utf8').trim().split('\n');
+  assert.equal(lines.length, 1, '告警文件档也只该有一行');
+  assert.equal(lines[0]!.includes(fingerprintOf('startup-recovery')), true, '那一条就是启动恢复告警');
+});
+
+test('启动告警：**不恢复窗口**时第二次启动会再发一条（P1-20 的病，这条锁住"为什么必须先恢复"）', async (t) => {
+  const fx = await setup(t);
+  const first = startupNotifier(fx.log, fx.dir, () => T0);
+  await notifyStartupRecoveryDetailed(first, { repairs: CRASH_REPAIRS, dataDir: fx.dir });
+
+  // 重启，但**故意跳过** restoreStartupAlertWindow —— 这就是修之前的顺序（告警早于 warmUp 的折回）
+  const second = startupNotifier(fx.log, fx.dir, () => T0);
+  const again = await notifyStartupRecoveryDetailed(second, { repairs: CRASH_REPAIRS, dataDir: fx.dir });
+  assert.equal(again.suppressed, false);
+  assert.equal((await alarmSent(fx.log)).length, 2, '不恢复窗口 ⇒ 每重启一条：这正是 P1-20 的病');
 });

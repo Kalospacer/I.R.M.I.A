@@ -201,7 +201,7 @@ function groupWakeBy(person: string, messageId: string, text: string): unknown {
 }
 
 /** 官方 bot 单聊里那个人的 openid（用户现场那条消息就是它发来的） */
-const OWNER_OPENID = 'E7FEC35E951B5CCF8BA66793BF6B1314';
+const OWNER_OPENID = '00000000000000000000000000000001';
 
 /**
  * 用户 2026-10-04 在现场发的那句话：**正常聊天**。它当初字面命中规则层
@@ -678,16 +678,17 @@ test('界面预览（buildReplay）与运行期对同一批事件给出相同字
   // ③ 此刻层：除 `本机：` 那一行外逐字节相同。
   //
   //    为什么独留这一行：本机事实（平台 / 进程已运行多久 / 工作根 / 磁盘剩余）是**宿主的瞬时环境值**，
-  //    日志里一个字都没记，重建不出来。预览把它写成"未知"是**如实承认**，不是编值——真去补上"现在"的
-  //    uptime 与磁盘，等于拿此刻的环境冒充当时的，比少一行更坏（CLI 的重放走同一条路：
-  //    `rebuildRenderedRequest` 也不传 machine，两边同为"未知"）。
-  //    所以这里的判据是"**只剩这一行**不同"：把运行期那行抹成"未知"后必须逐字节相等——
+  //    日志里一个字都没记，重建不出来。预览**整行不写**是**如实承认**（2026-10-16 口径：拿不到真值
+  //    就整项省略，不写"本机：未知"——与 `用度：` 同源），不是编值——真去补上"现在"的 uptime 与
+  //    磁盘，等于拿此刻的环境冒充当时的，比少一行更坏（CLI 的重放走同一条路：
+  //    `rebuildRenderedRequest` 也不传 machine，两边同为"整行不写"）。
+  //    所以这里的判据是"**只剩这一行**不同"：把运行期那行**删掉**后必须逐字节相等——
   //    "只剩它"是被证明的，不是被断言掉的。
   const viewNow = String((view.request.input.at(-1) as { content?: string }).content ?? '');
   const liveNow = String((live.input.at(-1) as { content?: string }).content ?? '');
   assert.ok(/(^|\n)本机：/u.test(liveNow), '运行期的此刻层里确实有 `本机：` 那一行（否则下面那条是空断言）');
-  const liveWithoutMachine = liveNow.replace(/(^|\n)本机：[^\n]*/u, '$1本机：未知');
-  assert.notEqual(liveWithoutMachine, liveNow, '运行期那一行不是本来就写着"未知"（这条对齐要有意义）');
+  const liveWithoutMachine = liveNow.replace(/(^|\n)本机：[^\n]*/u, '');
+  assert.notEqual(liveWithoutMachine, liveNow, '运行期那一行确实被删掉了（这条对齐要有意义）');
   assert.equal(
     viewNow,
     liveWithoutMachine,
@@ -732,7 +733,7 @@ test('界面预览（buildReplay）与运行期对同一批事件给出相同字
 // ──────────────── 名字真源的第三档（群成员别名）在预览这条路上（2026-10-11） ────────────────
 
 /** 群里那个**只有群成员别名**的人（`aliases.md` 的 `# 群成员` 段：裸 openid = 名字） */
-const MEMBER_ONLY_OPENID = 'B01F025D72D3B2075F49EFB08297D105';
+const MEMBER_ONLY_OPENID = '00000000000000000000000000000004';
 /** 她给他起的名字（写在那一档里；通知行那个"谁"要写的就是它） */
 const MEMBER_ONLY_NAME = '打本的老王';
 /** 三张名字表里都没有的人：那一行应当**照实**写这串 id */
@@ -781,8 +782,9 @@ test('界面预览里只有「群成员别名」的人也写成名字，认不�
   /** 此刻层那一条（input 末尾那条 developer 消息）：`预警：` 那一行就在它里面 */
   const nowLayerOf = (request: { input: unknown }): string =>
     String((request.input as Array<{ content?: unknown }>).at(-1)?.content ?? '');
-  /** 运行期那条 `本机：` 是宿主的瞬时值、日志里没有 ⇒ 预览如实写"未知"（与既有用例同一条对齐） */
-  const withoutMachine = (text: string): string => text.replace(/(^|\n)本机：[^\n]*/u, '$1本机：未知');
+  /** 运行期那条 `本机：` 是宿主的瞬时值、日志里没有 ⇒ 预览**整行不写**（2026-10-16 口径，
+   *  与上面那条用例同一条对齐；旧口径是抹成"本机：未知"） */
+  const withoutMachine = (text: string): string => text.replace(/(^|\n)本机：[^\n]*/u, '');
   /** 界面预览：与页面走同一个入口、同一批盘上事件 */
   const previewNowOf = async (turn: number): Promise<string> => {
     const { buildReplay } = await import('../src/web/server.ts');
@@ -917,9 +919,9 @@ test('界面预览的待办：STATE 里那两节有几项，预览的「未完�
   assert.match(viewNow, /- 核对备份目录/u);
   assert.match(viewNow, /- 看日志尾部/u);
 
-  // ② 逐字节：此刻层除 `本机：` 那一行外完全一致（口径同其他预览用例）
-  const liveWithoutMachine = liveNow.replace(/(^|\n)本机：[^\n]*/u, '$1本机：未知');
-  assert.notEqual(liveWithoutMachine, liveNow, '运行期那一行不是本来就写着"未知"（这条对齐要有意义）');
+  // ② 逐字节：此刻层除 `本机：` 那一行外完全一致（口径同其他预览用例：预览整行不写）
+  const liveWithoutMachine = liveNow.replace(/(^|\n)本机：[^\n]*/u, '');
+  assert.notEqual(liveWithoutMachine, liveNow, '运行期那一行确实被删掉了（这条对齐要有意义）');
   assert.equal(viewNow, liveWithoutMachine, `此刻层必须逐字节相同：\n预览=${viewNow}\n当时=${liveWithoutMachine}`);
 });
 
@@ -983,7 +985,7 @@ test('话题概括只喂**没看过的那一段**，且发言人不是 openid（
   // 含前面那些测试串）被一起喂进去，light 给出的概括成了「测试弥亚小姐能否选择不回复消息」
   // 这种元判断，而当时真正在说的是"用户要出门补课、让她自己待着"。
   const { log, write, loop } = await makeReadyRig(t);
-  const openid = 'E7FEC35E951B5CCF8BA66793BF6B1314';
+  const openid = '00000000000000000000000000000001';
   const old = ['弥亚小姐，突然想问你个事', '你能看见框架在给你告警吗？说我在注入', '测试测试测试'];
   for (let i = 0; i < old.length; i += 1) {
     write('channel/message', {
@@ -1284,4 +1286,299 @@ test('重启后预警与话题从日志折回来（内存表是空的，事件�
 
   log.close();
   void dir;
+});
+
+// ──────────────────────── ⑤b read_channel 不给 sid：列会话簿（v66） ────────────────────────
+//
+// 这一支存在的理由是一条链：此刻层那张清单是**有窗口的**（私聊常驻、群聊只列她 7 天内回过话
+// 或 1 小时内有人 @ 她的）⇒ 清单末尾会写「还有 N 个会话没列」⇒ 那句话必须配一个真出口。
+// 出口就是"不给 sid 的 read_channel"（**不新增动作名**：工具清单的每个字节都是常驻成本）。
+//
+// 判据的落点两个：① 给 sid ⇒ 行为一字不变（正面锁住"没改坏"）；② 不给 ⇒ 列清单。
+test('read_channel 不给 sid：列会话簿（类型/未读/最后活跃/在聊什么），给 sid 则行为一字不变', async (t) => {
+  const { write, loop } = await makeReadyRig(t);
+  // 一个群（有未读、有话题）与一个单聊（有未读、没话题）
+  write('channel/message', {
+    channel: 'qq-official', chatType: 'group', person: 'OPENID_A', chatId: 'G7',
+    text: '显卡降价了', messageId: 'g1', msgSeq: 1,
+  });
+  write('channel/topic', { sid: 'qq:group:G7', topic: '显卡降价', fromSeq: 1, toSeq: 1, count: 1 });
+  write('channel/message', {
+    channel: 'qq-official', chatType: 'c2c', person: 'OWNER_OPENID', chatId: 'OWNER_OPENID',
+    text: '在吗', messageId: 'c1', msgSeq: 1,
+  });
+
+  const { createAdminTools } = await import('../src/tools/admin.ts');
+  const { TimerStore } = await import('../src/wake/timer-store.ts');
+  const real = loop(fakeDs('{}').ds);
+  await real.tickOnce();
+  const tk = createAdminTools({
+    timers: new TimerStore(null),
+    emit: () => undefined,
+    channelReader: async (sid, limit) => await real.readChannelMessages(sid, limit),
+    channelSpokenReader: async (sid) => await real.readChannelSpoken(sid),
+    // v66 的注入点：**取值器**（会话簿逐拍在长，catalog 先于 RealLoop 就位）
+    channelSessions: () => real.sessionRows(),
+    timezone: TZ,
+  });
+  const ctx = { callId: 'c1', turn: 9, step: 1, signal: new AbortController().signal, workspaceRoot: process.cwd() };
+
+  // ② 不给 sid：列清单
+  const list = await tk.byName('read_channel').handler({}, ctx);
+  assert.equal(list.isError, undefined, `不给 sid 必须走列会话这一支：${list.content}`);
+  assert.match(list.content, /外部会话共 2 个/u, `两个会话都要列出来：\n${list.content}`);
+  assert.match(list.content, /群聊 · .*｜最后 \d\d-\d\d \d\d:\d\d｜1 条没看｜在聊：显卡降价/u,
+    `群那一行要带类型、未读与话题：\n${list.content}`);
+  assert.match(list.content, /单聊 · /u, '私聊也在清单里');
+  assert.match(list.content, /qq:group:G7/u, '每一行都要带 sid —— 她指定对象时手里必须有这个值');
+
+  // ③ 给了 sid：与改动前逐字节同一支（读回来的是消息，不是清单）
+  const one = await tk.byName('read_channel').handler({ sid: 'qq:group:G7', limit: 10 }, ctx);
+  assert.equal(one.isError, undefined, one.content);
+  assert.ok(!one.content.includes('外部会话共'), `给了 sid 就不许列清单：\n${one.content}`);
+  assert.ok(one.content.includes('显卡降价了'), `给了 sid 读的是那个会话的消息：\n${one.content}`);
+});
+
+test('read_channel 不给 sid 且没接线 / 一个会话都没有：两种回执都不许混', async () => {
+  const { createAdminTools } = await import('../src/tools/admin.ts');
+  const { TimerStore } = await import('../src/wake/timer-store.ts');
+  const ctx = { callId: 'c1', turn: 1, step: 1, signal: new AbortController().signal, workspaceRoot: process.cwd() };
+
+  // 没接会话簿：**如实说没接线**（不是"外面没人"——那两件事对她完全不同）
+  const bare = createAdminTools({ timers: new TimerStore(null), emit: () => undefined });
+  const noWire = await bare.byName('read_channel').handler({}, ctx);
+  assert.equal(noWire.isError, true, `没接线必须报错而不是假装空清单：${noWire.content}`);
+  assert.match(noWire.content, /会话簿|接线/u, noWire.content);
+
+  // 接了、但一个会话都没有：**诚实的空回执**（新装的实例就是这样）
+  const empty = createAdminTools({
+    timers: new TimerStore(null), emit: () => undefined, channelSessions: () => [],
+  });
+  const none = await empty.byName('read_channel').handler({}, ctx);
+  assert.equal(none.isError, undefined, none.content);
+  assert.match(none.content, /还没有任何外部会话/u, `空清单要如实说：${none.content}`);
+});
+
+// ──────────────────────── ⑤c 会话清单的两类保留（v67） ────────────────────────
+//
+// 用户 2026-10-16 的纠正（原话）：「省略的会话，**我不是说私聊默认保留**。然后群聊**只放频次最高的
+// 三个**，以及**最近 1h 有提及**的吗。**超过 1h 不提及而且频率很低就自动收起来了**。」
+// ⇒ **私聊与群聊同一套规则**：(a) 最近 1 小时内被 @/提及 ∪ (b) 她回复频次前 3（跨私聊+群聊一起排）。
+// 判据在 `self-brief.sessionListSelection` 一处（纯函数），素材由宿主折（`foldSpokeAndMention`）。
+test('会话清单：私聊与群聊同一套规则（1h 内被提及 ∪ 频次前 3），冷掉的自动收起来', async () => {
+  const {
+    SESSION_FREQ_TOP_N, SESSION_FREQ_WINDOW_MS, SESSION_MENTION_WINDOW_MS,
+    renderContactNote, sessionListSelection, spokeFreqOf,
+  } = await import('../src/model/self-brief.ts');
+  const { foldSpokeAndMention } = await import('../src/runtime/real-loop.ts');
+  const nowMs = Date.parse('2026-10-16T12:00:00.000Z');
+  const hour = 60 * 60 * 1000;
+  const day = 24 * hour;
+  const iso = (at: number): string => new Date(at).toISOString();
+
+  // **三个阈值各是一个常量**（一个数就能调）
+  assert.equal(SESSION_MENTION_WINDOW_MS, hour, '提及窗口 = 1 小时');
+  assert.equal(SESSION_FREQ_WINDOW_MS, 7 * day, '频次窗口 = 7 天滚动');
+  assert.equal(SESSION_FREQ_TOP_N, 3, '频次取前 3');
+
+  // ── 夹具**从事件折出来**（不是手搓一张表）：私聊但冷 / 群聊但热都在这里造 ──────────
+  // 判据与 `read_channel` 的「我自己的发言」同源：`speak/sent` + channel='reply-url' + text + sid
+  const ev = (type: string, at: number, data: Record<string, unknown>): AppEvent =>
+    ({ seq: 0, ts: iso(at), type, data } as unknown as AppEvent);
+  const spoke = (sid: string, at: number): AppEvent =>
+    ev('speak/sent', at, { channel: 'reply-url', chars: 3, sid, text: '好' });
+  const mentioned = (sid: string, at: number): AppEvent => {
+    const chatId = sid.split(':').at(-1)!;
+    return ev('wake/channel', at, {
+      channel: sid.split(':')[0]!, chatType: 'group', chatId,
+      person: 'A', text: '@她 在吗', messageId: `m-${chatId}-${at}`, msgSeq: 1,
+      mentionsMe: true, dedupeKey: `m-${chatId}-${at}`,
+    });
+  };
+  const folded = foldSpokeAndMention([
+    // 她在这个私聊里说过话 —— 但那是 8 天前（**窗口外**）：这一条就是本次的核心用例
+    spoke('qq:c2c:COLD', nowMs - 8 * day),
+    // 群里她回过 5 次（全在窗口内）⇒ 频次第一
+    spoke('qq:group:HOT', nowMs - 5 * day),
+    spoke('qq:group:HOT', nowMs - 4 * day),
+    spoke('qq:group:HOT', nowMs - 3 * day),
+    spoke('qq:group:HOT', nowMs - 2 * day),
+    spoke('qq:group:HOT', nowMs - 1 * day),
+    // 私聊也可以靠频次进清单（跨类一起排）：3 次
+    spoke('qq:c2c:WARM', nowMs - 3 * day),
+    spoke('qq:c2c:WARM', nowMs - 2 * day),
+    spoke('qq:c2c:WARM', nowMs - 1 * day),
+    // 本机对话流那一条不算（`channel='log'` 没有会话坐标 ⇒ 不是"发进了某个会话"）
+    ev('speak/sent', nowMs - 1 * day, { channel: 'log', chars: 3 }),
+    // 1 小时前有人 @ 她（**频次 0** 也照样进清单）
+    mentioned('qq:group:CALLED', nowMs - hour),
+    // 两小时前有人 @ 她 ⇒ 已出窗口（那件事由唤醒通知说过）
+    mentioned('qq:group:OLD_CALL', nowMs - 2 * hour),
+  ]);
+
+  assert.deepEqual(folded.spokeTimes.get('qq:group:HOT'), [nowMs - 5 * day, nowMs - 4 * day,
+    nowMs - 3 * day, nowMs - 2 * day, nowMs - 1 * day], '折出来的是**时刻表**（频次的素材）');
+  assert.equal(spokeFreqOf('qq:group:HOT', folded, nowMs), 5, '窗口内的条数就是频次读数');
+  assert.equal(spokeFreqOf('qq:c2c:COLD', folded, nowMs), 0, '8 天前说过话 ⇒ 这个窗口里是 0 条');
+  assert.equal(spokeFreqOf('qq:group:CALLED', folded, nowMs), 0, '只有提及、没回过话 ⇒ 频次 0');
+
+  // **幂等 / 跨重启**：同一批事件折两遍（warmUp 全量之后再被增量折一遍）读数一个字不变
+  const again = foldSpokeAndMention([
+    spoke('qq:group:HOT', nowMs - 5 * day), spoke('qq:group:HOT', nowMs - 4 * day),
+    spoke('qq:group:HOT', nowMs - 1 * day),
+  ]);
+  assert.deepEqual(again.spokeTimes.get('qq:group:HOT'),
+    [nowMs - 5 * day, nowMs - 4 * day, nowMs - 1 * day], '重折同一批 ⇒ 不许翻倍/重复');
+
+  // 窗口的两个边界（含边界算窗内——`nowMs - at <= 窗口`）
+  const edge = {
+    spokeTimes: new Map([['qq:group:E', [nowMs - SESSION_FREQ_WINDOW_MS, nowMs - SESSION_FREQ_WINDOW_MS - 1]]]),
+    mentionedAt: new Map([['qq:group:E', nowMs - SESSION_MENTION_WINDOW_MS - 1]]),
+  };
+  assert.equal(spokeFreqOf('qq:group:E', edge, nowMs), 1,
+    '恰好在 7 天线上算窗内、差 1 毫秒就不算');
+
+  // ── 会话簿（清单的输入）：私聊冷 / 群聊热 / 被 @ 的 / 老提及的 ────────────────────
+  const base = (sid: string, chatType: string, lastSeenAt: number): Record<string, unknown> => ({
+    sid, chatType, channel: 'qq-official', chatId: sid.split(':').at(-1),
+    person: 'A', lastText: 'x', lastSeenAt: iso(lastSeenAt),
+    messages: 3, label: null, readUpToSeq: 0, unread: 3,
+  });
+  const book = [
+    base('qq:c2c:COLD', 'c2c', nowMs - hour),
+    base('qq:group:HOT', 'group', nowMs - hour),
+    base('qq:c2c:WARM', 'c2c', nowMs - 2 * hour),
+    base('qq:group:CALLED', 'group', nowMs - hour),
+    base('qq:group:OLD_CALL', 'group', nowMs - 3 * hour),
+  ];
+  const facts = { ...folded, wakeChannel: null, sessions: book };
+  const picked = sessionListSelection(book as never, facts, nowMs).map((s) => s.sid);
+
+  // **核心**：私聊但冷 ⇒ 不在（"我不是说私聊默认保留"）
+  assert.equal(picked.includes('qq:c2c:COLD'), false, `冷掉的私聊要收起来：${picked.join(' / ')}`);
+  // 群聊热（频次进前 3）⇒ 在；私聊热（靠频次）⇒ 也在：跨私聊+群聊一起排
+  assert.deepEqual(picked.slice(0, 3).sort(),
+    ['qq:c2c:WARM', 'qq:group:CALLED', 'qq:group:HOT'].sort(),
+    `频次前 3 + 1 小时内被 @ 的那一个：${picked.join(' / ')}`);
+  // 任何会话 1 小时内被 @ ⇒ 在（无论频次）
+  assert.equal(picked.includes('qq:group:CALLED'), true, '刚被 @ 的会话必须进清单（频次 0 也进）——被判据排在最前');
+  assert.equal(picked[0], 'qq:group:CALLED', '1 小时内被点名的排最前（有人正在叫她）');
+  // 2 小时前的提及 ⇒ 不在
+  assert.equal(picked.includes('qq:group:OLD_CALL'), false, '1 小时之外的提及不占行');
+  // 判据里**没有 chatType 这一支**：这就是"私聊与群聊同一套规则"的落点
+  assert.equal(picked.length, 3, `只留该留的：${picked.join(' / ')}`);
+
+  // ── 恰好并列第 3：排序稳定（频次降序 → 最近活跃降序 → sid 字典序） ──────────────
+  const tie = (sid: string, lastSeenAt: number): Record<string, unknown> => base(sid, 'group', lastSeenAt);
+  const tieAll = [
+    tie('qq:group:ZZZ', nowMs - 5 * hour),   // 频次 3、最近活跃最旧 ⇒ 并列里排最后
+    tie('qq:group:AAA', nowMs - 5 * hour),   // 与 ZZZ 同频次、同活跃 ⇒ 按 sid 字典序胜出
+    tie('qq:group:BBB', nowMs - hour),       // 频次 3、最近活跃最新 ⇒ 并列里排最前
+    tie('qq:group:TOP', nowMs - hour),       // 频次 5 ⇒ 稳占第一
+  ];
+  const tieFacts = {
+    spokeTimes: new Map([
+      ['qq:group:TOP', [nowMs - day, nowMs - 2 * day, nowMs - 3 * day, nowMs - 4 * day, nowMs - 5 * day]],
+      ['qq:group:BBB', [nowMs - day, nowMs - 2 * day, nowMs - 3 * day]],
+      ['qq:group:AAA', [nowMs - day, nowMs - 2 * day, nowMs - 3 * day]],
+      ['qq:group:ZZZ', [nowMs - day, nowMs - 2 * day, nowMs - 3 * day]],
+    ]),
+    mentionedAt: new Map<string, number>(),
+  };
+  const tiePick = sessionListSelection(tieAll as never, tieFacts, nowMs).map((s) => s.sid);
+  assert.deepEqual(tiePick, ['qq:group:TOP', 'qq:group:BBB', 'qq:group:AAA'],
+    '并列第 3 时：最近活跃降序（BBB）→ 再按 sid 字典序（AAA 胜 ZZZ）');
+  const tiePickReversed = sessionListSelection([...tieAll].reverse() as never, tieFacts, nowMs)
+    .map((s) => s.sid);
+  assert.deepEqual(tiePickReversed, tiePick, '输入次序不许影响"第 3 个是谁"（判据是定数）');
+
+  // ── 渲染出来：清单只剩该留的，并给出"没列的有几个 + 怎么全看" ────────────────────
+  const note = renderContactNote(facts as never, { nowMs });
+  assert.ok(note.includes('qq:group:HOT'), `她回过的群要在：\n${note}`);
+  assert.equal(note.includes('qq:c2c:COLD'), false, `冷掉的私聊不占行（未读照旧记在簿里）：\n${note}`);
+  assert.match(note, /还有 2 个会话没列；read_channel 不给 sid 可以看全部/u,
+    `没列出来的要如实报数并给出口：\n${note}`);
+
+  // 拿不到"现在"（老调用点 / 诊断 / 重放）：**整条不过滤** ⇒ 与引入窗口之前逐字节相同
+  const unfiltered = renderContactNote(facts as never, {});
+  assert.ok(unfiltered.includes('qq:c2c:COLD'), `没有"现在"就不许按窗口藏会话：\n${unfiltered}`);
+  assert.equal(unfiltered.includes('没列'), false, '一个都没滤掉时不该出现"还有 N 个没列"');
+
+  // ── 全部冷 ⇒ 一条都不留时**文案诚实**（不许留一个空壳标题） ──────────────────────
+  const allCold = renderContactNote({
+    ...facts,
+    sessions: [base('qq:c2c:COLD', 'c2c', nowMs - hour), base('qq:group:OLD_CALL', 'group', nowMs - 3 * hour)],
+  } as never, { nowMs });
+  assert.match(allCold, /都收起来了/u, `全冷时要照实说收起来了：\n${allCold}`);
+  assert.match(allCold, /还有 2 个会话没列/u, `"还有 N 个会话没列"照旧：\n${allCold}`);
+  assert.match(allCold, /read_channel 不给 sid 可以看全部/u, `出口照旧：\n${allCold}`);
+  assert.equal(allCold.includes('qq:c2c:COLD'), false, allCold);
+  assert.equal(allCold.includes('qq:group:OLD_CALL'), false, allCold);
+  // 一个会话都没有（新装实例）：这一小段整段不出——与引入窗口之前逐字节相同
+  const noSessions = renderContactNote({ ...facts, sessions: [] } as never, { nowMs });
+  assert.equal(noSessions.includes('外部会话'), false, `没有会话就不出清单那段：\n${noSessions}`);
+});
+
+// ── 频次素材**跨重启**：它只从日志折得出来（进程内存里不许有独一份） ──────────────────
+//
+// 用户那一格的要点是"回复频次"要有**真素材**（上一版只有 `spokeAt` = 最后一次发言时刻，
+// 排不出频次）。素材落点是 `foldSpokeAndMention` 的 `spokeTimes`，两个折点（warmUp 全量 /
+// foldChannelEvents 增量）共用它——所以这里验的是"重启之后，那些读数从盘上的事件重新长出来"，
+// 以及"同一批事件折两遍不许翻倍"。
+test('频次素材跨重启：warmUp 从日志折回时刻表，同一毫秒的两条各算一条', async (t) => {
+  const { write, loop, log } = await makeReadyRig(t);
+  // 重启前落库：她在同一个群里说了两次话（测试台的钟是冻住的 ⇒ 这两条**同毫秒**，
+  // 正好验"一件事算一条"：同一时刻的两条发言不能被并成一条）
+  write('speak/sent', { channel: 'reply-url', chars: 3, sid: 'qq:group:HOT', text: '好' });
+  write('speak/sent', { channel: 'reply-url', chars: 3, sid: 'qq:group:HOT', text: '嗯' });
+  // 本机对话流那一路（`channel='log'`）：没有会话坐标，不进任何会话的频次
+  write('speak/sent', { channel: 'log', chars: 3 });
+
+  interface FactsView {
+    spokeAt?: Map<string, number>;
+    spokeTimes?: Map<string, number[]>;
+  }
+  const view = (target: RealLoop): FactsView =>
+    (target as unknown as { contactFacts: () => FactsView }).contactFacts();
+
+  // **新实例**（内存里一张表都没有）跑一拍：warmUp 读全量日志 —— 素材只可能来自盘上那些事件
+  const fresh = loop(fakeDs('嗯。').ds);
+  await fresh.tickOnce();
+  const times = view(fresh).spokeTimes?.get('qq:group:HOT');
+  assert.equal(times?.length, 2, `重启后从日志折回来两条发言（钟冻住 ⇒ 同毫秒也不许并成一条）：${times?.join(',')}`);
+  assert.equal(view(fresh).spokeTimes?.size, 1, '本机那一路（没有 sid）不进任何会话');
+  assert.equal(view(fresh).spokeAt?.get('qq:group:HOT'), times?.[1], '最后一格仍是最后一次发言的时刻');
+  const { spokeFreqOf } = await import('../src/model/self-brief.ts');
+  assert.equal(spokeFreqOf('qq:group:HOT', view(fresh) as never, Date.parse('2026-10-01T08:00:00.000Z')), 2,
+    '窗口内两条 ⇒ 频次读数 2（这就是"前 3"排得出来的那个数）');
+
+  // 同一批事件**再折一遍**（重启后 `channelBookSeq` 从低位起就会这样）：读数不许翻倍
+  const events: AppEvent[] = [];
+  for await (const event of log.readAll()) events.push(event);
+  (fresh as unknown as { foldSpokeAndMentionInto: (e: readonly AppEvent[]) => void })
+    .foldSpokeAndMentionInto(events);
+  assert.equal(view(fresh).spokeTimes?.get('qq:group:HOT')?.length, 2,
+    '重折不翻倍：去重键是**事件序号**（不是时刻——那会吃掉真正的第二条）');
+});
+
+// ──────────────────────── ⑤d light 不再总结"没人理的群"（v66） ────────────────────────
+//
+// 判据三条同时成立 ⇒ 不产 `channel/topic`（**消息一条不丢**：未读、信箱、read_channel 都不动）。
+test('没人理的群不跑话题：三条判据（7 天常量）逐条正反', async () => {
+  const { isUnattendedGroup, GROUP_QUIET_WINDOW_MS } = await import('../src/channel/topic.ts');
+  const now = Date.parse('2026-10-16T12:00:00.000Z');
+  const day = 24 * 60 * 60 * 1000;
+  const group = { sid: 'qq:group:G', chatType: 'group', unread: 4 };
+
+  assert.equal(GROUP_QUIET_WINDOW_MS, 7 * day, '阈值是 7 天，写成一个常量（一个数可调）');
+  assert.equal(isUnattendedGroup(group, {}, now), true, '从没回过话、也没人叫过她 ⇒ 没人理');
+  assert.equal(isUnattendedGroup(group, { spokeAt: now - 8 * day, mentionedAt: now - 8 * day }, now), true,
+    '两条都早于 7 天 ⇒ 没人理');
+  assert.equal(isUnattendedGroup(group, { spokeAt: now - 6 * day }, now), false, '她 6 天前说过话 ⇒ 有人理');
+  assert.equal(isUnattendedGroup(group, { mentionedAt: now - 1000 }, now), false, '刚有人 @ 她 ⇒ 有人理');
+  assert.equal(isUnattendedGroup({ ...group, unread: 0 }, {}, now), false, '没有未读的会话本来就不进这条流水线');
+  assert.equal(isUnattendedGroup({ ...group, chatType: 'c2c' }, {}, now), false,
+    '私聊一律不掐 —— 对方就是在跟她说话，按"她多久没回"去掐恰好掐掉最该看的那一屏');
+  assert.equal(isUnattendedGroup(group, { spokeAt: Number.NaN }, Number.NaN), false,
+    '拿不到"现在"就不判（宁可多跑一次 light，也不因为一个坏值把群判成没人理）');
 });

@@ -1,3 +1,7 @@
+// TODO(i18n): 本文件还有 3 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/home.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -143,7 +147,14 @@ class _Brand extends StatelessWidget {
                       const SizedBox(width: 6),
                       Expanded(
                         child: Text(
-                          state.stateText,
+                          // 左上这一行字是**唯一**换说法的地方（用户 2026-10-16 ①：
+                          // 这里原来跟着服务端的 `stateText` 写「Agent 正在值守」，
+                          // 而她在跑 turn 的时候那句话要改成「思考中」）。
+                          // 判据不在这一行：`stateTextForBrand` 只在 `thinking` 为真时换词，
+                          // 而 `thinking` 来自服务端同一个响应里的 `openTurn` + `state`
+                          // （见 AppState 的注释）。别处（总览页大卡、设置页协议卡）照旧
+                          // 显示服务端的原话——那是"当刻在干什么"的正式说法，不该被这里带偏。
+                          state.stateTextForBrand,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant),

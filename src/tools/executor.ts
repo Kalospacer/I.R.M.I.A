@@ -28,6 +28,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 
 import type { SideEffect, ToolResultStatus } from '../log/types.js';
+import { decodeText, utf8ConsoleEnv } from '../util/bytes-text.ts';
 import type { ListForModelOptions, ToolRegistry } from './registry.js';
 import type { ToolContext, ToolDefinition, ToolHandlerResult } from './types.js';
 
@@ -827,14 +828,30 @@ export const defaultIsolatedSpawner: IsolatedSpawner = (task) => {
     cwd: task.cwd ?? process.cwd(),
     stdio: [hasStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     windowsHide: true,
+    // 隔离任务多半是脚本（python/node）：让它们按 UTF-8 写（见 util/bytes-text.ts）
+    env: utf8ConsoleEnv(),
   });
   const handlers: Array<(chunk: string, stream: 'stdout' | 'stderr') => void> = [];
-  const emit = (stream: 'stdout' | 'stderr') => (buf: Buffer) => {
-    const text = buf.toString('utf8');
-    for (const handler of handlers) handler(text, stream);
+  // **收原始字节、在 close 时一次解码**（2026-10-18 收口）：原来是逐块 `toString('utf8')`，
+  // 既会把 GBK 字节换成 U+FFFD（回执里就是乱码），也会把跨块的多字节字符切成两半。
+  // 隔离任务的回执本来就只在结束时给人看，攒字节再判一次没有代价。
+  const outChunks: Buffer[] = [];
+  const errChunks: Buffer[] = [];
+  let emitted = false;
+  const flush = (): void => {
+    if (emitted) return;
+    emitted = true;
+    const out = decodeText(Buffer.concat(outChunks)).text;
+    const err = decodeText(Buffer.concat(errChunks)).text;
+    if (out !== '') for (const handler of handlers) handler(out, 'stdout');
+    if (err !== '') for (const handler of handlers) handler(err, 'stderr');
   };
-  child.stdout?.on('data', emit('stdout'));
-  child.stderr?.on('data', emit('stderr'));
+  child.stdout?.on('data', (buf: Buffer) => {
+    outChunks.push(buf);
+  });
+  child.stderr?.on('data', (buf: Buffer) => {
+    errChunks.push(buf);
+  });
   if (hasStdin) child.stdin?.end(task.stdin);
 
   return {
@@ -843,9 +860,15 @@ export const defaultIsolatedSpawner: IsolatedSpawner = (task) => {
       handlers.push(handler);
     },
     onClose(handler) {
-      child.once('close', (code) => handler(code));
+      child.once('close', (code) => {
+        flush();
+        handler(code);
+      });
       // 启动失败（命令不存在等）只发 error 不发 close：统一折算成「退出码未知」
-      child.once('error', () => handler(null));
+      child.once('error', () => {
+        flush();
+        handler(null);
+      });
     },
     kill() {
       killProcessTree(child);
@@ -910,10 +933,16 @@ function completedResult(
  * 归因错了，出路就错了；所以改口径时把"再试一次"这条路**收掉**，只留两条真出路：
  * 换做法，或如实报告用户。
  *
- * ⚠ 这一句进的是**事件**（日志/重放/界面读它）。**模型那侧读的不是它**：同一条 `tool/result`
- * 到了渲染层由 `model/render.ts` 的 `renderToolOutput` 按 status 分发，`case 'timeout'` 打的是
- * 一句固定文本、**把这里的 `content` 整个丢掉**。要真改她读到的口径，两处得一起改；
- * 只改这里等于只改了留痕。回归用例：`test/tool-failure-streak.test.ts` 的 ④ 逐字钉这一句。
+ * **2026-10-16 压缩**（用户方向：总体以减少输入为优化目标，含每次工具调用的回执）：
+ * 两句合成一句，**两条出路一条没少**，压掉的是"超时不会中断本轮循环"与括号里那句解释
+ * （前者是框架的行为说明、她据此不行动；后者是归因说明，已在上面那段注释里）。
+ * 渲染层那一句（`model/render.ts` 的 `case 'timeout'`）跟着改成同一份最简形状——
+ * 两处**一起改**，因为她读到的固定句与这段正文是挨着的两行。
+ *
+ * ⚠ 这一句进的是**事件**（日志/重放/界面读它）。**模型那侧读的是它 + 渲染层那一句**：
+ * 同一条 `tool/result` 到了渲染层由 `model/render.ts` 的 `renderToolOutput` 按 status 分发，
+ * `case 'timeout'` 打一句固定文本**再接上这里的 `content`**（v50 起不再丢掉它）。
+ * 回归用例：`test/tool-failure-streak.test.ts` 的 ④ 逐字钉这一句。
  */
 function timeoutResult(
   call: ToolCallRequest,
@@ -924,8 +953,7 @@ function timeoutResult(
     status: 'timeout',
     content:
       `工具 ${call.name} 超过 ${def.timeoutMs}ms 没有返回，已记为超时结果。`
-      + '超时不会中断本轮循环；同一个目标别再重试（超时通常不是参数问题）——'
-      + '要么换做法，要么如实报告用户。',
+      + '同一个目标别再重试（超时通常不是参数问题）——要么换做法，要么如实报告用户。',
     isError: true,
     error: { message: `工具 ${call.name} 执行超时（${def.timeoutMs}ms）`, code: 'TOOL_TIMEOUT' },
     durationMs: Date.now() - startedAt,

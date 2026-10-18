@@ -1,14 +1,29 @@
+// TODO(i18n): 本文件还有 32 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/app.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:async';
 import 'shell/tray.dart';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+// 托盘的「退出全部」与「显示/收进托盘」要直接操作窗口（托盘自己只认菜单，见 shell/tray.dart）
+import 'package:window_manager/window_manager.dart';
 
 import 'api.dart';
 import 'ask_card.dart';
 import 'auth_gate.dart';
+// 「退出全部」真的停后端那一步（端口 → pid → taskkill 树），判据与代价见那个文件
+import 'backend_stop.dart';
+// 「这次是我主动退的，别把我拉回来」（协议见 docs/gui-guard.md §3）
+import 'gui_quit.dart';
 import 'her_name.dart';
 import 'home.dart';
+import 'i18n/app_strings.dart';
+import 'i18n/strings_override.dart';
+import 'i18n/strings_scope.dart';
 import 'mention_prompt.dart';
 import 'onboarding.dart';
 import 'pages/channels_page.dart';import 'pages/chat_page.dart';
@@ -20,9 +35,13 @@ import 'pages/persona_page.dart';
 import 'pages/schedule_page.dart';
 import 'pages/settings_page.dart';
 import 'password_prompt.dart';
+// 重启那条路：首页那颗按钮与托盘那一项**共用这一个函数**（三态判据只有一份）
+import 'restart_action.dart';
 import 'session_store.dart';
 import 'theme.dart';
 import 'title_bar.dart';
+// toast（托盘那几句的落点）与 confirm（「退出全部」的确认框）
+import 'ui_kit.dart';
 import 'ui_state.dart';
 
 /// 「该设密码了」那张卡被按过「以后再说」的事实（与引导、"更多"折叠组同一份 ui-state.json）
@@ -72,10 +91,93 @@ const int kOfflinePollSeconds = 2;
 /// 正常轮询间隔（秒）
 const int kOnlinePollSeconds = 10;
 
+/// 见过 turn 动静、但它还没被**响应**确认成"正在跑"时，下一拍读隔多久（毫秒）：**250ms**。
+///
+/// 为什么要有这一档（用户 2026-10-16 ②「那个思考反应快一点」）：值守/思考这件事在界面上
+/// 只有一个读数（`/api/stats/dashboard`，见 [AppState._readDashboard]），而它原来只跟着
+/// 10 秒的心跳走——她第 1 秒就在想、第 8 秒才想到第 3 步，界面上要等最多 10 秒才动一下。
+///
+/// 为什么 250ms：这不是"把轮询打密"，而是**事件驱动的重读**（见 [AppState._onFeedEvent]）。
+/// 后端那条事件流本来就是这个节奏（`src/web/server.ts` 的 `SSE_POLL_MS = 250`：250ms 一轮
+/// 从日志尾部泵出来），所以 250ms 是"这一拍不可能比事件本身来得更晚"的下限——比它再小只是
+/// 对同一个响应空打。成本本机实测（`GET /api/stats/dashboard`，20 次采样）：
+/// **中位 5.1ms / p95 7.5ms / 载荷 5377 B**，中位即最坏约 4 次/秒 ⇒ 服务端约 2% 单核。
+const int kTurnReadMs = 250;
+
+/// 见过 turn 动静、但**事件流没在推**（SSE 掉了）时，那一拍的宽限间隔（毫秒）：**3 秒**。
+///
+/// 为什么落回这一档而不是直接回 10 秒：那一刻界面相信"最近有动静"，而这个判断最后是由
+/// **响应**纠正的（`openTurn` 在 [_readDashboard] 里被照抄）。回 10 秒意味着最坏 10 秒后
+/// 才知道她其实早停了；3 秒既能把"她停了"及时纠正过来，又不像 250ms 那样在一条坏掉的链路上
+/// 白打那么密。这一档正常情况下根本用不到——SSE 是 250ms 一轮的尾部泵，它掉了基本就等于后端没了。
+const int kStaleTurnReadMs = 3000;
+
+/// turn 信号钉着那几拍多久算**过期**（毫秒）。
+///
+/// 这是"最近这一小段有没有动静"的窗口：过了它，那条提示就算旧了（[AppState] 的
+/// `turnSignalFreshWithin` 读它）。**它不参与"她在不在思考"的判据**——那句判据永远来自
+/// 服务端的响应，这里只是对"链路还活不活"的一个粗判。5 秒是防"服务端投影比事件晚半步"的抖。
+const int kTurnSignalHoldMs = 5000;
+
+/// 事件到达后**合并**多久再读一次 dashboard（毫秒）。
+///
+/// 为什么需要合并：一条 turn 里 `tool/call`、`tool/result`、`step/*` 是成串来的，
+/// 一条一变就是几十次请求打在同一个响应上——那正是用户说的"别更频繁地整表重建"。
+/// 250ms 是"一帧到两帧"的量级：合并掉同一步里的连串事件，而人不觉得慢。
+const int kTurnSignalDebounceMs = 250;
+
+/// turn 信号合并窗口的覆盖值（毫秒）；null = 用 [kTurnSignalDebounceMs]。
+///
+/// 做法照 `gateGraceSecondsOverride`：**给测试用**，让"事件一到就重读、而且成串的只重读一次"
+/// 这条能在几十毫秒内测到，而不是让用例真等 250ms。真机上没人设它。
+int? turnSignalDebounceMsOverride;
+
+/// 合并窗口的实际取值：覆盖优先
+int get turnSignalDebounceMs => turnSignalDebounceMsOverride ?? kTurnSignalDebounceMs;
+
+/// 这条事件算不算**"她那边有动静"**——只用来决定"要不要提前重读一次 dashboard"。
+///
+/// 判据只认 turn 自己的那几条（`src/log/types.ts` 的 `EVENT_VISIBILITY` 与 `fold.ts` 的
+/// `applyOne` 逐条对得上）：
+///   · `turn/start` / `turn/end`：`openTurn` 被置位/清空的那两条（`fold.ts:208-220`）；
+///   · `step/start` / `step/end`：`openTurn.step` 跟着走的那两条（`fold.ts:221-227`）；
+///   · `message/reasoning` / `message/assistant` / `tool/call` / `tool/result`：
+///     turn 活着时成串来的东西，用来"别让一步跑完了界面还不知道"。
+///
+/// ★ **它不判"她在不在思考"**：那条判据只有一处——[AppState._readDashboard] 里服务端
+/// 自己那句话的同一个响应（`openTurn != null && state == 'running'`）。这里多认识一条事件，
+/// 最坏的后果只是多读一次 dashboard（读到什么由服务端说），**不会**让"思考中"这句话凭空成立。
+/// 反过来漏认一条的后果也只是"这一下没提前读"（10 秒那一拍照旧纠正）。
+///
+/// 不认通道消息、快照、慢拍告警那些：它们不改左上一行字，理会了就是白白重读整屏。
+bool isTurnSignalEvent(String? type) {
+  switch (type) {
+    case 'turn/start':
+    case 'turn/end':
+    case 'step/start':
+    case 'step/end':
+    case 'message/reasoning':
+    case 'message/assistant':
+    case 'tool/call':
+    case 'tool/result':
+      return true;
+    default:
+      return false;
+  }
+}
+
 /// GUI 外壳与全局状态。页面在 pages/ 下，通过 AppState 拿数据与会话凭据。
 /// 结构规格：docs/gui-design.md §3。
 class IrmiaApp extends StatefulWidget {
-  const IrmiaApp({super.key});
+  const IrmiaApp({super.key, this.initialLanguage = AppLanguage.zh});
+
+  /// 启动时生效的语言。**默认中文**（作者语言），入口 [main] 会按盘上的偏好与系统
+  /// locale 把它定下来（见 `i18n/strings_scope.dart` 的 `restoreLanguage`）。
+  ///
+  /// 为什么默认值不是"跟随系统"：语言**不在 widget 树里解析**——树里读平台 locale，
+  /// widget 测试的结论就会跟着跑测试那台机器的系统语言变。默认具体中文 ⇒ 任何
+  /// `IrmiaApp()` / 单独 pump 的页面在用例里的输出是确定的。
+  final AppLanguage initialLanguage;
 
   @override
   State<IrmiaApp> createState() => _IrmiaAppState();
@@ -196,49 +298,165 @@ PageEntry? pageEntryById(String id) {
 class _IrmiaAppState extends State<IrmiaApp> {
   late final AppState state;
 
+  /// 托盘的 toast 落点。
+  ///
+  /// 托盘点击是**原生菜单回调**，手上没有 BuildContext；而"重启/退出"的那几句话必须有个落点
+  /// （窗口收在托盘里时至少还进日志）。导航器的 context 在 `MaterialApp` 的
+  /// `ScaffoldMessenger` 与 `Theme` 之下，`IrmiaToast.show` 拿它就能画出与页里一模一样的那条。
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+
+  /// 语言 + 文案覆盖层：**哪一边变了都重建 `MaterialApp`**（都不重启界面）。
+  ///
+  /// 合成一条 listene 而不是套两层 builder：两者的动作完全一样（换一整棵树、保状态），
+  /// 分开监听只多一层缩进。`late final` 保证只订阅一次（build 里造新的会反复订阅/退订）。
+  late final Listenable _stringsSources = Listenable.merge(<Listenable>[
+    effectiveLanguage,
+    stringsOverrideState,
+  ]);
+
   @override
   void initState() {
     super.initState();
+    // 入口解析好的语言落进那个全局 notifier（默认中文，见 IrmiaApp.initialLanguage）
+    effectiveLanguage.value = widget.initialLanguage;
     final port = Platform.environment['IRMIA_WEB_PORT'] ?? '7788';
     state = AppState(api: IrmiaApi(baseUrl: 'http://127.0.0.1:$port'));
     // **不在这里决定画哪一态**：凭据按实例分文件存，而"我是哪个实例"只有服务端知道。
     // 所以先空手问一次（bootstrap），拿回实例标识与 `code` 之后才知道该弹"设置密码"还是"登录"。
     unawaited(state.bootstrap());
-    // **托盘接线**（2026-10-04）：菜单里的「重启前后端」复用界面这条命令通道，
-    // 与运行情况页那颗按钮走同一个后端动作（免得两处各写一份重启逻辑）。
+    // **托盘接线**（2026-10-04，2026-10-17 改）：菜单五项、四个动作都由这里注入——
+    // 托盘自己只认菜单与插件（见 shell/tray.dart 的文件头：两项退出为什么必须分开）。
     // 放在 initState 里而不是 main()：这里拿得到 state.api（凭据也在这一步就位）。
     // 门还没进的时候它也照装：托盘是窗口的财产，不归"登录了没有"管。
     unawaited(IrmiaTray.instance.install(
-      post: (command, payload) => state.api.post(
-        '/api/commands/$command',
-        payload,
-        confirm: command,
+      actions: TrayActions(
+        show: () {
+          unawaited(windowManager.show());
+          unawaited(windowManager.focus());
+        },
+        hide: () => unawaited(windowManager.hide()),
+        // 与首页那颗「重启前后端」**同一个函数**：请求、三态判据、说的话、等回来的窗口只有一份
+        restart: _restartFromTray,
+        // 「退出界面」= 老行为：写标记（别让保活把我拉回来）→ 收托盘 → 关窗。后端一个字节都不动
+        quitUi: _quitUi,
+        // 「退出全部」= 界面 + 后端（含它拉起的协议端）；确认框把硬杀的代价说清
+        quitAll: () => unawaited(_quitAll()),
       ),
-      // 托盘那条「重启前后端」也要**有反馈**（用户 2026-10-05：「点了没有反馈」）。
-      // 托盘点击时窗口可能收着，弹 toast 没有落点；但结论照旧要落地——服务端那句
-      // `note` 是**唯一一处**判据（成功带真实新 pid 与端口、失败带原因、未确认就说未确认），
-      // 这里原样记下来，不加工、不粉饰（debugPrint 会进 release 日志）。
-      onRestartResult: (result) {
-        final map = result is Map ? result : const {};
-        final note = map['note']?.toString() ?? '重启已发出（服务端没有给出结论）';
-        debugPrint('[托盘·重启前后端] $note');
-      },
+      strings: currentStrings,
       // 托盘提示里是**她的名字**（读不到时由 her_name.dart 决定显示什么）
       displayName: state.herDisplayName,
     ));
     // 名字是异步读来的（`persona/IDENTITY.md`），读到之后托盘提示也跟着换一次；
     // 每次轮询都会调到这里，而 setDisplayName 在值没变时直接返回（不做无用的系统调用）
     state.addListener(_syncTrayName);
+    // 菜单文字是**原生对象**，不跟着 Flutter 重建：语言一变就重画一遍（否则切到 English 之后
+    // 托盘还是中文，而这种不一致没人会想到去查）
+    effectiveLanguage.addListener(_syncTrayLanguage);
+    // 文案覆盖层同理：设置页点「重新载入文案」之后托盘那五项也要换成新的字
+    // （它是原生菜单，不会跟着 IrmiaStrings 重建）
+    stringsOverrideState.addListener(_syncTrayLanguage);
   }
 
   /// 状态一变就把她的名字同步给托盘（真正的判断在 [IrmiaTray.setDisplayName] 里）
   void _syncTrayName() => unawaited(IrmiaTray.instance.setDisplayName(state.herDisplayName));
 
+  /// 语言或文案覆盖一变就把托盘菜单的文字重画一遍（两边说的是同一句：
+  /// 语言换了换措辞，覆盖文件换了换用户自己改的那几个字）
+  void _syncTrayLanguage() => unawaited(IrmiaTray.instance.refreshMenu(currentStrings));
+
   @override
   void dispose() {
+    effectiveLanguage.removeListener(_syncTrayLanguage);
+    stringsOverrideState.removeListener(_syncTrayLanguage);
     state.removeListener(_syncTrayName);
     state.dispose();
     super.dispose();
+  }
+
+  // ────────────────────────── 托盘那四个动作 ──────────────────────────
+
+  /// 一个 toast 的落点：**有界面上下文就弹给人看，没有就只写日志**。
+  ///
+  /// 托盘点击时窗口可能收在托盘里——那时候弹 toast 没有落点，但**那句话不能丢**：
+  /// 它与首页那颗按钮说的是同一句（[performRestart] 给的），只是换了个去处。
+  void _say(String message, ToastKind kind) {
+    final context = _navigatorKey.currentContext;
+    debugPrint('[托盘] $message');
+    if (context == null) return;
+    IrmiaToast.show(context, message, kind: kind);
+  }
+
+  /// 托盘「重启前后端」：与首页那颗按钮**同一个函数**（判据一套，不严不松）
+  Future<void> _restartFromTray() => performRestart(
+        api: state.api,
+        strings: currentStrings,
+        say: _say,
+        online: () => state.online,
+        alive: () => mounted,
+      );
+
+  /// 托盘「退出界面（她继续在后台运行）」：老行为，一个后端进程都不动。
+  ///
+  /// **先写标记、再退**（协议见 docs/gui-guard.md §3）：后端保活按"有没有这个标记"分
+  /// "他主动退的"与"崩了/被杀了"，不写就会被当成崩溃拉回来（最多 6 次）。
+  void _quitUi() {
+    unawaited(markGuiQuit('tray-quit'));
+    unawaited(_finishQuit());
+  }
+
+  /// 托盘「退出全部（界面 + 后端）」。
+  ///
+  /// 三件事，每一件都有它非做不可的理由：
+  ///   ① **先确认**：这是唯一一个会结束后端（连同协议端）的动作，代价要摆在人面前
+  ///      （`quitAllConfirmBody`：硬杀丢了什么、她正在跑的那一轮会怎样、协议端要不要重登）；
+  ///   ② **真的停后端**（[stopBackendOnPort]：界面正在用的那个端口的监听者 → 它的进程树），
+  ///      并**核实端口不再应答**——停不下来就如实报错、**并且不关界面**，
+  ///      免得人以为"全退了"而实际上后端还在跑（那正是这次要修的毛病）；
+  ///   ③ **先写标记再退**：与「退出界面」同一个握手，否则保活会把界面又拉起来。
+  Future<void> _quitAll() async {
+    final opened = _navigatorKey.currentContext;
+    if (opened == null) {
+      // 极端情况（窗口/导航都还没建好）：什么都不做，也不假装退了
+      debugPrint('[托盘·退出全部] 拿不到界面上下文，这次不执行');
+      return;
+    }
+    // 确认框必须落在人看得见的地方：托盘点出来时窗口可能收着
+    unawaited(windowManager.show());
+    unawaited(windowManager.focus());
+    final strings = currentStrings;
+    // 她正在跑一轮时，这一轮会被硬杀打断——这件事要在确认框里说，不许事后才解释
+    final busy = state.openTurn != null;
+    final yes = await confirm(
+      opened,
+      title: strings.quitAllConfirmTitle,
+      body: strings.quitAllConfirmBody(busy),
+      confirmLabel: strings.quitAllConfirmLabel,
+      danger: true,
+    );
+    if (!yes || !mounted) return;
+    // 界面用的端口就是后端在听的那个端口（baseUrl 是回环地址，见 initState）
+    final port = Uri.parse(state.api.baseUrl).port;
+    // 话走 [_say]：它每次现取上下文（拿不到就只进日志），所以这里不用把 context 带过 await
+    _say(strings.quitAllWorking, ToastKind.info);
+    final result = await stopBackendOnPort(port);
+    // 停不下来就**不关界面**：那句失败必须有人看得见，而不是跟着窗口一起消失
+    if (!result.ok) {
+      _say(currentStrings.quitAllFailed(result.detail), ToastKind.error);
+      return;
+    }
+    debugPrint('[托盘·退出全部] ${currentStrings.quitAllDone}：${result.detail}');
+    await markGuiQuit('tray-quit-all');
+    await _finishQuit();
+  }
+
+  /// 退出流程的收尾：先拆托盘、再关窗（顺序反过来会留一个点不动的托盘图标）
+  Future<void> _finishQuit() async {
+    await IrmiaTray.instance.remove();
+    try {
+      await windowManager.destroy();
+    } catch (err) {
+      debugPrint('关窗失败：$err');
+    }
   }
 
   @override
@@ -246,51 +464,83 @@ class _IrmiaAppState extends State<IrmiaApp> {
     return ListenableBuilder(
       listenable: state,
       builder: (context, _) {
-        return MaterialApp(
-          // 窗口标题 = **她的名字**（读不到时回退成产品名，见 her_name.dart 的口径）。
-          // 产品名 `Irmia Agent Framework` 是另一件事：它在自绘标题栏与 C++ runner 里，
-          // 与她叫什么无关，所以这里不跟它走。
-          //
-          // 实测（2026-10-03，release 版跑起来用 GetWindowText 读原生标题）：Windows 上这一行
-          // **到不了原生窗口标题**——标题是 main.dart 的 `WindowOptions(title: …)`（产品名）
-          // 定的，一直显示 `Irmia Agent Framework`。所以改这里不会动到产品名，也不会像按下
-          // 开关那样换掉标题；它是"这个应用对外自称什么"的声明位（别的平台/无障碍会读它），
-          // 放着与她的名字一致是对的，但不能拿它当"窗口标题跟配置走"的证据。
-          title: herNameOrFallback(state.herName),
-          debugShowCheckedModeBanner: false,
-          theme: IrmiaTheme.light(),
-          darkTheme: IrmiaTheme.dark(),
-          themeMode: state.themeMode,
-          // 自绘标题栏画在所有页面之上（含那道门）：窗口已经没有系统标题栏，
-          // 这条既是标题也是唯一的拖动区（docs/gui-revision.md ①）。
-          builder: (context, child) => Column(
-            children: [
-              const IrmiaTitleBar(),
-              Expanded(child: child ?? const SizedBox.shrink()),
-            ],
-          ),
-          // 门与壳的切换只看 `ready`：它由 bootstrap/登录/设密码/401 自愈四处共同维护，
-          // 不在 build 里再算一遍判据（两处判据必然漂移，而漂移的表现就是"白屏"）。
-          home: state.ready
-              // 四层宿主包住整壳，从外到内：
-              //   · OnboardingHost —— 首次启动引导（一次性的，判据见 onboarding.dart）；
-              //   · PasswordPromptHost —— 「该设密码了」的首次提示（只对凭老凭据进门的人弹，
-              //     见 password_prompt.dart：不弹的话那条老路会一直能用，密码就没人设了）；
-              //   · MentionPromptHost —— 「她怎么被称呼」的首次提示；
-              //   · AskCardHost —— 她此刻在问的那张卡（每次都来）。
-              // 引导放最外层：它是"第一次用的人"最先该看到的东西，而它读的现状（人格种子、
-              // 密钥、通道）全都要先有会话凭据——所以它也只能在那道门之后（见 onboarding.dart 顶部）。
-              ? OnboardingHost(
-                  state: state,
-                  child: PasswordPromptHost(
-                    state: state,
-                    child: MentionPromptHost(
+        // 语言一变就重建 `MaterialApp`（**不重启**）：locale、Material 自带文案、
+        // 以及 [IrmiaStrings] 那一层的内容一起换。`ValueListenableBuilder` 在值没变时
+        // 不重建——"选一个已经选中的语言"不会白重建一整棵树。
+        //
+        // 2026-10-21 起这个 listene 换成"语言 **或** 文案覆盖层"（[Listenable.merge]）：
+        // 设置页那颗「重新载入文案」改的是 [stringsOverrideState]，语言一个字都没动，
+        // 但屏幕上的字必须跟着换——只监听语言的话按下去什么都不会发生。
+        return ListenableBuilder(
+          listenable: _stringsSources,
+          builder: (context, __) {
+            final language = effectiveLanguage.value;
+            final strings = resolveStrings(language);
+            return MaterialApp(
+              // 托盘的 toast 落点（见 [_navigatorKey]）：托盘回调没有 context，用它取一条
+              navigatorKey: _navigatorKey,
+              // 窗口标题 = **她的名字**（读不到时回退成产品名，见 her_name.dart 的口径）。
+              // 产品名 `Irmia Agent Framework` 是另一件事：它在自绘标题栏与 C++ runner 里，
+              // 与她叫什么无关，所以这里不跟它走。
+              //
+              // 实测（2026-10-03，release 版跑起来用 GetWindowText 读原生标题）：Windows 上这一行
+              // **到不了原生窗口标题**——标题是 main.dart 的 `WindowOptions(title: …)`（产品名）
+              // 定的，一直显示 `Irmia Agent Framework`。所以改这里不会动到产品名，也不会像按下
+              // 开关那样换掉标题；它是"这个应用对外自称什么"的声明位（别的平台/无障碍会读它），
+              // 放着与她的名字一致是对的，但不能拿它当"窗口标题跟配置走"的证据。
+              title: herNameOrFallback(state.herName),
+              debugShowCheckedModeBanner: false,
+              theme: IrmiaTheme.light(),
+              darkTheme: IrmiaTheme.dark(),
+              themeMode: state.themeMode,
+              // ── i18n 的两条线（分工见 i18n/app_strings.dart 顶部）──
+              //   · locale + 三个 delegate —— 管 **Material 自己那层文案**（文本框的
+              //     剪切/复制/粘贴菜单、滚动条与对话框的无障碍标签、数字日期格式）。
+              //     不装它，中文界面里那排菜单永远是英文（现状，2026-10-17 盘点）。
+              //   · [IrmiaStrings]（在 builder 里）—— 管**我们自己的文案**，
+              //     页面用 `IrmiaStrings.of(context)` 取。
+              locale: strings.locale,
+              localizationsDelegates: const [
+                GlobalMaterialLocalizations.delegate,
+                GlobalWidgetsLocalizations.delegate,
+                GlobalCupertinoLocalizations.delegate,
+              ],
+              supportedLocales: const [Locale('zh', 'CN'), Locale('en', 'US')],
+              // 自绘标题栏画在所有页面之上（含那道门）：窗口已经没有系统标题栏，
+              // 这条既是标题也是唯一的拖动区（docs/gui-revision.md ①）。
+              builder: (context, child) => IrmiaStrings(
+                strings: strings,
+                child: Column(
+                  children: [
+                    const IrmiaTitleBar(),
+                    Expanded(child: child ?? const SizedBox.shrink()),
+                  ],
+                ),
+              ),
+              // 门与壳的切换只看 `ready`：它由 bootstrap/登录/设密码/401 自愈四处共同维护，
+              // 不在 build 里再算一遍判据（两处判据必然漂移，而漂移的表现就是"白屏"）。
+              home: state.ready
+                  // 四层宿主包住整壳，从外到内：
+                  //   · OnboardingHost —— 首次启动引导（一次性的，判据见 onboarding.dart）；
+                  //   · PasswordPromptHost —— 「该设密码了」的首次提示（只对凭老凭据进门的人弹，
+                  //     见 password_prompt.dart：不弹的话那条老路会一直能用，密码就没人设了）；
+                  //   · MentionPromptHost —— 「她怎么被称呼」的首次提示；
+                  //   · AskCardHost —— 她此刻在问的那张卡（每次都来）。
+                  // 引导放最外层：它是"第一次用的人"最先该看到的东西，而它读的现状（人格种子、
+                  // 密钥、通道）全都要先有会话凭据——所以它也只能在那道门之后（见 onboarding.dart 顶部）。
+                  ? OnboardingHost(
                       state: state,
-                      child: AskCardHost(state: state, child: HomeShell(state: state)),
-                    ),
-                  ),
-                )
-              : AuthGate(state: state),
+                      child: PasswordPromptHost(
+                        state: state,
+                        child: MentionPromptHost(
+                          state: state,
+                          child: AskCardHost(state: state, child: HomeShell(state: state)),
+                        ),
+                      ),
+                    )
+                  : AuthGate(state: state),
+            );
+          },
         );
       },
     );
@@ -380,6 +630,56 @@ class AppState extends ChangeNotifier {
   int needsReview = 0;
   bool online = false;
 
+  /// **她在思考吗**——界面这一侧唯一的判断（`gui/lib/home.dart` 的左上一行字读它）。
+  ///
+  /// 判据不是"进程活着"、更不是时间窗，而是**服务端自己那句话的同一个响应里的两个字段**
+  /// （`/api/stats/dashboard`，判据本体在 `src/web/server.ts` 的 `deriveState`）：
+  ///
+  ///   · `openTurn != null`  ← 投影里有一个开着的 turn（`turn/start` 之后、`turn/end` 之前）；
+  ///   · `state == 'running'` ← 当刻没有待确认、没有暂停、没有降级。
+  ///
+  /// 两条同时成立，服务端给的 `stateText` 就是「Agent 正在值守」（`server.ts:1477`）；
+  /// 界面把它改说成「思考中」（见 [stateTextForBrand]）——**只改说法，不改判据**：
+  /// 界面不自己推断她在不在想，也不拿"最近有没有事件"这种时间窗去猜
+  /// （用户 2026-10-16 明确不许猜时间窗）。
+  ///
+  /// 事件流（[_onFeedEvent]）只能把这句话**提前**一拍说出口，不能凭空把它说成真的：
+  /// 它做的只是"别等 10 秒的心跳，现在就重读一次 dashboard"。
+  bool get thinking => _thinking;
+  bool _thinking = false;
+
+  /// 服务端**当次读数**里那个开着的 turn（`/api/stats/dashboard.openTurn`），没有就是 null。
+  ///
+  /// 它和 [thinking] 是同一份响应里的两个字段，用处不同：
+  ///   · [thinking] 回答"她**正在**想吗"（还要求 `state == 'running'`）；
+  ///   · 这一个回答"服务端认为**还有没有**未收尾的 turn"——`null` 就是"这一轮已经结束了"。
+  ///
+  /// ★ 为什么必须把它单独露出来（用户 2026-10-16 ②「待机时那个思考标志还在」）：
+  /// 聊天页那行进度**只认事件**（`turn/end` 一到就收）。而事件流是会断的：SSE 重连时
+  /// 断线窗口里那条 `turn/end` 补不回来（那时 `ChatPage.connectStream` 没带 `Last-Event-ID`），
+  /// 于是**那一行会一直挂着**——右上那行字却能自己好，因为它的判据取自响应。
+  /// 有了这一格，聊天页就能拿**服务端的话**去对账（见 `ChatPageState.reconcileThinking`），
+  /// 判据仍然只有服务端一处，界面不自己编"她大概停了"。
+  String? get openTurn => _openTurn;
+  String? _openTurn;
+
+  /// 左上一行字**实际显示**的那句话：她在想 ⇒「思考中」，否则照抄服务端给的 [stateText]。
+  ///
+  /// 为什么另开一个 getter 而不是直接改写 [stateText]：`stateText` 是服务端的原话，
+  /// 它还有别的读处（总览页那张大卡、设置页那张协议卡都照抄它），那些地方该显示原话。
+  /// 换说法只是**左上这一个窄位置**的事（用户 2026-10-16 ①：「左上角不要写"agent 值守中"，
+  /// 要写"思考中"」），所以换在这一处，不动数据本身。
+  String get stateTextForBrand => _thinking ? '思考中' : stateText;
+
+  /// 事件流里见过 turn 的动静（`turn/start` / `step/*` / `message/reasoning` 那些），
+  /// **还没被响应否掉**。
+  ///
+  /// 它只做一件事：决定 [_scheduleDashboardTick] 下一拍按哪一档打。**不参与 [thinking] 的判据**
+  /// ——判据永远来自服务端的响应，它只是"最近这一小段有动静"的一个提示。
+  bool _turnSignaled = false;
+  /// [_turnSignaled] 是什么时刻被点亮的，用来让提示自己过期（见 [kTurnSignalHoldMs]）
+  int _turnSignalAtMs = 0;
+
   /// **她在问**的那些卡（design §6）：按提问先后排好的一队，界面一次只弹队首那张（§6.3）。
   ///
   /// 空表示台面上没有她没答复的提问。卡上的字：`question`/`context` 是她的原话，
@@ -391,7 +691,23 @@ class AppState extends ChangeNotifier {
   /// 台面上还没答复的总条数（含 `askCards` 之外没下发的那几件）：左栏角标读它
   int askTotal = 0;
 
-  Timer? _poll;
+  /// 读一次 dashboard 的**下一拍**（不是 `Timer.periodic`：它读的间隔要在每一拍之后重算——
+  /// 她开始想的时候立刻降到 [kTurnReadMs]，停下来之后回到 [kOnlinePollSeconds]）。
+  ///
+  /// 为什么不用两条周期定时器来回切：切换点必须长在"这一拍的结果"上（`openTurn`），
+  /// 而两个 `Timer.periodic` 互切至少要记得两处取消，漏一处就是"两条心跳同时打"。
+  /// 全 app 就这一条读 dashboard 的链（[startPolling] 起点、[logout]/[dispose]/[_requireAuth]
+  /// 收口）——原来那种"10 秒 periodic + 另起一条快档"是两条链打同一个端点。
+  Timer? _dashboardTick;
+
+  /// 事件流的订阅（`GET /api/events/stream`）。与日志页/聊天页同一条端点，换个住处而已。
+  StreamSubscription<Map<String, dynamic>>? _eventsSub;
+  /// 事件流断了之后重连的那一拍
+  Timer? _eventsRetry;
+  /// 真的收过至少一条事件 = 这条链路**验证过**是通的（决定快档用 250ms 还是宽限档 3 秒）
+  bool _eventsLive = false;
+  /// 合并窗口的那一拍
+  Timer? _turnReadTimer;
 
   // ── 进门：探测 → 读凭据 → 设密码 / 登录 ──
 
@@ -553,7 +869,6 @@ class AppState extends ChangeNotifier {
   /// 再抄一份迟早会跟它长得不一样。代价只是壳先收起来一下。
   void openPasswordSetup() {
     needsPasswordPrompt = false;
-    _poll?.cancel();
     ready = false;
     gate = AuthGateKind.setup;
     gateError = '';
@@ -632,13 +947,16 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       // 见上：撤销没成功也不影响"本地登出"这件事，如实继续
     }
-    _poll?.cancel();
+    _dashboardTick?.cancel();
+    _dashboardTick = null;
+    _dropEventsFeed();
     _gateRetry?.cancel();
     _gateRetry = null;
     api.token = null;
     final key = instance;
     if (key != null) sessions.clear(key);
     ready = false;
+    _thinking = false;
     gate = _onLegacyToken ? AuthGateKind.setup : AuthGateKind.login;
     gateError = '';
     gateAttempt = 0;
@@ -852,8 +1170,12 @@ class AppState extends ChangeNotifier {
   /// 这是这轮修的另一半：过去这里只是把 token 清掉、写一句"认证失败（token 无效）"，
   /// 于是界面留在壳里、所有页面都读不到数据——人看到的是一片空白，只能自己去猜要重启。
   void _requireAuth(ApiAuthError err) {
-    _poll?.cancel();
+    // 快档那一拍与事件流同一条命：凭据都不作数了，它们再打也只是白挨 401
+    _dashboardTick?.cancel();
+    _dashboardTick = null;
+    _dropEventsFeed();
     ready = false;
+    _thinking = false;
     api.token = null;
     final key = instance;
     if (key != null) sessions.clear(key);
@@ -866,15 +1188,21 @@ class AppState extends ChangeNotifier {
   }
 
   void startPolling() {
-    _poll?.cancel();
     unawaited(pollOnce());
     // 名字跟着同一条生命周期的起点读一次（她改名走界面那几条路时会再读，见 refreshHerName）
     unawaited(refreshHerName());
-    _pollSeconds = kOnlinePollSeconds;
-    _poll = Timer.periodic(Duration(seconds: _pollSeconds), (_) => unawaited(pollOnce()));
+    // **只有这一条链在读 dashboard**：下面那一拍自己排下一拍（间隔按"她在不在想"重算，
+    // 见 [_sleepAfterRead]）。原来那种"10 秒 periodic + 另起一条快档"的写法会让两条链
+    // 同时打同一个端点（快档 250ms 时尤其明显）——同一份响应读两遍，谁都不需要。
+    _scheduleDashboardTick(const Duration(seconds: kOnlinePollSeconds));
+    _syncEventsFeed();
   }
 
-  /// 心跳的当前间隔（秒），跟着连接状态走：断线时快、正常时慢（见 [_pollWhile]）
+  /// 上一拍读还在路上（见 [_dashboardTickOnce] 的防重入）
+  bool _readingDashboard = false;
+
+  /// 当前那两档节奏里的"慢档"取值（秒）：连得上 → [kOnlinePollSeconds]，断线 → [kOfflinePollSeconds]。
+  /// 快档（[kTurnReadMs]）不在这里——它由 [_sleepAfterRead] 按当刻那一拍的结果算。
   int _pollSeconds = kOnlinePollSeconds;
 
   /// 按"现在连得上吗"调整心跳节奏：断线 → [kOfflinePollSeconds]（2 秒），恢复 → [kOnlinePollSeconds]。
@@ -883,12 +1211,291 @@ class AppState extends ChangeNotifier {
   /// **她回来了没有**——原来 10 秒一拍意味着她其实第 3 秒就起来了，界面还要装作断了 7 秒。
   /// 断线期间这一拍只是一条被立刻拒掉的回环请求（几毫秒），代价可以忽略。
   /// 恢复之后**必须**调回 10 秒：否则一次重启会让界面永久地每 2 秒打一次服务端。
+  ///
+  /// 它**只重排那一拍**（不再自己另起一条 periodic）：reads 的节奏归 [_sleepAfterRead] 一处管，
+  /// 两处各排各的就会在同一刻撞出两条并发读。
   void _pollWhile({required bool ok}) {
     final want = ok ? kOnlinePollSeconds : kOfflinePollSeconds;
-    if (want == _pollSeconds) return;
+    final changed = want != _pollSeconds;
     _pollSeconds = want;
-    _poll?.cancel();
-    _poll = Timer.periodic(Duration(seconds: want), (_) => unawaited(pollOnce()));
+    if (!changed) return;
+    _scheduleDashboardTick(Duration(seconds: want));
+  }
+
+  // ── turn 信号：别让"她在想"这句话等下一次心跳（用户 2026-10-16 ②） ──
+
+  /// 一条事件流事件 → 要不要把 dashboard 提前读一遍。
+  ///
+  /// 只认**turn 的动静**（见 [isTurnSignalEvent]），别的（通道消息、快照、慢拍告警…）
+  /// 一条都不理会：它们不改左上一行字，理会了就是白白重建一屏。
+  void _onFeedEvent(Map<String, dynamic> event) {
+    _eventsLive = true;
+    // 记下水位：重连时把它当 `Last-Event-ID` 交给服务端补拉（见 [_lastEventSeq]）。
+    // **只增不减**：补拉来的旧事件不会把这个水位往回带（否则每补一次都要重补一遍）。
+    final seq = event['seq'];
+    if (seq is num) {
+      final value = seq.toInt();
+      if (_lastEventSeq == null || value > _lastEventSeq!) _lastEventSeq = value;
+    }
+    if (!isTurnSignalEvent(event['type']?.toString())) return;
+    if (_disposed || !ready) return;
+    // 新的一段动静（本来没有信号 → 现在有）：**这一下要立刻读**，不能等合并窗口——
+    // 她刚开口的那一刻正是最该跟手的一下（之后连串来的事件才走合并）。
+    final rising = !_turnSignaled;
+    _markTurnSignal();
+    if (rising) {
+      unawaited(_readDashboardSoon());
+      return;
+    }
+    // 合并窗口：一步里成串来的事件只换一次重读（别一条一变地整表重建）
+    if (_turnReadTimer != null) return;
+    _turnReadTimer = Timer(Duration(milliseconds: turnSignalDebounceMs), () {
+      _turnReadTimer = null;
+      if (_disposed) return;
+      unawaited(_readDashboardSoon());
+    });
+  }
+
+  /// 立刻读一次 dashboard（事件驱动的入口）。
+  ///
+  /// 与那一拍**共用同一段实现**（[_readDashboard]）：多一条读法就多一处口径，
+  /// 而"状态词从哪来"这件事只能有一处。
+  ///
+  /// 读完**要重排下一拍**——这一下正是"快档什么时候开始"的关键：那一拍可能是按慢档
+  /// （10 秒）排着的，而这一读刚发现"她在跑"，重排才会把它收到 [kTurnReadMs]。
+  /// 不重排的后果是实测出来的：她开始想之后，界面仍旧要等满 10 秒才动第二下
+  /// （见 `test/brand_status_test.dart` 的"思考期按快档走"）。
+  Future<void> _readDashboardSoon() async {
+    if (_disposed || !ready || _readingDashboard) return;
+    _readingDashboard = true;
+    bool changed;
+    try {
+      changed = await _readDashboard();
+    } finally {
+      _readingDashboard = false;
+    }
+    if (_disposed || !ready) return;
+    if (changed) notifyListeners();
+    _scheduleDashboardTick(_sleepAfterRead());
+  }
+
+  /// 把"最近有 turn 动静"这条提示点亮（还没点亮才写时刻——每来一条都重写的话，
+  /// 一条不断的流就能让提示永不过期，那正好是"靠猜时间窗"的翻版）
+  void _markTurnSignal() {
+    if (_turnSignaled) return;
+    _turnSignaled = true;
+    _turnSignalAtMs = DateTime.now().millisecondsSinceEpoch;
+  }
+
+  /// 这条提示在 [ms] 之内点亮过没有（见 [kTurnSignalHoldMs]）
+  bool _turnSignalFreshWithin(int ms) =>
+      _turnSignaled && DateTime.now().millisecondsSinceEpoch - _turnSignalAtMs <= ms;
+
+  /// 服务端说"当刻没有 turn"时，把那条提示收掉（判据永远以响应为准）
+  void _clearTurnSignal() => _turnSignaled = false;
+
+  /// 掉线/回门时同时收掉事件流、合并窗口与那句"最近有动静"
+  void _dropEventsFeed() {
+    _eventsSub?.cancel();
+    _eventsSub = null;
+    _eventsRetry?.cancel();
+    _eventsRetry = null;
+    _turnReadTimer?.cancel();
+    _turnReadTimer = null;
+    _eventsLive = false;
+    _clearTurnSignal();
+  }
+
+  /// 接上（或重连）事件流。**与心跳同一份生命周期**：进了壳才接、回门就断（见 [_dropEventsFeed]）。
+  ///
+  /// 为什么界面要多接一条流（而不是把心跳打得更密）：turn 的开始/结束、每一步的推进，
+  /// 服务端本来就是**写事件**的，而事件到界面这段链路后端已经做到 250ms 级
+  /// （`src/web/server.ts` 的 `SSE_POLL_MS`）。拿现成的推送当扳机、把 dashboard 读快一档，
+  /// 比凭空把轮询打密可靠：快档只在 turn 活着时才开，她停下来就是原来的 10 秒。
+  void _syncEventsFeed() {
+    if (_disposed || !ready || _eventsSub != null) return;
+    _eventsSub = api.events(lastEventId: _lastEventSeq).listen(
+      _onFeedEvent,
+      onError: (_) => _scheduleEventsRetry(),
+      onDone: _scheduleEventsRetry,
+    );
+  }
+
+  /// 事件流里**最后见过的那条 seq**（`null` = 一条都还没见过）。
+  ///
+  /// ★ 为什么要记它（用户 2026-10-16 ②「待机时那个思考标志还在」，实测根因）：
+  /// 服务端**本来就支持断线补拉**（`src/web/server.ts` 的 `openStream`：带 `Last-Event-ID`
+  /// 就从 `lastId + 1` 把漏掉的那一段重发一遍），但界面过去**从来不传**它
+  /// （`api.events()` 签名里留着这个口子，两处调用都传 `null`）——于是 SSE 一断，
+  /// 断线窗口里的事件就**永远补不回来**。而那里面最要命的一条正是 `turn/end`：
+  /// 丢了它，聊天页那行「思考中」会一直挂着（它只认这条事件）。
+  ///
+  /// 补拉是**幂等**的：聊天页按 seq 去重（`_seen`），`AppState` 这一侧只认"有没有动静"。
+  int? _lastEventSeq;
+
+  void _scheduleEventsRetry() {
+    _eventsSub = null;
+    _eventsLive = false;
+    if (_disposed || !ready) return;
+    _eventsRetry?.cancel();
+    _eventsRetry = Timer(const Duration(seconds: 3), () {
+      _eventsRetry = null;
+      if (_disposed || !ready) return;
+      _syncEventsFeed();
+    });
+  }
+
+  /// 下一拍隔多久读（**每一拍之后都重算**，所以它跟着 `openTurn` 走）。
+  ///
+  /// 档位与先后（顺序有讲究，见"验证过再快"那一条）：
+  ///   · **没连上** ⇒ [kOfflinePollSeconds]（2 秒）：重启期间最要紧的是"她回来了没有"；
+  ///   · **事件流没在推**（SSE 掉了）⇒ [kStaleTurnReadMs]（3 秒）：这一刻界面手上只有
+  ///     一个"最近有动静"的旧提示，**没有**那条能在 250ms 内告诉她"她想完了"的推送，
+  ///     所以不许快——宽限档既能把"她早停了"及时读回来，又不在坏链路上白打；
+  ///   · **响应说她在跑**（[thinking]）⇒ [kTurnReadMs]（250ms）：思考这件事要跟手，
+  ///     而她的"第几步"也在这条响应里。**这一档要求上面两条都不成立**——也就是说，
+  ///     只有在事件流确实活着（"验证过"）的时候才按它打：快档配着推送才叫跟手，
+  ///     单靠轮询打 250ms 只是空转（用户 2026-10-16 ②：别靠更频繁的整表重建）；
+  ///   · 其余 ⇒ [kOnlinePollSeconds]（10 秒）：
+  ///     包括"刚见过动静、但响应还没确认"（下一拍仍按慢档，读到什么由服务端说）。
+  Duration _sleepAfterRead() {
+    if (!online) return const Duration(milliseconds: kOfflinePollSeconds * 1000);
+    if (!_eventsLive) return const Duration(milliseconds: kStaleTurnReadMs);
+    if (_thinking) return const Duration(milliseconds: kTurnReadMs);
+    return const Duration(milliseconds: kOnlinePollSeconds * 1000);
+  }
+
+  /// [_turnSignaled] 在 [ms] 之内点亮过没有（见 [kTurnSignalHoldMs]）。
+  ///
+  /// **不参与"她在不在思考"的判据**，只回答"这条链路上最近有没有动静"——
+  /// 给测试与排查看的读数（判据永远来自服务端的响应）。
+  bool turnSignalFreshWithin(int ms) => _turnSignalFreshWithin(ms);
+
+  /// 排下一拍读（[Duration.zero] = 马上）
+  void _scheduleDashboardTick(Duration delay) {
+    _dashboardTick?.cancel();
+    if (_disposed) return;
+    _dashboardTick = Timer(delay, () {
+      _dashboardTick = null;
+      unawaited(_dashboardTickOnce());
+    });
+  }
+
+  Future<void> _dashboardTickOnce() async {
+    if (_disposed || !ready) return;
+    // 防重入：事件成串来时 `_readDashboardSoon` 与这一拍可能撞在一起，
+    // 而"同一份响应读两遍"没有任何用处（服务端那一份构造是真的要花 5ms 的）。
+    // 让位的那一拍不补读：还在路上的那一拍回来时会照常排下一拍。
+    if (_readingDashboard) return;
+    _readingDashboard = true;
+    bool changed;
+    try {
+      changed = await _readDashboard();
+    } finally {
+      _readingDashboard = false;
+    }
+    if (_disposed || !ready) return;
+    if (changed) notifyListeners();
+    _scheduleDashboardTick(_sleepAfterRead());
+  }
+
+  /// 读一遍 dashboard，把**左上那一行字**与侧栏徽章要的几格写进本对象。
+  ///
+  /// 返回"这一读有没有真的改变界面"：没有改变就**不通知**——这是"思考期 250ms 一拍"
+  /// 不变成"每秒整天重建"的关键（用户 2026-10-16 ② 的硬要求：不许靠更频繁地整表重建）。
+  /// 判断只覆盖界面真的读的那几个字段；票数（tokensToday 之类）不在这里，它们由各页自己去读。
+  Future<bool> _readDashboard() async {
+    Map<String, dynamic>? stats;
+    try {
+      final data = await api.get('/api/stats/dashboard');
+      stats = data is Map<String, dynamic> ? data : null;
+    } on ApiAuthError catch (err) {
+      // 凭据不作数了：**回登录态**（401 自愈已经在 IrmiaApi 里试过一轮重读 + 重试）。
+      if (!_disposed) _requireAuth(err);
+      return true;
+    } catch (_) {
+      final wasOnline = online;
+      online = false;
+      dotKind = 'offline';
+      stateText = '连接中断';
+      _thinking = false;
+      _clearTurnSignal();
+      _pollWhile(ok: false);
+      return wasOnline || !_disposed; // 掉线总要让人看见（原来那一拍也是无条件通知）
+    }
+    if (stats == null) return false;
+
+    final previousOnline = online;
+    final previousThinking = _thinking;
+    final previousOpenTurn = _openTurn;
+    final previousStateText = stateText;
+    final previousNote = stateNote;
+    final previousSub = subText;
+    final previousDot = dotKind;
+    final previousReview = needsReview;
+    final previousAsks = askCards;
+    final previousAskTotal = askTotal;
+
+    final state = stats['state'] as String?;
+    final tiles = stats['tiles'];
+    needsReview = tiles is Map ? ((tiles['needsReview'] ?? 0) as num).toInt() : 0;
+    // 状态词**照抄服务端**（判据一处：`src/web/server.ts` 的 deriveState/livePausedLayers）。
+    // 界面过去自己按 `paused` 那张词表拼"已暂停（预算耗尽）"——而那正是用户 2026-10-05
+    // 看到的假话：她跑了十几个小时，左上角还写着"已暂停"（判据太松，见服务端的注释）。
+    // 界面不再有第二份判断：服务端说 `stateText` 就照它显示；老服务端没这个字段时
+    // 才退回词表（半升级态不至于一片空白）。
+    final served = stats['stateText'];
+    stateText = served is String && served.isNotEmpty
+        ? served
+        : IrmiaTheme.humanState(state, needsReview: needsReview);
+    final note = stats['stateNote'];
+    stateNote = note is String ? note : '';
+    dotKind = state ?? 'idle';
+    // **"她在思考吗"的判据**（界面这一侧唯一的一处）：服务端自己那句话的同一个响应里
+    // `openTurn` 有值、且当刻状态就是 `running`——两条都成立时它给的 `stateText` 正是
+    // 「Agent 正在值守」（`src/web/server.ts:1474-1483`），界面据此把它改说成「思考中」。
+    // 不猜时间窗、不看进程在不在：她没在跑 turn 的时候这里必须是 false。
+    _thinking = stats['openTurn'] != null && state == 'running';
+    // 服务端当次读数里那个开着的 turn（给聊天页对账用，见 [openTurn] 的注释）：
+    // 只认得上号的整数 turn；形状不对（老服务端 / 非对象）**照写成 null**——
+    // 它是"服务端认为还有没有未收尾的 turn"，缺字段就是没有，不许拿上一次的值继续糊着。
+    final openTurnRaw = stats['openTurn'];
+    _openTurn = openTurnRaw is Map && openTurnRaw['turn'] is num
+        ? '${(openTurnRaw['turn'] as num).toInt()}'
+        : null;
+    if (!_thinking) _clearTurnSignal();
+    final days = stats['guardedDays'] ?? 0;
+    final next = stats['nextWakeAt'];
+    subText = '已运行 $days 天'
+        '${next is String && next.isNotEmpty ? ' · 下次唤醒 ${hhmm(next)}' : ''}';
+    // 她在问的卡跟着同一份响应走（不另开一条通道：这是全 app 唯一的心跳）
+    final ask = stats['ask'];
+    if (ask is Map) {
+      final raw = ask['cards'];
+      askCards = raw is List
+          ? raw.map(AskCardData.fromJson).whereType<AskCardData>().toList(growable: false)
+          : const <AskCardData>[];
+      askTotal = ((ask['queued'] ?? askCards.length) as num).toInt();
+    } else {
+      // 老服务端（没有这个字段）时当作"没有卡"，而不是拿上一次的卡继续弹
+      askCards = const <AskCardData>[];
+      askTotal = 0;
+    }
+    online = true;
+    _pollWhile(ok: true);
+    return !previousOnline ||
+        previousThinking != _thinking ||
+        previousOpenTurn != _openTurn ||
+        previousStateText != stateText ||
+        previousNote != stateNote ||
+        previousSub != subText ||
+        previousDot != dotKind ||
+        previousReview != needsReview ||
+        previousAskTotal != askTotal ||
+        // **按值比，不按引用**：`ask.cards` 每次解析都会新建一个 List，用 `identical`
+        // 的话这里恒为 true ⇒ 250ms 快档里每一拍都通知一次，整棵 MaterialApp 跟着重建
+        // （每秒 4 次）。`AskCardData` 的 `==` 是逐字段的值相等（见它的实现）。
+        !listEquals(previousAsks, askCards);
   }
 
   /// 读一遍她的名字：`GET /api/persona/file?path=IDENTITY.md`（**复用现成的读端点**，
@@ -920,57 +1527,18 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 读一遍 dashboard 并把变化通知出去——**对面那几条路共用的入口**。
+  ///
+  /// 谁在用：`answerAsk`（答掉一张卡之后立刻刷新）、引导/重连那几处显式刷新，
+  /// 以及 [_dashboardTickOnce] 那一拍。为什么它们必须共用一段实现：状态词的判据只能有一处，
+  /// 而"这一读要不要通知"也只能有一处——过去 `pollOnce` 与 [_readDashboard] 各写一遍同一份
+  /// 解析，等于把同一个口径抄了两份，改一处就会漏另一处（那正是"10 秒 periodic 与快档并存"
+  /// 当时的代价：同一份响应被两条链各解析一遍）。
+  ///
+  /// 职责边界：**只读、只通知**；排下一拍由调用方决定（心跳自排，事件驱动不自排）。
   Future<void> pollOnce() async {
-    try {
-      final stats = await api.get('/api/stats/dashboard');
-      if (stats is Map<String, dynamic>) {
-        final state = stats['state'] as String?;
-        final tiles = stats['tiles'];
-        needsReview = tiles is Map ? ((tiles['needsReview'] ?? 0) as num).toInt() : 0;
-        // 状态词**照抄服务端**（判据一处：`src/web/server.ts` 的 deriveState/livePausedLayers）。
-        // 界面过去自己按 `paused` 那张词表拼"已暂停（预算耗尽）"——而那正是用户 2026-10-05
-        // 看到的假话：她跑了十几个小时，左上角还写着"已暂停"（判据太松，见服务端的注释）。
-        // 界面不再有第二份判断：服务端说 `stateText` 就照它显示；老服务端没这个字段时
-        // 才退回词表（半升级态不至于一片空白）。
-        final served = stats['stateText'];
-        stateText = served is String && served.isNotEmpty
-            ? served
-            : IrmiaTheme.humanState(state, needsReview: needsReview);
-        final note = stats['stateNote'];
-        stateNote = note is String ? note : '';
-        dotKind = state ?? 'idle';
-        final days = stats['guardedDays'] ?? 0;
-        final next = stats['nextWakeAt'];
-        subText = '已运行 $days 天'
-            '${next is String && next.isNotEmpty ? ' · 下次唤醒 ${hhmm(next)}' : ''}';
-        // 她在问的卡跟着同一个轮询走（不另开一条通道：这是全 app 唯一的心跳）
-        final ask = stats['ask'];
-        if (ask is Map) {
-          final raw = ask['cards'];
-          askCards = raw is List
-              ? raw.map(AskCardData.fromJson).whereType<AskCardData>().toList(growable: false)
-              : const <AskCardData>[];
-          askTotal = ((ask['queued'] ?? askCards.length) as num).toInt();
-        } else {
-          // 老服务端（没有这个字段）时当作"没有卡"，而不是拿上一次的卡继续弹
-          askCards = const <AskCardData>[];
-          askTotal = 0;
-        }
-      }
-      online = true;
-      _pollWhile(ok: true);
-    } on ApiAuthError catch (err) {
-      // 凭据不作数了：**回登录态**（401 自愈已经在 IrmiaApi 里试过一轮重读 + 重试）。
-      // 过去这里只是把 token 清掉、留一句状态话，人就卡在一片空白的壳里——那正是"突然进不去"。
-      _requireAuth(err);
-      return;
-    } catch (_) {
-      online = false;
-      dotKind = 'offline';
-      stateText = '连接中断';
-      _pollWhile(ok: false);
-    }
-    notifyListeners();
+    final changed = await _readDashboard();
+    if (changed && !_disposed) notifyListeners();
   }
 
   /// 按注册表 id 切页；未知 id 视为无效操作，保持当前页。
@@ -1056,7 +1624,11 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
-    _poll?.cancel();
+    // 快档那一拍与事件流也是活的：不收掉的话，退场之后它们还打服务端
+    // （测试里表现为 pending timer —— 与下面 `_gateRetry` 同一条理由）
+    _dashboardTick?.cancel();
+    _dashboardTick = null;
+    _dropEventsFeed();
     // 门前那条重连定时器也是活的：不收掉的话，退场之后它还打服务端（测试里表现为 pending timer）
     _gateRetry?.cancel();
     super.dispose();
@@ -1084,6 +1656,24 @@ class AskCardData {
   final String context;
   /// 非空 = 已超时无人答（**未批准、未拒绝**：她已收到这条事实，卡仍然有效）
   final String? expiredAt;
+
+  /// **按值相等**（逐字段），不是按引用。
+  ///
+  /// 为什么要它：`_readDashboard` 判"这一读有没有变化"时比的是「上一份卡」与「这一份卡」。
+  /// `ask.cards` 每次从 JSON 解析都会新建一个 List，引用永远不同——用 `identical` 比的话
+  /// 每一拍都算"变了"，250ms 快档里就是每秒 4 次 `notifyListeners`、整棵 `MaterialApp` 重建。
+  /// 值相等之后，同一份数据喂两遍只通知一次（见 `test/brand_status_test.dart`）。
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AskCardData &&
+          other.seq == seq &&
+          other.question == question &&
+          other.context == context &&
+          other.expiredAt == expiredAt;
+
+  @override
+  int get hashCode => Object.hash(seq, question, context, expiredAt);
 
   /// 服务端给的 JSON → 模型；形状不对时返回 null（宁可不弹，也不弹一张字段是猜的卡）
   static AskCardData? fromJson(dynamic raw) {

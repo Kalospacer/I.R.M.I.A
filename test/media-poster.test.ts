@@ -278,6 +278,74 @@ test('凭据文件一律不外发：拒绝、不发请求、回执里不含文�
   assert.equal(http.requests.length, 0, '被拒的凭据一次网络都不该发');
 });
 
+test('凭据文件：**带字节**的请求也在早退前被拒（v64 起 `send_media` 走的就是这条）', async () => {
+  const { dataDir, secrets } = dataDirWithSecrets();
+  const http = fakePlatform();
+  const poster = createWorkspaceMediaPoster({
+    dataDir,
+    channels: channelsFor(http),
+    protectedPaths: protectedPathsOf(dataDir),
+  });
+  const target = { url: 'qq:c2c:U-1', idempotencyKey: 't1' };
+  for (const [name, sentinel] of Object.entries(secrets)) {
+    // 工具层的真实形状：`data`（字节）+ 校验过的绝对 `path` 一起下来 ⇒ 走 with-data 早退分支
+    const outcome = await poster.post(target, {
+      fileType: 4,
+      path: join(dataDir, name),
+      data: new Uint8Array(Buffer.from(sentinel)),
+      name,
+    });
+    assert.equal(outcome.ok, false, `${name} 不该发得出去（带字节那条）`);
+    assert.ok(outcome.ok === false && outcome.reason.includes('本机凭据文件'), outcome.reason);
+    assert.ok(!JSON.stringify(outcome).includes(sentinel), `${name} 的内容不得出现在回执里`);
+  }
+  assert.equal(http.requests.length, 0, '被拒的凭据一次网络都不该发（早退那条也一样）');
+});
+
+test('凭据判定在早退前也读 realpath：目录联接**带字节**同样绕不过去', async () => {
+  const { dataDir } = dataDirWithSecrets();
+  const http = fakePlatform();
+  const poster = createWorkspaceMediaPoster({
+    dataDir,
+    channels: channelsFor(http),
+    protectedPaths: protectedPathsOf(dataDir),
+  });
+  const link = join(dataDir, 'workspace2', 'link-to-data');
+  mkdirSync(join(dataDir, 'workspace2'), { recursive: true });
+  try {
+    symlinkSync(dataDir, link, 'junction');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EPERM') return; // 无权限时跳过，而不是假装测过
+    throw err;
+  }
+  const outcome = await poster.post({ url: 'qq:c2c:U-1', idempotencyKey: 't1' }, {
+    fileType: 4,
+    path: join(link, '.keys.json'),
+    data: new Uint8Array([1, 2, 3]),
+  });
+  assert.equal(outcome.ok, false);
+  assert.ok(outcome.ok === false && outcome.reason.includes('本机凭据文件'), outcome.reason);
+  assert.equal(http.requests.length, 0);
+});
+
+test('同一份名单之外的普通文件**带字节**照旧发得出去（门只挡凭据，不挡媒体）', async () => {
+  const { dataDir } = dataDirWithSecrets();
+  const http = fakePlatform();
+  const poster = createWorkspaceMediaPoster({
+    dataDir,
+    channels: channelsFor(http),
+    protectedPaths: protectedPathsOf(dataDir),
+  });
+  const outcome = await poster.post({ url: 'qq:c2c:U-1', idempotencyKey: 't1' }, {
+    fileType: 4,
+    path: join(dataDir, 'pics', 'a.png'),
+    data: new Uint8Array([1, 2, 3, 4]),
+    name: 'a.png',
+  });
+  assert.equal(outcome.ok, true, JSON.stringify(outcome));
+  assert.equal(http.requests.length, 2, '上传 + 发送各一次');
+});
+
 test('同一份名单之外的普通文件照旧发得出去（门只挡凭据，不挡媒体）', async () => {
   const { dataDir } = dataDirWithSecrets();
   const http = fakePlatform();

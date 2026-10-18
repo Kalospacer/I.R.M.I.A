@@ -128,6 +128,8 @@ test('M5 应用点：turn 结束且历史超阈值 → 写 compaction/summary，
  *   ⑥ 装配：超预算历史 → 笔记 ≤ 预算，装不下的早期条目只记数量，最近条目优先装入
  *   ⑦ 遮蔽闭环：handoff note 写成 compaction/summary 后，用现成 render.ts 验证
  *      coveredUpToSeq 之前的事件不再出现；被遮蔽区间与思维链不计入历史规模
+ *      （⑦乙/⑦丙：**两个估算消费者都按渲染层同一顶帽子**——阈值 `estimateHistoryTokens`
+ *      与 ④甲 交接闸门 `estimateMaskedTokens`，读数 = 请求里 reasoning item 的 token 和）
  *   ⑧ 应用点：turn 结束且历史估算超阈值 → 日志里出现 compaction/summary，
  *      且 coveredUpToSeq == 该 turn 的 turn/start.seq
  *
@@ -146,11 +148,14 @@ import type {
 } from '../src/log/types.ts';
 import { defaultVisibility } from '../src/log/types.ts';
 import type { DsClient, DsRequest, DsStreamResult } from '../src/model/ds-client.ts';
-import { render, type RenderInput } from '../src/model/render.ts';
+import { render, type InputItem, type RenderInput } from '../src/model/render.ts';
+import {
+  REASONING_ECHO_NOTE_MAX_CHARS, REASONING_ECHO_POLICY, reasoningEchoOf,
+} from '../src/model/render.ts';
 import {
   DEFAULT_HANDOFF_BUDGET_TOKENS, DEFAULT_HANDOFF_FOLD_TOKENS, HANDOFF_MIN_FOLD_TOKENS,
   HANDOFF_TOOL_ARGS_MAX_BYTES,
-  estimateHistoryTokens, estimateTokens, foldToBudget, renderHandoffNote,
+  estimateHistoryTokens, estimateMaskedTokens, estimateTokens, foldToBudget, renderHandoffNote,
 } from '../src/persona/handoff-note.ts';
 import {
   runTurn, RECENT_TAIL_TOKENS, compactionCoveredUpToSeq,
@@ -295,6 +300,49 @@ test('M5-2 收录范围：对话本身（他说了什么/我答了什么）+ wak
   assert.equal(note.text.includes(SUMMARY_MARK), false, '上一份笔记不进笔记（避免自我引用）');
   assert.equal(note.text.includes('"action":"set"'), false, '纯流程调用不进笔记');
   assert.equal(note.included, 6);
+});
+
+// ──────────────────────────────── P1-15 wake/job 回读线索 ────────────────────────────────
+//
+// 出处 `D:\IrmiaAgent\_ops-review-stable\REVIEW.md` 第 40 行：`wake/job` 的正文与 `outputFile`
+// 都不进交接笔记——折叠之后连"去哪儿重读"都没有。修法：标题之外补一条"全文在哪、多大"。
+
+test('P1-15 正：wake/job 笔记带标题 + outputFile 回读路径；正文一个字不抄，token 增量极小', () => {
+  resetFactory();
+  const excerpt = '构建日志的一行。'.repeat(300); // 3,000 字（旧写法若照抄会吃满笔记预算）
+  const outputFile = 'D:\\workspace\\jobs\\job-1.out';
+  const withPath = renderHandoffNote([evt('wake/job', {
+    jobId: 'job-1', command: 'npm run build', exitCode: 0,
+    outputExcerpt: excerpt, outputTruncated: true, outputBytes: 123_456, outputFile,
+  })]);
+  const titleOnly = renderHandoffNote([evt('wake/job', { jobId: 'job-1', command: 'npm run build', exitCode: 0 })]);
+
+  assert.match(
+    withPath.text,
+    /\[唤醒\] \[后台任务完成\] job-1：npm run build（退出码 0）/u,
+    '标题（哪次任务、跑的什么、退出码）必须在',
+  );
+  assert.ok(withPath.text.includes(outputFile), '折叠之后唯一的回读线索：全文路径必须在笔记里');
+  assert.match(withPath.text, /全文 123,456 字节/u, '只给路径不够，还要说全文多大');
+  assert.match(withPath.text, /safe_read 重读/u, '告诉她怎么重读（她已有的能力）');
+  assert.equal(withPath.text.includes('构建日志的一行'), false, '正文不进笔记——只留"去哪儿重读"');
+
+  // token 读数：这条线索应该极小（笔记总预算 4096）；实测 13 token（长路径 ~20）
+  const delta = withPath.tokens - titleOnly.tokens;
+  assert.ok(delta > 0 && delta <= 40, `回读线索的 token 增量必须极小（实测 ${delta} token）`);
+});
+
+test('P1-15 反：没有 outputFile 时不编路径（如实说没有可回读的文件），正文同样不抄', () => {
+  resetFactory();
+  const excerpt = '构建日志的一行。'.repeat(300);
+  const note = renderHandoffNote([evt('wake/job', {
+    jobId: 'job-2', command: 'npm run test', exitCode: 1,
+    outputExcerpt: excerpt, outputTruncated: true, outputBytes: 99_999,
+  })]);
+
+  assert.match(note.text, /没有留下可回读的文件/u, '没有路径就如实说，不能编一个出来');
+  assert.equal(note.text.includes('构建日志的一行'), false, '没有路径也不许把正文塞进笔记');
+  assert.match(note.text, /退出码 1/u, '失败的任务更要一眼看得出（标题里的退出码照旧）');
 });
 
 // ──────────────────────────────── ④ 去重与合并 ────────────────────────────────
@@ -583,7 +631,7 @@ test('M5-2 摘要写入后遮蔽生效：coveredUpToSeq 之前的事件不再以
   assert.equal(shadowed.data.text.includes(SHADOWED), true);
 });
 
-test('M5-2 历史规模口径：被遮蔽区间与思维链都不计入', () => {
+test('M5-2 历史规模口径：被遮蔽区间不计；思维链**计入**（v68 起它是 model 可见）', () => {
   resetFactory();
   const events: AppEvent[] = [
     evt('message/user', { text: '很长的一段历史。'.repeat(50), source: 'human' }),
@@ -594,11 +642,260 @@ test('M5-2 历史规模口径：被遮蔽区间与思维链都不计入', () => 
 
   // 覆盖到 seq 2：只剩后面的"新的输入"（摘要事件本身不计）
   assert.equal(estimateHistoryTokens(events), estimateTokens('新的输入'));
-  // 没有摘要时：user 正文计入，思维链不计入
+  // 没有摘要时：user 正文与**思维链**都计入。
+  // v68 之前这一条断言的是"思维链不计入"——那是因为 `message/reasoning` 是 internal；
+  // 它变成 model 之后必须计入，否则历史被低估、压缩阈值失效（docs/review.md 记的就是这个黑洞）。
   assert.equal(
     estimateHistoryTokens(events.slice(0, 2)),
-    estimateTokens('很长的一段历史。'.repeat(50)),
+    estimateTokens('很长的一段历史。'.repeat(50)) + estimateTokens('思维链'.repeat(100)),
+    'v68：思维链已是 model 可见 ⇒ 历史规模必须计入它',
   );
+});
+
+// ──────────────────────── ⑦乙 思维链**按帽**计入（v68 的同源副作用） ────────────────────────
+
+/**
+ * 一窗"10 条更早的 + 3 条短的 + 1 条 30k 超长"的原始日志（2026-10-17 补）。
+ *
+ * **为什么要有这一组**：v68 把 `message/reasoning` 从 `internal` 改成 `model` 之后，它成了
+ * 可见历史的一部分；而渲染层只回传**最近 3 条、单条 ≤ 20,000 字符**的尾巴。估算器按全文累计
+ * 的话，实测每请求窗口 p50 ≈ 192k 字符的思维链会全进那 200,000 的阈值（实际回传 ≈2,056
+ * token/请求）⇒ 压缩比 v67 早得多、频繁得多，每次都白花一次 handoff 生成 + 下一次全 miss。
+ * 下面两条：**正**面钉住"估算 = 帽内那点"，**反**面钉住"帽外的再大也不算、请求也不变"。
+ *
+ * 数组顺序就是窗口顺序（`reasoningEchoOf` 按事件数组取最近 3 条），所以这里逐条 push，
+ * 不靠 seq 猜。seq 由 `evt` 自增，ts 由 seq 推出来 ⇒ 同一份夹具逐字节确定。
+ */
+const OLDER_COUNT = 10;
+const OLDER_CHARS = 5_000;
+const LONG_HEAD = 'LONG-HEAD-该被丢掉';
+const LONG_TAIL = 'LONG-TAIL-必留下';
+const LONG_CHARS = 30_000;
+const LONG_TEXT = LONG_HEAD + '长'.repeat(LONG_CHARS - LONG_HEAD.length - LONG_TAIL.length) + LONG_TAIL;
+const SHORT_A = `SHORT-A ${'甲'.repeat(350)}`;
+const SHORT_B = `SHORT-B ${'乙'.repeat(450)}`;
+const SHORT_C = `SHORT-C ${'丙'.repeat(550)}`;
+
+function reasoningWindowLog(extraEarly?: string, withOldSummary = false): AppEvent[] {
+  resetFactory();
+  const events: AppEvent[] = [];
+  if (withOldSummary) {
+    // ⑦丙 用：给闸门一个**真实的参照点**（旧遮蔽点 1）——这样 `render` 与
+    // `reasoningEchoOf`/`estimateMaskedTokens` 认的是同一处遮蔽点，两个读数才可比。
+    events.push(evt('message/user', { text: '被旧笔记遮掉的那段', source: 'human' }));
+    events.push(evt('compaction/summary', { coveredUpToSeq: 1, summary: '旧笔记' }));
+  }
+  events.push(evt('message/user', { text: '窗口起点', source: 'human' }));
+  for (let i = 0; i < OLDER_COUNT; i += 1) {
+    events.push(evt('message/reasoning', { turn: 1, step: i + 1, text: `OLDER-${i} ${'旧'.repeat(OLDER_CHARS)}` }));
+  }
+  if (extraEarly !== undefined) {
+    events.push(evt('message/reasoning', { turn: 1, step: 99, text: extraEarly }));
+  }
+  for (const text of [SHORT_A, SHORT_B, SHORT_C, LONG_TEXT]) {
+    events.push(evt('message/reasoning', { turn: 2, step: 1, text }));
+  }
+  return events;
+}
+
+/** 渲染层那顶帽子实际推出去的正文（顺序 = 历史顺序） */
+function reasoningTextsOf(input: readonly InputItem[]): string[] {
+  return input
+    .filter((item): item is Extract<InputItem, { type: 'reasoning' }> => item.type === 'reasoning')
+    .map(item => item.content.map(part => part.text).join(''));
+}
+
+/** 估算器里 reasoning 那一部分的贡献：整份估算 − 剔掉全部 reasoning 之后的估算 */
+function reasoningTokensOfEstimate(events: readonly AppEvent[]): number {
+  return estimateHistoryTokens(events)
+    - estimateHistoryTokens(events.filter(e => e.type !== 'message/reasoning'));
+}
+
+/** 全文口径（**这一组要排除掉的那个旧口径**）：把每条 `message/reasoning` 的全文各量一遍 */
+function fullReasoningTokensOf(events: readonly AppEvent[]): number {
+  return events
+    .filter((e): e is AppEvent & { type: 'message/reasoning' } => e.type === 'message/reasoning')
+    .reduce((sum, e) => sum + estimateTokens(e.data.text), 0);
+}
+
+const HISTORY_RENDER_BASE = {
+  persona: { identity: '我是 Irmia。', constitution: '底线若干。', style: '简短。', state: '待命。' },
+  tools: [],
+  wakeEvent: null,
+  taskCard: null,
+  now: '2026-10-17T12:00:00.000Z',
+  timezone: TIMEZONE,
+  model: 'fake-heavy',
+  lane: 'heavy' as ModelLane,
+};
+
+test('v68 思维链按帽计入：估算器量的是"最近 3 条 + 单条 20k 帽"那点，不是整窗全文', () => {
+  const events = reasoningWindowLog();
+  // 夹具里那条 30k 超长必须真的是 30k（判据按字符数，不按"看着挺长"）
+  assert.equal(LONG_TEXT.length, LONG_CHARS);
+  const texts = reasoningTextsOf(render({ ...HISTORY_RENDER_BASE, events } satisfies RenderInput).input);
+
+  // ① 帽内：最近 3 条；窗口外的一条都不进请求（超长那条的开头真被丢掉）
+  assert.equal(texts.length, REASONING_ECHO_POLICY.maxItems, '回传条数 = 帽子里的 maxItems');
+  const dump = JSON.stringify(texts);
+  assert.equal(dump.includes('OLDER-'), false, '10 条更早的一条都不进请求');
+  assert.equal(dump.includes('SHORT-A'), false, '第 3 近的那条被窗口切掉（不是"3 条短的"全都回传）');
+  assert.equal(dump.includes(LONG_HEAD), false, '超长那条的开头必须真的被丢掉');
+  assert.equal(dump.includes(LONG_TAIL), true, '留下来的必须是尾部');
+  for (const text of texts) {
+    assert.ok(
+      text.length <= REASONING_ECHO_POLICY.maxChars + REASONING_ECHO_NOTE_MAX_CHARS,
+      `单条越界：${text.length} > ${REASONING_ECHO_POLICY.maxChars}+${REASONING_ECHO_NOTE_MAX_CHARS}`,
+    );
+  }
+
+  // ② 同一顶帽子、两个消费者：渲染层推出去的就是 `reasoningEchoOf` 挑的那几条；
+  //    估算器量的也是**同一批字符串**（逐条 estimateTokens 加起来逐值相等）。
+  const expected = reasoningEchoOf(events, 0).map(entry => entry.text);
+  assert.deepEqual(texts, expected, '渲染层与 `reasoningEchoOf` 同一处判据');
+  const fromRequest = texts.reduce((sum, text) => sum + estimateTokens(text), 0);
+  const fromEstimate = reasoningTokensOfEstimate(events);
+  assert.equal(fromEstimate, fromRequest,
+    '估算器的 reasoning 贡献 = 请求里那几个字符串的 token（两个消费者、一处判据）');
+
+  // ③ 反面对照：**全文和**这条旧口径必须被排除
+  const fullTokens = fullReasoningTokensOf(events);
+  assert.notEqual(fromEstimate, fullTokens, '估算值不许等于"思维链全文之和"');
+  assert.ok(fromEstimate * 2 < fullTokens,
+    `帽内(${fromEstimate}) 应远小于全文和(${fullTokens})：这正是修之前那一笔账`);
+
+  // 字符侧也把"总量"钉住：帽内字符数 ≤ N × (20k + 说明行上界)，且**小于**全文
+  const requestChars = texts.reduce((sum, text) => sum + text.length, 0);
+  const fullChars = events
+    .filter((e): e is AppEvent & { type: 'message/reasoning' } => e.type === 'message/reasoning')
+    .reduce((sum, e) => sum + e.data.text.length, 0);
+  assert.ok(requestChars < fullChars, `帽内字符(${requestChars}) 必须小于全文(${fullChars})`);
+  assert.ok(
+    requestChars <= REASONING_ECHO_POLICY.maxItems
+      * (REASONING_ECHO_POLICY.maxChars + REASONING_ECHO_NOTE_MAX_CHARS),
+    `总量超过 N × 单条上界：${requestChars}`,
+  );
+});
+
+test('v68 思维链按帽计入：帽外再插一条 30k 也不改估算、也不改请求（旧口径会跳一大截）', () => {
+  const base = reasoningWindowLog();
+  const withExtra = reasoningWindowLog(`EXTRA-EARLY ${'超'.repeat(30_000)}`);
+
+  // 前置条件：多出来那一条真的在日志里，而且落在窗口之外（在 3 条短的前面）
+  const baseCount = base.filter(e => e.type === 'message/reasoning').length;
+  assert.equal(withExtra.filter(e => e.type === 'message/reasoning').length, baseCount + 1);
+
+  assert.equal(
+    reasoningTokensOfEstimate(withExtra), reasoningTokensOfEstimate(base),
+    '窗口外的那条一条 token 都不算（估算值不变）',
+  );
+  assert.deepEqual(
+    reasoningTextsOf(render({ ...HISTORY_RENDER_BASE, events: withExtra } satisfies RenderInput).input),
+    reasoningTextsOf(render({ ...HISTORY_RENDER_BASE, events: base } satisfies RenderInput).input),
+    '请求里的 reasoning item 逐字节相同（帽子没被"日志更长"带偏）',
+  );
+
+  // 对面那条口径的对照：旧口径会因为它多算一整条 30k
+  const jumped = fullReasoningTokensOf(withExtra) - fullReasoningTokensOf(base);
+  assert.ok(jumped > 15_000, `旧口径会因为这条跳 ${jumped} token（这正是不许再发生的那笔账）`);
+});
+
+// ──────────────── ⑦丙 交接闸门也按同一顶帽子量（v68 的同源收尾） ────────────────
+
+/**
+ * **为什么还要这一组**：⑦乙 修的是阈值那一侧（`estimateHistoryTokens`）。④甲 收益闸门
+ * （`estimateMaskedTokens`，消费者 `runtime/agent-loop.ts`）本该是同一把尺，却还在按 reasoning
+ * **全文**量——而闸门算的是"这次折叠能省多少"⇒ 旧口径把收益算**大**了，等于把
+ * `RECENT_TAIL_TOKENS` 那条线偷偷往下挪（更容易放行一次其实不够本的折叠）。
+ * 下面两条：**正**面钉住"闸门读数 = 请求里 reasoning item 的 token 和"，**反**面钉住
+ * "帽外的再长也不算进收益"。
+ *
+ * 夹具用 ⑦乙 那一窗思维链 + 一条旧摘要（`coveredUpToSeq: 1`），参照点就取 1 ⇒ 闸门的
+ * `fromSeq` 与渲染层的遮蔽点是同一处，两个读数逐值可比。
+ */
+const GATE_FROM_SEQ = 1;
+
+/** 闸门里 reasoning 那一部分：整份闸门读数 − 剔掉全部 reasoning 之后的闸门读数 */
+function reasoningTokensOfGate(
+  events: readonly AppEvent[],
+  fromSeq: number,
+  toSeq: number,
+): number {
+  return estimateMaskedTokens(events, fromSeq, toSeq)
+    - estimateMaskedTokens(events.filter(e => e.type !== 'message/reasoning'), fromSeq, toSeq);
+}
+
+/** 闸门**旧口径**（这一组要排除掉的那个）：区间内每条 `message/reasoning` 的全文各量一遍 */
+function fullMaskedReasoningOf(
+  events: readonly AppEvent[],
+  fromSeq: number,
+  toSeq: number,
+): number {
+  return events
+    .filter((e): e is AppEvent & { type: 'message/reasoning' } => e.type === 'message/reasoning')
+    .filter(e => e.seq > fromSeq && e.seq <= toSeq)
+    .reduce((sum, e) => sum + estimateTokens(e.data.text), 0);
+}
+
+const lastSeqOf = (events: readonly AppEvent[]): number => events[events.length - 1]!.seq;
+
+test('v68 收尾 · 闸门按帽量：读数 = 请求里 reasoning item 的 token 和（旧口径把收益算大）', () => {
+  const events = reasoningWindowLog(undefined, true);
+  const toSeq = lastSeqOf(events);
+  const texts = reasoningTextsOf(render({ ...HISTORY_RENDER_BASE, events } satisfies RenderInput).input);
+  const fromRequest = texts.reduce((sum, text) => sum + estimateTokens(text), 0);
+  // 前置条件：渲染层确实按**同一个遮蔽点**挑的（否则两个读数在比不同的东西）
+  assert.equal(texts.length, REASONING_ECHO_POLICY.maxItems, '渲染层回传条数 = 帽子里的 maxItems');
+  assert.deepEqual(texts, reasoningEchoOf(events, GATE_FROM_SEQ).map(entry => entry.text),
+    '渲染层与 `reasoningEchoOf` 认的是同一处遮蔽点');
+
+  // ① 正面：闸门（reasoning 那部分）与请求里那几个字符串逐值相等
+  const fromGate = reasoningTokensOfGate(events, GATE_FROM_SEQ, toSeq);
+  assert.equal(fromGate, fromRequest,
+    '闸门读数 = 请求里 reasoning item 的 token 和（同一顶帽子、一处判据）');
+
+  // ② 旧口径必须被排除：全文和更大，且大出来的正是被帽掉的那部分
+  const full = fullMaskedReasoningOf(events, GATE_FROM_SEQ, toSeq);
+  assert.notEqual(fromGate, full, '闸门读数不许等于"区间内思维链全文之和"');
+  assert.ok(full > 2 * fromGate,
+    `旧口径把收益算大了：全文 ${full} vs 帽内 ${fromGate}（这正是要修的偏差方向）`);
+
+  // ③ 方向落到闸门那句话上（`RECENT_TAIL_TOKENS` 20,000）：同一份夹具、同一处参照点，
+  //    旧口径会**放行**这一次折叠，改后**拦住**——差的那一节就是它凭空算出来的收益。
+  const gateNow = estimateMaskedTokens(events, GATE_FROM_SEQ, toSeq);
+  const gateOld = gateNow + (full - fromGate); // 旧实现 = 非 reasoning 部分 + reasoning 全文
+  assert.ok(gateOld >= RECENT_TAIL_TOKENS,
+    `旧口径量出来 ${gateOld} ≥ ${RECENT_TAIL_TOKENS} ⇒ 会放行`);
+  assert.ok(gateNow < RECENT_TAIL_TOKENS,
+    `改后量出来 ${gateNow} < ${RECENT_TAIL_TOKENS} ⇒ 这一次折叠其实不够本，应当拦住`);
+});
+
+test('v68 收尾 · 闸门按帽量：帽外再插一条 30k ⇒ 闸门读数不变（旧口径会跳一大截）', () => {
+  const base = reasoningWindowLog(undefined, true);
+  const withExtra = reasoningWindowLog(`EXTRA-EARLY ${'超'.repeat(30_000)}`, true);
+  // 前置条件：多出来那一条真在日志里，而且落在帽子窗口之外
+  assert.equal(
+    withExtra.filter(e => e.type === 'message/reasoning').length,
+    base.filter(e => e.type === 'message/reasoning').length + 1,
+  );
+
+  assert.equal(
+    reasoningTokensOfGate(withExtra, GATE_FROM_SEQ, lastSeqOf(withExtra)),
+    reasoningTokensOfGate(base, GATE_FROM_SEQ, lastSeqOf(base)),
+    '帽外那条一个 token 都不算进闸门收益（读数不变）',
+  );
+  // 请求侧同样不变：那一条不进请求 ⇒ 闸门量它就是在量空气
+  assert.deepEqual(
+    reasoningTextsOf(render({ ...HISTORY_RENDER_BASE, events: withExtra } satisfies RenderInput).input),
+    reasoningTextsOf(render({ ...HISTORY_RENDER_BASE, events: base } satisfies RenderInput).input),
+    '请求里的 reasoning item 逐字节相同',
+  );
+
+  // 对面那条口径的对照：旧口径会因为这一条把收益凭空放大一整条 30k
+  const jumped = fullMaskedReasoningOf(withExtra, GATE_FROM_SEQ, lastSeqOf(withExtra))
+    - fullMaskedReasoningOf(base, GATE_FROM_SEQ, lastSeqOf(base));
+  assert.ok(jumped > 15_000,
+    `旧口径会凭空多算 ${jumped} token 的收益（这就是"更容易放行折叠"的来源）`);
 });
 
 // ──────────────────────────────── ⑧ 应用点：压缩触发 ────────────────────────────────

@@ -27,6 +27,55 @@ export const DEFAULT_TOPIC_TIMEOUT_MS = 10_000;
 /** 概括成一句话的字数上限——她扫一眼就要懂，长了反而没人读 */
 export const TOPIC_MAX_CHARS = 24;
 
+/**
+ * **没人理的群**的窗口（v66）：她最后一次在那个群说话（或有人在群里 @/提及她）**早于**
+ * 这个时长 ⇒ 那个群不值得再花一次 light 跑话题。
+ *
+ * 一个数可调（用户 2026-10-16 的口径："阈值 7 天写成常量（一个数可调）"）。
+ *
+ * 为什么要有它：话题概括是一次 light 调用，而它服务的是"她可以选择看不看"——一个她一周
+ * 没参与、也没人叫她的群，未读再多也只是一堆别人的闲聊，概括出来她也不会去接话。
+ * **代价如实说**：那个群的未读**照旧记着**（会话簿、信箱、`read_channel` 一条都不少），
+ * 只是此刻层那张清单上不再缀「在聊：…」——而那一行本来也只在**有话题**时才出现，
+ * 两个口径因此天然一致（不用额外删字）。
+ *
+ * 为什么是 7 天：与 `self-brief.ts` 的 `SESSION_FREQ_WINDOW_MS` **同一个数、同一个理由**
+ * （v67 起那个常量叫 `SESSION_FREQ_WINDOW_MS`：清单的保留规则从"她 7 天内回过话"改成了"回复频次前 3"，
+ *   窗口本身没变；两处仍是同一个数）
+ * （"这个群还算她在参与的场合吗"）——两处取不同的值，就会出现"清单上列着它、却不给它跑话题"
+ * 那种自相矛盾的中间态。
+ */
+export const GROUP_QUIET_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * 这个会话**是不是"没人理的群"**（v66）：是 ⇒ 不给它跑话题概括（不产 `channel/topic`）。
+ *
+ * 判据**全部取自投影、可复算**，三条同时成立：
+ *   ① 最近一次 @/提及她**早于窗口**（或从来没有）——`mentionedAt` 缺席算"从来没有"；
+ *   ② 她最后一次发言**早于窗口**（或从来没有）——`spokeAt` 同上；
+ *   ③ **未读 > 0**——没有未读的会话本来就不会进这条流水线（floor 那一关先挡了），
+ *      写在这里是为了让这个函数的语义完整："有东西可看，但没人理她"。
+ *
+ * **私聊一律不算**（直接返回 false）：私聊是人对人的那条线，一共没几个，而且对方就是在
+ * 跟她说话——按"她多久没回"去掐它的话题，恰好会把最该看的那一屏掐掉。
+ *
+ * 时钟偏差：时间戳落在未来（或此刻）的按"最近"处理（`now - at <= window`），宁可多跑一次
+ * light，也不因为一个跑偏的钟把一个正在叫她的群判成"没人理"。
+ */
+export function isUnattendedGroup(
+  entry: { sid: string; chatType: string; unread: number },
+  at: { spokeAt?: number | undefined; mentionedAt?: number | undefined },
+  nowMs: number,
+  windowMs: number = GROUP_QUIET_WINDOW_MS,
+): boolean {
+  if (entry.chatType === 'c2c') return false;
+  if (entry.unread <= 0) return false;
+  if (!Number.isFinite(nowMs)) return false;
+  const recent = (value: number | undefined): boolean =>
+    value !== undefined && Number.isFinite(value) && nowMs - value <= windowMs;
+  return !recent(at.mentionedAt) && !recent(at.spokeAt);
+}
+
 export interface ChannelTopicPayload {
   sid: string;
   /** 一句话话题（可能为空串：那批消息没能概括出什么） */
@@ -205,7 +254,7 @@ const ORIGIN = 'channel/topic';
  * 只取 `channel/message` 与 `wake/channel`——会话里的话就是这两种事件。
  *
  * 发言人**不能直接写 openid**（2026-10-02 修）：QQ 给的是 32 位 openid，一句
- * `E7FEC35E951B5CCF8BA66793BF6B1314: 弥亚小姐…` 对概括模型来说是纯噪音——它既认不出
+ * `00000000000000000000000000000001: 弥亚小姐…` 对概括模型来说是纯噪音——它既认不出
  * 那是"同一个人"，也读不出名字，于是概括里谁在做什么全靠猜。现在把同一批消息里的
  * openid 映射成 **甲/乙/丙…**（按首次出现顺序），它至少能分清"两个不同的人在说话"。
  * 名字真源在联系人表里，而工具层读不到——那一层留给调用方（本模块只保证"不是噪音"）。

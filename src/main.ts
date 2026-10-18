@@ -25,7 +25,7 @@ import { msgSeqOf, mentionsKeyword, shouldWakeForChannelMessage } from './channe
 import { ManagedProtocolService, readEndpointFromConfig, resolveServiceDir } from './services/snowluma.ts';
 import { normalizeSid, parseAliases } from './channel/sessions.ts';
 import { createNotifier } from './alert/notifier.ts';
-import { notifyStartupRecovery } from './alert/startup.ts';
+import { notifyStartupRecoveryDetailed, restoreStartupAlertWindow } from './alert/startup.ts';
 import { loadConfig, readApiKey, trustBoundaryRoot, type AppConfig } from './config/config.ts';
 import { ConfigWatcher } from './config/watcher.ts';
 import { ensurePersonaSeeds, loadPersona, type PersonaAssets } from './persona/loader.ts';
@@ -93,7 +93,7 @@ import {
  * （**具体是第几个内测版、版号是什么，以这一行的字面量为准**——别把版号抄进注释：
  * 出包脚本只改版号那一行、不改注释，抄一处就留一处对不上）。
  */
-export const AGENT_VERSION = '0.1.0-beta.10';
+export const AGENT_VERSION = '0.1.0-beta.11';
 /** 事件形状版本（docs/schema.md） */
 export const SCHEMA_VERSION = '1';
 export const DEFAULT_DATA_DIR_NAME = 'data';
@@ -466,18 +466,42 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     now,
   });
 
+  /**
+   * **先恢复限流窗口，再发启动告警**（P1-20，2026-10-18）。
+   *
+   * 原顺序的代价（实测现场）：`notifier.restore(日志)` 只发生在真循环的 `warmUp` 里，
+   * 而启动告警在**那之前**就发了 ⇒ "同一类告警 30 分钟内只发一次"这条承诺在**告警自己身上**
+   * 失效：一个必然崩溃的进程被守护脚本反复拉起，每重启一次就合法地多发一条，而那时窗口还是空的。
+   *
+   * 代价说清楚：这里要把事件日志顺序读一遍（稍后 `warmUp` 还会再读一遍）。两份都是启动期
+   * 一次性成本，换来的是"崩溃循环里人只收到一条"。
+   * 读不动日志**不拦启动**（告警是观测，不是启动前置条件），但这时要说清"本次可能重复"——
+   * 悄悄退化成原顺序，等于把这条承诺又丢了一次。
+   */
+  try {
+    const restoredAlarms = await restoreStartupAlertWindow(notifier, log);
+    if (restoredAlarms > 0) write(`[告警] 已从日志重建限流窗口（${restoredAlarms} 条 alarm/sent）`);
+  } catch (err) {
+    write(`[告警] 限流窗口重建失败（不拦启动；本次启动告警可能重复）：${describeError(err)}`);
+  }
+
   // 启动异常退出告警（design §4.9 触发点首条）：recover 的补偿清单里出现 interrupted 结算即发一条。
   // 告警失败绝不拦启动——它是观测，不是启动的前置条件。
   try {
-    const receipt = await notifyStartupRecovery(notifier, {
+    const receipt = await notifyStartupRecoveryDetailed(notifier, {
       repairs: recovery.repairs,
       dataDir,
       pid: process.pid,
     });
-    if (receipt !== null) {
-      write(receipt.ok
-        ? '[告警] 上一次运行异常退出：启动告警已发出（详见 alarms/，warn 级）'
-        : `[告警] 上一次运行异常退出，但启动告警未送达：${receipt.reason}`);
+    if (receipt.outcome !== null) {
+      if (receipt.suppressed) {
+        // 窗口内**有意丢弃**：账早已在日志里（第一条 alarm/sent），这一次没有推第二条给人
+        write('[告警] 上一次运行异常退出：同类启动告警还在限流窗口内，这次没有再推一条（账在 alarms/，warn 级）');
+      } else if (receipt.outcome.ok) {
+        write('[告警] 上一次运行异常退出：启动告警已发出（详见 alarms/，warn 级）');
+      } else {
+        write(`[告警] 上一次运行异常退出，但启动告警未送达：${receipt.outcome.reason}`);
+      }
     }
   } catch (err) {
     write(`[告警] 启动告警发送异常（不拦启动）：${describeError(err)}`);
@@ -894,6 +918,27 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       apiKey,
       heavyModel: config.models.heavy.model,
       lightModel: config.models.light.model,
+      /**
+       * ───────────── 单次请求的三格时限（2026-10-16 加）─────────────
+       *
+       * **这一行原来没有**（`timeoutMs` 不传 ⇒ 落到 `ds-client.ts` 那个硬编码的
+       * `DEFAULT_TIMEOUT_MS = 180_000`），而那个 180s 是**总时限**：计时器在 `send()` 之前
+       * 就起跳、连收流一起算。于是一次正常的长思考会在写到一半时被我们自己的定时器掐断
+       * （实测被掐那一刻已累积 10 万字符推理、断在半句话上），而 `timeout` 又在可重试类别里
+       * ⇒ 掐断 → step 失败 → 输入退回队列 → 下一轮从第一步重跑同一个请求 → 再撞同一堵墙。
+       * 用户的原话是「**不要硬性掐断**，因为现代的大模型**超长思考很正常**。**思考 40 分钟都有可能**」。
+       *
+       * 三格的分工（取值与依据逐条写在 `config.ts` 的 `RequestTimeoutConfig`）：
+       *   · `silenceMs` —— 流式判**静默**（多久没收到任何数据），长思考期间一直在吐分片 ⇒ 撞不到；
+       *   · `hardCapMs` —— 静默之外那道很宽的兜底，抓"一直在吐字但永不结束"（3 小时）；
+       *   · `timeoutMs` —— 非流式（light 的一问一答）仍是总时限，那里没有增量可救。
+       *
+       * 三个数都来自配置（`models.requestTimeout`，出厂 120s / 3h / 180s）；
+       * 它们**不在热更白名单里** ⇒ 改完要重启进程才生效（与 budget.* / wake.* 同一口径）。
+       */
+      silenceMs: config.models.requestTimeout.requestSilenceMs,
+      hardCapMs: config.models.requestTimeout.requestHardCapMs,
+      timeoutMs: config.models.requestTimeout.nonStreamTimeoutMs,
     });
     /**
      * 工具侧的事件写入点。
@@ -1107,6 +1152,10 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       // 所以同样走惰性取值——调用发生在 turn 里，那一刻的循环才是要用的那个。
       channelReader: async (sid, limit, before) =>
         await realLoopRef.current?.readChannelMessages(sid, limit, before) ?? [],
+      // 会话簿（v66）：`read_channel` 不给 sid 时列的那一份。取的正是此刻层那张清单的**同一个口**
+      // （`RealLoop.sessions()`），所以"清单上说还有 N 个没列"与"这一支列出来的全部"必然一致。
+      // 惰性取值同上面几条：catalog 先于 RealLoop 就位，调用发生在 turn 里。
+      channelSessions: () => realLoopRef.current?.sessionRows() ?? [],
       // 她自己在这个会话里说过的话（2026-10-04 用户："read channel 返回的结果里应该包含 bot
       // 自己的 speak"）。同一个循环层的口——它读的是 speak 的投递回执，工具层不碰日志。
       channelSpokenReader: async (sid) => await realLoopRef.current?.readChannelSpoken(sid) ?? [],
@@ -1370,6 +1419,20 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       noteUserSpoke: (seq, type, data) => {
         if (loop instanceof RealLoop) loop.noteUserSpokeEvent(seq, type, data);
       },
+      /**
+       * 用户急停（`/stop`，2026-10-16 加）的两步口——与界面那条 `wake/manual` 的
+       * "落库 + 通报"同一个顺序、同一处（见 `WebServerDeps.ownerStopCommand` 那段注释）：
+       *   · ① 落库**之前**：是急停就当场掐流 + 清队列（判据与动作只有一份实现：
+       *     `RealLoop.ownerStopCommand` → 与 QQ 单聊入口 `onChannelMessage` 走的
+       *     `wake()` 那条路同一个 `stopCommandOf`）；
+       *   · ② 落库**之后**（同一个同步块里）：`consumeStopCommand` 落留痕、把这件急停作废。
+       * 缺省不注入 = 按老路走（落 `wake/manual`、下一拍处理），所以假循环与测试的装配不用改。
+       */
+      ownerStopCommand: (type, data) => (loop instanceof RealLoop ? loop.ownerStopCommand(type, data) : null),
+      consumeStopCommand: (type, data, wakeSeq) =>
+        (loop instanceof RealLoop ? loop.consumeStopCommand(type, data, wakeSeq) : null),
+      // 第三步：载体摘除。**只能在 `appendSync` 折完投影之后**（见 RealLoop.dropStopInput 的注释）
+      dropPendingStopInput: () => (loop instanceof RealLoop ? loop.dropStopInput() : 0),
       out: write,
     });
     // 启动时只报"门是什么状态"，**不打印任何凭据**（密码与会话凭据的原文从不进日志）。

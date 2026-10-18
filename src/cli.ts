@@ -441,7 +441,13 @@ function describeTurnEnd(reason: TurnEndReason): string {
     case 'blocked': return `blocked(${reason.by})`;
     case 'aborted': return `aborted(${reason.cause})`;
     case 'interrupted': return 'interrupted';
-    case 'error': return `error(${reason.code}: ${clip(reason.message, 40)})`;
+    case 'error': {
+      // v68：`reasoningEcho` 是 400 的一种可判别指纹（"思维链没回传"）。它**只加一格**，
+      // 其余格式一字不动（没这一格时输出与以前逐字相同）——读摘要的人不必去翻日志才知道
+      // 这个 http_400 是哪一类。
+      const echo = reason.reasoningEcho === true ? ' · 思维链未回传' : '';
+      return `error(${reason.code}${echo}: ${clip(reason.message, 40)})`;
+    }
     case 'budget-exhausted': return `budget-exhausted(${reason.layer})`;
     case 'rate-limited': return `rate-limited(${reason.retryAfterMs}ms)`;
     case 'max-tokens': return `max-tokens(${reason.outputTokens})`;

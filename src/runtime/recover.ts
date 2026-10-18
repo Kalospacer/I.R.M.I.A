@@ -549,6 +549,9 @@ function settleClaimedInputs(
           inputSeq: wakeSeq,
           claimCount: nextCount,
           lastError: '同一输入反复认领后均撞上进程退出，不再自动认领',
+          // **为什么进死信**要能一眼看出是哪一类（2026-10-16 加）：界面读字段、读不了自由文本，
+          // 而"认领到上限"与"用户按下 /stop"的下一步动作完全不同。
+          reason: 'claim-limit',
         },
         visibility: 'internal',
         origin: 'runtime/recover',

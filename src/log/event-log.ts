@@ -2,8 +2,15 @@
  * Irmia Agent — 事件日志（系统唯一真相源）
  *
  * 设计依据：design.md §4.1 / §4.7、schema.md §1 / §9 / §11 / §12、review.md 缺陷 1 与缺陷 8。
- * 职责边界：本模块只负责"字节级持久化 + 位置检索 + 末行自愈"，
+ * 职责边界：本模块只负责"字节级持久化 + 位置检索 + 半行/末行自愈"，
  * 不理解事件语义——哪个事件属于承诺类，由调用方通过 append 的 sync 显式声明（见 review.md 缺陷 1）。
+ *
+ * **"半个行"在这条路上有两个出口，两个都要堵**（2026-10-18，REVIEW P1-18）：
+ *   · 写：一行一次 write，抛错之前 ftruncate 回写前长度（{@link writeShardLine}）——
+ *     否则"写失败 → 进程继续 → 下一行接上去"会在分片**中间**留下半个行；
+ *   · 读：启动扫描时，一条解析不出来的行若**尾部**恰好是合法事件，就认定它是"半个行 + 下一整行"
+ *     的接缝，删掉那半截并重扫（{@link recoverEnvelopeSuffix}）。旧版本留下的那种分片
+ *     以前会让下次启动**拒绝启动**，现在只记一条 `log/repaired` 告警。
  */
 
 import {
@@ -17,6 +24,7 @@ import {
   readdirSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -39,11 +47,11 @@ export interface EventLogOpenOptions {
   indexStride?: number;
 }
 
-/** 末行自愈的结果，供调用方写 `log/repaired` 事件 */
+/** 自愈的结果，供调用方写 `log/repaired` 事件 */
 export interface LogRepair {
-  /** 被截断的分片文件名 */
+  /** 被修掉的分片文件名 */
   file: string;
-  /** 截掉的字节数（写了一半的尾行） */
+  /** 截掉的字节数（写了一半的尾行，或分片中间那半个行） */
   truncatedBytes: number;
   /** 修复后日志中最后一条完整事件的 seq */
   lastGoodSeq: number;
@@ -64,6 +72,15 @@ const SHARD_NAME_RE = /^(\d{12})\.jsonl$/;
 const NEWLINE = 0x0a;
 /** 与 serializeEvent 的字段顺序绑定：只匹配顶层首个字段，因此读出的 seq 一定是真值 */
 const FAST_SEQ_RE = /^\{"seq":(\d+),/;
+/**
+ * 上面那条正则的**字面前缀**：半行拼接的接缝一定落在它上面（见 `recoverEnvelopeSuffix`）。
+ *
+ * 为什么要这个常量而不是拿去正则里找：恢复要在"一行坏文本"里找**每**一个候选接缝，
+ * 那是一次次 `indexOf`，正则的 lastIndex 语义在这里反而难读。
+ */
+const ENVELOPE_PREFIX = '{"seq":';
+/** 单个分片的自愈次数上限：超过它就不是"写失败留下半个行"，而是别的损坏，拒绝启动 */
+const MAX_REPAIRS_PER_SHARD = 8;
 
 // ──────────────────────────────── 内部结构 ────────────────────────────────
 
@@ -177,12 +194,89 @@ function fastSeq(text: string): number | null {
   return matched === null ? null : Number(matched[1]);
 }
 
-function looksLikeEnvelope(text: string): boolean {
+/** 解析成功返回信封，失败返回 null（与 `parseEnvelope` 的唯一区别：这里不决定要不要抛） */
+function tryParseEnvelope(text: string): EventEnvelope | null {
   try {
-    parseEnvelope(text, 'probe');
-    return true;
+    return parseEnvelope(text, 'probe');
   } catch {
-    return false;
+    return null;
+  }
+}
+
+function looksLikeEnvelope(text: string): boolean {
+  return tryParseEnvelope(text) !== null;
+}
+
+/**
+ * **半行拼接**的恢复点（REVIEW P1-18 的读侧那一半）。
+ *
+ * 形状（写失败留在分片**中间**的那种）：上一行只写了半个 JSON，紧接着下一次写把一整行接在
+ * 后面 ⇒ 以换行结尾的这一"行"解析不出来，但它的**尾部**是一条完整事件。
+ *
+ * 判据只有一条：从某个 `{"seq":` 起、到行尾为止，必须解析成一个合法的信封（seq 是 >= 1 的
+ * 整数 + 带 ts/type）。`serializeEvent` 把 seq 固定成首字段（那是本模块自己的写出口，字节顺序
+ * 由它保证），所以真正的接缝一定落在 `{"seq":` 上；随便一段坏文本（`this is not json`）不含它
+ * ⇒ 不认，照旧拒绝启动（"中间位置的坏行属于真故障"那条判据没有被放宽）。
+ *
+ * 返回被删掉的**字节数**（那半个行的长度）与恢复出来的信封。
+ */
+function recoverEnvelopeSuffix(text: string): { removedBytes: number; envelope: EventEnvelope } | null {
+  let charAt = text.indexOf(ENVELOPE_PREFIX);
+  while (charAt >= 0) {
+    const envelope = tryParseEnvelope(text.slice(charAt));
+    if (envelope !== null) {
+      return { removedBytes: Buffer.byteLength(text.slice(0, charAt), 'utf8'), envelope };
+    }
+    charAt = text.indexOf(ENVELOPE_PREFIX, charAt + 1);
+  }
+  return null;
+}
+
+/**
+ * 把 `[at, at + count)` 这段字节从句首删掉（后面的内容整体前移），然后截尾、fsync。
+ *
+ * 为什么原地前移而不是重写整个分片：自愈要能在**启动路径**上跑完，而分片可以到 32 MB
+ * （单条超限事件独片时更大）；重写要一份同样大的临时文件，且中途崩掉会把好数据也弄丢。
+ * 前移是 `dest < src` 的方向，所以按块**从前往后**搬不会覆盖还没读到的字节。
+ */
+function removeBytesAt(path: string, at: number, count: number): void {
+  const fd = openSync(path, 'r+');
+  const buf = Buffer.alloc(SCAN_CHUNK_BYTES);
+  try {
+    const size = statSync(path).size;
+    let src = at + count;
+    let dst = at;
+    while (src < size) {
+      const n = readSync(fd, buf, 0, Math.min(buf.length, size - src), src);
+      if (n <= 0) throw new Error(`半行自愈失败：读 ${path} 偏移 ${src} 只拿到 ${n} 字节`);
+      let written = 0;
+      while (written < n) {
+        const w = writeSync(fd, buf, written, n - written, dst + written);
+        if (w <= 0) throw new Error(`半行自愈失败：写 ${path} 偏移 ${dst + written} 只写了 ${w} 字节`);
+        written += w;
+      }
+      src += n;
+      dst += n;
+    }
+    ftruncateSync(fd, dst);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** 扫描期发现的"半行拼接"：内部信号，转成 {@link scanShard} 的自愈动作，不抛给调用方 */
+class HalfLineSplice extends Error {
+  // ⚠ 别写成 TypeScript 的 parameter property（`constructor(readonly at: number, …)`）：
+  // 本项目 `npm test` 走 Node 22 的 `--experimental-strip-types`（只剥类型、不做代码生成），
+  // 它**不支持** parameter property，会在 import 期直接 `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`，
+  // 把任何 import 本文件的用例一起打死（2026-10-17 真踩过）。所以这里显式声明 + 赋值。
+  readonly at: number;
+  readonly removedBytes: number;
+  constructor(at: number, removedBytes: number) {
+    super('半行拼接：写失败留下的半个行紧贴在下一整行前面');
+    this.at = at;
+    this.removedBytes = removedBytes;
   }
 }
 
@@ -203,44 +297,82 @@ interface ShardScanResult {
 }
 
 /**
- * 扫描单个分片：建检查点索引、查重复 seq、修末行。
+ * 扫描单个分片：建检查点索引、查重复 seq、修末行/半行。
  *
  * 坏行的判定边界（这是本模块最需要说清的一条）：
- * - 以换行结尾的完整行解析失败 → 真故障，一律抛错（拒绝启动）；
- * - 文件末尾没有换行结尾的残行解析失败 → 写一半崩了，只在最后一个分片上自愈截断；
+ * - 以换行结尾的完整行解析失败，且**尾部不是**一条完整事件 → 真故障，一律抛错（拒绝启动）；
+ * - 以换行结尾的完整行解析失败，但尾部是一条完整事件 → **写失败留下的半个行**（见
+ *   {@link recoverEnvelopeSuffix}）：删掉那半截、重扫这个分片，并记一条修复记录
+ *   （调用方据此写 `log/repaired` 与告警）。这种形状只可能由本模块自己的写失败产生，
+ *   与"外部把日志改坏了"是两回事（后者没有那个 `{"seq":` 接缝）；
+ * - 文件末尾没有换行结尾的残行解析失败 → 写一半崩了（或写失败之后轮转走了），自愈：
+ *   残行里若藏着一条完整事件就只删那半截（不把好数据一起截掉），否则按完整行截断到
+ *   最后一条好行。**任何分片都修**——REVIEW P1-18 的原话是"读到不完整末行 ⇒ 记一条告警并按
+ *   完整行恢复，不要拒绝启动"；那半截本来就不是事件，截掉不丢任何可读内容，而 `log/repaired`
+ *   把"修了哪一片、多少字节、最后好到哪条"如实记下来；
  * - 文件末尾残行恰好是合法事件（缺尾换行）→ 补一个换行，否则下次追加会与它粘成一行。
+ *
+ * `repairs` 是重扫次数（自愈要重扫：删字节之后所有偏移都前移了），上限见
+ * {@link MAX_REPAIRS_PER_SHARD}——超过它说明不是本模块能认的那种损坏，拒绝启动。
  */
 function scanShard(
   path: string,
   file: string,
   startSeq: number,
   stride: number,
-  allowRepair: boolean,
   seen: Set<number>,
+  repairs = 0,
 ): ShardScanResult {
   const size = statSync(path).size;
   const checkpoints: Checkpoint[] = [];
+  /** 本次已收下的 seq：重扫前要撤掉，否则会与自己撞"重复 seq" */
+  const accepted: number[] = [];
   let lines = 0;
   let firstSeq: number | null = null;
   let lastSeq = 0;
   let end = 0;
-  let truncatedBytes = 0;
-  let repaired = false;
+  let splice: HalfLineSplice | null = null;
 
-  const accept = (text: string, lineStart: number, lineEnd: number): void => {
-    const envelope = parseEnvelope(text, `${file} 偏移 ${lineStart}`);
+  const accept = (text: string, lineStart: number, lineEnd: number): boolean => {
+    let envelope: EventEnvelope;
+    try {
+      envelope = parseEnvelope(text, `${file} 偏移 ${lineStart}`);
+    } catch (cause) {
+      const recovered = recoverEnvelopeSuffix(text);
+      // seq 必须比本片已收下的都大：半行后面接的必然是**下一**条事件。做不到就退回原判据。
+      if (recovered === null || recovered.removedBytes === 0 || recovered.envelope.seq <= lastSeq) throw cause;
+      splice = new HalfLineSplice(lineStart, recovered.removedBytes);
+      // 停下来：那半个行删掉之后，这一行以及后面所有行的偏移都会前移（重扫比换算便宜）
+      return false;
+    }
     if (seen.has(envelope.seq)) {
       throw new Error(
         `事件日志出现重复 seq ${envelope.seq}（${file} 偏移 ${lineStart}）：日志被拼接或分片重叠，拒绝启动`,
       );
     }
     seen.add(envelope.seq);
+    accepted.push(envelope.seq);
     // 每 stride 条一个检查点，检查点必须落在行首，get() 才能从它开始顺序扫
     if (lines % stride === 0) checkpoints.push({ seq: envelope.seq, offset: lineStart });
     if (firstSeq === null) firstSeq = envelope.seq;
     lines += 1;
     lastSeq = envelope.seq;
     end = lineEnd;
+    return true;
+  };
+
+  /** 删掉半个行、重扫本片；两段的修复字节数如实相加 */
+  const healAndRescan = (found: HalfLineSplice): ShardScanResult => {
+    if (repairs >= MAX_REPAIRS_PER_SHARD) {
+      throw new Error(
+        `事件日志损坏：${file} 里发现第 ${repairs + 1} 处半行拼接（写失败留下的半个行），`
+        + `超过 ${MAX_REPAIRS_PER_SHARD} 处就不再猜了，拒绝启动`,
+      );
+    }
+    for (const seq of accepted) seen.delete(seq);
+    removeBytesAt(path, found.at, found.removedBytes);
+    const inner = scanShard(path, file, startSeq, stride, seen, repairs + 1);
+    return { ...inner, repaired: true, truncatedBytes: found.removedBytes + inner.truncatedBytes };
   };
 
   const splitter = new LineSplitter();
@@ -248,17 +380,20 @@ function scanShard(
   const buf = Buffer.alloc(SCAN_CHUNK_BYTES);
   try {
     let readPos = 0;
-    while (readPos < size) {
+    while (readPos < size && splice === null) {
       const n = readSync(fd, buf, 0, Math.min(buf.length, size - readPos), readPos);
       if (n <= 0) break;
-      splitter.push(buf.subarray(0, n), readPos, (text, start) => {
-        accept(text, start, start + Buffer.byteLength(text) + 1);
+      const more = splitter.push(buf.subarray(0, n), readPos, (text, start) => {
+        return accept(text, start, start + Buffer.byteLength(text) + 1);
       });
+      if (!more) break;
       readPos += n;
     }
   } finally {
     closeSync(fd);
   }
+
+  if (splice !== null) return healAndRescan(splice);
 
   const tail = splitter.finish();
   if (tail !== null) {
@@ -271,7 +406,17 @@ function scanShard(
         closeSync(appendFd);
       }
       accept(tail.text, tail.start, tail.start + Buffer.byteLength(tail.text) + 1);
-    } else if (allowRepair) {
+    } else {
+      // 残行里可能藏着一条完整事件（半个行 + 下一整行，且下一整行也没写完换行）：
+      // 那就只删那半个行，不把好数据一起截掉。
+      const recovered = recoverEnvelopeSuffix(tail.text);
+      if (recovered !== null && recovered.removedBytes > 0) {
+        return healAndRescan(new HalfLineSplice(tail.start, recovered.removedBytes));
+      }
+      // 否则按完整行截断到 `end`（最后一条好行的末尾）。中间分片也修：那半截本来就不是事件，
+      // 截掉不丢任何可读内容——REVIEW P1-18 的口径是"不要拒绝启动"，而不是"只在末片修"。
+      // 代价（照实写）：中间分片被外部截断/拼接时，这段残行不再当"真故障"挡启动；
+      // 事后仍然查得出来——`log/repaired` 里有 `file` / `truncatedBytes` / `lastGoodSeq`。
       const truncateFd = openSync(path, 'r+');
       try {
         ftruncateSync(truncateFd, end);
@@ -279,12 +424,13 @@ function scanShard(
       } finally {
         closeSync(truncateFd);
       }
-      truncatedBytes = size - end;
-      repaired = true;
-    } else {
-      throw new Error(
-        `事件日志损坏：${file} 末尾的残行不完整，但它不是最后一个分片（中间位置的坏行属于真故障）`,
-      );
+      return {
+        shard: { file, path, startSeq, bytes: end, lines, checkpoints },
+        lastSeq,
+        firstSeq,
+        repaired: true,
+        truncatedBytes: size - end,
+      };
     }
   }
 
@@ -292,16 +438,57 @@ function scanShard(
     shard: { file, path, startSeq, bytes: end, lines, checkpoints },
     lastSeq,
     firstSeq,
-    repaired,
-    truncatedBytes,
+    repaired: false,
+    truncatedBytes: 0,
   };
+}
+
+// ──────────────────────────────── 写：一行一次、失败即回滚 ────────────────────────────────
+
+/**
+ * 把**一整行**写进分片；中途失败就把这次写进去的半截截掉（回滚到 `rollbackTo` 字节）。
+ *
+ * 为什么不能只靠一次 `writeFileSync`（本模块 2026-10-18 之前就是那样，REVIEW P1-18）：
+ * 一整行交给内核，失败发生在**中途**时（磁盘满、EIO）前半行已经落盘，而调用方只看到一个异常
+ * ——进程继续跑，下一条事件接在半个行后面，于是分片**中间**留下"半个行 + 下一整行"。
+ * 那一刻的代价是隐形的：本进程的 `readRange` 从此读不到那一段；下次启动 `scanShard` 把它当
+ * 坏行 ⇒ **拒绝启动**。两道防线都在这里：
+ *   ① 先拼成 Buffer 再一次 write——一行只有一次写系统调用（Windows 上 512 KB 以内是单次原子写）；
+ *   ② 抛错之前 ftruncate 回写前长度——不许留半个行。回滚本身失败也不吞掉原始原因，两个都报。
+ *
+ * 导出只为让失败路径**可实测**（`test/event-log.test.ts`：只读 fd ⇒ 抛错且文件长度不变）。
+ */
+export function writeShardLine(fd: number, line: string, rollbackTo: number): void {
+  const buf = Buffer.from(line, 'utf8');
+  let written = 0;
+  try {
+    while (written < buf.length) {
+      const n = writeSync(fd, buf, written, buf.length - written);
+      if (n <= 0) throw new Error(`写入只前进 ${n} 字节（磁盘满？）`);
+      written += n;
+    }
+  } catch (cause) {
+    let rollbackError: unknown = null;
+    try {
+      ftruncateSync(fd, rollbackTo);
+      fsyncSync(fd);
+    } catch (err) {
+      rollbackError = err;
+    }
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    const detail = rollbackError === null
+      ? `已回滚到写前长度 ${rollbackTo}，半个行没留下`
+      : `回滚也失败（${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}）：`
+        + '分片里可能留下半个行，下次启动会自愈并写 log/repaired';
+    throw new Error(`分片写入失败（${detail}）：${reason}`, { cause });
+  }
 }
 
 // ──────────────────────────────── 主类 ────────────────────────────────
 
 export class EventLog {
   readonly dir: string;
-  /** 本次启动的末行修复记录；无修复为 null。调用方据此写 log/repaired 事件 */
+  /** 本次启动的半行/末行修复记录；无修复为 null。调用方据此写 log/repaired 事件与告警 */
   readonly repair: LogRepair | null;
 
   private readonly shardMaxBytes: number;
@@ -338,8 +525,9 @@ export class EventLog {
   }
 
   /**
-   * 打开事件日志：建分片索引、找最大 seq、修末行。
-   * 任何"真故障"（中间坏行、重复 seq、分片被改写）都在这里抛错，拒绝启动。
+   * 打开事件日志：建分片索引、找最大 seq、修半行/末行。
+   * 任何"真故障"（中间坏行、重复 seq、分片被改写）都在这里抛错，拒绝启动；
+   * "写失败留下半个行"那一种**不拒启动**——自愈并留一条 `repair` 记录（调用方写 `log/repaired`）。
    */
   static async open(dir: string, options: EventLogOpenOptions = {}): Promise<EventLog> {
     const shardMaxBytes = options.shardMaxBytes ?? DEFAULT_SHARD_MAX_BYTES;
@@ -367,7 +555,6 @@ export class EventLog {
         file,
         startSeq,
         indexStride,
-        i === names.length - 1,
         seen,
       );
       if (scan.firstSeq !== null && scan.firstSeq !== startSeq) {
@@ -389,6 +576,10 @@ export class EventLog {
         throw new Error(`分片 ${shard.file} 为空且不是最后一个分片：分片序列被破坏，拒绝启动`);
       }
     }
+
+    // `lastGoodSeq` 要给的是**整份日志**最后一条完整事件（中间分片自愈时，那一片自己的末条
+    // seq 不是"日志的最后一条"——告警里那个数得对得上 `latestSeq()`）
+    if (repair !== null) repair = { ...repair, lastGoodSeq: maxSeq };
 
     return new EventLog(dir, shardMaxBytes, indexStride, shards, maxSeq, repair);
   }
@@ -542,6 +733,10 @@ export class EventLog {
 
   /**
    * 唯一写入点：轮转判定与执行、检查点记录、实际写盘都在这里，三者不可能错位。
+   *
+   * 写盘走 {@link writeShardLine}（一行一次 write + 失败回滚）——**写失败绝不能留下半个行**，
+   * 那会让本进程此后读不到那一段、下次启动拒绝启动（REVIEW P1-18）。检查点是按"这一行会落在
+   * `shard.bytes`"记的，所以写失败时要把它一起撤掉，否则 `get()` 会从一个空位置开始扫。
    */
   private writeEntry(entry: LogLine, sync: boolean): void {
     const bytes = Buffer.byteLength(entry.line);
@@ -550,10 +745,17 @@ export class EventLog {
     if (shard.lines > 0 && shard.bytes + bytes > this.shardMaxBytes) {
       shard = this.rotate(entry.seq);
     }
-    if (shard.lines % this.indexStride === 0) {
+    const checkpointed = shard.lines % this.indexStride === 0;
+    if (checkpointed) {
       shard.checkpoints.push({ seq: entry.seq, offset: shard.bytes });
     }
-    writeFileSync(this.fd, entry.line);
+    try {
+      // `shard.bytes` 恒等于活动分片文件的字节数（本类只有一个写者），所以它就是回滚点
+      writeShardLine(this.fd, entry.line, shard.bytes);
+    } catch (cause) {
+      if (checkpointed) shard.checkpoints.pop();
+      throw cause;
+    }
     if (sync) fsyncSync(this.fd);
     shard.bytes += bytes;
     shard.lines += 1;

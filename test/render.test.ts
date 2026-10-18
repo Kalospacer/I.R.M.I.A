@@ -3,7 +3,7 @@
  *
  * 对齐 docs/design.md §4.13 与 docs/schema.md §13 的 KV cache 五条铁律，逐条断言：
  *   1 渲染确定性（禁相对时间/随机/环境值）
- *   2 剥离 reasoning
+ *   2 思维链按 Responses API 规范回传，且 v68 起**带帽**（最近 3 步 · 单条 ≤ 20,000 字符）
  *   3 配对完整（call → output 相邻；unknown/timeout/denied 固定模板）
  *   4 遮蔽点冻结（coveredUpToSeq 唯一确定渲染形态）
  *   5 外部输入边界（webhook 包裹、心跳、timer payload）
@@ -16,17 +16,21 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import {
-  INSTRUCTION_RULES, LAYER_RULES, NOW_LAYER_BANNER, RENDER_VERSION, SECTION_RULE,
-  TURN_BLOCK_BANNER, render, renderWake, stateBudgetReminder, stateBytesOf,
+  INSTRUCTION_RULES, LAYER_RULES, NOW_LAYER_BANNER, NOW_LAYER_FIELD_LABELS, NOW_MUST_KEEP_LABELS,
+  RENDER_VERSION, SECTION_RULE, TURN_BLOCK_BANNER, maintenanceWindowOf, render, renderWake,
+  stateBudgetReminder, stateBytesOf,
 } from '../src/model/render.ts';
 import type {
-  InputItem, MachineFacts, RenderImageRef, RenderInput, RenderPersona, RenderedRequest, UsageFacts,
+  InputItem, MachineFacts, MaintenanceWindowNote, RenderImageRef, RenderInput, RenderPersona,
+  RenderedRequest, UsageFacts, WindowRewrite,
 } from '../src/model/render.ts';
 // 装置自述是常量：测试断言「它在不在、在什么位置」，不重抄它的正文（抄一份就等于维护两份）
 import { SELF_BRIEF, renderMentionNote, type ContactFacts, type OpenAskFacts } from '../src/model/self-brief.ts';
 import { INJECTION_WARN_WINDOW_MS, type InjectionWarnFacts } from '../src/channel/injection.ts';
 import { defaultVisibility } from '../src/log/types.ts';
 import type { ContextImageChosen } from '../src/log/types.ts';
+// 提醒的长度是成本口径的一部分（用户的钱包）：用例按仓库自己的估算器量它的量级
+import { estimateTokens } from '../src/tools/registry.ts';
 import type {
   AppEvent, AssistantMessage, CompactionSummary, DeveloperMessage, HumanAnswered, HumanAsked,
   InjectionFlagged, InjectionNoted, ModelLane, PolicyDenied, ReasoningMessage, ReviewResolved, SessionStart,
@@ -43,7 +47,10 @@ const MIN_MS = 60_000;
 const NOW_A = '2020-06-01T09:00:00.000Z';
 const NOW_B = '2020-06-01T21:30:00.000Z';
 const TZ = 'Asia/Shanghai';
-/** reasoning 泄露哨兵：出现在任何请求字节里即视为铁律 2 被破坏 */
+/**
+ * 思维链哨兵：用来"找得到"它（v68 起它会**合法地**出现在请求体里——按帽回传）。
+ * ⚠ 别再拿它当"泄露"判据：v68 之前那条"请求里一个 reasoning 都不许有"的口径已经作废。
+ */
 const REASONING_MARKER = 'REASONING-LEAK-MARKER';
 /** 遮蔽区哨兵 */
 const SHADOW_MARK = 'SHADOWED-BEFORE';
@@ -155,6 +162,17 @@ interface RenderOverrides {
   stateBytes?: number | null;
   /** STATE 的字节预算（v32）：缺省取 `DEFAULT_STATE_BUDGET_BYTES`（8 KB，与配置默认值同源） */
   stateBudgetBytes?: number | null;
+  /**
+   * v66：**上一步渲染出来的此刻层文本**（逐字段增量的基线）。缺省 null = 没有参照
+   * （本轮第 1 步、重放、子代理、诊断）⇒ 每个字段都发。
+   * 这一格存在的理由只有一个：让"某个字段在一轮里只发一次"这条成本口径可以被用例钉住。
+   */
+  previousNowLayer?: string | null;
+  /**
+   * 维护窗口那一行（v70 起 2/3 档也带行首 `维护窗口：` 标签）。缺省 null = 不是窗口 ⇒ 整行不出现。
+   * 生产里由宿主在轮首算好递进来（`maintenanceWindowOf`），这里显式给是为了让用例**不读时钟**。
+   */
+  maintenanceWindow?: MaintenanceWindowNote | null;
 }
 
 function renderOnce(
@@ -197,6 +215,8 @@ function renderOnce(
     // 出厂预算），所以绝大多数用例根本不用管它——它们关心的是别的层。
     stateBytes: o.stateBytes ?? null,
     stateBudgetBytes: o.stateBudgetBytes ?? null,
+    previousNowLayer: o.previousNowLayer ?? null,
+    maintenanceWindow: o.maintenanceWindow ?? null,
   });
 }
 
@@ -397,7 +417,7 @@ function buildMixedLog(): AppEvent[] {
     }),
     evt<UserMessage>('message/user', { text: '看下 D 盘备份状态', source: 'human' }),
     evt<ReasoningMessage>('message/reasoning', {
-      turn: 1, step: 0, text: `内部推理 ${REASONING_MARKER} 只留日志供复盘`,
+      turn: 1, step: 0, text: `内部推理 ${REASONING_MARKER} 按帽回传`,
     }),
     // assistant 事件同时携带 toolCalls：渲染层只取文本，调用由 tool/call 统一渲染（防重复）
     evt<AssistantMessage>('message/assistant', {
@@ -812,7 +832,10 @@ describe('此刻层 · 声明式字段（v23）', () => {
 
   test('缺省路径：取不到的事实写"未知"或整项省略，不抛、不出现 NaN', () => {
     const bare = envLayer(renderOnce());
-    assert.ok(bare.includes(`本机：未知`), '没给本机事实就直说未知，不许编一个"看起来没事"');
+    // 本机（2026-10-16 改判）：**整项都没有 ⇒ 整行不写**，与 `用度：` 同一条口径。
+    // 旧口径是写 `本机：未知`——它不提供事实却要每次调用付费，而运行期那条路
+    // （real-loop 的 machineFacts）总是给全值，所以"未知"只在没接线的装配里出现。
+    assert.ok(!bare.includes('本机：'), `没给本机事实就整项不写（不再写"未知"）：\n${bare}`);
     assert.ok(!bare.includes('用度：'), 'v24：连"未知"都不写——这一行默认整个不出现');
     assert.ok(!bare.includes('NaN'));
 
@@ -820,7 +843,11 @@ describe('此刻层 · 声明式字段（v23）', () => {
     const noDisk = envLayer(renderOnce({ machine: { ...MACHINE_A, disk: null } }));
     assert.ok(noDisk.includes('本机：Windows 10.0.26200 x64 · 进程已运行 3 小时 12 分钟'), noDisk);
     assert.ok(!noDisk.includes('磁盘剩余'), '读不到磁盘就不写磁盘那一项');
-    assert.ok(envLayer(renderOnce({ machine: {} })).includes('本机：未知'), '一项都给不出时是未知');
+    // 一项都给不出（空对象）⇒ 同样整行不写（**部分**缺省才写"未知"，见 machineLine）
+    assert.ok(
+      !envLayer(renderOnce({ machine: {} })).includes('本机：'),
+      '一项都给不出时整行不写（不再写"本机：未知"）',
+    );
 
     // 坏值（NaN / total 为 0 / 负数）不许渲染成磁盘信息，更不许出现 NaN
     for (const disk of [
@@ -942,53 +969,97 @@ describe('此刻层 · `用度：` 只在告警时出现（v24）', () => {
   });
 });
 
-// ──────────────────────────────── 此刻层 · STATE 预算提醒（v32） ────────────────────────────────
+// ──────────────────────── 此刻层 · STATE 预算提醒（v32；2026-10-17 换措辞） ────────────────────────
 
 /**
- * 用户 2026-10-05 的口径（逐字）：
+ * 用户 2026-10-17 的原话（**唯一判据**，逐字）：
  *
- *   > 「STATE 如果超预算的话，就加个提醒 `[STATE.md]预算超限，记得维护，将过时内容移入记忆文件或删除`」
+ *   > 「**限额到 2KB**，超过限额的时候会注入框架提示吧，**未决的事及时询问，已决已办及时销项移除。
+ *   >   不清楚的跟用户沟通移除**。否则会造成大量输入成本，伤害用户的钱包。**保持好 STATE.md 的干净整洁**」
  *
- * 并且明确选了**只提醒、不截断**（框架不动她的文件，她看到提醒自己去维护）。所以这一组钉四件事：
- *   ① 超预算时那一行**在**，含用户的原话与两个数字；
- *   ② 没超时**整行不出现**（不是"0%"、不是"正常"）；
- *   ③ 掉回预算内 → 下一轮就不出现（渲染是纯函数：同一份素材同一个结果，不记"已提醒过"）；
- *   ④ 它是**此刻层**的字段，不进冻结前缀 / 记忆层 / 固定块——那三层的轮内冻结性质一个字没动。
+ * 这一组钉七件事（前四条就是他的四件事）：
+ *   ① 超限时那一行**在**，四件事 + 成本理由 + "干净整洁"**逐字**都在（少一条就是没做到）；
+ *   ② 数字是**字节**口径：`4383 字节 / 限额 2 KB = 2048 字节`（`stateBudgetBytes` 与 `write_persona`
+ *      同源；只写 KB 会在 2049 vs 2048 这种边上显示成"2 KB / 限额 2 KB"）；
+ *   ③ 没超时**整行不出现**（不写"0%"、不写"正常"）；判据是**严格大于**（正好 2048 不出现、2049 出现）；
+ *   ④ 掉回预算内 → 下一轮就不出现（渲染是纯函数：同一份素材同一个结果，不记"已提醒过"）；
+ *   ⑤ 它只在**此刻层**，不进冻结前缀 / 记忆层 / 固定块；且是**单行**（这一层是"一项一行"的字段表）；
+ *   ⑥ **短**：估算 token 有上界——它随请求付费，长度直接是用户的钱包；
+ *   ⑦ **每轮的第 1 步一次（整轮一次）**（2026-10-17 用户批准补 `预算提醒：` 行首标签）：
+ *      v66 的逐字段增量按**行首标签**切分（`src/model/render.ts` 的 `nowFieldsOf`，只认
+ *      `NOW_LAYER_FIELD_LABELS` 那 11 个标签）⇒ 第 2 步起逐字节相同、整项不发。
+ *      标签是这条"不发"的**唯一**开关：删掉它，用例会红。
+ *
+ * ⚠ **v69 修的两处失真（这一组用例同时钉着"修好了"）**：
+ *   · **基线口径**：v66-v68 的基线是"上一步**真发出去**的那一层"，被省掉的字段下一步会
+ *     **再发一次**（隔步重发：第 1/3/5 步发）。v69 起基线是"上一步**完整**的那一层"
+ *     （`RenderedRequest.nowLayerFull`）⇒ 第 2/3/4/5 步都不再出现。
+ *   · **切分口径**：v66 的通用正则把字段正文里的 `…：` 当标签、又把分隔换行算进前一个字段的
+ *     值里 ⇒ `通道/会话/…` 那些字段**从来不会被省**。v69 只认登记过的标签、并剥掉尾随 `\n`。
  */
-describe('此刻层 · STATE 预算提醒（v32）', () => {
-  /** 用户那句话本身（一个标点都不许改）：这一行必须在提醒的正文里逐字出现 */
-  const OWNER_WORDS = '预算超限，记得维护，将过时内容移入记忆文件或删除';
-  /** 出厂默认预算（KB）：与 config.ts 的 DEFAULT_STATE_BUDGET_BYTES 同源（8 KB） */
-  const BUDGET = 8 * 1024;
-  /** 实测那份 17007 字节的 STATE（16.6 KB） */
-  const OVER = 17_007;
+describe('此刻层 · STATE 预算提醒（v32；2026-10-17 新措辞）', () => {
+  /** 用户的新限额：2 KB = 2048 字节（`config.json` 的 `persona.stateBudgetBytes`，用户自己改） */
+  const BUDGET = 2048;
+  /** 现网那份 STATE.md：4383 字节（2026-10-17 13:00 实测 ⇒ 超限） */
+  const OVER = 4383;
+  /** 用户新规里必须逐字出现的六句（四件事 + 成本 + 干净整洁） */
+  const REQUIRED = [
+    '超限',
+    '未决的事及时问他',
+    '已决、已办的销项、从 STATE.md 移除',
+    '拿不准的跟他沟通后移除',
+    '保持 STATE.md 干净整洁',
+    '否则每轮都要多背这些字，直接烧的是他的钱',
+  ];
 
-  test('超预算：那一行在此刻层，带用户的原话与两个数字（16.6 KB / 8 KB）', () => {
-    const r = renderOnce({ stateBytes: OVER, stateBudgetBytes: BUDGET });
-    const now = envLayer(r);
+  test('超限：四件事 + 成本 + 干净整洁逐字都在；数字按字节口径（4383 / 限额 2 KB = 2048）', () => {
+    const line = stateBudgetReminder(OVER, BUDGET);
+    assert.ok(line !== null);
+    // 整行逐字锁住：这一行的每个字都是给她的规矩，改了就该同步改测试与文档（不是"差不多就行"）
+    assert.equal(
+      line,
+      '预算提醒：[STATE.md] 4383 字节 / 限额 2 KB = 2048 字节——超限：未决的事及时问他；'
+      + '已决、已办的销项、从 STATE.md 移除；拿不准的跟他沟通后移除。'
+      + '保持 STATE.md 干净整洁——否则每轮都要多背这些字，直接烧的是他的钱',
+    );
+    for (const words of REQUIRED) assert.ok(line.includes(words), `缺了「${words}」`);
+    // 它在请求里（此刻层），不是只在纯函数里
+    const now = envLayer(renderOnce({ stateBytes: OVER, stateBudgetBytes: BUDGET }));
+    assert.ok(now.includes(line), `提醒要进此刻层：\n${now}`);
+  });
 
-    assert.ok(now.includes('[STATE.md]'), `提醒要在（此刻层）：\n${now}`);
-    assert.ok(now.includes(OWNER_WORDS), '用户的原话必须逐字出现');
-    assert.ok(now.includes('16.6 KB'), '要给实际大小');
-    assert.ok(now.includes('预算 8 KB'), '要给预算值');
-    // 用户给的形态就是这个：`[STATE.md] 16.6 KB / 预算 8 KB——预算超限，…`
+  test('限额是字节：2 KB = 2048；换个预算只换数字、不换措辞', () => {
+    assert.ok(stateBudgetReminder(OVER, 4096)?.includes('限额 4 KB = 4096 字节'));
+    assert.ok(stateBudgetReminder(OVER, 4096)?.includes('[STATE.md] 4383 字节'));
+    // 缺省预算 = 出厂 8 KB（调用方漏传时按代码口径判，而不是"永不提醒"）
     assert.ok(
-      now.includes(`[STATE.md] 16.6 KB / 预算 8 KB——${OWNER_WORDS}`),
-      `整行照用户给的格式：\n${now}`,
+      stateBudgetReminder(17_007)?.includes('限额 8 KB = 8192 字节'),
+      '缺省取 DEFAULT_STATE_BUDGET_BYTES（8 KB）',
     );
   });
 
-  test('没超预算（含正好等于）：整行不出现——不写"0%"、不写"正常"', () => {
+  test('判据是严格大于：正好 2048 字节不出现，2049 才出现', () => {
+    assert.equal(stateBudgetReminder(BUDGET, BUDGET), null, '正好等于限额：不提醒（不是 >=）');
+    assert.equal(stateBudgetReminder(BUDGET - 1, BUDGET), null);
+    const line = stateBudgetReminder(BUDGET + 1, BUDGET);
+    assert.ok(line !== null, '多一个字节就提醒');
+    // 边上不能有歧义：只写 KB 会显示成"2 KB / 限额 2 KB"，所以两个数都给字节
+    assert.ok(line.includes('2049 字节') && line.includes('2048 字节'), `边上也要看得出超了：${line}`);
+  });
+
+  test('没超预算（含正好等于、没量到）：一个字都不出现——不写"0%"、不写"正常"', () => {
     for (const [label, bytes] of [
       ['远小于预算', 1024],
       ['正好等于预算', BUDGET],
       ['没量到（缺省）', null],
     ] as Array<[string, number | null]>) {
-      const now = envLayer(renderOnce(
-        bytes === null ? {} : { stateBytes: bytes, stateBudgetBytes: BUDGET },
-      ));
+      const r = renderOnce(bytes === null ? {} : { stateBytes: bytes, stateBudgetBytes: BUDGET });
+      const now = envLayer(r);
       assert.ok(!now.includes('[STATE.md]'), `${label}：不该出现这一行：\n${now}`);
-      assert.ok(!now.includes('预算超限'), `${label}：连那几个字都不该有`);
+      assert.ok(!now.includes('超限'), `${label}：连"超限"都不该有`);
+      // 整份请求（含固定块 / 历史 / 指令）都不许有这句话
+      assert.ok(!dumpInput(r).includes('未决的事及时问他'), `${label}：整份 input 一个字都不该有`);
+      assert.ok(!r.instructions.includes('未决的事及时问他'), `${label}：指令里也不该有`);
     }
   });
 
@@ -1000,7 +1071,7 @@ describe('此刻层 · STATE 预算提醒（v32）', () => {
     assert.equal(envLayer(heavy()), envLayer(heavy()));
 
     // 压到预算内之后的下一轮：同一批事件、同一份其它素材，只有尺寸变了
-    const slim = renderOnce({ stateBytes: 4096, stateBudgetBytes: BUDGET });
+    const slim = renderOnce({ stateBytes: 1500, stateBudgetBytes: BUDGET });
     assert.ok(!envLayer(slim).includes('[STATE.md]'), '下一轮就不出现了');
     assert.equal(
       withoutNow(heavy()),
@@ -1008,7 +1079,7 @@ describe('此刻层 · STATE 预算提醒（v32）', () => {
       '尺寸变只动此刻层：前缀、记忆层、事件流逐字节不变',
     );
     // 反过来也一样：尺寸变大时，那一行**只**出现在此刻层
-    assert.ok(!withoutNow(heavy()).includes(OWNER_WORDS), '提醒不进此刻层以外的任何一层');
+    assert.ok(!withoutNow(heavy()).includes('未决的事及时问他'), '提醒不进此刻层以外的任何一层');
   });
 
   test('只在此刻层、不进冻结前缀与固定块：固定块的轮内冻结一字未动', () => {
@@ -1024,11 +1095,11 @@ describe('此刻层 · STATE 预算提醒（v32）', () => {
       now: NOW_A,
     });
     const over = step1(OVER);
-    const slim = step1(4096);
+    const slim = step1(1500);
 
     // ① 冻结前缀：instructions 一个字节都不许有它
     assert.ok(!over.instructions.includes('[STATE.md]'), 'instructions 是冻结前缀：提醒不许进去');
-    assert.ok(!over.instructions.includes(OWNER_WORDS));
+    assert.ok(!over.instructions.includes('未决的事及时问他'));
     // ② 固定块：尺寸变了它逐字节相同（"一轮之内逐字节不变"这条契约没被这一行碰）
     const blockOver = textOfItem(over.input.find(isTurnBlock), '固定块');
     assert.equal(
@@ -1038,7 +1109,7 @@ describe('此刻层 · STATE 预算提醒（v32）', () => {
     );
     assert.ok(!blockOver.includes('[STATE.md]'), '固定块里没有提醒那一行');
     assert.ok(blockOver.includes('[当前状态]') && blockOver.includes('# 记忆索引（机制生成'), '（前置事实）块里本来有状态与索引');
-    // ③ 它在**此刻层**那一条里，且那一条仍然是 input 的最后一条（每步都发）
+    // ③ 它在**此刻层**那一条里，且那一条仍然是 input 的最后一条（v66 之后这一条一轮发一次）
     const now1 = over.input.filter(isNowLayer);
     assert.equal(now1.length, 1, '此刻层仍然只有一条');
     assert.equal(now1[0], over.input[over.input.length - 1], '此刻层收尾');
@@ -1049,6 +1120,81 @@ describe('此刻层 · STATE 预算提醒（v32）', () => {
     assert.ok(
       (over.context.now?.tokens ?? 0) > (slim.context.now?.tokens ?? 0),
       '多出来的 token 记在此刻层那一段',
+    );
+  });
+
+  test('它是单行、且短：估算 ≤ 70 token / ≤ 320 字节（每轮第 1 步发一次，长度=钱包）', () => {
+    const line = stateBudgetReminder(OVER, BUDGET);
+    assert.ok(line !== null);
+    // 这一层是"一项一行"的字段表：提醒正文里多一个换行，读的人会把它当成另一个字段
+    assert.equal(line.includes('\n'), false, '这一行里不许有换行');
+    assert.ok(estimateTokens(line) <= 70, `估算 ${estimateTokens(line)} token，超了 70 的上界`);
+    assert.ok(Buffer.byteLength(line, 'utf8') <= 320, `实测 ${Buffer.byteLength(line, 'utf8')} 字节，超了 320 的上界`);
+  });
+
+  test('同一轮第 2/3/4/5 步：这一行都不再出现（整轮只发一次，不是隔步）', () => {
+    // 2026-10-17 用户批的那一笔：给它补 `预算提醒：` 行首标签 ⇒ 逐字段增量认得出，
+    // 第 2 步与上一步逐字节相同就**整项不发**（不是发一句"同上"、也不留空壳）。
+    // v69 起基线是"上一步**完整**的那一层"（`nowLayerFull`），所以第 3/4/5 步也不会再发；
+    // 实测 v68 的隔步形状是"第 1/3/5 步发"——这条用例就是那个病的回归锁。
+    let previous = renderOnce({ stateBytes: OVER, stateBudgetBytes: BUDGET, now: NOW_A });
+    const now1 = envLayer(previous);
+    assert.ok(now1.includes('预算提醒：'), '第 1 步：在（带标签）');
+    assert.ok(now1.includes('[STATE.md]'), '第 1 步：正文也在');
+    const nows = [now1];
+    const NOWS = [NOW_B, NOW_A, NOW_B, NOW_B];
+    for (const [i, now] of NOWS.entries()) {
+      const rendered = renderOnce({
+        stateBytes: OVER, stateBudgetBytes: BUDGET, now, previousNowLayer: previous.nowLayerFull,
+      });
+      const layer = envLayer(rendered);
+      const step = i + 2;
+      // 逐字断言"不再出现"：标签、正文里的数字、四件事那几句，一句都不许剩下
+      assert.ok(!layer.includes('预算提醒：'), `第 ${step} 步不许再发（标签也不留）：\n${layer}`);
+      assert.ok(!layer.includes('[STATE.md]'), `第 ${step} 步不许再发（正文也不在）：\n${layer}`);
+      assert.ok(!layer.includes('未决的事及时问他'), `第 ${step} 步一个字都不该有：\n${layer}`);
+      assert.ok(layer.includes('时刻：'), `第 ${step} 步照旧发时刻（它是这一层的锚点，永远发）`);
+      nows.push(layer);
+      previous = rendered;
+    }
+    // 掉回预算内：下一条请求里它本来就不在（判据只看这一次的字节数，不记"发过没"）
+    const slim = renderOnce({
+      stateBytes: 1500, stateBudgetBytes: BUDGET, now: NOW_B, previousNowLayer: previous.nowLayerFull,
+    });
+    assert.ok(!envLayer(slim).includes('[STATE.md]'), '掉回预算内：下一条请求里它就不在了');
+  });
+
+  test('行首标签是"第 2 步不发"的唯一开关：把标签剥掉（v32 的裸行形态）⇒ 照样每步重发', () => {
+    // 防后人删标签：这条用例把"标签在场"钉死。形状必须**行首**——`nowFieldsOf` 只认
+    // 换行之后紧跟的 `<已登记标签>：`（登记表是 `NOW_LAYER_FIELD_LABELS`）。
+    const step1 = renderOnce({ stateBytes: OVER, stateBudgetBytes: BUDGET, now: NOW_A });
+    const now1 = envLayer(step1);
+    assert.match(now1, /\n预算提醒：\[STATE\.md\] /u, `标签必须在行首：\n${now1}`);
+    // 对照实验：同一份基线，只把那 5 个字剥掉（模拟"没有标签"的旧形态）⇒ 增量认不出它，
+    // 第 2 步的判据落到"上一步没有它 ⇒ 发它"，于是每步都发。
+    const bare = step1.nowLayerFull.replace('\n预算提醒：', '\n');
+    const step2 = renderOnce({
+      stateBytes: OVER, stateBudgetBytes: BUDGET, now: NOW_B, previousNowLayer: bare,
+    });
+    const now2 = envLayer(step2);
+    assert.ok(now2.includes('[STATE.md]'), `没有标签 ⇒ 认不出 ⇒ 每步重发：\n${now2}`);
+  });
+
+  test('用 v66 的老病灶当对照：基线若是"上一步发出去的那几行"，第 3 步会再发一次', () => {
+    // 这条不是契约，是**证据**：它把 v68 的反例钉在这里，防止谁把基线改回"发出去的那一层"
+    // 却以为没影响（那条路会隔步重发，成本 ÷2 而不是 ÷5.65）。
+    const step1 = renderOnce({ stateBytes: OVER, stateBudgetBytes: BUDGET, now: NOW_A });
+    const step2 = renderOnce({
+      stateBytes: OVER, stateBudgetBytes: BUDGET, now: NOW_B, previousNowLayer: step1.nowLayerFull,
+    });
+    const sent2 = envLayer(step2); // v66 的老口径会把这一份当基线
+    assert.ok(!sent2.includes('[STATE.md]'), '第 2 步确实不发');
+    const step3Old = renderOnce({
+      stateBytes: OVER, stateBudgetBytes: BUDGET, now: NOW_A, previousNowLayer: sent2,
+    });
+    assert.ok(
+      envLayer(step3Old).includes('[STATE.md]'),
+      '老口径（基线 = 上一步真发出去的那一层）到第 3 步会重发——这正是 v69 修掉的东西',
     );
   });
 
@@ -1064,9 +1210,12 @@ describe('此刻层 · STATE 预算提醒（v32）', () => {
   });
 
   test('缺省与坏值：没设预算 / 坏数字一律当"没量到"，返回 null 而不是抛异常', () => {
-    assert.equal(stateBudgetReminder(OVER, BUDGET)?.startsWith('[STATE.md]'), true);
+    assert.equal(stateBudgetReminder(OVER, BUDGET)?.startsWith('预算提醒：[STATE.md]'), true);
     // 缺省预算 = 出厂 8 KB（调用方漏传时按代码口径判，而不是"永不提醒"）
-    assert.ok(stateBudgetReminder(OVER)?.includes('预算 8 KB'), '缺省取 DEFAULT_STATE_BUDGET_BYTES');
+    assert.ok(
+      stateBudgetReminder(17_007)?.includes('限额 8 KB = 8192 字节'),
+      '缺省取 DEFAULT_STATE_BUDGET_BYTES',
+    );
     for (const bad of [
       [null, BUDGET], [undefined, BUDGET], [Number.NaN, BUDGET], [-1, BUDGET],
       [OVER, 0], [OVER, -8], [OVER, Number.NaN], [OVER, null],
@@ -1077,6 +1226,260 @@ describe('此刻层 · STATE 预算提醒（v32）', () => {
         `(${String(bad[0])}, ${String(bad[1])}) 应当整行省略`,
       );
     }
+  });
+});
+
+// ──────────────────────── 此刻层 · 逐字段增量（v66；v69 修好两处失真） ────────────────────────
+
+/**
+ * 这一组钉的是 v69 修好的**两处失真**（它们让 v66 装了几乎白装）：
+ *
+ *   ① **切分**：v66 用通用正则 `/\n([^\n：]{1,16})：/u` 找标签 ⇒ `通道：` 正文里那一行
+ *      `[联络方式] 已启用的通道：…`（以及 `当前任务：` 正文里的 `未完成计划：`）被当成新字段，
+ *      前一个字段的旧值被**从中间切断** ⇒ 那些字段**永远比不上、从来不会被省**；
+ *      同一处还把两个字段之间的分隔换行算进**前一个**字段的值里 ⇒ 同样永不相等。
+ *   ② **基线**：v66-v68 的基线是"上一步**真发出去**的那一层"⇒ 被省掉的字段下一步在基线里
+ *      不存在 ⇒ 判据落到"上一步没有它 ⇒ 发它" ⇒ **隔步重发**（第 1/3/5 步发）。
+ *      v69 起基线是 `RenderedRequest.nowLayerFull`（上一步**完整**的那一层）。
+ *
+ * 实测（v68 的探针，同一套事实、5 步）：通道/会话**每步都在**、整层 530 字符不变；
+ * 修好之后（同一份探针）：第 2 步起 530 → 257 → 190，通道/会话/提问小结全部不再出现。
+ * 这里不重跑探针，而是把结论钉成断言——探针只是给人看的，回归要靠用例。
+ *
+ * ⚠ **v70 改了其中一组的待遇（P1-01）**：`通道：` / `会话：` / `在等你答复：` 从"没变就不发"
+ * 挪进"**每一步都发**"（`NOW_MUST_KEEP_LABELS`）——它们被省掉之后**历史补不回来**：此刻层不是
+ * 事件（第 1 步那一条不在第 2 步的请求里），而带同样内容的**固定块第 2 步起整块摘掉**（v31）。
+ * 上面那句"修好之后 530 → 257 → 190"因此作废成"530 → 474 → 474"（`render.ts` 文件头 v70 那篇
+ * 有完整读数与代价）。其余字段照旧省——下面那条反例钉着"省字没有作废"。
+ */
+describe('此刻层 · 逐字段增量（v66；v69 修好切分与基线；v70 划出"必须看见"的一组）', () => {
+  /** P1-01：这三样**每一步都发**（`NOW_MUST_KEEP_LABELS` 的三个值，逐字） */
+  const MUST_KEEP = ['通道：', '会话：', '在等你答复：'];
+  /** 同一份夹具里"没变就该省"的字段：都不在清单里（本机 / 点名） */
+  const OMISSIBLE = ['本机：', '点名：'];
+
+  /** 同一份"什么都没变"的事实（联络 + 提问 + 本机），逐 step 渲染 */
+  const stableStep = (previousNowLayer: string | null = null) => renderOnce({
+    contact: CONTACT_A, asks: ASKS_A, machine: MACHINE_A, now: NOW_A, previousNowLayer,
+  });
+
+  /**
+   * 按登记标签把一层切回"字段 → 那一段正文"（测试侧的小切法）。
+   *
+   * 刻意**不复用**生产那份 `nowFieldsOf`：这一组要看的是"某几个字段整段一模一样"，
+   * 拿实现切实现会把"切不出来"这件事一起藏掉（那正是 P1-04 的病）。
+   */
+  const segmentsOf = (layer: string): Map<string, string> => {
+    const marks = NOW_LAYER_FIELD_LABELS
+      .map(label => ({ label, at: layer.indexOf(`\n${label}：`) }))
+      .filter(mark => mark.at >= 0)
+      .sort((a, b) => a.at - b.at);
+    return new Map(marks.map((mark, index) => [
+      mark.label,
+      layer.slice(mark.at, index + 1 < marks.length ? marks[index + 1]!.at : layer.length),
+    ] as const));
+  };
+
+  test('P1-01 正面：第 2/3 步里 通道/会话/在等你答复 **仍在**，且与第 1 步逐字节相同', () => {
+    const step1 = stableStep();
+    const now1 = envLayer(step1);
+    for (const label of [...MUST_KEEP, ...OMISSIBLE]) {
+      assert.ok(now1.includes(`\n${label}`), `第 1 步要有「${label}」：\n${now1}`);
+    }
+    // 通道正文里就有那一行"长得像标签"的（v66 的切分正是在这里断的）——先确认它在
+    assert.ok(now1.includes('[联络方式] 已启用的通道：'), '正文里那行带冒号的必须在（否则测不到那个坑）');
+    const firstStep = segmentsOf(step1.nowLayerFull);
+
+    const step2 = stableStep(step1.nowLayerFull);
+    const step3 = stableStep(step2.nowLayerFull);
+    for (const [index, rendered] of [step2, step3].entries()) {
+      const step = index + 2;
+      const layer = envLayer(rendered);
+      const sent = segmentsOf(layer);
+      for (const label of MUST_KEEP) {
+        const name = label.replace('：', '');
+        assert.ok(sent.has(name), `第 ${step} 步必须仍在「${label}」（P1-01：省掉就补不回来）：\n${layer}`);
+        assert.equal(sent.get(name), firstStep.get(name),
+          `第 ${step} 步的「${label}」必须与第 1 步逐字节相同（不是"又拼了一句意思差不多的"）`);
+      }
+    }
+  });
+
+  test('P1-01 反面：不在清单里的不变字段照旧不发（v66 的"没变就不发"没有作废）', () => {
+    const step1 = stableStep();
+    const step2 = stableStep(step1.nowLayerFull);
+    const layer = envLayer(step2);
+    for (const label of OMISSIBLE) {
+      assert.ok(!layer.includes(label), `第 2 步不该再发「${label}」（它不在 must-keep 清单里）：\n${layer}`);
+    }
+    // 整层确实变小了：增量仍在省（v69 的 257 字符那一档；v70 因为补回三样比它大，但仍远小于第 1 步）
+    assert.ok(envLayer(step1).length > layer.length, '第 2 步那一层必须比第 1 步小（否则增量等于没装）');
+  });
+
+  test('整层都没变 ⇒ 只剩段头 + 时刻 + 必须看见的那三样；nowLayerFull 照旧完整（基线不能空）', () => {
+    // 同一份 now（时刻那一行也逐字节相同）⇒ 除`时刻：`（永远发）与 must-keep 那一组之外都没变
+    const step1 = stableStep();
+    const step2 = stableStep(step1.nowLayerFull);
+    const layer = envLayer(step2);
+    assert.equal(step1.nowLayerFull, step2.nowLayerFull, '完整的那一层仍在、没有变——下一步的基线不是空的');
+    // 期望值 = 段头 + 时刻那一行 + must-keep 那三样（逐字节拼出来，不是"看起来差不多"）
+    const bannerLines = NOW_LAYER_BANNER.split('\n').length;
+    const head = step1.nowLayerFull.split('\n').slice(0, bannerLines + 1).join('\n');
+    const firstStep = segmentsOf(step1.nowLayerFull);
+    const tail = MUST_KEEP.map(label => firstStep.get(label.replace('：', '')) ?? '').join('');
+    assert.equal(tail.length > 0, true, '（前置）三样都切出来了');
+    assert.equal(layer, `${head}${tail}`,
+      '只剩段头 + 时刻那一行 + must-keep 那三样（没有空壳、没有"同上"）');
+    assert.equal(step2.input.filter(isNowLayer).length, 1, '此刻层仍然只有一条');
+  });
+
+  test('v66 的两个反例（防止改回去）：基线用"发出去的那层"⇒ 第 3 步重发；旧切分认不出这行', () => {
+    // 反例一：基线 = 上一步真发出去的那一层（v66-v68 的口径）⇒ 第 3 步重发。
+    // v70 起拿 `本机：` 当这个"该省的字段"（`会话：` 已经进 must-keep 清单，不再省——
+    // 它的"不发"不再是契约，拿它当反例会把 P1-01 修回来的东西又钉死回去）。
+    const step1 = renderOnce({ contact: CONTACT_A, asks: ASKS_A, machine: MACHINE_A, now: NOW_A });
+    const step2 = renderOnce({
+      contact: CONTACT_A, asks: ASKS_A, machine: MACHINE_A, now: NOW_A, previousNowLayer: step1.nowLayerFull,
+    });
+    const sent2 = envLayer(step2); // 老口径把它当基线
+    assert.ok(!sent2.includes('本机：'), '第 2 步确实省了');
+    const step3Old = renderOnce({
+      contact: CONTACT_A, asks: ASKS_A, machine: MACHINE_A, now: NOW_A, previousNowLayer: sent2,
+    });
+    assert.ok(envLayer(step3Old).includes('本机：'), '老口径到第 3 步会把省掉的字段重发一遍');
+
+    // 反例二：v66 的通用正则会把正文里那行 `[联络方式] 已启用的通道：` 当标签 ⇒「通道」的旧值
+    // 被切断 ⇒ 永不相等。这里按老正则把"上一字段"切出来，断言它与真值**不相等**——这就是那处
+    // 失真的最小复现（不依赖实现细节：正则就是 v66 的行首标签判据）。
+    const full = step1.nowLayerFull;
+    const body = full.slice(NOW_LAYER_BANNER.length);
+    const re = /\n([^\n：]{1,16})：/gu;
+    const labels: Array<{ label: string; at: number }> = [];
+    for (let m = re.exec(body); m !== null; m = re.exec(body)) labels.push({ label: m[1]!, at: m.index });
+    assert.ok(
+      labels.some((item) => item.label.includes('已启用的通道')),
+      `v66 的正则确实把正文那行当成标签（实测标签表：${labels.map((item) => item.label).join(' / ')}）`,
+    );
+    const channelAt = labels.find((item) => item.label === '通道');
+    const nextAt = labels.find((item) => item.at > (channelAt?.at ?? -1))?.at ?? body.length;
+    const oldValue = body.slice(channelAt!.at, nextAt);
+    // v66 把通道正文里那一行当成了新字段的开头 ⇒ 切出来的旧值只剩个标签（永不等于真值）
+    assert.equal(oldValue, '\n通道：', `v66 的切法把「通道」的旧值切没了：${JSON.stringify(oldValue)}`);
+    // 另一处：两个字段之间的分隔换行被算进**前一个**字段的值里 ⇒ 同样永不相等。
+    // 用一份"字段紧挨着当前任务"的层（当前任务的正文自带前导空行，分隔符是 `\n\n`），
+    // 老切法会把那个多出来的 `\n` 算进前一个字段（会话）的值里。
+    const withCard = renderOnce({
+      contact: { ...CONTACT_A, wakeMessage: null },
+      taskCard: { title: '盯备份', turn: 1, step: 1, todoOpen: [] },
+      now: NOW_A,
+    });
+    const cardBody = withCard.nowLayerFull.slice(NOW_LAYER_BANNER.length);
+    const cardLabels: Array<{ label: string; at: number }> = [];
+    for (let m = re.exec(cardBody); m !== null; m = re.exec(cardBody)) cardLabels.push({ label: m[1]!, at: m.index });
+    const sessionsAt = cardLabels.find((item) => item.label === '会话');
+    const afterSessions = cardLabels.find((item) => item.at > (sessionsAt?.at ?? -1))?.at ?? cardBody.length;
+    assert.equal(cardLabels[cardLabels.indexOf(sessionsAt!) + 1]?.label, '当前任务', '会话后面紧挨着当前任务');
+    assert.ok(
+      cardBody.slice(sessionsAt!.at, afterSessions).endsWith('\n'),
+      'v66 切出来的「会话」值带着尾随分隔换行（与当步的 field.text 永不相等）',
+    );
+  });
+});
+
+// ────────────────── 此刻层 · 行首标签不变量 + 维护窗口 2/3 档（P1-04，v70） ──────────────────
+
+/**
+ * P1-04 的两半，各钉一条：
+ *
+ *   ① **不变量**：此刻层每一个字段都以**行首 `标签：`** 开头（遍历登记表里的 11 个字段）。
+ *      为什么这是硬要求，而不是"格式好看"：`nowFieldsOf` 只认登记过的标签 ⇒ 一个字段没有行首
+ *      标签时，逐字段增量**认不出它**（判据落到"上一步没有它 ⇒ 发它"）⇒ 它每步重发，而且它的
+ *      正文被算进**前一个字段**的值里（切分被污染，那个字段因此也永远比不上旧值）。
+ *   ② **2/3 档**（夜里 / 长时间空拍）：那段正文原先开头是 `[自主时段]`，没有标签 ⇒ 夜里/空拍档
+ *      **每步重发 ≈114 token**（`render.ts` 文件头 v70 那篇有实测）。v70 只在正文前面补五个字
+ *      `维护窗口：`，正文其余一个字没动。
+ */
+describe('此刻层 · 行首标签不变量 + 维护窗口 2/3 档（P1-04）', () => {
+  /** 夜里那一档：走**生产判据**（`maintenanceWindowOf`）算出来，不手抄正文 */
+  const NIGHT = maintenanceWindowOf({
+    historyTokens: null, compactionThresholdTokens: null, localHour: 3,
+    idleTicks: 0, lastWindowAtMs: null, localDay: '2026-10-18',
+  }, Date.parse(NOW_A));
+  /** 长时间空拍那一档（同一段正文、另一条判据）——2/3 档里另外那一档 */
+  const IDLE = maintenanceWindowOf({
+    historyTokens: null, compactionThresholdTokens: null, localHour: 12,
+    idleTicks: 6, lastWindowAtMs: null, localDay: '2026-10-18',
+  }, Date.parse(NOW_A));
+
+  /** 那一行的正文（去掉 v70 补的行首标签——v69 的形态就是它） */
+  const bareAutonomous = (text: string): string => text.replace(/^维护窗口：/u, '');
+
+  test('① 2/3 档的正文以行首 `维护窗口：` 开头，`[自主时段]` 那一段一个字没动', () => {
+    assert.ok(NIGHT !== null && IDLE !== null, '两条判据都要命中（夜里 / 空拍）');
+    for (const [name, note] of [['夜里', NIGHT], ['空拍', IDLE]] as const) {
+      assert.equal(note.text.startsWith('维护窗口：'), true,
+        `${name}那一档必须以行首标签开头（否则增量认不出、每步重发）：${JSON.stringify(note.text.slice(0, 40))}`);
+      assert.equal(bareAutonomous(note.text).startsWith('[自主时段] '), true,
+        `${name}那一档的正文（用户 v53 给的逐字草稿）必须原样跟在标签后面`);
+    }
+  });
+
+  test('② 不变量：遍历此刻层每一个字段，都以 `\\n标签：` 开头（11/11 一个不少）', () => {
+    // 把 11 个字段全部打开：本机 / 用度告警 / 预警 / 通道 / 会话 / 在等你答复 / 点名 /
+    // 任务卡 / 维护窗口 / 预算提醒（+ 永远在的时刻）
+    const r = renderOnce({
+      contact: CONTACT_A,
+      asks: ASKS_A,
+      machine: MACHINE_A,
+      usage: USAGE_B,
+      injection: [{
+        who: '用户（OWNER）', chatType: 'c2c', person: 'OPENID_A', count: 2, lastTs: '2020-06-01T08:48:00.000Z',
+      }],
+      taskCard: { title: '盯备份', turn: 3, step: 2, todoOpen: ['看一眼备份目录'] },
+      maintenanceWindow: NIGHT,
+      stateBytes: 4000,
+      stateBudgetBytes: 2048,
+      now: NOW_A,
+    });
+    const layer = envLayer(r);
+    assert.equal(NOW_LAYER_FIELD_LABELS.length, 11, '登记表就是这 11 个字段（加字段要一起加这里）');
+    assert.equal(NOW_MUST_KEEP_LABELS.length, 3, 'must-keep 清单是 P1-01 那三样（显式清单，别让它悄悄长）');
+    for (const label of NOW_LAYER_FIELD_LABELS) {
+      const marks = layer.split(`\n${label}：`).length - 1;
+      assert.equal(marks, 1,
+        `字段「${label}」必须以行首「标签：」出现、且只出现一次——没标签的字段会被增量当成"每步都变"，`
+        + `还会把它的正文算进前一个字段的值里：\n${layer}`);
+    }
+    // 段头之后紧跟第一个字段：中间不许夹一段没有标签的正文
+    assert.equal(layer.startsWith(NOW_LAYER_BANNER), true);
+    assert.match(layer.slice(NOW_LAYER_BANNER.length), /^\n时刻：/u);
+  });
+
+  test('③ 正面：那一行第 2/3 步不再重发（标签是"整轮一次"的唯一开关）', () => {
+    const step1 = renderOnce({ contact: CONTACT_A, asks: ASKS_A, maintenanceWindow: NIGHT, now: NOW_A });
+    assert.ok(envLayer(step1).includes('\n维护窗口：'), `第 1 步要有那一行：\n${envLayer(step1)}`);
+    let previous = step1;
+    for (const step of [2, 3, 4]) {
+      const rendered = renderOnce({
+        contact: CONTACT_A, asks: ASKS_A, maintenanceWindow: NIGHT, now: NOW_A,
+        previousNowLayer: previous.nowLayerFull,
+      });
+      const layer = envLayer(rendered);
+      assert.equal(layer.includes('维护窗口'), false, `第 ${step} 步不许再发（标签也不留）：\n${layer}`);
+      assert.equal(layer.includes('[自主时段]'), false, `第 ${step} 步正文也不在：\n${layer}`);
+      assert.equal(rendered.nowLayerFull.includes('\n维护窗口：'), true, '基线里仍在（整轮一次，不是"忘了"）');
+      previous = rendered;
+    }
+  });
+
+  test('④ 反面：把行首标签剥掉（v69 的形态）⇒ 增量认不出，每步都重发', () => {
+    // 这就是那个 bug 的最小复现：正文一字不差，只少五个字 `维护窗口：`
+    const bareNote = NIGHT === null ? null : { ...NIGHT, text: bareAutonomous(NIGHT.text) };
+    assert.ok(bareNote !== null);
+    const step1 = renderOnce({ maintenanceWindow: bareNote, now: NOW_A });
+    assert.ok(envLayer(step1).includes('[自主时段]'), '第 1 步当然在');
+    const step2 = renderOnce({ maintenanceWindow: bareNote, now: NOW_A, previousNowLayer: step1.nowLayerFull });
+    assert.ok(envLayer(step2).includes('[自主时段]'), `没有标签 ⇒ 认不出 ⇒ 每步重发：\n${envLayer(step2)}`);
   });
 });
 
@@ -1164,7 +1567,8 @@ describe('铁律 3 · 思维链按 Responses API 回传', () => {
       evt<ReasoningMessage>(
         'message/reasoning',
         { turn: 1, step: 0, text: `先看一眼待办 ${REASONING_MARKER}` },
-        { visibility: 'model' },
+        // v68：可见性**从 schema 表推**，不再手写 'model'——表若退回 internal，这一条当场红
+        { visibility: defaultVisibility('message/reasoning') },
       ),
       evt<AssistantMessage>('message/assistant', { text: '在。', toolCalls: [] }),
     ];
@@ -1182,7 +1586,8 @@ describe('铁律 3 · 思维链按 Responses API 回传', () => {
       evt<ReasoningMessage>(
         'message/reasoning',
         { turn: 1, step: 0, text: `误标可见的推理 ${REASONING_MARKER}` },
-        { visibility: 'model' },
+        // v68：同上——从真实可见性推出来（生产写入点走的也是 `defaultVisibility`）
+        { visibility: defaultVisibility('message/reasoning') },
       ),
       evt<AssistantMessage>('message/assistant', { text: '在。', toolCalls: [] }),
     ];
@@ -1201,7 +1606,7 @@ describe('铁律 3 · 思维链按 Responses API 回传', () => {
         'reasoning',
         'assistant:在。',
         `developer:${TURN_BLOCK_BANNER}\n\n[当前状态]\nSTATE 段：正在搭 render 层。`,
-        `developer:${NOW_LAYER_BANNER}\n时刻：2020-06-01 17:00:00（周一 · ${TZ} · UTC+08:00）｜UTC ${NOW_A}\n本机：未知`,
+        `developer:${NOW_LAYER_BANNER}\n时刻：2020-06-01 17:00:00（周一 · ${TZ} · UTC+08:00）｜UTC ${NOW_A}`,
       ],
     );
   });
@@ -1297,9 +1702,9 @@ describe('铁律 3 · 配对完整', () => {
     ];
     const r = renderOnce({ events });
     const outs = outputsByCallId(r);
-    assert.equal(outs.get('t1'), '工具执行超时（1500ms）。结果未知，不要假设成功。\n超时正文');
+    assert.equal(outs.get('t1'), '工具执行超时（1500ms）。结果未知，别重试这个目标。\n超时正文');
     assert.equal(outs.get('t1'), outs.get('t2'), '模板只依赖 status 与 durationMs 与 content');
-    assert.equal(outs.get('t3'), '工具执行超时（?ms）。结果未知，不要假设成功。\n超时正文');
+    assert.equal(outs.get('t3'), '工具执行超时（?ms）。结果未知，别重试这个目标。\n超时正文');
   });
 
   /**
@@ -1319,7 +1724,7 @@ describe('铁律 3 · 配对完整', () => {
   test('timeout：content 可见（框架软提醒真的进上下文）', () => {
     resetFactory();
     const timeoutBody = '工具 read_channel 超过 10000ms 没有返回，已记为超时结果。'
-      + '超时不会中断本轮循环；同一个目标别再重试（超时通常不是参数问题）——要么换做法，要么如实报告用户。';
+      + '同一个目标别再重试（超时通常不是参数问题）——要么换做法，要么如实报告用户。';
     const reminder = '[框架提示] 这是连续第 7 次调用 `read_channel`（其中同参数 1 次）。'
       + '重复调用工具过多，考虑检查参数或重新决定策略：需要等就用 `timer wait`，需要重新想就直接停下重新规划。'
       + '（如果你是在逐个处理不同的目标，忽略这条。）';
@@ -1332,7 +1737,7 @@ describe('铁律 3 · 配对完整', () => {
     const out = outputsByCallId(r).get('c1') ?? '';
     assert.equal(
       out,
-      `工具执行超时（10000ms）。结果未知，不要假设成功。\n${timeoutBody}\n\n${reminder}`,
+      `工具执行超时（10000ms）。结果未知，别重试这个目标。\n${timeoutBody}\n\n${reminder}`,
     );
     assert.ok(out.includes(timeoutBody), '超时回执正文必须逐字可见');
     assert.ok(out.includes(reminder), '框架软提醒必须逐字可见（它是守卫唯一的落点）');
@@ -1358,7 +1763,7 @@ describe('铁律 3 · 配对完整', () => {
     ];
     const outs = outputsByCallId(renderOnce({ events }));
     assert.equal(outs.get('o1'), '短正文');
-    assert.equal(outs.get('o2'), '头部预览\n[完整结果 123456 字节，不在本次对话里；用 read_blob 取（offset/limit 可翻页）：blob-abc，即 data/blobs/blob-abc]');
+    assert.equal(outs.get('o2'), '头部预览\n[完整结果 123456 字节，不在本次对话里：data/blobs/blob-abc；要原文用 safe_read 读这个路径]');
   });
 
   test('error 状态：error.message 优先，缺省回退 content', () => {
@@ -1377,7 +1782,7 @@ describe('铁律 3 · 配对完整', () => {
     // **只打一句固定文本、把 content 整个丢掉** ⇒ 她根本看不到"别再试了"，守卫就只剩日志里的一句话。
     // 所以拒绝走 `error` 形状、且 `content` 与 `error.message` 写同一句：两条分支打出同一行。
     resetFactory();
-    const refusal = '工具 read_channel 在 qq:group:953245617 这个目标上这一轮已经连续失败 3 次，'
+    const refusal = '工具 read_channel 在 qq:group:123456780 这个目标上这一轮已经连续失败 3 次，'
       + '别再试了——换做法，或如实报告用户。';
     const both = toolPair('f1', 'read_channel', 'error', {
       content: refusal, error: { message: refusal, code: 'TOOL_FAILURE_STREAK_REFUSED' },
@@ -1482,7 +1887,7 @@ describe('铁律 5 · 外部输入边界', () => {
   });
 
   test('wake/channel 的附件必须带上临时直链——只给文件名她会照着名字满盘找', () => {
-    // 实测：用户发了张图，她拿到的是 `[image/gif: 7AA3….jpg]`，于是 es_search 全盘搜文件名、
+    // 实测：用户发了张图，她拿到的是 `[image/gif: 7AA3….jpg]`，于是 find 全盘搜文件名、
     // list_dir、Get-ChildItem 连着试三轮，全空，最后只能回一句"图加载不出来"。
     // 图在腾讯服务器上（临时直链，带 rkey），本机根本没有这个文件——地址不给她，她就无从下手。
     resetFactory();
@@ -1561,18 +1966,18 @@ describe('铁律 5 · 外部输入边界', () => {
   test('v32：wake/channel 带上名字与会话名（她得知道是谁、在哪个群）', () => {
     resetFactory();
     const evtOne = evt<WakeChannel>('wake/channel', {
-      channel: 'qq-official', chatType: 'group-at', person: 'E7FE…', chatId: 'G1',
+      channel: 'qq-official', chatType: 'group-at', person: '0000…', chatId: 'G1',
       text: '看这个', messageId: 'm1', msgSeq: 1,
     });
     const rendered = renderWake(evtOne, undefined, undefined, {
       sessionLabel: '技术群', sid: 'qq:group:G1', personLabel: '张三',
     });
-    assert.ok(rendered.includes('person=张三(E7FE…)'), `名字与 openid 都要在：${rendered}`);
+    assert.ok(rendered.includes('person=张三(0000…)'), `名字与 openid 都要在：${rendered}`);
     assert.ok(rendered.includes('session=技术群'), '要说清是哪个群——只说"张三"她不知道那是什么地方');
     assert.ok(rendered.includes('sid=qq:group:G1'), 'sid 要带上：她拿它直接就能 speak 回去');
     // 解析不出名字时退回 openid（不编名字），且不写出一个空括号
     const bare = renderWake(evtOne, undefined, undefined, {});
-    assert.ok(bare.includes('person=E7FE…'));
+    assert.ok(bare.includes('person=0000…'));
     assert.ok(!bare.includes('session='), '没有会话名就不写这一段');
   });
 
@@ -1750,6 +2155,60 @@ describe('图片进上下文 · 聊天图片直通', () => {
       { loadImage: () => chosen('image/jpeg', 'AAAA'), maxContextImages: 0 },
     );
     assert.ok(!dumpInput(r).includes('input_image'));
+  });
+
+  // ── P1-03（v70）：窗口改写**已经发出去过**的 item —— 读数 ────────────────────────────
+  //
+  // 图片窗口（最近 N 张）会改写**已经发出去过**的 item：第 3 张到达时，最早那条 `[文本+图]`
+  // 退回纯文本。这件事**取消不了**（"有界"与"只追加"不可兼得，证明与代价写在 `render.ts`
+  // 的 `WindowRewrites` 注释里），所以 v70 做的是那一半"明说"。这一组钉两件事：
+  //   · **正面**：真有第 3 张时，读数指得出最早那一条（`kind:'image'` + 它的 seq），
+  //     而**除它之外**的 item 与上一步逐字节相同（不许顺手改动别的）；
+  //   · **反面**：窗口没超时读数必须是空的——"没有改写"不许报成"有"。
+  /** 一步的起点：`windowRewrites` 靠它认"上一步"（生产里 `runStep` 先渲染再写它） */
+  const stepStartOf = (seq: number, step: number): AppEvent => evt<StepStart>('step/start', {
+    turn: 1, step, model: 'fake-heavy', lane: 'heavy', renderVersion: RENDER_VERSION, personaHash: 'h',
+  }, { seq });
+
+  test('P1-03 正面：第 3 张图到达 ⇒ 读数指得出最早那条被挤掉，其余 item 一字不动', () => {
+    resetFactory();
+    const loadImage = () => chosen('image/jpeg', 'AAAA');
+    // 第 1/2 步各带来一张图（当时的唤醒）；第 3 步的渲染看得见三张
+    const events = [
+      channelImageEvent(1), stepStartOf(2, 1),
+      channelImageEvent(3), stepStartOf(4, 2),
+      channelImageEvent(5),
+    ];
+    // 上一步（第 2 步）看见的那一段 = `seq < 4`（与 `windowRewritesOf` 的重建口径同一处）
+    const previous = renderOnce({ events: events.filter(e => e.seq < 4) }, { loadImage, maxContextImages: 2 });
+    const current = renderOnce({ events }, { loadImage, maxContextImages: 2 });
+
+    assert.equal(previous.windowRewrites.unknown, false, '（前置）上一步得认得出');
+    assert.deepEqual(current.windowRewrites, {
+      items: [{ kind: 'image', seq: 1, chars: 0 }], unknown: false,
+    }, '读数必须指出"最早那张（seq 1）被挤掉了"');
+
+    const imageItems = (r: RenderedRequest): InputItem[] => eventItems(r).filter(it =>
+      it.type === 'message' && Array.isArray(it.content) && it.content.some(p => p.type === 'input_image'));
+    assert.equal(imageItems(previous).length, 2, '（前置）第 2 步两张图都在');
+    assert.equal(imageItems(current).length, 2, '第 3 步仍然只有两张（窗口 = 2）');
+    // **除被挤掉那条之外，逐字节相同**：共同的那几条（去掉第一条 = 被改写的那条）必须一字不差
+    const prev = eventItems(previous);
+    const cur = eventItems(current);
+    assert.equal(cur.length, prev.length + 1, '（前置）第 3 步本来就要往后追加一条新输入');
+    assert.equal(JSON.stringify(cur.slice(1, prev.length)), JSON.stringify(prev.slice(1)),
+      '除被挤掉那条之外，共同的 item 一个字节都不许动（铁律 2 在窗口这一处只让一条破例）');
+  });
+
+  test('P1-03 反面：窗口没超 ⇒ 读数必须是空的，一条都不许报', () => {
+    resetFactory();
+    const loadImage = () => chosen('image/jpeg', 'AAAA');
+    const events = [channelImageEvent(1), stepStartOf(2, 1), channelImageEvent(3), stepStartOf(4, 2)];
+    const r = renderOnce({ events }, { loadImage, maxContextImages: 2 });
+    assert.deepEqual(r.windowRewrites, { items: [], unknown: false }, '只有两张 ⇒ 没有第 3 张来挤');
+    // 图片直通关掉时同理：没有图进去，也就没有图被挤出来（不许报一个"看着像"的改写）
+    const off = renderOnce({ events }, { maxContextImages: 0 });
+    assert.deepEqual(off.windowRewrites.items, [], 'maxContextImages=0 ⇒ 一条图片改写都不报');
   });
 
   test('本轮新输入（首 step 的 wakeEvent）同样会带图——它不在 events 里也不能漏', () => {
@@ -2068,7 +2527,10 @@ describe('铁律 6 · 组装顺序', () => {
     const persona: RenderPersona = { identity: '只有身份', constitution: '  ', style: '', state: '' };
     const ins = renderOnce({ persona }).instructions;
     assert.equal(ins, `${INSTRUCTION_RULES.identity}\n\n只有身份\n\n${INSTRUCTION_RULES.brief}\n\n${SELF_BRIEF}`);
-    assert.ok(!ins.includes('\n\n\n'));
+    // v65：装置自述里有两处四连换行（用户那两行结束标记的前后）⇒ 改成**点名**锁：
+    // 除那两处之外一个三连以上换行都不许有（空块**不许新增**空行）——不是放宽。
+    assert.equal((ins.match(/\n{3,}/gu) ?? []).length, 2,
+      'v65：三连以上空行只许是用户版式那两处（两个结束标记前后）');
     // v56：宪法 / 风格那两条线必须**跟着空块一起消失**（不能留一根悬空的横线）
     assert.ok(!ins.includes(INSTRUCTION_RULES.constitution), '空块不带线');
     assert.ok(!ins.includes(INSTRUCTION_RULES.style), '空块不带线');
@@ -2094,7 +2556,11 @@ describe('铁律 6 · 组装顺序', () => {
     assert.ok(i1 > i0 && i2 > i1, '顺序：时刻 → 联络方式 → 状态');
     assert.ok(st.includes('已启用的通道：QQ 官方 Bot API。'), '只列启用的通道');
     assert.ok(st.includes('告警出口：未配置。'));
-    assert.ok(st.includes('这一轮没有人从外面叫你'), '无回投时直说发不出去');
+    // 2026-10-16 改判：这一档的措辞压短了（此刻层每一次调用都付费），判据跟着新字面量；
+    // **判的不是措辞而是"无回投时把话说出去这件事的后果与出路都说了"**——两件都还在。
+    assert.ok(st.includes('这轮没人从外面叫你'), '无回投时直说发不出去');
+    assert.ok(st.includes('说出去的话只在对话流里'), '说清后果：话只落在本机对话流');
+    assert.ok(st.includes('先写 STATE.md 或布一条 intention'), '给出路：写下来或布一条 intention');
   });
 
   test('本轮能回投时，联络段直说能发回哪个会话', () => {
@@ -2106,7 +2572,7 @@ describe('铁律 6 · 组装顺序', () => {
     }));
     assert.ok(st.includes('告警出口：已配置。'));
     assert.ok(st.includes('本轮可回投：QQ 官方 Bot API · 单聊——speak 会把话发回这个会话。'));
-    assert.ok(!st.includes('这一轮没有人从外面叫你'));
+    assert.ok(!st.includes('这轮没人从外面叫你'));
   });
 
   test('联络事实缺省时状态层不出现联络段（重放与诊断场景）', () => {
@@ -2153,7 +2619,7 @@ describe('铁律 6 · 组装顺序', () => {
     assert.deepEqual(r.input.map(i => (i.type === 'message' ? i.role : i.type)), ['developer']);
     assert.equal(
       st,
-      `${NOW_LAYER_BANNER}\n时刻：2020-06-01 17:00:00（周一 · ${TZ} · UTC+08:00）｜UTC ${NOW_A}\n本机：未知`,
+      `${NOW_LAYER_BANNER}\n时刻：2020-06-01 17:00:00（周一 · ${TZ} · UTC+08:00）｜UTC ${NOW_A}`,
     );
   });
 
@@ -2620,12 +3086,23 @@ describe('可见性单向承诺与固定模板', () => {
     assert.ok(texts.includes('developer:[人工确认] 调用 c9 的实际结局：partial。备份了一半'));
   });
 
-  test('request 形状：model / instructions / input / tools 四键齐备（外加渲染副产物 context）', () => {
+  test('request 形状：model / instructions / input / tools 四键齐备（外加两个渲染副产物）', () => {
     const r = renderOnce({});
     // `context` 是 2026-10-03 加的**渲染副产物**（上下文归因），不是发往模型的那四个键之一：
     // 发送形状由 agent-loop 的 toDsRequest 显式装配（它只挑 model/input/instructions/tools），
     // 所以多出这一键不会改变请求字节——这里把它一并锁住，免得以后有人以为它是发出去的字段。
-    assert.deepEqual(Object.keys(r).sort(), ['context', 'input', 'instructions', 'model', 'tools']);
+    // `nowLayerFull` 是 v69 加的第二个副产物（此刻层**完整**的那一层，下一步的比对基线）：
+    // 它同样不进请求体（`ds-client.buildRequestBody` 只挑那几个键），只给运行期/重放转手。
+    // `windowRewrites` 是 v70 加的第三个（P1-02/P1-03 的读数：这一步改写了哪几条历史 item）：
+    // 同一条纪律——**观测字段，一个字节都不进请求体**，所以它也必须出现在这份键表里。
+    assert.deepEqual(
+      Object.keys(r).sort(),
+      ['context', 'input', 'instructions', 'model', 'nowLayerFull', 'tools', 'windowRewrites'],
+    );
+    assert.equal(typeof r.nowLayerFull, 'string');
+    assert.equal(r.nowLayerFull.startsWith(NOW_LAYER_BANNER), true, '它是一整段此刻层（含段头）');
+    assert.deepEqual(r.windowRewrites, { items: [], unknown: true },
+      '没有 step/start 的调用认不出"上一步"⇒ unknown:true（"不知道"不是"没有改写"）');
     for (const it of r.input) {
       assert.ok(typeof it === 'object' && it !== null);
       assert.ok(['message', 'function_call', 'function_call_output'].includes(it.type));

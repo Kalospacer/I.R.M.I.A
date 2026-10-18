@@ -1,3 +1,7 @@
+// TODO(i18n): 本文件还有 38 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/pages/logs_ops.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 part of 'logs_page.dart';
 
 /// 概览里的告警落盘与自检两块（原为独立 tab，现并入概览折叠区），以及追踪 tab

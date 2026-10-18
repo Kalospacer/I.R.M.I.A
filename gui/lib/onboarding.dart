@@ -1,21 +1,45 @@
+// TODO(i18n): 本文件还有 ~40 处硬编码中文字符串字面量未迁（2026-10-20 盘点，lib/onboarding.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:async';
+// 「上次装完的结局」是一条 JSON 字符串（写进 ui-state.json 那一格）；不引新依赖，用 sdk 自带的
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 
 import 'app.dart';
+// QQ 官方 Bot 那两把凭据的键名与「消息适配器」页**同一份**（见 channel_keys.dart）：
+// 第 3 步填的就是设置页那两格，落盘走同一条 set-key。
+import 'channel_keys.dart';
+// 开外链只有一条实现（系统默认浏览器）。第 2、3 步那几颗蓝链与设置页的「下载页」走同一个
+// `Process.run`，这里不另写一份（否则平台分支与失败措辞就要各养一套）。
+import 'external_link.dart';
+// 第 2/3/4 步的所有界面话都进文案表（中英各一条），页面里不再拼中文字面量
+import 'i18n/app_strings.dart';
 import 'her_name.dart';
+// 手动打开那两句收尾话走文案表（`IrmiaStrings.read`）：新增的界面话一律进那一层
+import 'i18n/strings_scope.dart';
+// 「配置引导」那颗按钮的手动打开通道（`lib/onboarding_request.dart`）：
+// 页里那颗按钮 → 这一层宿主 → 同一张卡，**不碰**首次判据。
+import 'onboarding_request.dart';
 // 「信任范围」那一步与设置页读**同一份**文案与**同一个**二选一控件：
 // 两处各写一份的下场是"引导页默认 A、设置页默认 B"这种没人会发现的漂移。
 import 'pages/settings_page.dart';
+// 「立即重启」也走**既有那条唯一的路**（首页与托盘都走它）：同端点、同确认短语、同一套结局判据。
+// 第 6 步装完依赖之后那个顶层窗口里的按钮就交给它，这里一行重启逻辑都不新写。
+import 'restart_action.dart';
 import 'theme.dart';
+// 字号/间距/圆角不写魔法数字：新加的那几块（推荐语、蓝链、凭据格）一律取令牌
+import 'theme/design_tokens.dart';
 import 'ui_kit.dart';
 import 'ui_state.dart';
 
-/// 首次启动引导（五步：她叫什么 / API 配置 / 消息适配器 / 人格 / 信任范围）。
+/// 首次启动引导（六步：她叫什么 / API 配置 / 消息适配器 / 人格 / 信任范围 / 外部依赖）。
 ///
 /// 形制与「她在问」的那张卡同族（[AskCardHost]）：**顶层**（包住整个壳，人在哪一页都看得见）、
-/// 遮罩之上一次只一张、五步在同一张卡里前后走完——不是新开一页。
+/// 遮罩之上一次只一张、六步在同一张卡里前后走完——不是新开一页。
 ///
 /// 三件事先说清：
 ///   ① **判据**（[shouldShowOnboarding]）：见那个函数的注释，一句话——人格还是种子模板、
@@ -33,6 +57,9 @@ import 'ui_state.dart';
 ///        · 信任范围 → `POST /api/commands/config-update`
 ///                     （`X-Confirm: config-update; trust-full-access`——多出来的那半是**字段短语**，
 ///                       见 [kTrustConfirm]；写 `trust.mode` 少了它服务端回 400）
+///        · 外部依赖 → 逐件 `POST /api/commands/dep-install`（`X-Confirm: dep-install`），
+///                     **只读** `/api/deps` 取现状；已就位的跳过，一件失败不中断其余
+///                     （见 [_OnboardingCardState._runDepsRound]）
 ///
 ///      （前三步都写 `X-Confirm: config-update`；`config-update` 这条命令在服务端的
 ///        `CONFIRM_PHRASES` 里是 **null**，所以那半截短语是声明性的，真正被校验的是字段短语。）
@@ -41,6 +68,12 @@ import 'ui_state.dart';
 /// 这一步定的是"她能碰多远"。放最后是因为它是**一次边界声明**——前四步没有一步会问她
 /// "你能动我的电脑吗"，而这件事必须在第一次运行时就问过一遍（默认值是**完全信任**，
 /// 与配置里的默认值同一个字面量，见 [defaultTrustMode]）。
+///
+/// **第 6 步「外部依赖」为什么排在信任范围之后**（2026-10-20 用户第 3 轮 ⑤）：前面五步都是
+/// "写进配置文件的东西"，这一屏是**装东西**——它会往数据目录里落可执行文件，而且装完要重启
+/// 才生效（所以它后面跟一个顶层窗口）。把它放最后，人才是"配置已经填完、最后再决定要不要装"。
+/// 四件依赖（pwsh / rg / es / python）的说明与状态都在这一屏，**不装也走得完**：
+/// 勾选框默认勾上，但没勾就一个请求都不发（见 [_OnboardingCardState._runDepsRound]）。
 ///
 /// **第一步为什么写两件事**：这一屏问的其实是两件事——"她叫什么"（她的人格身份，落在
 /// persona/IDENTITY.md）与"群里喊什么算在叫她"（机器配置 channels.mentionKeywords）。
@@ -80,8 +113,176 @@ const kOnboardingCardWidth = 620.0;
 /// 但下一次有人改默认值时就只会改一处——这个常量是那条要求唯一能落地的形状。
 const defaultTrustMode = 'full';
 
-/// 步骤区的最小高度：四步的内容长短不一，不钉住高度就会一跳一跳
+/// 第 2 步「模型名」那一格的**默认值**（用户 2026-10-18 定的）。
+///
+/// 为什么不是后端那个 `DEFAULT_MODEL`：`buildDefaults()` 里的出厂值是
+/// `'deepseek-chat'`（`src/config/config.ts:60`），而用户要新用户默认走 `deepseek-flash`。
+/// 界面不改 `config.json` 的默认值（那是后端的事），只把**这一格预填成什么**定在这里；
+/// 人点「继续」时按这一格的值写进 `models.heavy.model`（与"改了才写"同一条口径）。
+const kDefaultModelName = 'deepseek-flash';
+
+/// 后端 `buildDefaults()` 的出厂模型名（`src/config/config.ts` 的 `DEFAULT_MODEL`）。
+///
+/// 判据用它区分"人选的模型"与"没人动过的出厂值"：盘上还是它 ⇒ 这一格显示 [kDefaultModelName]；
+/// 是别的值 ⇒ 原样回填，**绝不**拿推荐值盖掉人自己选过的模型。
+const kFactoryDefaultModel = 'deepseek-chat';
+
+/// 第 2 步模型格首次进入时预填什么。
+///
+/// 三种输入：空（读不到配置）、出厂默认（没人选过）、人自己选的模型。
+/// 前两种给推荐值 [kDefaultModelName]，第三种原样回去——这是"预填"唯一说得通的语义：
+/// 界面上摆的就是"你现在按哪个模型跑"，除了"还没选过"以外都不该替人改。
+String initialOnboardingModel(String configured) {
+  final model = configured.trim();
+  if (model.isEmpty || model == kFactoryDefaultModel) return kDefaultModelName;
+  return model;
+}
+
+/// 第 2 步「DeepSeek 的模型」那颗蓝链的地址：DeepSeek 的 API 平台。
+///
+/// 2026-10-18 实测可达（HTTP 200）。地址是**产品事实**不是界面文案，所以不进 AppStrings——
+/// 两种语言的同一句话打开的是同一个页面。
+const kDeepSeekPlatformUrl = 'https://platform.deepseek.com/';
+
+/// 第 2 步「点击注册账号并获取 API Key」那颗蓝链的地址：DeepSeek 的注册页。
+const kDeepSeekSignupUrl = 'https://platform.deepseek.com/sign_up';
+
+/// 第 3 步「QQ 官方 Bot」那颗蓝链的地址：QQ 开放平台。
+const kQqOpenPlatformUrl = 'https://q.qq.com/';
+
+/// 步骤区的最小高度：六步的内容长短不一，不钉住高度就会一跳一跳
 const _bodyMinHeight = 268.0;
+
+// ────────────────────── 第 6 步：外部依赖（2026-10-20） ──────────────────────
+
+/// 第 6 步要摆出来的四件外部依赖，**顺序就是界面顺序，也是安装的串行顺序**。
+///
+/// 与后端 `src/deps/probe.ts` 的 `DEP_NAMES`（`['pwsh','rg','es','python']`）同一份名单：
+/// 那一份是"有哪些依赖"的唯一来源，这里只决定"这一屏按什么顺序摆、按什么顺序装"。
+/// 写死而不是拿 `/api/deps` 的 `entries` 顺序：接口的条目顺序是服务端的实现细节，
+/// 界面上的顺序不该随它变（人第三次打开这张卡时，前两次学的还是这个顺序）。
+const kOnboardingDepNames = <String>['pwsh', 'rg', 'es', 'python'];
+
+/// 这一屏要读的现状（`GET /api/deps`），一件一条。
+class OnboardingDep {
+  const OnboardingDep({required this.name, required this.ready});
+
+  /// `pwsh` / `rg` / `es` / `python`
+  final String name;
+
+  /// 服务端说它**就位**了（`status == 'ready'`）。
+  ///
+  /// 只有 `ready` 才算就位：`version-mismatch`（装了但版本不够）与 `missing` 在本屏都按
+  /// "未就位"处理——这一屏要回答的是"要不要装"，而那一档同样需要（重）装一次。
+  final bool ready;
+
+  /// 刚装成的那一件：服务端复检过了，现状就是"就位"。
+  OnboardingDep asReady() => OnboardingDep(name: name, ready: true);
+
+  /// 从 `GET /api/deps` 的回包里取这一件。
+  ///
+  /// 形状照服务端（`src/deps/manager.ts` 的 `DepReportEntry`）：每条有 `name` / `status` /
+  /// `version` / ……。读不到那条、或形状不对，一律按**未就位**处理：这一屏宁可说"没装"
+  /// 让人去装一次，也不能反过来替服务端宣称"已就位"（那样人就再也不会去装了）。
+  static OnboardingDep from(String name, Object? raw) {
+    final map = raw is Map ? raw : const {};
+    return OnboardingDep(name: name, ready: map['status']?.toString() == 'ready');
+  }
+}
+
+/// 上一次装完的结局（落 `ui-state.json` 的 [kOnboardingDepsKey] 一格，JSON 字符串）。
+///
+/// 为什么它要落盘（用户第 3 轮 ⑤「装完的勾选状态与结果要能复查」）：卡片一关，内存里的
+/// 状态就没了；而"上次勾没勾、装成没装成"是人做过的决定与这次动作的结局，下一次打开
+/// 这一页时必须还看得见——否则"装失败了"会被静默吞掉，人只会记得"我点过安装"。
+class DepsAttempt {
+  const DepsAttempt({
+    required this.checked,
+    required this.ok,
+    required this.failed,
+    this.failures = const <String, String>{},
+  });
+
+  /// 人当时勾没勾那个勾选框（默认是勾上的，见 [_OnboardingCardState.depsInstallChecked]）
+  final bool checked;
+
+  /// 成功几件
+  final int ok;
+
+  /// 失败几件
+  final int failed;
+
+  /// 失败的那几件：名字 → 原因（复查时点名说清是哪一件、为什么）
+  final Map<String, String> failures;
+
+  String encode() => jsonEncode(<String, dynamic>{
+        'checked': checked,
+        'ok': ok,
+        'failed': failed,
+        'failures': failures,
+      });
+
+  /// 读回来。认不出（JSON 坏了、形状不对）一律 null——那时界面上不摆"上次装完"那一行。
+  ///
+  /// **0 成功 0 失败也是一条有效记录**：它是"上次没勾"那个决定的载体
+  /// （见 [_OnboardingCardState._runDepsRound] 的未勾选分支），勾选状态照样要复查得到。
+  static DepsAttempt? decode(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final map = decoded.cast<String, dynamic>();
+      final ok = map['ok'];
+      final failed = map['failed'];
+      final rawFailures = map['failures'];
+      if (ok is! num || failed is! num) return null;
+      return DepsAttempt(
+        checked: map['checked'] != false,
+        ok: ok.toInt(),
+        failed: failed.toInt(),
+        failures: rawFailures is Map
+            ? {
+                for (final entry in rawFailures.entries)
+                  entry.key.toString(): entry.value?.toString() ?? '',
+              }
+            : const <String, String>{},
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 装没装过东西（0/0 那条记录只回答"上次勾没勾"，没有结局可复查）
+  bool get hasResult => ok + failed > 0;
+}
+
+/// 「上一次装完的结局」在 `ui-state.json` 里的键名（值是 [DepsAttempt] 的 JSON）
+const kOnboardingDepsKey = 'onboarding-deps';
+
+/// 读回上一次装完的结局（读不到 = null，界面不摆那一行）
+Future<DepsAttempt?> loadDepsAttempt() async => DepsAttempt.decode(await loadString(kOnboardingDepsKey));
+
+/// 落盘这一次装完的结局（写不进去不影响使用，`ui_state.dart` 那边失败静默）
+Future<void> saveDepsAttempt(DepsAttempt attempt) =>
+    saveString(kOnboardingDepsKey, attempt.encode());
+
+/// 一把「只写不读」的密钥在界面上的现状：**只有"配没配"与掩码**，完整值从不经过界面
+/// （`GET /api/keys` 就只回这两个字段）。
+///
+/// 第 3 步的 AppID / AppSecret 与第 2 步的 API Key 是同一族东西，所以形状也同一个：
+/// 已配置时输入框留空、占位提示显示掩码（见 ui_kit 的 `secretLook`）。
+class SecretState {
+  const SecretState({required this.configured, this.mask});
+
+  /// 盘上有没有这把密钥
+  final bool configured;
+
+  /// 服务端给的掩码（例如 `qqA…9f3c`）；null = 没给/没配置
+  final String? mask;
+
+  /// 没配置的那一档（读不到 `/api/keys` 时也回它）
+  static const absent = SecretState(configured: false);
+}
 
 /// 引导要读的那几项**服务端现状**。三个字段刻意给得很直白，判据（[shouldShowOnboarding]）
 /// 只读它们，不读原始 JSON——"怎么读"与"根据它决定什么"分开，换端点时判据一个字都不用动。
@@ -95,6 +296,8 @@ class OnboardingSignals {
     required this.apiKeyConfigured,
     required this.qqEnabled,
     required this.onebotEnabled,
+    required this.qqAppId,
+    required this.qqClientSecret,
     required this.mentionKeywords,
     required this.identityContent,
     required this.herName,
@@ -118,6 +321,11 @@ class OnboardingSignals {
   final bool apiKeyConfigured;
   final bool qqEnabled;
   final bool onebotEnabled;
+
+  /// QQ 官方 Bot 那两把凭据的现状（只写不读：界面只知道"配没配"与掩码）。
+  /// 第 3 步的两个输入框据此决定占位提示——已配置就**不回显**，只摆掩码。
+  final SecretState qqAppId;
+  final SecretState qqClientSecret;
 
   /// 她当前被怎么称呼（可能被喊的那些词）：回填第一步的词表
   final List<String> mentionKeywords;
@@ -198,11 +406,19 @@ Future<OnboardingSignals> readOnboardingSignals(AppState state) async {
     cfg = null;
   }
 
+  // 密钥现状（`GET /api/keys`）：只回 {configured, mask}，完整值从不经过界面。
+  //
+  // 为什么要读 qqAppId / qqClientSecret：第 3 步那两个框就在引导页上填（用户 2026-10-18），
+  // 与「消息适配器」页一样**已有的不回显**——已配置时框留空、占位提示摆掩码。
   var apiKeyConfigured = false;
+  var qqAppId = SecretState.absent;
+  var qqClientSecret = SecretState.absent;
   try {
     final keys = await state.api.get('/api/keys');
     final heavy = keys is Map ? keys['heavy'] : null;
     apiKeyConfigured = heavy is Map && heavy['configured'] == true;
+    qqAppId = _secretState(keys, kQqAppIdKey);
+    qqClientSecret = _secretState(keys, kQqAppSecretKey);
   } catch (_) {
     // 读不到就当作"没配"：这一点只影响"这一步要不要提醒"，不影响是否弹卡（人格那边说了算）
   }
@@ -257,6 +473,8 @@ Future<OnboardingSignals> readOnboardingSignals(AppState state) async {
     apiKeyConfigured: apiKeyConfigured,
     qqEnabled: qqEnabled,
     onebotEnabled: onebotEnabled,
+    qqAppId: qqAppId,
+    qqClientSecret: qqClientSecret,
     mentionKeywords: keywords,
     identityContent: identityContent,
     // 名字就地认出来（同一份正文，不必再发一条请求）：口径全在 her_name.dart——
@@ -288,10 +506,41 @@ class _OnboardingHostState extends State<OnboardingHost> {
   /// 本次运行里已经处理过（弹过、或读完现状判定不弹）：一次会话里只做一次判断
   bool checked = false;
 
+  /// 卡片此刻开着没有（手动再点一次「配置引导」不叠第二张）
+  bool _cardUp = false;
+
   @override
   void initState() {
     super.initState();
+    // 手动打开通道（首页「配置引导」那颗按钮）：与首帧那次自动判断**是两条路**，
+    // 互不影响——自动那条只跑一次，手动这条可以来很多次。
+    onboardingOpenRequest.addListener(_onManualRequest);
     WidgetsBinding.instance.addPostFrameCallback((_) => unawaited(_maybeShow()));
+  }
+
+  @override
+  void dispose() {
+    onboardingOpenRequest.removeListener(_onManualRequest);
+    super.dispose();
+  }
+
+  /// 有人按了「配置引导」：打开同一张卡，但**不读也不写** `onboarding-done`。
+  ///
+  /// 为什么手动打开不许动那个标志：它是**唯一**的"不再自动弹"来源（见
+  /// [shouldShowOnboarding] 的 askedBefore）。人来只是"再看看这张卡、提点意见"——
+  /// 把"已经引导过"写死，等于替他把"第一次启动该弹一次"这件事消费掉；
+  /// 反过来（先手动打开、再去读标志）也不该让自动那条提前认为"已经引导过"。
+  void _onManualRequest() {
+    unawaited(_openManually());
+  }
+
+  Future<void> _openManually() async {
+    if (!mounted || _cardUp) return;
+    // 卡片里每一格都要回填"现在盘上是什么"，所以照样读一遍现状——
+    // 读不到也照开（手动是显式动作，不该被"判据说不该弹"拦住）。
+    final signals = await readOnboardingSignals(widget.state);
+    if (!mounted) return;
+    await _show(signals: signals, fromFirstRun: false);
   }
 
   Future<void> _maybeShow() async {
@@ -317,66 +566,101 @@ class _OnboardingHostState extends State<OnboardingHost> {
     await _show(signals: signals);
   }
 
-  Future<void> _show({OnboardingSignals? signals}) async {
-    final ready = signals ?? await readOnboardingSignals(widget.state);
-    if (!mounted) return;
-    final wrote = await showOnboardingCard(context, state: widget.state, signals: ready);
-    // 先落「问过了」再提示：写盘失败也只是下次再问一遍，不阻塞任何人
-    await saveFlag(kOnboardingDoneFlag, true);
-    if (!mounted) return;
-    IrmiaToast.show(
-      context,
-      wrote ? '引导走完了，之后不再自动弹出' : '先记着这件事——设置页与人格配置页里随时能填',
-      kind: wrote ? ToastKind.success : ToastKind.info,
-    );
+  Future<void> _show({OnboardingSignals? signals, bool fromFirstRun = true}) async {
+    if (_cardUp) return;
+    _cardUp = true;
+    try {
+      final ready = signals ?? await readOnboardingSignals(widget.state);
+      if (!mounted) return;
+      final wrote = await showOnboardingCard(
+        context,
+        state: widget.state,
+        signals: ready,
+        // 手动打开（「配置引导」那颗按钮）= 只是打开看看：预填的推荐模型不算"改动"，
+        // 关掉时一个字节都不写（见 `_OnboardingCardState._modelDirty`）
+        commitDefaults: fromFirstRun,
+      );
+      // 只有"首次那条路"才写「问过了」：手动打开不动它（见 [_openManually]）
+      if (fromFirstRun) await saveFlag(kOnboardingDoneFlag, true);
+      if (!mounted) return;
+      final strings = IrmiaStrings.read(context);
+      IrmiaToast.show(
+        context,
+        fromFirstRun
+            ? (wrote ? '引导走完了，之后不再自动弹出' : '先记着这件事——设置页与人格配置页里随时能填')
+            : (wrote ? strings.onboardingManualSaved : strings.onboardingManualNoChanges),
+        kind: wrote ? ToastKind.success : ToastKind.info,
+      );
+    } finally {
+      _cardUp = false;
+    }
   }
 
   @override
   Widget build(BuildContext context) => widget.child;
 }
 
-/// 五步的标题与一句人话（标题也当步骤条的标签用：一处措辞，两处显示）
-class _Step {
-  const _Step(this.key, this.title, this.note);
+/// 六步的**键**：结算时按它分派（[`_OnboardingCardState._settle`]）。
+///
+/// 标题与说明**不在**这里——它们在 [AppStrings] 里，中英各一份（见 `_stepCopyOf`）。
+/// 步骤条上的标签与正文标题是同一句，所以只在文案表里写一次。
+///
+/// **第 6 步 `deps` 不在这条结算链上**：它会装东西、要弹重启窗口、失败了还要能重试，
+/// 不是一个 `Future<String?>` 能说清的（见 [_OnboardingCardState._runDepsRound]）。
+/// 所以 [_settle] 对它什么都不做，`_finish` 单独走那一条。
+const _stepKeys = <String>['name', 'api', 'channel', 'persona', 'trust', 'deps'];
 
-  final String key;
-  final String title;
-  final String note;
-}
+/// 一步的标题 + 一句人话（两种语言由 [AppStrings] 给；标题也当步骤条的标签用）
+typedef _StepCopy = ({String title, String note});
 
-const _steps = <_Step>[
-  _Step('name', '她叫什么', '名字是她的身份；下面那份词表是"机器怎么认出在叫她"——群里不打 @ 直接喊到它，框架才当作在叫她。'),
-  _Step('api', 'API 配置', '她用的是哪家模型。写进 config.json 与 data/.keys.json，进程重启后接管。'),
-  _Step('channel', '消息适配器', '她从哪个通道收消息。密钥与端点细节在「消息适配器」页里补齐。'),
-  _Step('persona', '人格', '她是谁。这一段写进 persona/IDENTITY.md，是她的常驻人格。'),
-  // 最后一步（2026-10-05 加）：**活动边界**。它排在最后是因为前四步都在填"她是谁、
-  // 怎么说话"，没有一步会问"她能碰多远"——而那件事必须在第一次就摆到人面前一次。
-  _Step('trust', '信任范围', '她能碰到多远：整台电脑，还是只有一个工作目录。二选一，默认完全信任。'),
-];
+/// 按当前语言取六步的标题与说明（顺序与 [_stepKeys] 一一对应）。
+///
+/// 为什么是"每次 build 现取"而不是顶层 const：语言可以在不重启的情况下切换
+/// （见 `i18n/strings_scope.dart`），const 一份中文会把切换锁死在启动那一刻。
+List<_StepCopy> _stepCopyOf(AppStrings s) => <_StepCopy>[
+      (title: s.onboardingStepNameTitle, note: s.onboardingStepNameNote),
+      (title: s.onboardingStepApiTitle, note: s.onboardingStepApiNote),
+      (title: s.onboardingStepChannelTitle, note: s.onboardingStepChannelNote),
+      (title: s.onboardingStepPersonaTitle, note: s.onboardingStepPersonaNote),
+      (title: s.onboardingStepTrustTitle, note: s.onboardingStepTrustNote),
+      (title: s.onboardingStepDepsTitle, note: s.onboardingStepDepsNote),
+    ];
 
 /// 打开引导卡，返回**有没有真的写进去过东西**（false = 四步都跳过了或原地关掉）。
 ///
 /// 返回这个 boolean 是为了让宿主那句收尾提示说准：全跳过的场合说"走完了"是假的。
+///
+/// [commitDefaults] 只有"首次启动那条路"是 true：那时**预填的推荐值**（第 2 步的
+/// `deepseek-flash`）就是人看到的默认配置，点继续/关掉时照写；手动打开（人按「配置引导」
+/// 只是打开看看）传 false——预填值不算改动，关掉时一个字节都不写。
 Future<bool> showOnboardingCard(
   BuildContext context, {
   required AppState state,
   required OnboardingSignals signals,
+  bool commitDefaults = true,
 }) async {
   if (!context.mounted) return false;
   final result = await showDialog<bool>(
     context: context,
     // 点遮罩不关：这张卡里有四个输入框，误点一下就把人刚打的字丢了
     barrierDismissible: false,
-    builder: (_) => _OnboardingCard(state: state, signals: signals),
+    builder: (_) => _OnboardingCard(state: state, signals: signals, commitDefaults: commitDefaults),
   );
   return result ?? false;
 }
 
 class _OnboardingCard extends StatefulWidget {
-  const _OnboardingCard({required this.state, required this.signals});
+  const _OnboardingCard({
+    required this.state,
+    required this.signals,
+    this.commitDefaults = true,
+  });
 
   final AppState state;
   final OnboardingSignals signals;
+
+  /// 预填的推荐值算不算"人的改动"（见 [showOnboardingCard]）
+  final bool commitDefaults;
 
   @override
   State<_OnboardingCard> createState() => _OnboardingCardState();
@@ -425,13 +709,23 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   String autoKeywords = '';
 
   // ── 第二步：API 配置 ──
-  late final TextEditingController modelCtl = TextEditingController(text: widget.signals.model);
+  /// 模型名：出厂默认（`deepseek-chat`）或空 ⇒ 预填 [kDefaultModelName]（见 [initialOnboardingModel]）
+  late final TextEditingController modelCtl =
+      TextEditingController(text: initialOnboardingModel(widget.signals.model));
   late final TextEditingController baseCtl = TextEditingController(text: widget.signals.baseUrl);
   final keyCtl = TextEditingController();
 
   // ── 第三步：消息适配器（现状 + 人这次的选择；勾上的就是"这次要开"的） ──
   late bool qqOn = widget.signals.qqEnabled;
   late bool onebotOn = widget.signals.onebotEnabled;
+
+  /// QQ 官方 Bot 的两把凭据（用户 2026-10-18：首次就在这一页填）。
+  ///
+  /// 与第 2 步的 API Key 一个规格：**只写不读**，已经配置过就不回显、框留空
+  /// （掩码摆在占位提示里，见 `secretLook`）。落盘走设置页「消息适配器」同一条 set-key，
+  /// 键名取自 `channel_keys.dart`——两处填的是同一把凭据。
+  final appIdCtl = TextEditingController();
+  final appSecretCtl = TextEditingController();
 
   /// 第四步：人格
   late final TextEditingController personaCtl =
@@ -450,21 +744,115 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   /// 第一步刚写的名字当成"人的改动"，或者反过来把名字冲掉。
   late String personaBase = widget.signals.identityContent ?? '';
 
+  // ── 第六步：外部依赖（2026-10-20 用户第 3 轮 ⑤） ──
+  //
+  // 这一屏的四件事：现状（只读 /api/deps）、勾选框、逐件串行安装、装完要重启。
+  // **一律不新写安装逻辑**：安装请求就是设置页 `_installDep` 那一条（同端点、同
+  // `X-Confirm: dep-install`），重启就是 `restart_action.dart` 的 `performRestart`。
+
+  /// 四件依赖的现状（顺序固定为 [kOnboardingDepNames]；读不到时是空表）
+  List<OnboardingDep> deps = const <OnboardingDep>[];
+
+  /// 正在读 `/api/deps`（这一屏的三态之一）
+  bool depsLoading = false;
+
+  /// 读不到的原因（null = 读到了）
+  String? depsError;
+
+  /// 服务端没装配依赖管理器（`available: false`）：这一屏只说明，不摆勾选框、不装
+  bool depsUnavailable = false;
+
+  /// 读现状那条 Future：人可能一进这一屏就点「完成」，那时先等它，再决定装哪几件
+  Future<void>? depsPending;
+
+  /// 这一屏有没有发起过那条读（一次就够：装完的现状由安装回执就地更新）
+  bool depsRequested = false;
+
+  /// 勾选框：下载并安装这些外部依赖。
+  ///
+  /// **默认勾上**（用户的要求）；但"上次没勾"那个决定会被 [DepsAttempt] 读回来
+  /// （见 [_restoreDepsAttempt]）——复查要看得见，同时没勾就一个请求都不发。
+  bool depsInstallChecked = true;
+
+  /// 人这一趟亲手改过勾选框没有（改过就不让读回来的旧值盖掉它）
+  bool depsCheckTouched = false;
+
+  /// 正在装哪一件（null = 没在装）
+  String? depsRunning;
+
+  /// 这一轮每件的结局：名字 → (成了没, 原因/版本)
+  final Map<String, ({bool ok, String reason})> depsResults = <String, ({bool ok, String reason})>{};
+
+  /// 这一轮装完没有（装完才摆汇总行与「重试」）
+  bool depsRoundDone = false;
+
+  /// 上一次装完的结局（上一轮，或上一次开这张卡时落盘的那一份）——复查就靠它
+  DepsAttempt? depsLastAttempt;
+
+  @override
+  void initState() {
+    super.initState();
+    // 上次装完的结局：开卡就读回来（本地文件，不打服务端）。读回来之后这一屏才有
+    // "上次装完：成功 N / 失败 M"那一行，勾选框也照上次那个决定。
+    unawaited(_restoreDepsAttempt());
+  }
+
+  /// 读回上一次装完的结局（见 [kOnboardingDepsKey]）。
+  Future<void> _restoreDepsAttempt() async {
+    final attempt = await loadDepsAttempt();
+    if (!mounted || attempt == null) return;
+    setState(() {
+      depsLastAttempt = attempt;
+      if (!depsCheckTouched) depsInstallChecked = attempt.checked;
+    });
+  }
+
   @override
   void dispose() {
     // 退场动画跑完再销毁输入控制器：`showDialog` 的 Future 在路由弹出时就 resolve，
     // 而这几个 TextField 还要几十毫秒才从树上摘掉（原因见 ui_kit 里那段注释）。
-    for (final ctl in [nameCtl, keywordsCtl, modelCtl, baseCtl, keyCtl, personaCtl]) {
+    for (final ctl in [
+      nameCtl,
+      keywordsCtl,
+      modelCtl,
+      baseCtl,
+      keyCtl,
+      appIdCtl,
+      appSecretCtl,
+      personaCtl,
+    ]) {
       disposeLater(ctl);
     }
     super.dispose();
   }
 
-  /// 输入框的值变没变（统一 trim：尾部空格是手滑，不是值）
-  bool get _modelDirty =>
-      modelCtl.text.trim() != widget.signals.model || baseCtl.text.trim() != widget.signals.baseUrl;
+  /// 输入框的值变没变（统一 trim：尾部空格是手滑，不是值）。
+  ///
+  /// 基准是"**这一屏进来时摆的是什么**"：
+  ///   · 首次启动（[widget.commitDefaults] = true）时基准是盘上那份——这一格摆的是
+  ///     [kDefaultModelName] 而盘上还是后端出厂值（`deepseek-chat`）时，点「继续」就写一次
+  ///     （"默认走 deepseek-flash"这条要求落地的形状）；
+  ///   · 手动打开（false）时基准是**预填值**：人只是打开看看，什么都没改就关掉 ⇒ 零写入
+  ///     （`onboarding_manual_open_test` 钉着这条）。
+  bool get _modelDirty {
+    final baseline = widget.commitDefaults
+        ? widget.signals.model
+        : initialOnboardingModel(widget.signals.model);
+    return modelCtl.text.trim() != baseline || baseCtl.text.trim() != widget.signals.baseUrl;
+  }
 
   bool get _keyDirty => keyCtl.text.trim().isNotEmpty;
+
+  /// 两把凭据都填上了就把 QQ 官方 Bot 勾上（只自动勾、不自动取消）。
+  ///
+  /// 为什么要有这一下：用户要的是"首次就能填"——填完两把凭据却还得再勾一个框，
+  /// 那一步谁都会漏；漏了的下场是"填完了她照样收不到消息"，而界面没有任何提示。
+  /// 只勾不取消：人手动取消过就是一个决定，不能被输入框里的字又翻回来。
+  void _syncQqFromCredentials() {
+    if (qqOn || widget.signals.qqEnabled) return;
+    if (appIdCtl.text.trim().isEmpty || appSecretCtl.text.trim().isEmpty) return;
+    qqOn = true;
+  }
 
   bool get _personaDirty => personaCtl.text.trim() != personaBase.trim();
 
@@ -488,6 +876,8 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    // 六步的标题与说明来自文案表（切语言时这一步跟着变，见 `_stepCopyOf`）
+    final steps = _stepCopyOf(IrmiaStrings.of(context));
     return Dialog(
       insetPadding: const EdgeInsets.all(24),
       shape: RoundedRectangleBorder(
@@ -500,23 +890,23 @@ class _OnboardingCardState extends State<_OnboardingCard> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _header(scheme),
+            _header(scheme, steps.length),
             Padding(
               padding: const EdgeInsets.fromLTRB(22, 4, 22, 14),
-              child: _stepStrip(scheme),
+              child: _stepStrip(scheme, steps),
             ),
             Flexible(
               child: SingleChildScrollView(
                 padding: const EdgeInsets.fromLTRB(22, 0, 22, 4),
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(minHeight: _bodyMinHeight),
-                  child: _body(scheme),
+                  child: _body(scheme, steps),
                 ),
               ),
             ),
             if (problem != null) _problemBar(scheme),
             if (requirement != null) _requirementBar(scheme),
-            _footer(scheme),
+            _footer(scheme, steps.length),
           ],
         ),
       ),
@@ -525,7 +915,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
 
   // ── 卡头：她的脸 + 标题 + 关闭 ──
 
-  Widget _header(ColorScheme scheme) {
+  Widget _header(ColorScheme scheme, int stepCount) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(22, 20, 14, 6),
       child: Row(
@@ -542,12 +932,12 @@ class _OnboardingCardState extends State<_OnboardingCard> {
                     const Text(kOnboardingTitle,
                         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
                     const SizedBox(width: 8),
-                    Text('${step + 1} / ${_steps.length}',
+                    Text('${step + 1} / $stepCount',
                         style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
                   ],
                 ),
                 const SizedBox(height: 4),
-                Text('${_steps.length} 步把她的基本配置填完，跳过的那几项之后在设置页里随时能改。',
+                Text('$stepCount 步把她的基本配置填完，跳过的那几项之后在设置页里随时能改。',
                     style: TextStyle(fontSize: 12, height: 1.6, color: scheme.onSurfaceVariant)),
               ],
             ),
@@ -564,10 +954,10 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   }
 
   /// 步骤条：序号 + 标题。点已经走过的那几步可以一步一步退回去改（与「上一步」同一条路）
-  Widget _stepStrip(ColorScheme scheme) {
+  Widget _stepStrip(ColorScheme scheme, List<_StepCopy> steps) {
     return Row(
       children: [
-        for (var i = 0; i < _steps.length; i++) ...[
+        for (var i = 0; i < steps.length; i++) ...[
           if (i > 0)
             Expanded(
               child: Container(
@@ -576,13 +966,13 @@ class _OnboardingCardState extends State<_OnboardingCard> {
                 color: i <= step ? scheme.primary.withValues(alpha: 0.45) : scheme.outlineVariant,
               ),
             ),
-          _stepChip(i, scheme),
+          _stepChip(i, scheme, steps),
         ],
       ],
     );
   }
 
-  Widget _stepChip(int index, ColorScheme scheme) {
+  Widget _stepChip(int index, ColorScheme scheme, List<_StepCopy> steps) {
     final active = index == step;
     final done = index < step;
     final tone = active ? scheme.primary : (done ? scheme.primary : scheme.onSurfaceVariant);
@@ -614,7 +1004,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
             ),
             const SizedBox(width: 6),
             Text(
-              _steps[index].title,
+              steps[index].title,
               style: TextStyle(
                 fontSize: 11.5,
                 fontWeight: active ? FontWeight.w600 : FontWeight.w400,
@@ -684,8 +1074,8 @@ class _OnboardingCardState extends State<_OnboardingCard> {
     );
   }
 
-  Widget _footer(ColorScheme scheme) {
-    final last = step == _steps.length - 1;
+  Widget _footer(ColorScheme scheme, int stepCount) {
+    final last = step == stepCount - 1;
     return Container(
       padding: const EdgeInsets.fromLTRB(22, 12, 22, 16),
       decoration: BoxDecoration(
@@ -713,7 +1103,9 @@ class _OnboardingCardState extends State<_OnboardingCard> {
           ),
           const SizedBox(width: 6),
           FilledButton(
-            onPressed: busy ? null : () => unawaited(last ? _finish() : _next()),
+            // 最后一步那颗是「完成」：**只有它**会把第 6 步的安装跑起来（install: true）。
+            // 「以后再说」/ 关闭 / 跳过这一步都不装——"我只是打开看了看"不该落四个可执行文件。
+            onPressed: busy ? null : () => unawaited(last ? _finish(install: true) : _next()),
             child: busy
                 ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
                 : Text(last ? kOnboardingDoneLabel : kOnboardingNextLabel),
@@ -725,21 +1117,22 @@ class _OnboardingCardState extends State<_OnboardingCard> {
 
   // ── 每步的正文 ──
 
-  Widget _body(ColorScheme scheme) {
+  Widget _body(ColorScheme scheme, List<_StepCopy> steps) {
+    final copy = steps[step];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(_steps[step].title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+        Text(copy.title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
         const SizedBox(height: 6),
-        Text(_steps[step].note,
-            style: TextStyle(fontSize: 12, height: 1.7, color: scheme.onSurfaceVariant)),
+        Text(copy.note, style: TextStyle(fontSize: 12, height: 1.7, color: scheme.onSurfaceVariant)),
         const SizedBox(height: 16),
         switch (step) {
           0 => _nameStep(scheme),
           1 => _apiStep(scheme),
           2 => _channelStep(scheme),
           3 => _personaStep(scheme),
-          _ => _trustStep(scheme),
+          4 => _trustStep(scheme),
+          _ => _depsStep(scheme),
         },
       ],
     );
@@ -759,7 +1152,11 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   ///   ② 词表 = 机器怎么认出在叫她，落在 `channels.mentionKeywords`——是**唤醒判据**，
   ///      从名字派生出来的第一份默认值，人可以按群里的叫法改宽或改窄。
   /// 名字改了而词表没改，群里喊新名字她照样听不见——所以两格并排摆着，关系写在旁注里。
+  ///
+  /// 两段旁注（名字框下 / 词表下）**第 3 轮压成了一行**（用户 2026-10-20 ①）：一行里
+  /// 说清"写哪儿、有没有快照能回滚、怎么分隔、清空等于什么"，字数上界由用例钉着。
   Widget _nameStep(ColorScheme scheme) {
+    final s = IrmiaStrings.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -775,8 +1172,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
           }),
           decoration: const InputDecoration(hintText: '小七'),
         ),
-        _note('写进 persona/IDENTITY.md 的「名字：」那一行——她的人格身份（服务端写前会留一份'
-            '旧版本快照，人格配置页里能看能回滚）。界面上显示的就是这个名字。', scheme),
+        _note(s.onboardingStepNameHint, scheme),
         const SizedBox(height: 16),
         Text('群里喊哪些词算在叫她', style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
         const SizedBox(height: 6),
@@ -786,13 +1182,13 @@ class _OnboardingCardState extends State<_OnboardingCard> {
           onChanged: (_) => setState(() => problem = null),
           decoration: InputDecoration(hintText: mentionKeywordsHint(_knownName)),
         ),
-        _note('正文里出现这几个词就当"在叫她"（与平台的 @ 同一条路）。'
-            '逗号或顿号隔开；填了名字这里会自动跟一份。清空 = 只认平台的 @。', scheme),
+        _note(s.onboardingKeywordsHint, scheme),
       ],
     );
   }
 
   Widget _apiStep(ColorScheme scheme) {
+    final s = IrmiaStrings.of(context);
     // 已配置时的样子（蓝、居中）与设置页的密钥格共用一份：ui_kit 的 secretLook
     final look = secretLook(
       context,
@@ -813,7 +1209,8 @@ class _OnboardingCardState extends State<_OnboardingCard> {
           enableSuggestions: false,
           style: const TextStyle(fontSize: 13),
           onChanged: (_) => setState(() => problem = null),
-          decoration: const InputDecoration(hintText: 'deepseek-chat'),
+          // 框里已经有默认值（[kDefaultModelName]），提示只在人清空之后才看得见
+          decoration: const InputDecoration(hintText: kDefaultModelName),
         ),
         const SizedBox(height: 12),
         Text('Base URL', style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
@@ -840,20 +1237,59 @@ class _OnboardingCardState extends State<_OnboardingCard> {
           onChanged: (_) => setState(() => problem = null),
           decoration: look.decoration,
         ),
-        _note('密钥只写不读（写进 data/.keys.json，界面此后只显示掩码）。'
-            '轻量那条 lane 跟着这里的主配置走，不必再填一遍。', scheme),
+        // 用户 ②（2026-10-18）：原来这里是一段"密钥只写不读…"的解释，删掉，换成
+        // 「我们推荐您使用 DeepSeek 的模型」+「点击注册账号并获取 API Key」两段话，
+        // 里面那两截是蓝链——点开浏览器去 DeepSeek 的 API 平台（注册页）。
+        // 地址是产品事实（两种语言同一个），文案在 AppStrings 里。
+        //
+        // 第 3 轮（2026-10-20 用户 ②）：那**两行合成一行**——原来一次 `_recommendLine`
+        // 只有一句话，两行读起来像两条互不相干的推荐；现在四段排在同一行（同一个 [Wrap]），
+        // 中间那个连接词也进文案表（英文是 ", "、中文是 "，"）。
+        const SizedBox(height: Space.x3),
+        _recommendLine(
+          scheme,
+          [
+            (text: s.onboardingApiRecommendLead, url: null, keyName: null),
+            (
+              text: s.onboardingApiRecommendModel,
+              url: kDeepSeekPlatformUrl,
+              keyName: 'onboarding-link-deepseek-model',
+            ),
+            (text: s.onboardingApiRecommendJoin, url: null, keyName: null),
+            (
+              text: s.onboardingApiRegisterKey,
+              url: kDeepSeekSignupUrl,
+              keyName: 'onboarding-link-deepseek-signup',
+            ),
+          ],
+          // 用例按这个 key 找"那一行"：整句话只许有一个 [Wrap]（两行就成两个了）
+          lineKey: const ValueKey('onboarding-api-recommend'),
+        ),
       ],
     );
   }
 
   Widget _channelStep(ColorScheme scheme) {
+    final s = IrmiaStrings.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        // 用户 ③（2026-10-18）：一句推荐 + 蓝链，链到 QQ 开放平台。
+        // 「QQ 官方 Bot」那截可点，句子其余部分照原文排（语序两种语言各一份，见 AppStrings）。
+        _recommendLine(scheme, [
+          (text: s.onboardingChannelRecommendLead, url: null, keyName: null),
+          (
+            text: s.onboardingChannelRecommendQq,
+            url: kQqOpenPlatformUrl,
+            keyName: 'onboarding-link-qq-open-platform',
+          ),
+          (text: s.onboardingChannelRecommendTail, url: null, keyName: null),
+        ]),
+        const SizedBox(height: Space.x3),
         _channelTile(
           scheme,
           label: 'QQ 官方 Bot API',
-          detail: '官方开放平台那条通道；AppID 与 AppSecret 在「消息适配器」页里填。',
+          detail: s.onboardingQqTileDetail,
           value: qqOn,
           wasOn: widget.signals.qqEnabled,
           onChanged: (next) => setState(() {
@@ -861,7 +1297,10 @@ class _OnboardingCardState extends State<_OnboardingCard> {
             problem = null;
           }),
         ),
-        const SizedBox(height: 8),
+        // 用户 ④（2026-10-18）：两把凭据**首次就在这一页填**（原来只写着"在「消息适配器」页里填"）。
+        // 跳过也行：这两个框空着就等于没填，后面仍能在设置页补。
+        _qqCredentialFields(scheme, s),
+        const SizedBox(height: Space.x2),
         _channelTile(
           scheme,
           label: 'OneBot 11',
@@ -877,6 +1316,148 @@ class _OnboardingCardState extends State<_OnboardingCard> {
             ? '两个都关着 = 她收不到任何消息；之后在「消息适配器」页里随时能开。'
             : '现在开着的那条不会再被这里关掉（这一屏只负责"要开哪条"）。', scheme),
       ],
+    );
+  }
+
+  /// 旁注那一档字（说明 12/18）。蓝链与它旁边的说明**同一个字号**，只有颜色与下划线不同。
+  TextStyle _asideStyle(ColorScheme scheme) => Type.caption.style(color: scheme.onSurfaceVariant);
+
+  /// 一段"说明 + 蓝链"的旁注（用户 ②③）：[parts] 里带 url 的那几段是蓝链。
+  ///
+  /// 为什么用 [Wrap] 而不是一行 [Row]：中英两种语言的句子长度不同，窄窗（或长翻译）时
+  /// 整句排不进一行——Wrap 会自己折行，Row 只会溢出。
+  ///
+  /// [lineKey] 是给用例的一个抓手：一次调用 = **那一行**（第 2 步那两句推荐语合成一行之后，
+  /// "只有一行"这件事只能靠"只有一个 Wrap"来钉，见 `test/onboarding_copy_one_line_test.dart`）。
+  Widget _recommendLine(
+    ColorScheme scheme,
+    List<({String text, String? url, String? keyName})> parts, {
+    Key? lineKey,
+  }) {
+    return Wrap(
+      key: lineKey,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        for (final part in parts)
+          part.url == null
+              ? Text(part.text, style: _asideStyle(scheme))
+              : _inlineLink(scheme, label: part.text, url: part.url!, keyName: part.keyName!),
+      ],
+    );
+  }
+
+  /// 内联蓝链：一段说明里那截可以点的字。
+  ///
+  /// 为什么不是 TextButton：按钮自带 labelLarge 的字号与最小触控尺寸，塞进 12px 的旁注里
+  /// 会把这一行撑高一档；而 `button_typography_test` 又不许页面里写 `textStyle:`
+  /// （按钮会丢字体栈）。所以链接就是一个 InkWell + Text：字号行高取 [Type.caption]，
+  /// 颜色取主题主色——**不写魔法数字**，也不必给按钮另造一套文字样式。
+  Widget _inlineLink(
+    ColorScheme scheme, {
+    required String label,
+    required String url,
+    required String keyName,
+  }) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: InkWell(
+        key: ValueKey(keyName),
+        borderRadius: Shape.control,
+        onTap: busy ? null : () => unawaited(_openLink(url)),
+        child: Text(
+          label,
+          style: _asideStyle(scheme).copyWith(
+            color: scheme.primary,
+            decoration: TextDecoration.underline,
+            decorationColor: scheme.primary,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 点蓝链：交给系统默认浏览器（全仓唯一那条实现在 `external_link.dart`）。
+  /// 打不开就**把地址说出来**——那是唯一不靠外部程序也能让人拿到它的方式。
+  Future<void> _openLink(String url) async {
+    final opened = await openExternalUrl(url);
+    if (!mounted || opened) return;
+    IrmiaToast.show(
+      context,
+      IrmiaStrings.read(context).onboardingOpenLinkFailed(url),
+      kind: ToastKind.warn,
+    );
+  }
+
+  /// 第 3 步 QQ 官方 Bot 的两把凭据（AppID / AppSecret）。
+  ///
+  /// 三件与设置页「消息适配器」**同一套**的事：
+  ///   · 落盘走同一条 `POST /api/commands/set-key`，键名取自 `channel_keys.dart`
+  ///     （见 [_settleChannel]）——不新开写入路径；
+  ///   · 输入框 `obscureText`（密钥掩码）；**已配置的不回显**，只把服务端给的掩码摆在占位提示里；
+  ///   · 已配置时套 `secretLook`（蓝边 + 居中），与第 2 步的 API Key 那格长得一样。
+  Widget _qqCredentialFields(ColorScheme scheme, AppStrings s) {
+    return Padding(
+      padding: const EdgeInsets.only(top: Space.x2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(s.onboardingQqCredentialsTitle, style: _asideStyle(scheme)),
+          const SizedBox(height: Space.x2),
+          Text(s.onboardingQqAppIdLabel, style: _asideStyle(scheme)),
+          const SizedBox(height: Space.x1),
+          _secretField(
+            controller: appIdCtl,
+            fieldKey: 'onboarding-qq-appid',
+            state: widget.signals.qqAppId,
+            hint: s.onboardingQqAppIdHint,
+            s: s,
+          ),
+          const SizedBox(height: Space.x3),
+          Text(s.onboardingQqAppSecretLabel, style: _asideStyle(scheme)),
+          const SizedBox(height: Space.x1),
+          _secretField(
+            controller: appSecretCtl,
+            fieldKey: 'onboarding-qq-appsecret',
+            state: widget.signals.qqClientSecret,
+            hint: s.onboardingQqAppSecretHint,
+            s: s,
+          ),
+          const SizedBox(height: Space.x1),
+          Text(s.onboardingQqCredentialsNote, style: _asideStyle(scheme)),
+        ],
+      ),
+    );
+  }
+
+  /// 一格「只写不读」的密钥：与设置页渠道卡里那两格同一个规格（掩码、不回显、secretLook）。
+  Widget _secretField({
+    required TextEditingController controller,
+    required String fieldKey,
+    required SecretState state,
+    required String hint,
+    required AppStrings s,
+  }) {
+    final look = secretLook(
+      context,
+      configured: state.configured,
+      hintFontSize: 13,
+      base: InputDecoration(
+        hintText: state.configured ? s.onboardingSecretConfigured(state.mask) : hint,
+      ),
+    );
+    return TextField(
+      key: ValueKey(fieldKey),
+      controller: controller,
+      obscureText: true,
+      autocorrect: false,
+      enableSuggestions: false,
+      style: const TextStyle(fontSize: 13),
+      textAlign: look.textAlign,
+      onChanged: (_) => setState(() {
+        problem = null;
+        _syncQqFromCredentials();
+      }),
+      decoration: look.decoration,
     );
   }
 
@@ -926,6 +1507,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   }
 
   Widget _personaStep(ColorScheme scheme) {
+    final s = IrmiaStrings.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -944,11 +1526,10 @@ class _OnboardingCardState extends State<_OnboardingCard> {
             ),
           ),
         ),
-        _note('这段文字就是 persona/IDENTITY.md 的全部内容（写上去 = 替换整份文件，服务端会先留一份'
-            '旧版本快照，人格配置页里能看能回滚）。留空或没改动就不写；'
-            '框里是空的且你现在写点什么，那就是用这段文字替掉文件里原来的内容。'
-            '第一步填过名字的话，它会作为开头那一行「名字：…」跟着写进去——别删掉那一行，'
-            '界面上的称呼与唤醒词的默认值都读它。', scheme),
+        // 用户 ⑤（2026-10-18）：原来这里是一大段散文（"这段文字就是 … 的全部内容…"），
+        // 压成三句、只留四条关键信息：整份替换 / 服务端留快照可回滚 / 留空或没改就不写 /
+        // 第一步那个名字行别删。字数由 `onboarding_copy_test.dart` 钉着上界。
+        _note(s.onboardingPersonaHint, scheme),
       ],
     );
   }
@@ -965,6 +1546,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   /// 是同一套东西。这里多点一层"改哪一档就按哪一档的后果算"的旁注，是因为这一屏的人
   /// 大多第一次见这个概念：他只看到两个选项，得知道选了之后**谁来执行**这条边界。
   Widget _trustStep(ColorScheme scheme) {
+    final s = IrmiaStrings.of(context);
     final root = widget.signals.trustRoot;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -972,7 +1554,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
         TrustModeChoice(
           mode: kTrustFull,
           selected: trustMode == kTrustFull,
-          consequence: trustModeConsequence(kTrustFull, root),
+          consequence: trustModeConsequence(s, kTrustFull, root),
           enabled: !busy,
           onPick: (picked) => setState(() {
             trustMode = picked;
@@ -983,20 +1565,474 @@ class _OnboardingCardState extends State<_OnboardingCard> {
         TrustModeChoice(
           mode: kTrustWorkspace,
           selected: trustMode == kTrustWorkspace,
-          consequence: trustModeConsequence(kTrustWorkspace, root),
+          consequence: trustModeConsequence(s, kTrustWorkspace, root),
           enabled: !busy,
           onPick: (picked) => setState(() {
             trustMode = picked;
             problem = null;
           }),
         ),
+        // 第 3 轮（2026-10-20 用户 ④）：这段压成**一行**。原来它是
+        // "这是边界，不是提醒：…（fs 工具族与 pwsh 都管）。" + 分叉句 + "之后在设置页…"三截拼的，
+        // 读起来三句。现在两档各一整句（进文案表，中英各一条），拼的动作没有了：
+        // 分叉那半句本来就得跟着盘上那份走，但"哪一档"这件事只剩一个三元。
         _note(
-          '这是边界，不是提醒：越界的读写与命令会被拒绝（fs 工具族与 pwsh 都管）。'
-          '${trustMode == widget.signals.trustMode ? '与现在盘上那份一致，这一屏不会写任何东西。' : '与现在盘上那份不同：点「完成」时写进 config.json，重启进程后接管。'}'
-          '之后在设置页「信任范围」里随时能改。',
+          trustMode == widget.signals.trustMode
+              ? s.onboardingTrustNoteSame
+              : s.onboardingTrustNoteChanged,
           scheme,
         ),
       ],
+    );
+  }
+
+  // ── 第六步：外部依赖（2026-10-20 用户第 3 轮 ⑤） ──
+
+  /// 这一屏一进来就把 `/api/deps` 读一次。
+  ///
+  /// 为什么放在"进这一屏"而不是"开卡"：前五步与依赖无关，开卡就去探测四件依赖只是白等
+  /// （设置页那张卡也是"不阻塞首屏"的同一条理由）。也不能直接在 build 里发：
+  /// build 期间 `setState` 会炸，所以挪到本帧之后。
+  void _ensureDepsLoaded() {
+    if (depsRequested) return;
+    depsRequested = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final pending = _loadDeps();
+      depsPending = pending;
+      unawaited(pending);
+    });
+  }
+
+  /// 读四件依赖的现状：`GET /api/deps`（**只读**，一个写请求都不发）。
+  ///
+  /// 形状照服务端（`src/web/server.ts` 的 `depsView`）：`{available, entries:[{name,status,…}]}`。
+  /// 三条兜底：`available:false` ⇒ 这台服务端没装依赖管理器（不摆勾选框）；
+  /// 读失败 / 形状不对 ⇒ [depsError]（不猜"都没装"，那会让人白装四件）。
+  Future<void> _loadDeps() async {
+    if (!mounted) return;
+    setState(() {
+      depsLoading = true;
+      depsError = null;
+    });
+    try {
+      final data = await widget.state.api.get('/api/deps');
+      if (!mounted) return;
+      final map = data is Map ? data.cast<String, dynamic>() : null;
+      final unavailable = map != null && map['available'] == false;
+      final rawList = map == null ? null : map['entries'];
+      setState(() {
+        depsUnavailable = unavailable;
+        depsLoading = false;
+        if (unavailable) {
+          deps = const <OnboardingDep>[];
+          depsError = null;
+          return;
+        }
+        if (rawList is! List) {
+          // 响应形状不对：不猜"四件都没装"（那会让人白装一遍），如实说读不到
+          deps = const <OnboardingDep>[];
+          depsError = 'entries';
+          return;
+        }
+        final byName = <String, Object?>{};
+        for (final raw in rawList) {
+          if (raw is Map) byName[raw['name']?.toString() ?? ''] = raw;
+        }
+        // 四件里**少了一件**也当读不到：缺的那件到底是没装还是接口没说，这一屏分不出来，
+        // 而"猜它没装"的代价是让人白装一遍（真装上之后复检也过不了）
+        if (kOnboardingDepNames.any((name) => !byName.containsKey(name))) {
+          deps = const <OnboardingDep>[];
+          depsError = 'entries';
+          return;
+        }
+        deps = [
+          for (final name in kOnboardingDepNames) OnboardingDep.from(name, byName[name]),
+        ];
+        depsError = null;
+      });
+    } catch (err) {
+      if (!mounted) return;
+      setState(() {
+        depsError = '$err';
+        depsLoading = false;
+      });
+    }
+  }
+
+  /// 第 6 步的正文：说明 + 四件的现状 + 勾选框（或"都已就位"）+ 这一轮的结局。
+  ///
+  /// 说明那一句（不装会怎样、点名四件）在步骤文案里（[AppStrings.onboardingStepDepsNote]），
+  /// 与另外五步同一个位置——不在这一屏另起一套版式。
+  Widget _depsStep(ColorScheme scheme) {
+    final s = IrmiaStrings.of(context);
+    _ensureDepsLoaded();
+    final missing = deps.where((dep) => !dep.ready).length;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (depsLoading && deps.isEmpty)
+          Row(
+            children: [
+              const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+              const SizedBox(width: Space.x2),
+              Text(s.onboardingDepsItemRunning, style: _asideStyle(scheme)),
+            ],
+          )
+        else if (depsUnavailable)
+          _note(s.onboardingDepsUnavailable, scheme)
+        else if (depsError != null)
+          _note(s.onboardingDepsReadFailed(depsError!), scheme)
+        else ...[
+          for (final dep in deps) _depRow(dep, s, scheme),
+          const SizedBox(height: Space.x2),
+          // 四件都已就位时不摆勾选框：没什么可装的，摆一个按不动的勾选框只会让人以为还得点它
+          if (missing == 0) _note(s.onboardingDepsAllReady, scheme) else _depsCheckbox(s, scheme),
+        ],
+        if (depsRoundDone || depsLastAttempt != null) _depsOutcome(s, scheme),
+      ],
+    );
+  }
+
+  /// 一件依赖那一行：名字 · 现状（就位 / 未就位）· 这一轮的进度或结局。
+  ///
+  /// 现状与结局**分两行**（同一个 `Column` 里两个 `Text`）：现状是"盘上现在是什么"，
+  /// 结局是"这一趟干了什么"——两者可以同时存在（刚装成的那一件：就位 + 成功）。
+  Widget _depRow(OnboardingDep dep, AppStrings s, ColorScheme scheme) {
+    final result = depsResults[dep.name];
+    final running = depsRunning == dep.name;
+    return Padding(
+      key: ValueKey('onboarding-dep-${dep.name}'),
+      padding: const EdgeInsets.only(bottom: Space.x2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 58,
+            child: Text(
+              dep.name,
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: scheme.onSurface),
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  dep.ready ? s.onboardingDepsStatusReady : s.onboardingDepsStatusMissing,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: dep.ready ? IrmiaTheme.ok : IrmiaTheme.warn,
+                  ),
+                ),
+                if (running || result != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      running
+                          ? s.onboardingDepsItemRunning
+                          : (result!.ok
+                              ? s.onboardingDepsItemOk
+                              : s.onboardingDepsItemFailed(result.reason)),
+                      key: ValueKey('onboarding-dep-result-${dep.name}'),
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        height: 1.6,
+                        color: running
+                            ? scheme.onSurfaceVariant
+                            : (result!.ok ? IrmiaTheme.ok : IrmiaTheme.danger),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 那个勾选框：下载并安装这些外部依赖（默认勾上）。
+  ///
+  /// 勾不勾是一个**人的决定**，所以 `depsCheckTouched` 记着它：卡片开的时候读回来的
+  /// "上次没勾"不许盖掉这一次的点击（读盘是异步的，两个动作会撞在同一帧附近）。
+  Widget _depsCheckbox(AppStrings s, ColorScheme scheme) {
+    return InkWell(
+      borderRadius: Shape.control,
+      onTap: busy ? null : () => _toggleDepsInstall(!depsInstallChecked),
+      child: Padding(
+        padding: const EdgeInsets.only(top: Space.x2),
+        child: Row(
+          children: [
+            Checkbox(
+              key: const ValueKey('onboarding-deps-install'),
+              value: depsInstallChecked,
+              onChanged: busy ? null : (next) => _toggleDepsInstall(next ?? false),
+              visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            const SizedBox(width: Space.x2),
+            Expanded(
+              child: Text(
+                s.onboardingDepsInstallLabel,
+                style: TextStyle(fontSize: 12, height: 1.6, color: scheme.onSurface),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _toggleDepsInstall(bool next) {
+    depsCheckTouched = true;
+    setState(() {
+      depsInstallChecked = next;
+      problem = null;
+    });
+  }
+
+  /// 这一轮的结局：装完的汇总（成功 N / 失败 M）+ 失败时的「重试」，
+  /// 或者（还没装过时）上次装完的那份记录——**复查**就靠这一行。
+  Widget _depsOutcome(AppStrings s, ColorScheme scheme) {
+    if (depsRoundDone) {
+      final ok = depsResults.values.where((entry) => entry.ok).length;
+      final failed = depsResults.values.where((entry) => !entry.ok).length;
+      return Padding(
+        padding: const EdgeInsets.only(top: Space.x2),
+        child: Wrap(
+          spacing: Space.x2,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Text(
+              s.onboardingDepsSummary(ok, failed),
+              key: const ValueKey('onboarding-deps-summary'),
+              style: TextStyle(fontSize: 12, height: 1.6, color: scheme.onSurface),
+            ),
+            if (failed > 0)
+              TextButton(
+                key: const ValueKey('onboarding-deps-retry'),
+                onPressed: busy ? null : () => unawaited(_retryDeps()),
+                child: Text(s.onboardingDepsRetry),
+              ),
+          ],
+        ),
+      );
+    }
+    final attempt = depsLastAttempt;
+    // 0 成功 0 失败那条只说明"上次没勾"，没有结局可复查——不摆一行 0/0
+    if (attempt == null || !attempt.hasResult) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: Space.x2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            s.onboardingDepsLastRun(attempt.ok, attempt.failed),
+            key: const ValueKey('onboarding-deps-last'),
+            style: TextStyle(fontSize: 12, height: 1.6, color: scheme.onSurfaceVariant),
+          ),
+          // 失败的那几件逐条点名：只说"上次失败 2 件"等于什么都没说
+          for (final entry in attempt.failures.entries)
+            Padding(
+              padding: const EdgeInsets.only(top: Space.x1),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(
+                    width: 58,
+                    child: Text(
+                      entry.key,
+                      style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: scheme.onSurface),
+                    ),
+                  ),
+                  Expanded(
+                    child: Text(
+                      s.onboardingDepsItemFailed(entry.value),
+                      style: TextStyle(fontSize: 11.5, height: 1.6, color: IrmiaTheme.danger),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 汇总行旁边那颗「重试」：只重试**还没就位 / 上次没装成**的那几件（同一条 [_runDepsRound]）。
+  ///
+  /// 与「完成」的区别只在收尾：重试成功之后卡片**不关**（人按的是重试，不是完成），
+  /// 汇总行会变成"成功 N / 失败 0"，他再按一次「完成」即可。
+  Future<void> _retryDeps() async {
+    if (busy) return;
+    setState(() {
+      busy = true;
+      problem = null;
+      depsRoundDone = false;
+    });
+    await _runDepsRound();
+    if (!mounted) return;
+    setState(() => busy = false);
+  }
+
+  /// 第 6 步的**结算**：勾了就逐件装（串行），装完弹那个顶层窗口。
+  ///
+  /// 返回 true = 这一屏可以关了；false = 留在这一屏（有失败：汇总与「重试」就在这一屏上）。
+  ///
+  /// 五条纪律（用户第 3 轮 ⑤ 的原话，逐条落在下面）：
+  ///   ① **未勾选 ⇒ 零请求**：`depsInstallChecked` 为假时一个 `dep-install` 都不发；
+  ///   ② **只调既有的那条命令**：`POST /api/commands/dep-install` + `X-Confirm: dep-install`，
+  ///      与设置页 `_installDep` 同一套（这里不新写任何安装逻辑，下载/解压/复检都在服务端）；
+  ///   ③ **已就位的跳过**：[missing] 只装没就位的那几件；
+  ///   ④ **串行**、每件给进度（进行中 / 成功 / 失败+原因），**一件失败不中断其余**：
+  ///      循环里没有 `return`，失败只往 [depsResults] 记一笔；
+  ///   ⑤ **装完才要重启**：至少一件装成了就弹那个顶层窗口——一件都没装上时没有"生效"可言。
+  Future<bool> _runDepsRound() async {
+    // ① 先等这一屏那份现状（人可能一点进来就点「完成」）
+    final pending = depsPending;
+    if (pending != null) {
+      try {
+        await pending;
+      } catch (_) {
+        // 读失败的原因已经摆在 depsError 上，这里不必再说一遍
+      }
+      if (!mounted) return false;
+    }
+    // 读不到 / 服务端没装依赖管理器 / 四件都已就位 / 人没勾 ⇒ 一个请求都不发
+    if (depsUnavailable || depsError != null || deps.isEmpty) return true;
+    final missing = [for (final dep in deps) if (!dep.ready) dep.name];
+    if (missing.isEmpty) return true;
+    if (!depsInstallChecked) {
+      // 人明确没勾：一个请求都不发，但这个**决定**要留下来——
+      // 下次打开这一屏时"上次没勾"要看得见（复查的另一半，见 [DepsAttempt]）
+      final declined = const DepsAttempt(checked: false, ok: 0, failed: 0);
+      depsLastAttempt = declined;
+      await saveDepsAttempt(declined);
+      return true;
+    }
+
+    setState(() {
+      depsResults.clear();
+      depsRoundDone = false;
+      depsRunning = null;
+      problem = null;
+    });
+
+    var ok = 0;
+    final failures = <String, String>{};
+    for (final name in missing) {
+      if (!mounted) return false;
+      setState(() => depsRunning = name);
+      try {
+        final data = await widget.state.api.post(
+          '/api/commands/dep-install',
+          {'name': name},
+          confirm: 'dep-install',
+        );
+        if (!mounted) return false;
+        final map = data is Map ? data.cast<String, dynamic>() : const <String, dynamic>{};
+        if (map['ok'] == true) {
+          ok += 1;
+          setState(() {
+            depsResults[name] = (ok: true, reason: '');
+            // 服务端装完**就地复检**过（`src/web/server.ts` 的 dep-install 那一段）：
+            // 这一件现在真的能跑了，界面上的现状跟着点亮
+            deps = [for (final dep in deps) dep.name == name ? dep.asReady() : dep];
+          });
+        } else {
+          final reason = _depInstallReason(map);
+          failures[name] = reason;
+          setState(() => depsResults[name] = (ok: false, reason: reason));
+        }
+      } catch (err) {
+        // 请求本身没出去（网络断了 / 501 / 400）：同样是"这一件没装成"，其余照旧往下走
+        failures[name] = '$err';
+        if (mounted) setState(() => depsResults[name] = (ok: false, reason: '$err'));
+      }
+    }
+    if (!mounted) return false;
+    if (ok > 0) wrote = true;
+    setState(() {
+      depsRunning = null;
+      depsRoundDone = true;
+    });
+    // 落盘：这一页下次打开时要能复查"上次装完 / 失败"（含勾没勾）
+    depsLastAttempt = DepsAttempt(
+      checked: depsInstallChecked,
+      ok: ok,
+      failed: failures.length,
+      failures: failures,
+    );
+    await saveDepsAttempt(depsLastAttempt!);
+    if (!mounted) return false;
+    if (ok == 0) return failures.isEmpty;
+    final restart = await _showDepsRestartDialog();
+    if (!mounted) return false;
+    if (restart) await _restartNow();
+    if (!mounted) return false;
+    return failures.isEmpty;
+  }
+
+  /// 一件依赖没装成时那句原因。
+  ///
+  /// 服务端的 `error` 本身就是给人读的（三种失败各带一句下一步，见 `src/deps/manager.ts`），
+  /// 所以原样摆出来；它没给就退回 `step`（阶段名）——宁可只有一格阶段名，也不要凭空编一句话。
+  String _depInstallReason(Map<String, dynamic> map) {
+    final error = map['error']?.toString().trim() ?? '';
+    if (error.isNotEmpty) return error;
+    final step = map['step']?.toString().trim() ?? '';
+    return step.isEmpty ? 'ok:false' : step;
+  }
+
+  /// 装完那个**顶层窗口**（用户 ⑤ 的 ★）：标题 + 一句原因 + 两个按钮。
+  ///
+  /// 它压在引导卡之上（`showDialog` 走根 Navigator），所以是"顶层窗口"而不是卡里的一行字：
+  /// 装完依赖这件事必须被看见，而"要不要现在重启"是它唯一的决定。
+  /// 点遮罩不关（`barrierDismissible: false`）：这里没有"误触关掉"这个选项，只有「立即重启」与「稍后」。
+  ///
+  /// 返回 true = 人点了「立即重启」。
+  Future<bool> _showDepsRestartDialog() async {
+    final s = IrmiaStrings.read(context);
+    final picked = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(s.onboardingRestartTitle),
+        content: Text(s.onboardingRestartBody),
+        actions: [
+          TextButton(
+            key: const ValueKey('onboarding-restart-later'),
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(s.onboardingRestartLater),
+          ),
+          FilledButton(
+            key: const ValueKey('onboarding-restart-now'),
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(s.onboardingRestartNow),
+          ),
+        ],
+      ),
+    );
+    return picked == true;
+  }
+
+  /// 「立即重启」：**不新写重启逻辑**——交给 `restart_action.dart` 的 [performRestart]
+  /// （首页那颗「重启前后端」与托盘那个菜单项走的是同一个函数：同端点、同确认短语、
+  /// 同一套"三态只认链条自己的话"的判据，连"等它回来"也是同一段）。
+  Future<void> _restartNow() async {
+    final strings = IrmiaStrings.read(context);
+    final state = widget.state;
+    await performRestart(
+      api: state.api,
+      strings: strings,
+      say: (message, kind) {
+        // 卡片可能已经被重启链条关掉：那时这句话没地方落，说出来只是在日志里制造噪音
+        if (!mounted) return;
+        IrmiaToast.show(context, message, kind: kind);
+      },
+      online: () => state.online,
+      alive: () => mounted,
     );
   }
 
@@ -1017,7 +2053,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   /// 顺手一起结算只会撞上"还没填"的拦阻——那正是"往前走一步"该走成的动作。
   /// 一路走到底时每步各结算各的；中途关卡的场合由 [_finish] 把剩下的补齐。
   Future<void> _next() async {
-    if (busy || step >= _steps.length - 1) return;
+    if (busy || step >= _stepKeys.length - 1) return;
     setState(() {
       busy = true;
       problem = null;
@@ -1071,7 +2107,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   /// 跳过这一步：这一步**一个字节都不写**，只是不再问它（退回来再填照样能写进去）
   Future<void> _skipStep() async {
     if (busy) return;
-    if (step == _steps.length - 1) {
+    if (step == _stepKeys.length - 1) {
       await _finish();
       return;
     }
@@ -1095,20 +2131,40 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   ///
   /// 「以后再说」与关闭的区别只在措辞：两者都写 `onboarding-done`（不再自动弹），
   /// 但已经填好的那几步照样落盘——人填了东西却因为"没点完成"而丢掉，最没道理。
-  Future<void> _finish() async {
+  ///
+  /// **第 6 步（外部依赖）走的是另一个口子**（[install]）：只有卡脚那颗主按钮按到它
+  /// （「完成」，last 那一步）才**真的开始装**。关闭 / 以后再说 / 跳过这一步一律不装
+  /// ——"我只是打开看了看"不该往数据目录里落四个可执行文件（那正是零请求那条用例钉着的）。
+  Future<void> _finish({bool install = false}) async {
     if (busy) return;
     setState(() {
       busy = true;
       problem = null;
       requirement = null;
     });
-    for (var i = 0; i < _steps.length; i++) {
+    // 前五步照旧：一步一步补写，写失败就停在那一屏并说清原因
+    for (var i = 0; i < _stepKeys.length - 1; i++) {
       final err = await _settleOnce(i);
       if (err != null) {
         if (!mounted) return;
         setState(() {
           step = i;
           problem = err;
+          busy = false;
+        });
+        return;
+      }
+    }
+    if (!mounted) return;
+    // 第 6 步：勾了、且真有没就位的那几件，才逐件装（串行）。
+    // 「有失败」在这里**不是** problem（那会把人锁在卡里）：装东西失败不丢任何数据，
+    // 人完全可以关掉以后再来——所以汇总与「重试」摆在那一屏上，卡片照旧能关。
+    if (install) {
+      final done = await _runDepsRound();
+      if (!mounted) return;
+      if (!done) {
+        setState(() {
+          step = _stepKeys.length - 1;
           busy = false;
         });
         return;
@@ -1123,7 +2179,7 @@ class _OnboardingCardState extends State<_OnboardingCard> {
   /// "还缺一样东西"（[requirement]）不算失败：它把话摆在卡上，但**不**拦住这一次动作
   /// ——人按「继续」时看到"缺密钥"就说明白了（这一步没写成），按关闭/以后再说则直接退出。
   Future<String?> _settle(int index) async {
-    switch (_steps[index].key) {
+    switch (_stepKeys[index]) {
       case 'name':
         return _settleName();
       case 'api':
@@ -1132,8 +2188,12 @@ class _OnboardingCardState extends State<_OnboardingCard> {
         return _settleChannel();
       case 'persona':
         return _settlePersona();
-      default:
+      case 'trust':
         return _settleTrust();
+      default:
+        // 第 6 步不在结算链上：它会装东西、要弹重启窗口、失败了还要能重试，
+        // 那条路是 [_runDepsRound]（见 [_stepKeys] 的说明）
+        return null;
     }
   }
 
@@ -1225,17 +2285,50 @@ class _OnboardingCardState extends State<_OnboardingCard> {
     return null;
   }
 
-  /// 第三步 → `POST /api/commands/config-update`（短语 config-update），只提交开关本身
+  /// 第三步 → 两条既有通道，各写各的：
+  ///   · 通道开关 → `POST /api/commands/config-update`（短语 config-update），只提交开关本身；
+  ///   · AppID / AppSecret → `POST /api/commands/set-key`（短语 set-key），**与设置页「消息适配器」
+  ///     页那两格完全同一条路**：同一个端点、同一个键名（`channel_keys.dart`）、同一个确认短语。
+  ///
+  /// 为什么凭据也在这里写（用户 2026-10-18 ④）：首次使用的人就在这一页把两把凭据填了，
+  /// 再让他去设置页填一遍是白跑一趟；但**写入路径不新开一条**——set-key 落到同一份
+  /// `data/.keys.json`，设置页那边读到的就是这里写进去的。
+  ///
+  /// 只写非空的那几条：框空着 = 这一次不碰那条（不是"清空"；清除密钥在渠道页有专门的确认动作）。
   Future<String?> _settleChannel() async {
     final fields = <String, dynamic>{};
     if (qqOn && !widget.signals.qqEnabled) fields['channels.qqOfficial.enabled'] = true;
     if (onebotOn && !widget.signals.onebotEnabled) fields['channels.onebot.enabled'] = true;
-    if (fields.isEmpty) return null;
-    try {
-      await widget.state.api
-          .post('/api/commands/config-update', {'fields': fields}, confirm: 'config-update');
-    } catch (err) {
-      return '通道开关没写进去：$err';
+
+    final secrets = <String, String>{};
+    final appId = appIdCtl.text.trim();
+    final appSecret = appSecretCtl.text.trim();
+    if (appId.isNotEmpty) secrets[kQqAppIdKey] = appId;
+    if (appSecret.isNotEmpty) secrets[kQqAppSecretKey] = appSecret;
+
+    if (fields.isEmpty && secrets.isEmpty) return null;
+    final strings = IrmiaStrings.read(context);
+    if (fields.isNotEmpty) {
+      try {
+        await widget.state.api
+            .post('/api/commands/config-update', {'fields': fields}, confirm: 'config-update');
+      } catch (err) {
+        return strings.onboardingChannelSaveFailed('$err');
+      }
+    }
+    if (secrets.isNotEmpty) {
+      try {
+        for (final entry in secrets.entries) {
+          await widget.state.api.post(
+            '/api/commands/set-key',
+            {'name': entry.key, 'value': entry.value},
+            confirm: 'set-key',
+          );
+        }
+      } catch (err) {
+        // 开关与凭据是两条通道，错误分开说：混成一句"保存失败"人就不知道该重填哪个
+        return strings.onboardingSecretsSaveFailed('$err');
+      }
     }
     wrote = true;
     return null;
@@ -1318,4 +2411,15 @@ Object? _at(Object? doc, String path) {
 String _text(Object? doc, String path) {
   final value = _at(doc, path);
   return value is String ? value.trim() : '';
+}
+
+/// 从 `GET /api/keys` 的回包里取一把密钥的现状。
+///
+/// 形状照服务端：`{ "<name>": { "configured": true, "mask": "qqA…9f3c" } }`。
+/// 读不到/形状不对 ⇒ [SecretState.absent]（"当作没配"，不抛：引导是个提示，不该让壳崩）。
+SecretState _secretState(Object? keys, String name) {
+  final raw = keys is Map ? keys[name] : null;
+  if (raw is! Map) return SecretState.absent;
+  final mask = raw['mask'];
+  return SecretState(configured: raw['configured'] == true, mask: mask is String ? mask : null);
 }

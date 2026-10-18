@@ -83,7 +83,7 @@ export function oversizeMessage(subject: string, size: number, limit: number): s
     `${subject} 有 ${humanBytes(size)}，超过本工具能安全处理的上限 ${humanBytes(limit)}，已拒绝（**一个字节都没动**）。`
     + '为什么是"拒绝"而不是"读一部分"：写工具会把整篇内容写回去，读到一部分就等于把没读到的那部分删掉。'
     + '可以怎么做：① 把要改的地方挪到一个小文件里再改；'
-    + '② 用 rg_search 定位后只 safe_read 需要的区间，不要整篇改写；'
+    + '② 用 grep 定位后只 safe_read 需要的区间，不要整篇改写；'
     + '③ 确实要动这么大的文件，请由人在外部编辑器里改（或把 FsEnv.maxEditBytes 调大后重启）。'
   );
 }
@@ -333,7 +333,9 @@ function planExactReplace(
       return {
         ok: false,
         code: FS_ERROR_CODES.INVALID_ARGS,
-        message: `occurrence=${occurrence} 越界，old 只出现 ${exact.length} 次`,
+        // v64（她的实测）：原来这句报"old 找不到"——**与真因不符**：`old` 明明找到了，是 `occurrence`
+        // 要的第 N 处不存在。措辞改成事实（语义一个字没动：仍然是 INVALID_ARGS + 列出全部位置）。
+        message: `occurrence=${occurrence} 越界：old 在文件里只有 ${exact.length} 处，你要的是第 ${occurrence} 处`,
         matches: locate(normalized, exact),
       };
     }
@@ -408,7 +410,7 @@ export function planEdit(original: string, request: EditRequest): PlanResult {
         code: FS_ERROR_CODES.NO_MATCH,
         message:
           'old 在文件中找不到（精确匹配与缩进容错都未命中）。' +
-          '请先用 safe_read 或 rg_search 确认原文，注意行尾空白与换行符也是内容的一部分。',
+          '请先用 safe_read 或 grep 确认原文，注意行尾空白与换行符也是内容的一部分。',
       };
     }
     if (hits.length > 1 && request.occurrence === undefined) {
@@ -420,7 +422,8 @@ export function planEdit(original: string, request: EditRequest): PlanResult {
       return {
         ok: false,
         code: FS_ERROR_CODES.INVALID_ARGS,
-        message: `occurrence=${request.occurrence ?? 1} 越界，缩进容错只命中 ${hits.length} 处`,
+        // 同上（v64）：缩进容错那条路也一样——说清"只有 N 处、你要第 M 处"，别报成"找不到"。
+        message: `occurrence=${request.occurrence ?? 1} 越界：缩进容错只命中 ${hits.length} 处，你要的是第 ${request.occurrence ?? 1} 处`,
         matches: hits.map((h) => ({ line: h.start + 1, column: 1, preview: previewLine(h.actual.split('\n')[0] ?? '') })),
       };
     }

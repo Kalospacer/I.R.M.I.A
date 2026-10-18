@@ -133,9 +133,48 @@ export function createWorkspaceMediaPoster(options: WorkspaceMediaPosterOptions)
   ];
   const label = roots.join(' ｜ ');
   const maxBytes = options.maxBytes ?? MEDIA_MAX_BYTES;
+  const protectedPaths = options.protectedPaths ?? [];
+
+  /**
+   * 受保护路径（本机凭据）的判定 —— **全文只有这一处**（两个调用点共用，不另写一套）。
+   *
+   * 调用点 ①：带字节的请求（v64 起 `send_media` 走这条——工具层把本机文件读成字节，连同
+   * 校验过的绝对路径一起递下来，`data` 一在场就会走下面那条**早退**）。必须在早退**之前**判：
+   * 早退会跳过允许根校验，也就跳过了原先唯一的凭据判定 ⇒ `.keys.json` 一度能被原样发出去
+   * （2026-10-17 修的安全回归，用例见 `test/media-poster.test.ts` 与 `test/send-media.test.ts`）。
+   * 调用点 ②：只带路径的请求（允许根校验之后、读字节之前）。
+   *
+   * 判据读 **realpath**：允许根里的一个目录联接（`link/.keys.json`）在字符串层看不出问题，
+   * 展开后才是真正要读的那个文件。解析失败（路径不存在/没权限）**不在这里越权判**——
+   * 交给下游如实报"不存在/读不到"。
+   */
+  const refuseProtected = (path: string): ReplyOutcome | null => {
+    if (protectedPaths.length === 0) return null;
+    let real: string;
+    try {
+      real = realpathSync(path);
+    } catch {
+      return null;
+    }
+    if (!insideAny(protectedPaths, real)) return null;
+    return {
+      ok: false,
+      reason:
+        `拒绝外发：${basename(path)} 是本机凭据文件（受保护路径），不会交给任何通道。`
+        + '要换密钥或密码请在设置页填写（或由人直接改盘上那份文件）；'
+        + '确实需要把内容发出去时，请先复制一份、去掉敏感字段，再发那份副本。',
+    };
+  };
+
   return {
     async post(target, media) {
       const poster = createMediaDispatcher(options.channels);
+      // 凭据判定**先于**早退：`data` 在场就走早退，早退不会碰允许根校验——不先判就等于没有这道门。
+      // （v64 起 `send_media` 每次都是 `data` + 绝对 `path` 一起下来，走的就是这一条。）
+      if (media.path !== undefined) {
+        const denied = refuseProtected(media.path);
+        if (denied !== null) return denied;
+      }
       // 已经是字节（宿主自己的调用方）或本来就是网络地址：直接交给通道层
       if (media.data !== undefined || media.path === undefined) {
         return await poster.post(target, media);
@@ -161,21 +200,9 @@ export function createWorkspaceMediaPoster(options: WorkspaceMediaPosterOptions)
             : `文件不存在：${media.path}（找过：${candidates.join(' ｜ ')}）`,
         };
       }
-      // 受保护路径（本机凭据）：**在读字节之前**拒。按 realpath 判——允许根里的一个
-      // 目录联接（`link/.keys.json`）在字符串层看不出问题，展开后才是真正要读的那个文件。
-      const protectedPaths = options.protectedPaths ?? [];
-      if (protectedPaths.length > 0) {
-        const real = realpathSync(full);
-        if (insideAny(protectedPaths, real)) {
-          return {
-            ok: false,
-            reason:
-              `拒绝外发：${basename(full)} 是本机凭据文件（受保护路径），不会交给任何通道。`
-              + '要换密钥或密码请在设置页填写（或由人直接改盘上那份文件）；'
-              + '确实需要把内容发出去时，请先复制一份、去掉敏感字段，再发那份副本。',
-          };
-        }
-      }
+      // 受保护路径（本机凭据）：**在读字节之前**拒（判据与文案在 `refuseProtected`，与早退那条共用）
+      const denied = refuseProtected(full);
+      if (denied !== null) return denied;
       let size: number;
       try {
         const stat = statSync(full);

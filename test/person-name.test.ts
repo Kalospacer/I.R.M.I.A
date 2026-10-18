@@ -38,7 +38,7 @@ import type { DsClient } from '../src/model/ds-client.ts';
 import type { PersonaAssets } from '../src/persona/loader.ts';
 
 const TZ = 'Asia/Shanghai';
-const QQ = '1269541505';
+const QQ = '1234567890';
 const OTHER = '1719500341';
 const OWNER = '用户（OWNER）';
 
@@ -95,7 +95,7 @@ test('① 只有群成员别名（裸 id）时她也认得出：原来断掉的�
   const loop = await makeLoop(t, {
     aliases: [
       '# 身份别名',
-      'qq:c2c:E7FEC35E951B5CCF8BA66793BF6B1314 = OWNER（用户）',
+      'qq:c2c:00000000000000000000000000000001 = OWNER（用户）',
       '# 该群成员（openid，不是 sid；只在认人时用）',
       `${QQ} = **OWNER（用户）**——02:27 GUI 亲口认领`,
     ].join('\n'),
@@ -106,7 +106,7 @@ test('① 只有群成员别名（裸 id）时她也认得出：原来断掉的�
 });
 
 test('①b `#` 开头那行仍然是注释：写在标题行里的映射不算声明（不许偷偷放宽）', async (t) => {
-  // 她 10-07 02:27 那一笔正落在这种形状里（`# 该群成员（…）：1269541505 = **OWNER（用户）**…`，
+  // 她 10-07 02:27 那一笔正落在这种形状里（`# 该群成员（…）：1234567890 = **OWNER（用户）**…`，
   // 见 aliases.md 第 21 行）——`#` 是 markdown 标题/散文，`forEachAliasRow` 一律跳过。
   // 这条**不是**要修的东西：放宽它等于让正文里的等号变成别名。所以这里正面钉住"它不算"。
   const loop = await makeLoop(t, {
@@ -144,7 +144,7 @@ test('④ 别名只改"叫什么"，不改"谁能指挥她"：成员别名写着
     seq: 1,
     ts: '2026-10-11T00:00:00.000Z',
     type: 'wake/channel',
-    data: { channel: 'onebot', chatType: 'group', chatId: '777879783', person, text: '在吗', messageId: 'm1' },
+    data: { channel: 'onebot', chatType: 'group', chatId: '123456781', person, text: '在吗', messageId: 'm1' },
     visibility: defaultVisibility('wake/channel'),
     origin: 'test/person-name',
   } as unknown as AppEvent);

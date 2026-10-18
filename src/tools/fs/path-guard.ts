@@ -28,7 +28,7 @@ import { existsSync } from 'node:fs';
 import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
-import { boundaryDecision, comparisonKey, isInside, outsideBoundaryReason } from '../boundary.ts';
+import { boundaryDecision, boundaryRootFor, comparisonKey, isInside, outsideBoundaryReason, type PathAccess } from '../boundary.ts';
 import { FS_ERROR_CODES, type FsErrorCode, toErrorMessage } from './types.ts';
 
 export type GuardResult =
@@ -181,7 +181,7 @@ export interface GuardOptions {
    */
   requireDirectory?: boolean;
   /**
-   * 允许目标是目录——**目录与文件两种都收**，怎么用由调用方决定（`rg_search` 用：
+   * 允许目标是目录——**目录与文件两种都收**，怎么用由调用方决定（`grep` 用：
    * 传目录它就递归搜，传单个文件就只搜那一个文件）。
    *
    * 与 `requireDirectory` 不是一回事：那个是"只收目录"，这个是"两种都收"。
@@ -192,6 +192,15 @@ export interface GuardOptions {
   /** 调用用途，用于组织错误消息，例如 'safe_edit' */
   purpose?: string;
   /**
+   * **这次是读还是写**（v64，用户 2026-10-13：「当开启工作目录模式时，**写操作**被限制到自身目录内」）
+   * —— **必填**：漏写编译不过。别让"漏一个词"静默丢掉一条边界。
+   *
+   * 由它决定要不要套 `boundaryRoot`（判据只在 `boundary.ts` 的 `boundaryRootFor` 一处）：
+   *   · `'read'` ⇒ **不设边界**（读与检索一律不受限；全盘就是全盘）；
+   *   · `'write'` ⇒ 按 `ctx.boundaryRoot` 三态收口（见下）。
+   */
+  access: PathAccess;
+  /**
    * 活动边界根（`ToolContext.boundaryRoot` 的三态，语义见 tools/types.ts）：
    *   · `undefined`（默认）= 拿第一个参数 `workspaceRoot` 当边界——历史行为，一个字不变
    *     （**连拒绝措辞也不变**：仍然是那句"白名单只允许工作目录内"）；
@@ -200,6 +209,8 @@ export interface GuardOptions {
    *   · `string` = 用这个根当边界。**显式给值就等于说"这条边界来自 trust.mode"**——
    *     哪怕它恰好与 `workspaceRoot` 是同一个根（`workspace` 档的默认边界正是工作根），
    *     拒绝消息也要说清 trust.mode 与怎么改（判据见 `boundaryDecision`，这里不另写一套）。
+   * ⚠ `access: 'read'` 时这一格**被忽略**（读类不设边界）——调用点不许靠传 `null` 表达"我是读"，
+   * 那会把"配置说了什么"和"工具做了什么"混成一件事。
    */
   boundaryRoot?: string | null;
 }
@@ -218,15 +229,18 @@ export interface GuardOptions {
 export async function resolveInsideRoot(
   workspaceRoot: string,
   input: string,
-  options: GuardOptions = {},
+  options: GuardOptions,
 ): Promise<GuardResult> {
   const purpose = options.purpose ?? '文件操作';
   // 三态 → 有效边界 + "是不是显式给的"（判据在 tools/boundary.ts，这里不另写一套）。
+  // v64：**再过"读/写"这一关**——读类恒为不设边界（全盘就是全盘），写类才看三态结论。
   // 条件展开是 exactOptionalPropertyTypes 下的既定写法：`undefined` 与"没有这个字段"同义。
-  const { boundary, explicit } = boundaryDecision({
+  const decided = boundaryDecision({
     workspaceRoot,
     ...(options.boundaryRoot === undefined ? {} : { boundaryRoot: options.boundaryRoot }),
   });
+  const boundary = boundaryRootFor(options.access, decided.boundary);
+  const explicit = decided.explicit;
 
   if (typeof input !== 'string' || input.trim() === '') {
     return { ok: false, code: FS_ERROR_CODES.INVALID_ARGS, reason: 'path 不能为空' };

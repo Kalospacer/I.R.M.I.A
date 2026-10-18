@@ -564,7 +564,15 @@ test('② 配置面里没有这个旋钮：塞进 config.json 也不生效', asy
     knobPaths(first.config), [],
     '出厂配置里不许有任何 thinking / reasoning / effort 字段——这两档**不提供更改**',
   );
-  assert.deepEqual(modelsBefore, ['heavy', 'light'], 'models 这一层只有这两档（没有第三个旋钮的家）');
+  assert.deepEqual(
+    modelsBefore,
+    // `requestTimeout` 是**单次请求的时限**（2026-10-16 加，JSON 字段名里没有
+    // thinking / reasoning / effort 那三个词），不是思考强度旋钮：
+    // 它管"多久没收到数据算卡死"，改它一个字都改不到 `reasoning` 段发出的 `effort`。
+    // 这条断言的**实质**（上面那条 `knobPaths` 为空）没有放松，只是列全了 models 这一层的键。
+    ['heavy', 'light', 'requestTimeout'],
+    'models 这一层只有这两档 + 时限那一段（没有思考强度旋钮的家）',
+  );
 
   // 人为把"旋钮"写进配置文件：生效配置里一个都不许出现（框架里没有读它的地方）
   const doc = JSON.parse(readFileSync(first.path, 'utf8')) as Record<string, unknown>;

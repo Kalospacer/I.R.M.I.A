@@ -107,3 +107,46 @@ Future<void> _writeFlag(String key, bool value) async {
     // 写不进去不影响使用：本次会话内照常按内存里的展开态渲染
   }
 }
+
+/// 读一个**字符串**偏好（语言就是走这条）：文件不存在、JSON 坏了、键缺失都当作 null。
+///
+/// 为什么不给布尔开关凑合（比如把语言存成一堆 `language-zh = true`）：那是把三态
+/// 拍成三张布尔，读的时候还要互斥一遍，读坏一处就自相矛盾。字符串原样存、原样读，
+/// 认不出的值由调用方兜底（见 `i18n/strings_scope.dart` 的 `kLanguageFlag`）。
+Future<String?> loadString(String key) async {
+  await _queue;
+  try {
+    final file = File(stateFilePath());
+    if (!await file.exists()) return null;
+    final decoded = jsonDecode(await file.readAsString());
+    if (decoded is! Map) return null;
+    final value = decoded[key];
+    return value is String ? value : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// 写一个字符串偏好：读改写整份文件，失败静默；并发调用按调用顺序串行
+/// （与 [saveFlag] 共用同一条 [_queue]——两处各写一份就会有互相覆盖的窗口）。
+Future<void> saveString(String key, String value) {
+  final next = _queue.then((_) => _writeString(key, value));
+  _queue = next;
+  return next;
+}
+
+Future<void> _writeString(String key, String value) async {
+  try {
+    final file = File(stateFilePath());
+    final flags = <String, dynamic>{};
+    if (await file.exists()) {
+      final decoded = jsonDecode(await file.readAsString());
+      if (decoded is Map) flags.addAll(decoded.cast<String, dynamic>());
+    }
+    flags[key] = value;
+    await file.parent.create(recursive: true);
+    await file.writeAsString(jsonEncode(flags));
+  } catch (_) {
+    // 写不进去不影响使用：本次会话内照常按内存里的值渲染
+  }
+}

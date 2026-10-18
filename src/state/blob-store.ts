@@ -8,7 +8,7 @@
  *      备份面 = `events/` + `blobs/` + `persona/` + `config.toml`。
  *
  * 阈值口径（schema §4 的字段注释）：估算 token 超阈值才外置，事件的 `content` 只留头部预览，
- * 全文靠 `contentRef.blobId` 取回（模型侧用 `read_blob` 工具分页读，见 tools/fs/read-tools.ts）。
+ * 全文靠 `contentRef.blobId` 取回（模型侧**直接用 `safe_read` 读 `data/blobs/<blobId>`**：v64 删掉 `read_blob` 之后那条路只此一条，见 tools/fs/read-tools.ts）。
  * token 估算与 `tools/registry.ts` **同一份实现**（2026-10-06 收口）：以前这里另有一份
  * "ASCII 4 字符/token + 非 ASCII 1 字符/token"的启发式，而交接笔记与工具描述预算用的是
  * 中文 1.5 字/token 那份——同一个结果在两条路上量出两个"多少 token"，判据迟早分岔。
@@ -33,7 +33,7 @@ import { estimateTokens } from '../tools/registry.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
-/** blob 根目录名；read_blob 工具按它定位（唯一定义点，工具层从这里导入，避免两处口径漂移） */
+/** blob 根目录名（唯一定义点：写入端与 `safe_read` 的读法都从这里认这个目录名） */
 export const BLOB_DIR_NAME = 'blobs';
 /** blobId 形状：sha256 的小写十六进制。写入端与读取端共用同一条判据 */
 export const BLOB_ID_PATTERN = /^[0-9a-f]{64}$/u;

@@ -1,5 +1,5 @@
 /**
- * Irmia Agent — 文件系工具包：搜索两件（rg_search / es_search）
+ * Irmia Agent — 文件系工具包：搜索两件（grep / find）
  *
  * **两件都是条件注册的**（v30）：探测到引擎才把这件工具造出来，没有就不注册。
  *
@@ -7,10 +7,10 @@
  * 于是"引擎缺失"是一个**已经被告知过的环境状态**，不再需要工具层面的降级链——
  * "因为强制安装了依赖，那么可以删掉降级链了"。删掉的收益不只是少一段代码：
  * 一件"永远降级"的工具比没有这件工具更糟，模型会先想到它，然后每次都以
- * "引擎调用失败"开场，白烧一次调用与一份常驻 token（v27 对 es_search 的实测：
- * 5 次调用全部 fallback）。rg_search 这一轮补上同一条口径。
+ * "引擎调用失败"开场，白烧一次调用与一份常驻 token（v27 对 find 的实测：
+ * 5 次调用全部 fallback）。grep 这一轮补上同一条口径。
  *
- * 它原先的降级是"TS 逐行扫描"（v27 之前 es_search 也有一份，那时已删）。那个 fallback
+ * 它原先的降级是"TS 逐行扫描"（v27 之前 find 也有一份，那时已删）。那个 fallback
  * 的坏处更隐蔽：它让"降级"看起来像成功——**同一件工具、同一种结果形状、换了个引擎**，
  * 模型完全看不出这次搜索是全盘扫出来的（慢、且不受 .gitignore 约束），
  * 于是也没人会想到去装 ripgrep。宁可它不出现。
@@ -19,7 +19,7 @@
  * 启动日志里会写一条（`buildFsTools` 的 onNote，见 fs/index.ts），
  * `GET /api/deps` 与设置页「外部依赖」卡片也会说清"没装 rg 会怎样 + 怎么装"。
  *
- * rg_search 的输出解析基于 rg 的 `--null`：路径与行内容之间是 NUL 字节，
+ * grep 的输出解析基于 rg 的 `--null`：路径与行内容之间是 NUL 字节，
  * 于是「Windows 路径里的 `C:\` 冒号」与「匹配文本里的冒号」都不再是歧义源。
  * 实测输出形状（rg 15.1.0）：
  *     .\a.txt<NUL>2:foo one      ← 匹配行：<行号>:<文本>
@@ -27,7 +27,7 @@
  * 列号不由 rg 提供，改由本模块在匹配文本上重跑一次匹配算出来，避免依赖
  * `--column` 那种「上下文行没有列号」的不对称格式。
  *
- * es_search 的参数取自 voidtools 官方 CLI 文档，并且**每一条都在本机 es.exe 1.1.0.38
+ * find 的参数取自 voidtools 官方 CLI 文档，并且**每一条都在本机 es.exe 1.1.0.38
  * 上真机冒烟过**（命令形状与实测输出见 docs/tools-audit.md §8.3）：
  *   `-n <num>` 限制结果数、`-path <path>` 限定目录、`-p` 全路径匹配、
  *   `-r <regex>` 正则、`-w` 全词、`/ad` 只目录、`/a-d` 只文件、
@@ -60,7 +60,8 @@
 
 import { relative } from 'node:path';
 
-import { PATH_BOUNDARY_HINT } from '../boundary.ts';
+import { PATH_HINT } from '../boundary.ts';
+import { effectiveBoundaryRoot } from '../boundary.ts';
 import type { FsEnv } from './env.ts';
 import { resolveGuarded } from './env.ts';
 import { buildMatcher } from './search-core.ts';
@@ -120,6 +121,21 @@ function truncationNote(shown: number, limit: number): string {
   return shown >= limit ? `\n[已达上限 ${limit}：缩小 pattern、加 path/glob 或用更精确的正则]` : '';
 }
 
+/**
+ * 引擎输出不是 UTF-8 时**必须说出来**的那一句（正常路径返回空串，一个字节都不多说）。
+ *
+ * 为什么搜索工具也要说：`rg` 把命中行的**原始字节**原样写到 stdout 里，中文 Windows 上
+ * 那个文件很可能就是 GBK。整段输出按 GB18030 解出来时，命中内容是对的、而同一个缓冲区里
+ * 的 UTF-8 路径会跟着一起被当成 GB18030——她看到的路径可能不是原文。**说出来比装作没事好**。
+ */
+function decodeNote(result: ProcessResult): string {
+  const decoded = result.decode;
+  if (decoded === undefined || decoded.encoding === 'utf8') return '';
+  const loss = decoded.lossy ? `，其中 ${decoded.replaced} 个字符无法映射` : '';
+  return `\n[编码] 引擎输出不是 UTF-8，已按 ${decoded.encoding} 解码${loss}：`
+    + '上面的路径/内容里非 ASCII 部分可能与原文不同形（字节没丢，是同一份字节的另一种解读）。';
+}
+
 // ──────────────────────────────── 引擎探测结论 ────────────────────────────────
 
 /**
@@ -159,7 +175,7 @@ export function searchGateOf(
   return { available: false, command: '', label: '', reason: probe.reason };
 }
 
-// ──────────────────────────────── rg_search ────────────────────────────────
+// ──────────────────────────────── grep ────────────────────────────────
 
 /** 解析 rg --null 输出。任何解析不了的行都丢掉，绝不让格式细节把整次搜索变成错误 */
 function parseRgNullOutput(stdout: string, root: string, fallbackPath: string): SearchHit[] {
@@ -230,25 +246,37 @@ function parseRgNullOutput(stdout: string, root: string, fallbackPath: string): 
   return hits;
 }
 
-export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefinition {
+export function createGrepTool(env: FsEnv, gate: SearchEngineGate): ToolDefinition {
   return {
-    name: 'rg_search',
+    // 名字：`grep` → **`grep`**（用户 2026-10-13 的裁决「名字不误导，desc 才算」那一批）。
+    // 与 `find` 成对：`grep` 按**内容**、`find` 按**文件名**——这两个动词她本来就熟，
+    // 而旧名 `grep` 把引擎名写进了工具名（换个引擎就该改名，名字也就跟着骗人）。
+    name: 'grep',
     // path 那句是 P3 的正面修法：描述说清"文件也吃得下"，她就不必先猜对工具。
     // 实测依据：11 次把文件路径喂进来、被"不是目录"挡回去（docs/tools-audit.md §2.2），
     // 而 `rg` 本来就吃文件操作数——挡它的是我们自己多要的那一道 requireDirectory。
+    //
+    // 描述口径（用户 2026-10-13：「agent 应该看到 desc 之后就立马知道它是做什么的」）：
+    // 第一句＝**动作 + 对象**；然后三件写清——**范围/默认**（仓库根，可用 path 换）、
+    // **路径按什么算**（相对仓库根）、**最容易踩错的那条边界**（默认不区分大小写）。
+    // **不解释实现**：原来那句"由 ripgrep 引擎执行"删掉了（引擎名对"它做什么"没有帮助）。
     description:
-      '按内容搜索（不是文件名）：由 ripgrep 引擎执行，首行标注 engine。' +
-      '支持正则、glob 过滤、上下文行、忽略大小写；path 给目录就递归搜、给单个文件就只搜它。' +
-      '定位后用 safe_read 读区间。',
+      '用 ripgrep 搜文件内容（不是文件名）。给目录递归搜、给文件只搜它（路径相对仓库根）；'
+      + '默认不区分大小写（要区分传 case_sensitive）；定位后用 safe_read 读区间。'
+      // v64（她的实测，本机复核过）：`rg` **不做编码嗅探** ⇒ 非 UTF-8（GBK 等）的文件搜不到
+      // ——`0 命中`不等于`没有`。用户的裁决：**不追平**（给 rg 加逐文件嗅探代价大、收益低），写明真相即可。
+      // ⚠ 长度：这一件贴着**单件 100 token 的预算**（`MAX_DESCRIPTION_TOKENS`）——写短句，别展开。
+      + '只搜 UTF-8：非 UTF-8 文件搜不到，0 命中不等于没有。' + PATH_HINT + '。',
     parameters: {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: '正则表达式（默认）或字面量（fixed_strings=true）' },
-        path: { type: 'string', description: '搜索范围：目录（递归搜）或单个文件（只搜它），默认工作根' },
+        path: { type: 'string', description: '搜索范围：目录（递归）或单个文件；默认仓库根' },
         glob: { type: 'string', description: '文件名过滤，如 "*.ts" 或 "src/**/*.{ts,js}"；多个用逗号分隔' },
         context: { type: 'integer', description: '每条命中前后各带几行上下文，默认 0，上限 20' },
         max_results: { type: 'integer', description: '最多返回多少条命中，默认 40' },
-        case_sensitive: { type: 'boolean', description: '区分大小写，默认 false（与 ripgrep 默认相反）' },
+        // 边界那条：默认值写在这里，描述**只**说"要区分就传 true"（不再拿引擎名做参照物）
+        case_sensitive: { type: 'boolean', description: '区分大小写，默认 false' },
         fixed_strings: { type: 'boolean', description: '把 pattern 当字面量而不是正则，默认 false' },
         max_file_bytes: { type: 'integer', description: '跳过大于该字节数的文件，默认 8388608' },
       },
@@ -259,17 +287,17 @@ export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
     sideEffect: 'none',
     timeoutMs: 15_000,
     async handler(rawArgs: unknown, ctx: ToolContext) {
-      const args = argsObject(rawArgs, 'rg_search');
-      if (args === null) return invalidArgs('rg_search', '期望一个对象，例如 {"pattern": "TODO", "glob": "*.ts"}');
+      const args = argsObject(rawArgs, 'grep');
+      if (args === null) return invalidArgs('grep', '期望一个对象，例如 {"pattern": "TODO", "glob": "*.ts"}');
       const pattern = readString(args, 'pattern');
-      if (pattern === null || pattern === '') return invalidArgs('rg_search', '缺少 pattern');
+      if (pattern === null || pattern === '') return invalidArgs('grep', '缺少 pattern');
 
       const ctxRes = readOptionalInt(args, 'context', 0, 20);
-      if ('error' in ctxRes) return invalidArgs('rg_search', ctxRes.error);
+      if ('error' in ctxRes) return invalidArgs('grep', ctxRes.error);
       const maxRes = readOptionalInt(args, 'max_results', 1, 1000);
-      if ('error' in maxRes) return invalidArgs('rg_search', maxRes.error);
+      if ('error' in maxRes) return invalidArgs('grep', maxRes.error);
       const sizeRes = readOptionalInt(args, 'max_file_bytes', 1024, 512 * 1024 * 1024);
-      if ('error' in sizeRes) return invalidArgs('rg_search', sizeRes.error);
+      if ('error' in sizeRes) return invalidArgs('grep', sizeRes.error);
       const contextLines = ctxRes.value ?? 0;
       const maxResults = maxRes.value ?? 40;
       const maxFileBytes = sizeRes.value ?? MAX_FILE_BYTES;
@@ -289,14 +317,15 @@ export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
       // 旧口径要的是 `requireDirectory: true`（只收目录），把"文件操作数"整个挡在门外：
       // 实测 11 次传文件被拒，占它 16 次失败里的 11 次（docs/tools-audit.md §2.2）。
       const target = await resolveGuarded(env, ctx, pathInput, {
-        purpose: 'rg_search',
+        purpose: 'grep',
+        access: 'read',
         allowDirectory: true,
       });
       if (!target.ok) return fail(target.code, target.reason);
       const searchRoot = target.path;
 
       const matcherResult = buildMatcher(pattern, { ignoreCase, fixedStrings });
-      if ('error' in matcherResult) return invalidArgs('rg_search', matcherResult.error);
+      if ('error' in matcherResult) return invalidArgs('grep', matcherResult.error);
       const matcher = matcherResult.matcher;
       if (ctx.signal.aborted) return ABORTED_RESULT;
 
@@ -334,7 +363,7 @@ export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
         return fail(
           FS_ERROR_CODES.SEARCH_FAILED,
           `ripgrep 未返回结果：${why}（引擎 ${gate.command}）。`
-          + '请确认它在设置页「外部依赖」里显示为已就绪；按文件名找用 es_search，'
+          + '请确认它在设置页「外部依赖」里显示为已就绪；按文件名找用 find，'
           + '或先 safe_read 那个目录看结构（传目录即列目录）。',
         );
       }
@@ -349,12 +378,12 @@ export function createRgSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
       const header =
         `模式 ${'`'}${pattern}${'`'} · 命中 ${hits.length} 处 / 文件 ${new Set(hits.map((h) => h.relPath)).size} 个 · ` +
         `context=${contextLines}${ignoreCase ? ' · 忽略大小写' : ' · 区分大小写'}${fixedStrings ? ' · 字面量' : ''}`;
-      return ok(renderHits(limited, engine, header) + truncationNote(limited.length, maxResults));
+      return ok(renderHits(limited, engine, header) + truncationNote(limited.length, maxResults) + decodeNote(result));
     },
   };
 }
 
-// ──────────────────────────────── es_search ────────────────────────────────
+// ──────────────────────────────── find ────────────────────────────────
 
 /**
  * `sort_by` → es.exe `-sort <键>` 的映射表，**逐键照抄 devkit**（`tools/es_search.py:30-39`
@@ -481,6 +510,19 @@ function parseCsvRows(text: string): string[][] {
 }
 
 /**
+ * `-get-result-count` 的输出解成一个数（**认不出给 `null`**，调用方回落"数行数"那条老路）。
+ *
+ * 为什么加它（v64）：全盘成了默认范围之后，`max_results:0` 那条路原来靠"把全部命中行出来再数"
+ * ——`*.md` 实测 74,527 行 / 431ms；引擎自带的计数器只回一个数，**189ms**。老版本 es.exe 没有
+ * 这个开关（它会报错或回一句别的话）⇒ 判据是"整段输出就是一个非负整数"，否则回落。
+ */
+function parseEsCount(stdout: string): number | null {
+  const text = stdout.trim();
+  if (!/^\d+$/u.test(text)) return null;
+  return Number(text);
+}
+
+/**
  * 把 `-csv` 输出解成结构化条目。**按表头认列**（而不是按位置猜）：es.exe 版本之间的列序
  * 或列名若有变化，这里会退回位置序，不会把 Size 当时间用。第一行是表头，要吃掉。
  */
@@ -521,7 +563,7 @@ function esItemPath(item: EsCsvItem, root: string): string {
 }
 
 /**
- * es_search 的探测闸门在 v27 就有了（当时是本文件里的 `createEsSearchProbeGate`），
+ * 这一件（当时的名字是 `es_search`）的探测闸门在 v27 就有了（当时是本文件里的 `createEsSearchProbeGate`），
  * v30 把它交给了框架层：候选清单与三段顺序（用户指定 → 自装目录 → PATH）现在只有
  * `src/deps/probe.ts` 一处知道，本文件只拿结论。上一版那 5 个候选**串行各一次 ENOENT**
  * 的代价（review v27 的 Σ-5）也随之消失——探测只做一次，结论在工具之间共享。
@@ -529,31 +571,49 @@ function esItemPath(item: EsCsvItem, root: string): string {
  * handler 直接照 `gate` 分派、不再探第二次：注册结论与运行行为必须一致，
  * 否则会出现"注册时说有、执行时说没有"的自相矛盾两句话。
  *
- * 参数面按用户的验收口径**对齐 devkit 的 es_search**（`D:\IrmiaAgent\_devkit-open\tools\es_search.py`）：
+ * 参数面按用户的验收口径**对齐 devkit 那一件**（那边还叫 `es_search`：`D:\IrmiaAgent\_devkit-open\tools\es_search.py`）：
  * `regex` / `whole_word` / `file_type` / `ext` / `sort_by` / `detail` 六项补齐后，
  * 这边能拿到的信息**不低于**那边（那边一次调用固定回结构化条目 name/path/full/size/date_modified
  * + count + total_size；这边 `detail:'full'` 同样给全，`detail:'paths'` 是省上下文的默认档）。
  */
-export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefinition {
+export function createFindTool(env: FsEnv, gate: SearchEngineGate): ToolDefinition {
   return {
-    name: 'es_search',
-    // 压缩（v55，2026-10-13）：末句原本把 `max_results` 的默认值/上限/0 的语义又写了一遍——
-    // 那三件在同一件工具的**参数描述**里逐字都有（参数不进单件描述那份预算，而两处一起进清单）。
-    // 同一件事写两遍是纯常驻开销：删掉它，工具描述仍是"做什么 + 一句能力"，用法一个字没少。
+    // 名字：`find` → **`find`**（用户 2026-10-13 的裁决「名字不误导，desc 才算」那一批）。
+    // 与 `grep` 成对：`find` 按**文件名**、`grep` 按**内容**（`find` 本来就是"找文件"的动词）。
+    name: 'find',
+    // 描述口径（用户 2026-10-13：「agent 应该看到 desc 之后就立马知道它是做什么的」）：
+    // 第一句＝**动作 + 对象**（"按文件名搜本机文件"）；随后三件写清——
+    //   · **范围/默认**：**默认搜全盘**（v64 的改动：全盘才是这类"全盘查找"工具的默认行为），
+    //     可用 `path` 收窄；
+    //   · **路径按什么算**：相对**仓库根**（不是"工作根"——那是代码里的旧叫法）；
+    //   · **最容易踩错的边界**：正则走它自己的语法，**不认 `\d`**（要数字写 `[0-9]`）。
+    // **不解释实现**：旧描述里那句"Everything 索引"删掉了（换个引擎描述就该改，且对"它做什么"没帮助）。
+    // 压缩纪律照 v55：同一件事不写两遍（`max_results` 的默认/上限/0 只在它自己那一格说）。
     description:
-      '按文件名/路径搜 Everything 索引（秒回；找文件内容用 rg_search）：支持 * ? 通配符、正则、'
-      + '全词、只找文件或目录、按大小时间排序；detail=full 连大小与修改时间一起给。',
+      '按名字或路径查文件（索引查，默认全盘、秒回）。限定范围传 path（相对仓库根）；'
+      // ⚠ 正则那句的来历（v64 **实测**，矩阵表见提交说明）：她 10-15/10-16 两次"0 命中"都被读成
+      // "引擎不认 `\d`/`[0-9]`"——**实测不是**：`\d`、`[0-9]`、`[0-9]+`、`{}`、`^$`、`.*` **全认**；
+      // 她那两次是 **pattern 形状**（文件名里数字后面还有一个 `_`：`\d+\.png` 自然匹配不上
+      // `irmia_selfie_03203_.png`，而 `.*\.png` 能）。
+      // 唯一真会踩的坑是**分组里的分支**（`(a|b)` / `(?:a|b)` / `a(1|2)c` 静默 0 命中，而
+      // `[ab]` / `a[12]c` 命中）——所以 desc 只写这一条 + "匹配整个文件名"。
+      // ⚠ 长度：这一件同样贴着**单件 100 token 的预算**，别把矩阵表搬进来（表在提交说明与 `_research`）。
+      + '正则支持 \\d、[0-9]、{}、^$，但分支不能写在括号里（用 [ab] 或摊平成 a|b）；'
+      + '匹配整个文件名（含扩展名）。找文件内容用 grep。' + PATH_HINT + '。',
     parameters: {
       type: 'object',
       properties: {
-        // ── es_search 参数面压缩（v55，2026-10-13）：只删重复与废话，取值/默认值/边界一个没删 ──
+        // ── 参数面压缩（v55，2026-10-13）：只删重复与废话，取值/默认值/边界一个没删 ──
         // 逐条账见 `_research/_tmp-v55-params-account.mts`。三条口径：
         //   ① 同一件事在同一件工具里不写两遍（`max_results` 的默认/上限/0 语义只在它自己那一格说）；
         //   ② 括号里的举例能用更短的写法说清就换短的（`match_path` 那对命中示例保留——它是判据本身）；
         //   ③ **不删能力、不删取值、不删边界**：`sort_by` 的 8 个取值仍在 `enum` 里，`detail` 的两档、
         //      `file_type` 的三档、`regex`/`whole_word`/`ignore_case` 的默认值全部原样保留。
         pattern: { type: 'string', description: '文件名模式，支持 * ?，如 "*.test.ts"；也吃字面子串 "config"；regex=true 按正则解释' },
-        path: { type: 'string', description: '限定目录（相对工作根），默认工作根；只吃目录，传文件走 rg_search' },
+        // 范围那条（v64）：**不传＝搜全盘**才是这一件的默认行为（用户：「全盘使用应该是默认行为，
+        // 怎么可以设计成默认工作根呢」）。⚠ 信任范围只限工作目录那一档里，"全盘"会绕过配置里写明
+        // 的限制 ⇒ 那种配置下默认仍是**边界根**（实现见 handler 里的 boundary 判据）。
+        path: { type: 'string', description: '限定目录（相对仓库根）；不传＝搜全盘（只限工作目录那一档＝该根内）；只吃目录，传文件走 grep' },
         max_results: { type: 'integer', description: '最多几条，默认 100，上限 2000；0 = 只报数量' },
         // `match_path`（v55）：删掉的是"而不是只匹配名字"这句**重复**——同一句的前半句已经说了
         // "匹配整条路径"，默认值与那对命中示例（判据本身）一字未动。
@@ -575,17 +635,17 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
     sideEffect: 'none',
     timeoutMs: 15_000,
     async handler(rawArgs: unknown, ctx: ToolContext) {
-      const args = argsObject(rawArgs, 'es_search');
-      if (args === null) return invalidArgs('es_search', '期望一个对象，例如 {"pattern": "*.test.ts"}');
+      const args = argsObject(rawArgs, 'find');
+      if (args === null) return invalidArgs('find', '期望一个对象，例如 {"pattern": "*.test.ts"}');
       const pattern = readString(args, 'pattern');
-      if (pattern === null || pattern === '') return invalidArgs('es_search', '缺少 pattern');
+      if (pattern === null || pattern === '') return invalidArgs('find', '缺少 pattern');
       // max_results 的最小值是 **0**（旧实现是 1，`max_results:0` 直接报参数错）：devkit 把
       // 0 定义为"只统计不返回列表"（`tools/es_search.py:220`、`:275-276`），它的 schema 里
       // 这个 0 是写明的默认边界之一。模型在"先探一下有多少个"的场景会真的用 0。
       const maxRes = readOptionalInt(args, 'max_results', 0, 2000);
-      if ('error' in maxRes) return invalidArgs('es_search', maxRes.error);
+      if ('error' in maxRes) return invalidArgs('find', maxRes.error);
       const maxResults = maxRes.value ?? 100;
-      // 0 = 只要数量：es.exe 那边就不加 `-n`（与源 `if max_results > 0` 同判据），
+      // 0 = 只要数量：引擎那条路走它自带的计数器（见下面的 `-get-result-count`），
       // 但**结果一条都不列**——这正是她传 0 时要的东西，也是它省上下文的地方。
       const countOnly = maxResults === 0;
       const matchPath = readOptionalBool(args, 'match_path') ?? false;
@@ -595,42 +655,54 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
       // 三个枚举参数一律**先校验再落参**：值非法时给的是"参数错 + 合法取值"，
       // 而不是把非法值拼进 es.exe 实参、换来一句 `Error 4: Unknown sort: bogus`。
       const fileTypeRes = readOptionalEnum(args, 'file_type', ES_FILE_TYPES);
-      if ('error' in fileTypeRes) return invalidArgs('es_search', fileTypeRes.error);
+      if ('error' in fileTypeRes) return invalidArgs('find', fileTypeRes.error);
       const fileType = fileTypeRes.value ?? 'all';
       const sortRes = readOptionalEnum(args, 'sort_by', ES_SORT_KEYS);
-      if ('error' in sortRes) return invalidArgs('es_search', sortRes.error);
+      if ('error' in sortRes) return invalidArgs('find', sortRes.error);
       const sortBy = sortRes.value;
       const detailRes = readOptionalEnum(args, 'detail', ES_DETAILS);
-      if ('error' in detailRes) return invalidArgs('es_search', detailRes.error);
+      if ('error' in detailRes) return invalidArgs('find', detailRes.error);
       // max_results=0 一条都不列，这时 CSV 那组开关纯属白付：detail 一律按 paths 走
       const detail: EsDetail = countOnly ? 'paths' : (detailRes.value ?? 'paths');
       // 空串与不传同义（devkit 也是 `if ext and not regex` 的判据：空串为假 → 不拼）
       const ext = (readOptionalString(args, 'ext') ?? '').trim();
 
-      const pathInput = readOptionalString(args, 'path') ?? '.';
-      const guarded = await resolveGuarded(env, ctx, pathInput, {
-        purpose: 'es_search',
-        requireDirectory: true,
-      });
-      // 错误消息给一句出路（0 token：结果不进 tools 段，行为一个字不动）：
-      // es 的实参是 `-path <dir>`，给它文件只会返回空——所以"只吃目录"这条要**拦在前面**，
-      // 而 path-guard 只说"不是目录"、没有下一步。传文件进来时她要做的正是 rg_search（P3 之后它吃文件）。
-      if (!guarded.ok) {
-        return fail(
-          guarded.code,
-          guarded.reason
-          + (guarded.code === FS_ERROR_CODES.NOT_A_DIRECTORY
-            ? '；es_search 只按文件名搜目录，要按内容搜这个文件请用 rg_search（它吃文件操作数）'
-            : ''),
-        );
+      // ──────────────── 默认范围（v64，用户 2026-10-13 的裁决） ────────────────
+      // 「全盘使用应该是默认行为，怎么可以设计成默认工作根呢」⇒ **不传 path ⇒ 搜全盘**
+      // （实现方式就是**不给 es.exe 传 `-path`**，不是把某个绝对路径塞进参数——那只是换个假默认）。
+      // ⚠ 一处收口：`trust.mode='workspace'` 时"全盘"会绕过配置里写明的限制（配置说 A、实际做 B
+      // 是仓库明令禁止的第二例）⇒ 那一档下默认仍是**边界根**；`full` 档（不设边界）才真的全盘。
+      // 空串与不传**同义**（不做出第三种行为）：两者都走这里的默认。
+      const pathInput = (readOptionalString(args, 'path') ?? '').trim();
+      let searchRoot: string | null;
+      if (pathInput === '') {
+        searchRoot = effectiveBoundaryRoot(ctx); // null = 不设边界（full 档）⇒ 真·全盘
+      } else {
+        const guarded = await resolveGuarded(env, ctx, pathInput, {
+          purpose: 'find',
+          access: 'read',
+          requireDirectory: true,
+        });
+        // 错误消息给一句出路（0 token：结果不进 tools 段，行为一个字不动）：
+        // es 的实参是 `-path <dir>`，给它文件只会返回空——所以"只吃目录"这条要**拦在前面**，
+        // 而 path-guard 只说"不是目录"、没有下一步。传文件进来时她要做的正是 grep（P3 之后它吃文件）。
+        if (!guarded.ok) {
+          return fail(
+            guarded.code,
+            guarded.reason
+            + (guarded.code === FS_ERROR_CODES.NOT_A_DIRECTORY
+              ? '；find 只按文件名搜目录，要按内容搜这个文件请用 grep（它吃文件操作数）'
+              : ''),
+          );
+        }
+        searchRoot = guarded.path;
       }
-      const searchRoot = guarded.path;
       if (ctx.signal.aborted) return ABORTED_RESULT;
 
       // ──────────────── 实参拼装：逐条对应 devkit 的判据（顺序按 es.exe 的实测要求） ────────────────
-      // `-n` 只在 max_results > 0 时给（源 `tools/es_search.py:275-276` 同判据）
-      const esArgs: string[] = countOnly ? [] : ['-n', String(maxResults)];
-      esArgs.push('-path', searchRoot);
+      // 范围那一对（`-path <dir>`）只在**有范围**时给：不给就是全盘（见上面那一段判据）。
+      const scopeArgs: string[] = searchRoot === null ? [] : ['-path', searchRoot];
+      const esArgs: string[] = [...scopeArgs];
       // file_type：file ⇒ `/a-d`（只文件）、folder ⇒ `/ad`（只目录）、all ⇒ 不加（源 `:260-263` 同款）
       if (fileType === 'file') esArgs.push('/a-d');
       else if (fileType === 'folder') esArgs.push('/ad');
@@ -654,52 +726,62 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
         esArgs.push('--', pattern);
       }
 
-      const result = await env.deps.runProcess(gate.command, esArgs, {
-        timeoutMs: 14_000,
-        signal: ctx.signal,
-      });
+      const result = countOnly
+        // `-get-result-count`：引擎自带的计数器，**只回一个数**（实测 189ms vs 数 74,527 行 431ms
+        // ——全盘成为默认之后，这条路的行数会从千级涨到万级，值得换）。过滤器与列表档同一套
+        // （`scopeArgs` + 下面那几对开关都已拼好），所以数出来的口径一致。
+        ? await env.deps.runProcess(gate.command, ['-get-result-count', ...esArgs], {
+            timeoutMs: 14_000,
+            signal: ctx.signal,
+          })
+        : await env.deps.runProcess(gate.command, ['-n', String(maxResults), ...esArgs], {
+            timeoutMs: 14_000,
+            signal: ctx.signal,
+          });
       if (ctx.signal.aborted) return ABORTED_RESULT;
-
-      // 退出码 8 = Everything IPC 窗口不存在（客户端没在跑）。装过 es.exe 的机器上这仍然会发生
-      // ——Everything 客户端退出了而 es.exe 还在。此时**不降级**：工具既然是因为探测到引擎
-      // 才注册的，静默走一遍全盘扫描只会让模型误以为索引还有效（也白烧一次扫描）。
-      // 如实报错 + 给出路，比一个换了引擎的"成功"结果诚实。
-      const engineDead = result.code === 8 || /IPC|Everything search client/u.test(result.stderr);
-      if (result.timedOut || engineDead || result.code !== 0) {
-        const why = result.timedOut
-          ? '调用超时'
-          : engineDead
-            ? 'Everything 客户端没有在运行（退出码 8）——启动 Everything 后重试'
-            : result.stderr.trim() || `退出码 ${result.code ?? 'null'}`;
-        return fail(
-          FS_ERROR_CODES.SEARCH_FAILED,
-          `es.exe 未返回结果：${why}。找文件内容用 rg_search；按名字找且引擎不可用时，可用 safe_read 传目录逐层看。`,
-        );
-      }
 
       const engine = `engine: everything (${gate.label})`;
       // 头部三段固定（engine / 模式 / 命中）+ 一个按 file_type 的限定语：
       // 只要文件或只要目录时说一句，免得"命中 3 个"被读成全都在。
       const filterNote = fileType === 'file' ? '（只要文件）' : fileType === 'folder' ? '（只要目录）' : '';
-      // max_results=0：只报数量。**一条路径都不列**——这是"先探一下有多少个"的调用，
-      // 列出来就等于没省（而省上下文正是她传 0 的目的）。不加 `-n` 时 es.exe 返回全部命中，
-      // 所以这个数就是准确的总数。
-      if (countOnly) {
-        const total = result.stdout
-          .split(/\r?\n/u)
-          .map((line) => line.trim())
-          .filter((line) => line !== '')
-          .length;
+      // 退出码 8 = Everything IPC 窗口不存在（客户端没在跑）。装过 es.exe 的机器上这仍然会发生
+      // ——Everything 客户端退出了而 es.exe 还在。此时**不降级**：工具既然是因为探测到引擎
+      // 才注册的，静默走一遍全盘扫描只会让模型误以为索引还有效（也白烧一次扫描）。
+      // 如实报错 + 给出路，比一个换了引擎的"成功"结果诚实。
+      // ⚠ 计数器路：老版本/异常（非 0 退出、输出不是纯数字）⇒ **回落**到"不加 -n 数 stdout 行数"
+      // 那条老路（同一个数，只是慢）；回落失败才报错。
+      const engineDead = result.code === 8 || /IPC|Everything search client/u.test(result.stderr);
+      const counted = countOnly ? parseEsCount(result.stdout) : null;
+      if (countOnly && result.code === 0 && !result.timedOut && counted !== null) {
         return ok(
-          `${engine}\n模式 ${'`'}${pattern}${'`'} · 命中 ${total} 个${filterNote}\n`
-          + '（max_results=0：只统计不列条目；要看清单请传 max_results≥1）',
+          `${engine}\n模式 ${'`'}${pattern}${'`'} · 命中 ${counted} 个${filterNote}\n`
+          + `（max_results=0：只统计不列条目；要看清单请传 max_results≥1）${decodeNote(result)}`,
         );
       }
+      const fallback = countOnly && result.code === 0 && !result.timedOut && counted === null
+        ? await env.deps.runProcess(gate.command, esArgs, { timeoutMs: 14_000, signal: ctx.signal })
+        : null;
+      const effective = fallback ?? result;
+      if (ctx.signal.aborted) return ABORTED_RESULT;
+      if (effective.timedOut || engineDead || effective.code !== 0) {
+        const why = effective.timedOut
+          ? '调用超时'
+          : engineDead
+            ? 'Everything 客户端没有在运行（退出码 8）——启动 Everything 后重试'
+            : effective.stderr.trim() || `退出码 ${effective.code ?? 'null'}`;
+        return fail(
+          FS_ERROR_CODES.SEARCH_FAILED,
+          `es.exe 未返回结果：${why}。找文件内容用 grep；按名字找且引擎不可用时，可用 safe_read 传目录逐层看。`,
+        );
+      }
+      const stdout = effective.stdout;
 
+      // 这里只剩**列表档**（计数档在上面那条分支里就返回了，回落那一路也从同一个出口出）；
+      // `engine` / `filterNote` 在那条分支之前就拼好了，两档共用。
       // detail:'full' —— devkit 一次调用能拿到的全在这里：每条 name/size/修改时间，
       // 外加头部总大小（源 `tools/es_search.py:316-346` 的 items + total_size + count）。
       if (detail === 'full') {
-        const items = parseEsCsv(result.stdout);
+        const items = parseEsCsv(stdout);
         const knownSizes = items.filter((item) => item.sizeKnown);
         const totalSize = knownSizes.reduce((sum, item) => sum + item.size, 0);
         // 目录在 es.exe 的 CSV 里**没有大小**（Size 列是空串，实测）：一个目录都没有大小时
@@ -709,24 +791,27 @@ export function createEsSearchTool(env: FsEnv, gate: SearchEngineGate): ToolDefi
         const header =
           `模式 ${'`'}${pattern}${'`'} · 命中 ${items.length} 个${filterNote}${sizeNote}`
           + (truncated ? `（前 ${items.length} 项合计）` : '');
-        if (items.length === 0) return ok(`${engine}\n${header}\n(无命中)`);
+        if (items.length === 0) return ok(`${engine}\n${header}\n(无命中)${decodeNote(effective)}`);
         const body = items
           .map((item) => {
             const size = item.sizeKnown ? formatBytes(item.size) : '-';
             return `${size} · ${item.dateModified} · ${esItemPath(item, ctx.workspaceRoot)}`;
           })
           .join('\n');
-        return ok(`${engine}\n${header}\n\n${body}${truncationNote(items.length, maxResults)}`);
+        return ok(`${engine}\n${header}\n\n${body}${truncationNote(items.length, maxResults)}${decodeNote(effective)}`);
       }
 
-      const found = result.stdout
+      const found = stdout
         .split(/\r?\n/u)
         .map((line) => line.trim())
         .filter((line) => line !== '');
       const header = `模式 ${'`'}${pattern}${'`'} · 命中 ${found.length} 个${filterNote}`;
       const limited = found.slice(0, maxResults);
       const body = limited.map((p) => relative(ctx.workspaceRoot, p).replaceAll('\\', '/')).join('\n');
-      return ok(`${engine}\n${header}\n\n${body}${found.length === 0 ? '(无命中)' : ''}${truncationNote(limited.length, maxResults)}`);
+      return ok(
+        `${engine}\n${header}\n\n${body}${found.length === 0 ? '(无命中)' : ''}`
+        + `${truncationNote(limited.length, maxResults)}${decodeNote(effective)}`,
+      );
     },
   };
 }

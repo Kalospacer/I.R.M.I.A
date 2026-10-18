@@ -14,7 +14,7 @@
  * 零外部依赖：只用 node: 标准库。
  */
 
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import type { TimerStore } from '../wake/timer-store.js';
 import type { JobManager } from '../runtime/job-manager.js';
@@ -25,7 +25,7 @@ import type { WakeChannel, MemoryRead } from '../log/types.js';
 import { defaultVisibility } from '../log/types.ts';
 import type { DepsManager } from '../deps/manager.js';
 import type { DsClient, DsResponse } from '../model/ds-client.js';
-import type { MediaPoster, AdminEventEmitter, ChannelNameResolver, ChannelNoticeReader, ChannelReader, ChannelSelfActionReader, ChannelSpokenReader, InputNotifyPoster, Notifier, PersonaUpdatedPayload, ReplyPoster } from './admin.js';
+import type { MediaPoster, AdminEventEmitter, ChannelNameResolver, ChannelNoticeReader, ChannelReader, ChannelSelfActionReader, ChannelSessionRow, ChannelSpokenReader, InputNotifyPoster, Notifier, PersonaUpdatedPayload, ReplyPoster } from './admin.js';
 import type { ToolDefinition } from './types.js';
 import type { ListForModelOptions, ToolModelSpec } from './registry.js';
 import type { IsolationConfig, ToolPlanGate } from './executor.js';
@@ -38,7 +38,14 @@ import { createTaskTool, TASK_TOOL_NAME } from '../runtime/subagent.ts';
 import { createAdminTools } from './admin.ts';
 import { createNetTools } from './net.ts';
 import { ANYSEARCH_SKILL_DIR, createWebSearchTool } from './web-search.ts';
-import { createPwshTool } from './pwsh.ts';
+import { createPwshTool, LANG_INTERPRETERS, type LangDepProbeOutcome } from './pwsh.ts';
+import {
+  DEP_SPECS,
+  isManagedHit,
+  managedInterpreterOf,
+  pathInterpreterSlotOf,
+} from '../deps/probe.ts';
+import { defaultDepFs } from '../deps/manager.ts';
 import { buildFsTools, DEFAULT_READ_ONLY_PREFIXES } from './fs/index.ts';
 import { createVisionTools } from './vision.ts';
 import { createMemoryReadTool } from './memory-tools.ts';
@@ -80,7 +87,7 @@ export interface ToolCatalogOptions {
   /**
    * `task`（隔离子代理工具，design §4.21）注不注册。**默认 false = 不注册**。
    *
-   * 为什么默认不开（理由与 `rg_search` / `es_search` 那两件**不一样**）：那两件是"本机装了才
+   * 为什么默认不开（理由与 `grep` / `find` 那两件**不一样**）：那两件是"本机装了才
    * 存在"，判据在机器上；这一件的判据在**代价**上——工具清单是请求**冻结前缀**的一部分
    * （docs/schema.md §13：模型请求的全部内容可由 model 事件 + 人格资产重建），
    * 多一件 = 每次请求都多付一份 schema（常驻 token），而且**清单变化的那个 turn 必然是一次
@@ -106,7 +113,7 @@ export interface ToolCatalogOptions {
   /**
    * MCP 入口（`mcp` 工具，2026-10-09 用户拍板：「增加一个内置 mcp 工具。此后 mcp 都从此工具调用。」）。
    *
-   * **给了它就一定注册、无条件常驻**——这是这一件与 `task` / `rg_search` 那一类**相反**的地方：
+   * **给了它就一定注册、无条件常驻**——这是这一件与 `task` / `grep` 那一类**相反**的地方：
    *   · `task` 是条件注册（它只是"多一件能力"，不加也不缺什么）；
    *   · `mcp` 是**唯一入口**：不注册 = 她一件 MCP 工具都没有（没有第二条路可走）。
    *     而"按有没有声明 server 决定注不注册"这条判据在这里是**有害**的：声明面一变就改
@@ -146,7 +153,7 @@ export interface ToolCatalogOptions {
   blobOffload?: BlobOffloadOptions | undefined;
   /**
    * 外部依赖管理器（`src/deps/`，v30）。**探测只做一次**的来源：
-   *   · `buildFsTools` 用它决定 rg_search / es_search 注不注册（没装就不注册）；
+   *   · `buildFsTools` 用它决定 grep / find 注不注册（没装就不注册）；
    *   · pwsh 工具用它拿默认 shell（探测到的 pwsh 7，可能是 PATH/自装目录/用户指定）。
    * 不传时各处各自兜底探测——CLI 只读场景（replay / doctor）也就能白拿一份缓存。
    */
@@ -239,6 +246,14 @@ export interface ToolCatalogOptions {
    * 不传时 read_channel 照常注册，但一调就如实报"宿主没接线"（而不是假装读到空）。
    */
   channelReader?: ChannelReader;
+  /**
+   * **会话簿**（`read_channel` 不给 `sid` 时列的那一份；v66）。
+   *
+   * 与 `channelReader` 同一条纪律：宿主注入，工具层不读日志、也不维护会话簿。
+   * 这是**取值器**（不是快照）：会话簿逐拍在长，而 catalog 先于 RealLoop 就位
+   * （与 `selfIds` / `userSpoke` 同一形状）。
+   */
+  channelSessions?: () => readonly ChannelSessionRow[];
   /**
    * 她在这个会话里**说过的话**（`read_channel` 用）：宿主注入。
    *
@@ -369,7 +384,7 @@ export function unwiredVisionClient(): VisionModelClient {
  * 默认工具集的工具定义清单（顺序即断言顺序：render 的 tools 数组按注册顺序序列化，
  * 顺序变了就是一次缓存前缀变更，必须是有意为之）。
  *
- * async 的唯一来源是 fs 那一族：es_search 要探测到 es.exe 才注册（见 fs/index.ts），
+ * async 的唯一来源是 fs 那一族：find 要探测到 es.exe 才注册（见 fs/index.ts），
  * 而"清单里有哪几件"必须落定之后才谈得上顺序。
  */
 export async function buildToolCatalog(options: ToolCatalogOptions): Promise<ToolDefinition[]> {
@@ -392,6 +407,9 @@ export async function buildToolCatalog(options: ToolCatalogOptions): Promise<Too
     // read_channel 的两个注入点（v32）：消息从日志里来、名字从她的别名表与人的联系人表来。
     // 两样都在宿主的视野里，工具层只接收结论。
     ...(options.channelReader === undefined ? {} : { channelReader: options.channelReader }),
+    // 会话簿（v66）：`read_channel` 不给 sid 时列的那一份。取的是**同一个口**
+    // （`RealLoop.sessions()`，此刻层那张清单也读它）⇒ 两处不可能各说各的会话。
+    ...(options.channelSessions === undefined ? {} : { channelSessions: options.channelSessions }),
     // 她自己在这个会话里说过的话（2026-10-04）：同一个来源（日志里的投递回执），
     // 只是读法不同——它不参与未读与话题，只让 read_channel 能摆出"我已经回过什么"。
     ...(options.channelSpokenReader === undefined ? {} : { channelSpokenReader: options.channelSpokenReader }),
@@ -565,7 +583,7 @@ export async function buildToolCatalog(options: ToolCatalogOptions): Promise<Too
  * 打开——"加一件能力"从来不该是另一个开关的副作用。所以判据只有一处：用户显式写了
  * `tools.taskEnabled: true`。
  *
- * 不注册时**必须说话**：条件注册的工具不出现不能无声无息（与 rg_search / es_search 同一
+ * 不注册时**必须说话**：条件注册的工具不出现不能无声无息（与 grep / find 同一
  * 条纪律，用户的原话"没有时如实告知"）。它缺省就不在，所以只在"用户要了却没接上"时出声。
  */
 function buildTaskTools(options: ToolCatalogOptions): ToolDefinition[] {
@@ -650,9 +668,64 @@ function buildShellTools(options: ToolCatalogOptions): ToolDefinition[] {
           reason: probe.reason,
         };
       } }),
+    /**
+     * 2026-10-16（Python 成为第 4 件外部依赖）/ 2026-10-17 翻正：`lang:'python'` 那一档
+     * 现在是「**PATH 优先 · 托管兜底**」。
+     *
+     * 与上面 `depsProbe` 同一条分工：`src/deps/` 回答"本机有没有 python、在哪"，
+     * 工具拿这个结论办事。**这里给的是两个候选槽**，不是"答案"——
+     *   · `pathSlot`：机器上本来那一份（PATH 上的裸名，或 `deps.paths.python` 指的路径）；
+     *   · `managedSlot`：框架自装目录 `<数据Dir>/tools/python/` 里那一份（一键安装的落点）。
+     * 谁先用由 `tools/pwsh.ts` 的 `resolveInterpreter` 定（**PATH 先试**）——上一版是宿主
+     * 直接给赢家、工具照办（那是"托管优先"）；用户 2026-10-17 把口径翻了过来：
+     * > 「**Python 和 pip 不应该是默认要求装的，而是有就用 PATH 里的。没有的话就要求装。**」
+     * 两槽都给，工具那一侧才能在"PATH 上那个起不来"时**如实说清**、并知道兜底那一份在哪。
+     *
+     * `pipConfigFile` **只在真的用托管那一份时**才给（`isManagedHit`）。
+     * 上一版是无条件按 `probe.path` 旁边算一份——PATH 优先之后那样会把托管的那份 `pip.ini`
+     * 盖到**系统 python** 头上（污染她的 pip 配置）。它只对 python 档生效（作为
+     * `PIP_CONFIG_FILE`），另两档一个字节都不加。
+     */
+    ...(options.deps === undefined
+      ? {}
+      : { langProbe: async (): Promise<LangDepProbeOutcome> => {
+        const probe = await options.deps!.get('python');
+        const managedDir = options.deps!.managedDir('python');
+        const managedSlot = managedInterpreterOf(
+          DEP_SPECS.python.candidates,
+          managedDir,
+          defaultDepFs.exists,
+          defaultDepFs.listDir,
+        );
+        return {
+          pathSlot: pathInterpreterSlotOf(probe, LANG_INTERPRETERS.python),
+          managedSlot,
+          // 托管那份自包含 pip 配置（引导步骤写在解释器旁边）只在**用托管那一份**时带上；
+          // 系统那份旁边没有我们的 pip.ini，硬塞过去会改掉她自己的 pip 配置
+          pipConfigFile: isManagedHit(probe, managedDir) && probe.path !== ''
+            ? pipConfigPathOf(options.deps!, probe.path)
+            : null,
+        };
+      } }),
   });
 
   return [pwsh];
+}
+
+/**
+ * 托管 pip 配置的路径（`<数据Dir>/tools/python/pip.ini`）。
+ *
+ * 判据**不是**"托管目录在哪"——那样要在这里重算一遍 `<数据Dir>`（tools 层不该知道它），
+ * 而是"**探测到的那个解释器旁边**"：`probe.path` 是托管目录里的 `python.exe`，
+ * 它旁边就是引导步骤写的 `pip.ini`。用户自己指定路径（`deps.paths.python`）时，
+ * 那个 `pip.ini` 不存在也没关系——工具侧会 `statSync` 一次，文件不在就不设这个环境变量。
+ *
+ * 用 `dirname` 而不是自己切字符串：探测到的可能是 `C:\...\python.exe`（原生）
+ * 也可能是 `python`（PATH 上的裸名）——后者的 `dirname` 是 `.`，于是回退到托管目录。
+ */
+function pipConfigPathOf(deps: { managedDir(name: 'python'): string }, exePath: string): string {
+  const dir = exePath.includes('\\') || exePath.includes('/') ? dirname(exePath) : deps.managedDir('python');
+  return join(dir, 'pip.ini');
 }
 
 export interface CatalogRegistryResult {

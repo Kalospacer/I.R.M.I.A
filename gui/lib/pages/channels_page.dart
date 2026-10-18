@@ -1,9 +1,15 @@
+// TODO(i18n): 本文件还有 123 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/pages/channels_page.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:async';
 
 import 'package:flutter/material.dart';
 
 import '../api.dart';
 import '../app.dart';
+// QQ 官方 Bot 两把凭据的键名（与首次引导第 3 步同一份，见 channel_keys.dart）
+import '../channel_keys.dart';
 import '../theme.dart';
 import '../ui_kit.dart';
 import 'page_chrome.dart';
@@ -79,9 +85,12 @@ typedef _ChannelDef = ({
 
 /// QQ 官方通道的两把密钥：开放平台管理端给的 AppID 与 AppSecret。
 /// 界面上直接填**值**（写进本机 data/.keys.json），不填变量名。
+///
+/// 键名取 `channel_keys.dart` 那份（与首次引导第 3 步**同一对**）：两处填的是同一把凭据，
+/// 各写一遍键名就会漂成"这边写进去、那边读不到"。
 final _qqSecrets = <_SecretField>[
-  (label: 'AppID', keyName: 'qqAppId', hint: '开放平台管理端的机器人 ID。'),
-  (label: 'AppSecret', keyName: 'qqClientSecret', hint: '换取 access_token 的密钥。'),
+  (label: 'AppID', keyName: kQqAppIdKey, hint: '开放平台管理端的机器人 ID。'),
+  (label: 'AppSecret', keyName: kQqAppSecretKey, hint: '换取 access_token 的密钥。'),
 ];
 final _onebotSecrets = <_SecretField>[
   (label: 'access_token', keyName: 'onebotToken', hint: '协议端开了校验时必填。'),

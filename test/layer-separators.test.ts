@@ -84,7 +84,10 @@ describe('层分割线（v56）· instructions 四层', () => {
     assert.equal(countOf(ins, INSTRUCTION_RULES.style), 0);
     assert.equal(countOf(ins, INSTRUCTION_RULES.identity), 1);
     assert.equal(countOf(ins, INSTRUCTION_RULES.brief), 1);
-    assert.ok(!ins.includes('\n\n\n'), '空块不许留下空行');
+    // v65：装置自述里有两处四连换行（用户那两行结束标记的前后）⇒ 改成**点名**锁：
+    // 除那两处之外，三连以上换行一处都不许有（空块**不许新增**空行）——不是放宽。
+    assert.equal((ins.match(/\n{3,}/gu) ?? []).length, 2,
+      'v65：三连以上空行只许是用户版式那两处（两个结束标记前后）');
   });
 
   test('人格全空时：装置自述那条线仍在（它是程序给的，不随人格空掉）', () => {

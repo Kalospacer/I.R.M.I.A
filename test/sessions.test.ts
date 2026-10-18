@@ -213,8 +213,8 @@ describe('会话簿 · 名字从哪来', () => {
   test('别名里的备注：名字只取第一个括号之前，备注整段留着', () => {
     // 用户实测踩到的那一行（形如 aliases.md 第 10 行）：名字 + 口径一起写在等号右边，
     // 读取侧原来把整串当名字 → 界面那格窄、光标被顶到末尾，人看到的是备注的尾巴
-    const line = 'qq:group:0AE5 = IRMIA框架测试群（10-04 18:15 用户拉我进来；**群友多是他的网友**——口径：不透露用户的私事，看情况淡着）';
-    assert.deepEqual(parseAliases(line).get('qq:group:0AE5'), {
+    const line = 'qq:group:0000 = IRMIA框架测试群（10-04 18:15 用户拉我进来；**群友多是他的网友**——口径：不透露用户的私事，看情况淡着）';
+    assert.deepEqual(parseAliases(line).get('qq:group:0000'), {
       name: 'IRMIA框架测试群',
       note: '10-04 18:15 用户拉我进来；**群友多是他的网友**——口径：不透露用户的私事，看情况淡着',
     });
@@ -230,13 +230,13 @@ describe('会话簿 · 名字从哪来', () => {
  * 发言人（`person`）→ 名字 —— src/channel/sessions.ts 的 `resolvePersonNameFromTables`
  *
  * 这一组锁的是 2026-10-11 修的那处缺口：她在 `aliases.md` 的 `# 群成员` 段里按段头那句
- * "只在认人时用"写下 `1269541505 = OWNER（用户）`，而框架原来只查合成出来的
+ * "只在认人时用"写下 `1234567890 = OWNER（用户）`，而框架原来只查合成出来的
  * `qq:c2c:<id>` / `onebot:c2c:<id>` 两个键——**她写在正确位置的身份声明一个字都没被看见**，
  * 于是用户第一次在 OneBot 群里露面时，那一行显示成机器发的一次性占位名「群友A（群昵称：用户）」，
  * 她当众回他"这会儿光一串号我还认不了你"（现场见 data/events 的 seq 41686 / 41733）。
  */
 describe('发言人 → 名字 · 人写的三处', () => {
-  const QQ = '1269541505';
+  const QQ = '1234567890';
   const OWNER = '用户（OWNER）';
 
   test('只有群成员别名（裸 id）也能认出来：这是原来断掉的那一档', () => {
@@ -264,28 +264,28 @@ describe('发言人 → 名字 · 人写的三处', () => {
 
   test('两条通道的 id 各自命中：官方 openid 与 OneBot QQ 号都能查', () => {
     const contacts = new Map([
-      ['qq:c2c:E7FEC35E951B5CCF8BA66793BF6B1314', OWNER],
+      ['qq:c2c:00000000000000000000000000000001', OWNER],
       [`onebot:c2c:${QQ}`, OWNER],
     ]);
-    assert.equal(resolvePersonNameFromTables('E7FEC35E951B5CCF8BA66793BF6B1314', contacts, undefined, undefined), OWNER);
+    assert.equal(resolvePersonNameFromTables('00000000000000000000000000000001', contacts, undefined, undefined), OWNER);
     assert.equal(resolvePersonNameFromTables(QQ, contacts, undefined, undefined), OWNER);
   });
 
   test('成员别名的解析口径与会话别名逐字对称（同一份文件、同一个 `裸 id = 名字`）', () => {
     const text = [
       '# 身份别名',
-      'qq:c2c:E7FE = OWNER（用户）',
+      'qq:c2c:0000 = OWNER（用户）',
       '# 该群成员（openid，不是 sid；只在认人时用）',
-      '- 1269541505 = **OWNER（用户）**——GUI 亲口认领那次',
-      'B01F025D72D3B2075F49EFB08297D105 = 1 号',
+      '- 1234567890 = **OWNER（用户）**——GUI 亲口认领那次',
+      '00000000000000000000000000000004 = 1 号',
       '这不是别名',
     ].join('\n');
     const members = parseMemberAliases(text);
     // 名字 = 第一个括号之前那一段（`splitAliasNote` 的既有口径，与会话别名**同一个**解析）。
     // 注意她那种 `**OWNER（用户）**` 的写法：粗体标记夹着括号时，`用户）**` 会落进备注
     // ——这不是这一版引入的，`parseAliases` 一直如此；两张表口径一致才是这里要钉的事。
-    assert.deepEqual(members.get('1269541505'), { name: 'OWNER', note: '用户）**——GUI 亲口认领那次' });
-    assert.deepEqual(members.get('B01F025D72D3B2075F49EFB08297D105'), { name: '1 号' });
+    assert.deepEqual(members.get('1234567890'), { name: 'OWNER', note: '用户）**——GUI 亲口认领那次' });
+    assert.deepEqual(members.get('00000000000000000000000000000004'), { name: '1 号' });
     assert.equal(members.size, 2, 'sid 那类键不进成员表；坏行照旧跳过');
     assert.equal(parseAliases(text).size, 1, '两张表互补：会话表只收 sid 那类键');
   });

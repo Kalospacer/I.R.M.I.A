@@ -634,7 +634,7 @@ test('vision_read 目录遍历只收图片扩展名，GIF 标注仅首帧', asyn
   assert.match(gifRequest?.input[0]?.content[1]?.type === 'input_image' ? gifRequest.input[0].content[1].image_url : '', /^data:image\/gif;base64,/);
 });
 
-test('vision_read 拒绝越界路径与非图片扩展名', async () => {
+test('vision_read：路径越界不再被边界拒（v64 读类），非图片扩展名照旧拒', async () => {
   const workspace = await makeTempDir();
   const dataDir = await makeTempDir();
   await writeFile(join(workspace, 'note.txt'), 'x');
@@ -642,8 +642,10 @@ test('vision_read 拒绝越界路径与非图片扩展名', async () => {
   const read = toolOf(createVisionTools({ dsClient: mock.client, dataDir }), 'vision_read');
   const ctx = makeCtx(workspace);
 
+  // v64：`vision_read` 属**读类** ⇒ `trust.mode` 不管它；这条路径不存在，所以按"文件不存在"报，
+  // 但**不许**再出现边界拒绝那一条（那是旧口径的产物）
   const escape = await read.handler({ paths: ['../outside.png'] }, ctx);
-  assert.equal(escape.error?.code, 'E_UNSAFE_PATH');
+  assert.notEqual(escape.error?.code, 'E_UNSAFE_PATH', '读类不该再有边界拒绝这条路');
 
   const unsupported = await read.handler({ paths: ['note.txt'] }, ctx);
   assert.equal(unsupported.error?.code, 'UNSUPPORTED_TYPE');

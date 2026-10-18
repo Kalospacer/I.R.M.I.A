@@ -24,6 +24,10 @@ import { fileURLToPath } from 'node:url';
 import test, { type TestContext } from 'node:test';
 
 import { defaultConfig, type AppConfig } from '../src/config/config.ts';
+import {
+  grantContextOfAny, grantHashOf, grantQuestionOfAny, isMcpRequest, parseGrantRequest,
+} from '../src/grant/mcp-grant.ts';
+import { skillGrantSummaryOf } from '../src/grant/skill-grant.ts';
 import { EventLog } from '../src/log/event-log.ts';
 import { emptyProjection, defaultVisibility } from '../src/log/types.ts';
 import type { AppEvent, Projection } from '../src/log/types.js';
@@ -52,6 +56,10 @@ interface Fixture {
   registry: ToolRegistry;
   server: WebServer;
   base: string;
+  /** 注入的投影（`grant-decide` 要读 `humanAsks`；替她落申请单那两条事件时也要折进来） */
+  projection: Projection;
+  /** 落一条事件并折进投影（与 `RealLoop.appendSync` 同形：`grant-decide` 的判据全读事件） */
+  append: (type: string, data: unknown) => AppEvent;
   /** 服务端诊断出口收到的行（`[web] skill-remove ...` 这类留痕靠它证明） */
   logLines: string[];
   readAll(): Promise<AppEvent[]>;
@@ -133,6 +141,20 @@ async function setup(
     registry,
     server,
     base: server.url(),
+    projection,
+    append: (type: string, data: unknown): AppEvent => {
+      const event = {
+        seq: log.nextSeq(),
+        ts: T0.toISOString(),
+        type,
+        data,
+        visibility: defaultVisibility(type),
+        origin: 'test/extensions-commands',
+      } as unknown as AppEvent;
+      log.append(event, { sync: true });
+      applyOne(projection, event);
+      return event;
+    },
     logLines,
     readAll: async () => {
       const out: AppEvent[] = [];
@@ -1532,4 +1554,168 @@ test('set-mention-keywords：形状错一律 400，且盘上那份一个字节�
     assert.equal(res.status, 400, `应当拒绝：${JSON.stringify(bad)}`);
   }
   assert.equal(readFileSync(fx.configPath, 'utf8'), before, '拒绝的请求不许碰配置文件');
+});
+
+// ──────────────────── 申请单那一下（grant-decide）：批准/驳回的通知与回执 ────────────────────
+//
+// 用户这一轮的第 ① 条判据：「**skill 批准要有和 mcp 批准一样的通知**」。
+// "一样"落成四条可断言的事实（这一节就是它们）：
+//   · **同一个事件**：`wake/manual`，`via: 'grant'`（界面据此渲染成框架卡片）；
+//   · **同一条代码路**：`grant-decide` → `wakeForGrant` → `appendSync('wake/manual', …)`；
+//   · **三态都有话说**：批准且落地 / 批准但没落地 / 被驳回（不是"只在日志里留一行"）；
+//   · **回执里那几格如实**：`woken` / `wakeSeq` / `receipt` / `restartRequired`。
+
+/** 替她把一份申请单落到 `data/grants/<id>.json`（她要做的就是这个动作） */
+function writeGrant(fx: Fixture, id: string, raw: unknown): string {
+  const dir = join(fx.dataDir, 'grants');
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${id}.json`);
+  writeFileSync(path, JSON.stringify(raw, null, 2), 'utf8');
+  return path;
+}
+
+/**
+ * 把「框架拾取那张单子」会落的两条事件摆好。
+ *
+ * 本文件的台子不跑 `RealLoop` 的 tick（拾取那一步在循环里），而 `grant-decide` 的判据**全读事件**
+ * ⇒ 拾取那一半只能这样给。给的内容与 `settleGrants` 落下的形状逐格相同。
+ */
+function raiseGrant(fx: Fixture, id: string, raw: Record<string, unknown>): void {
+  const parsed = parseGrantRequest(raw);
+  assert.equal(parsed.ok, true, parsed.ok === false ? parsed.detail : '');
+  if (!parsed.ok) return;
+  const request = parsed.request;
+  const question = grantQuestionOfAny(request);
+  const context = grantContextOfAny(request);
+  const askSeq = fx.append('human/asked', { question, context, turn: 0, source: 'system' }).seq;
+  const path = writeGrant(fx, id, raw);
+  fx.append('grant/requested', {
+    id, kind: request.kind, name: request.name, by: 'agent',
+    contentHash: grantHashOf(request), path,
+    reason: request.reason, turn: 0, question, context,
+    ...(isMcpRequest(request)
+      ? {
+        desc: request.desc, command: request.command, args: [...request.args],
+        envKeys: Object.keys(request.env), disabled: request.disabled,
+      }
+      // 技能那几格：描述 / 正文字节 / 文件数 / 脚本名单（内容与正文**不进事件**）
+      : skillGrantSummaryOf(request)),
+    askSeq,
+  });
+}
+
+/** 日志里那些 `wake/manual{via:'grant'}`（"通知"就是它们） */
+function grantWakesOf(events: readonly AppEvent[]): Array<{ note: string; via?: string; dedupeKey?: string }> {
+  return events
+    .filter((event) => event.type === 'wake/manual')
+    .map((event) => event.data as { note: string; via?: string; dedupeKey?: string })
+    .filter((data) => data.via === 'grant');
+}
+
+test('grant-decide（技能）：批准 ⇒ 装上 + 与 MCP 同一条通知（wake/manual · via=grant）', async (t) => {
+  const fx = await setup(t);
+  raiseGrant(fx, 's-1', {
+    kind: 'skill-install',
+    name: 'morning-review',
+    description: '每天早上翻一遍昨天的进展，落一份摘要',
+    body: '# 早上复盘\n\n1. 读昨天的日记\n',
+    files: [{ path: 'scripts/run.js', content: 'console.log(1)\n' }],
+    reason: '想每天固定做一次',
+  });
+  const configBefore = readFileSync(fx.configPath, 'utf8');
+
+  const res = await command(fx, 'grant-decide', { id: 's-1', decision: 'approve' });
+  assert.equal(res.status, 200, res.text);
+  const body = res.body as {
+    outcome: string; exec: { state: string }; woken: boolean; wakeSeq: number | null;
+    receipt: string; restartRequired: boolean; restartNote: string; skillInstalledSeq: number | null;
+  };
+  assert.equal(body.outcome, 'approved');
+  assert.equal(body.exec.state, 'ok');
+  // "批准 ⇒ 通知到"：**发得出去**（不是只在日志里留一行），回执里如实报
+  assert.equal(body.woken, true, '通知必须真的发出去');
+  assert.equal(typeof body.wakeSeq, 'number', '回执要给出那条唤醒的 seq');
+  assert.equal(typeof body.skillInstalledSeq, 'number', '信任门那条凭据也要落（不写 = 装了但看不见）');
+  assert.match(body.receipt, /装进技能根/u, '回执是技能那一支的措辞（不是"写进配置"）');
+  // 技能那一支**不写 config.json** ⇒ 不许说"mcp.servers 要重启"（那是实测到的一句假话）
+  assert.equal(body.restartRequired, false);
+  assert.equal(body.restartNote.includes('mcp.servers'), false);
+  assert.equal(readFileSync(fx.configPath, 'utf8'), configBefore, '技能批准不写配置');
+
+  const events = await fx.readAll();
+  const wakes = grantWakesOf(events);
+  assert.equal(wakes.length, 1, '一次决定恰好一条 via=grant 的唤醒');
+  assert.match(wakes[0]!.note, /装一个技能「morning-review」/u);
+  assert.match(wakes[0]!.note, /已被批准并且执行成功/u);
+  assert.match(wakes[0]!.note, /下一次归集/u, '索引什么时候变要与 MCP 同一口径（缓存保护）');
+  assert.match(wakes[0]!.note, /没有执行/u, '带脚本 ⇒ 必须说清框架一个都没跑');
+  assert.ok(!wakes[0]!.note.includes('MCP server'), '技能那一支不许说成 MCP server');
+  // 落地：目录 + 随包脚本 + 信任门凭据 + 结局文件（她读得到的那一份）
+  assert.ok(existsSync(join(fx.skillsRoot, 'skills', 'morning-review', 'scripts', 'run.js')));
+  assert.ok(events.some(
+    (event) => event.type === 'skill/installed' && (event.data as { by?: string }).by === 'human',
+  ));
+  assert.ok(existsSync(join(fx.dataDir, 'grants-resolved', 's-1.json')));
+});
+
+test('grant-decide（技能）：驳回 ⇒ 有回执、**不装**，并说清"这是人的决定"', async (t) => {
+  const fx = await setup(t);
+  raiseGrant(fx, 's-2', {
+    kind: 'skill-install',
+    name: 'morning-review',
+    description: '每天早上翻一遍昨天的进展，落一份摘要',
+    body: '# 早上复盘\n',
+    files: [],
+    reason: '想每天固定做一次',
+  });
+
+  const res = await command(fx, 'grant-decide', {
+    id: 's-2', decision: 'reject', reason: '不想让它常驻',
+  });
+  assert.equal(res.status, 200, res.text);
+  const body = res.body as {
+    outcome: string; exec: { state: string }; woken: boolean; receipt: string; restartRequired: boolean;
+  };
+  assert.equal(body.outcome, 'rejected');
+  assert.equal(body.exec.state, 'not-applicable', '驳回 = 没有可执行的东西（不是"执行失败"）');
+  assert.equal(body.woken, true, '驳回同样要通知到她（这是决定，不是没人理）');
+  assert.equal(body.restartRequired, false);
+  assert.match(body.receipt, /人驳回了这张申请单，理由是：不想让它常驻/u);
+
+  const events = await fx.readAll();
+  const wakes = grantWakesOf(events);
+  assert.equal(wakes.length, 1);
+  assert.match(wakes[0]!.note, /装一个技能「morning-review」.*被驳回了/u);
+  assert.match(wakes[0]!.note, /他写的理由是：「不想让它常驻」/u);
+  // 驳回 = 一个文件都不建、一条信任凭据都不写
+  assert.equal(existsSync(join(fx.skillsRoot, 'skills', 'morning-review')), false, '驳回不许装');
+  assert.equal(events.some((event) => event.type === 'skill/installed'), false);
+  assert.ok(existsSync(join(fx.dataDir, 'grants-resolved', 's-2.json')), '结局照样留一份（她读得到）');
+});
+
+test('grant-decide（MCP）：同一处通知路径（via=grant）——技能那一条不是另开一路', async (t) => {
+  const fx = await setup(t);
+  raiseGrant(fx, 'g-1', {
+    kind: 'mcp-add',
+    name: 'obscura',
+    desc: '读本机浏览器历史与当前标签页',
+    command: 'node',
+    args: ['C:\\nowhere\\not-a-real-mcp-server.js'],
+    reason: '想用它看本机浏览器里开着什么',
+  });
+
+  const res = await command(fx, 'grant-decide', { id: 'g-1', decision: 'approve' });
+  assert.equal(res.status, 200, res.text);
+  const body = res.body as { outcome: string; exec: { state: string }; woken: boolean; receipt: string };
+  assert.equal(body.outcome, 'approved');
+  assert.equal(body.exec.state, 'ok');
+  assert.equal(body.woken, true);
+  assert.match(body.receipt, /写进配置/u, 'MCP 那一支的措辞是"写进配置"（两支同一入口、不同说法）');
+
+  const wakes = grantWakesOf(await fx.readAll());
+  assert.equal(wakes.length, 1);
+  assert.match(wakes[0]!.note, /加 MCP server「obscura」/u);
+  // 两条路（技能与 MCP）的通知是**同一格**：同一事件类型、同一个 via、同一种幂等键形状
+  assert.match(String(wakes[0]!.dedupeKey), /^grant-/u);
+  assert.equal((fx.configDoc()['mcp'] as { servers: Array<{ name: string }> }).servers[0]!.name, 'obscura');
 });

@@ -46,11 +46,17 @@
  *    `taskkill /T /F` 杀**进程树**——只杀父进程会留下仍在写盘的后代，
  *    那是 review.md 缺陷 6 的 zombie。输出截断头 8k + 尾 2k 并附续读指导。
  *
- * 6. **活动边界**（`config.trust.mode`，2026-10-05）：`'full'`（默认）**不拦**——她能在任意
- *    目录跑命令；`'workspace'` 时两处要判：① `workdir` 必须落在 `trust.workspaceRoot` 内
- *    （此前 `assertWorkdir` 只判 `isDirectory()`，实测可以选 `C:\Windows`）；② 命令行里出现的
- *    **绝对路径字面量**（`[A-Za-z]:\` 与 `\\` 开头）必须在边界内，否则整条命令拒绝、原因说清
- *    边界在哪。判据与 fs 工具族**同一份**（`tools/boundary.ts` 的 `isInside`）。
+ * 6. **活动边界**（`config.trust.mode`，2026-10-05；v64 归类为**写类**）：`'full'`（默认）**不拦**
+ *    ——她能在任意目录跑命令；`'workspace'` 时两处要判：① `workdir` 必须落在
+ *    `trust.workspaceRoot` 内（此前 `assertWorkdir` 只判 `isDirectory()`，实测可以选 `C:\Windows`）；
+ *    ② 命令行里出现的**绝对路径字面量**（`[A-Za-z]:\` 与 `\\` 开头）必须在边界内，否则整条命令拒绝、
+ *    原因说清边界在哪。判据与 fs 工具族**同一份**（`tools/boundary.ts` 的 `isInside`）。
+ *
+ *    ⚠️ **v64 把这条边界归到"写"这一类**（用户 2026-10-13：「当开启工作目录模式时，**写操作**被限制到
+ *    自身目录内」）：`pwsh` 能改盘上的东西 ⇒ 它按写类受限（`fs/path-guard.ts` 的 `access: 'write'`
+ *    是那条判据的入口；`pwsh` 自己走上面这两处判断，语义相同）。
+ *    ⚠️ **但只能管住上面那两处**：脚本内部（变量拼出来的路径、`..` 上升、子进程）仍可写到盘外——
+ *    这是**既有事实**，不许读成"已经拦住"；真正兜底的是 destructive 门、黑名单与人工确认。
  *
  *    ⚠️ 这条边界管的是"能在哪儿动"，**不是**"能改什么"：`FORBIDDEN_PATTERNS` 黑名单照旧
  *    （删除、格式化、注册表、关机…在两种模式下都拒绝），destructive 默认关闭也照旧。
@@ -104,6 +110,13 @@ import { dirname, join, resolve } from 'node:path';
 import type { Readable } from 'node:stream';
 
 import { boundaryFixHint, boundaryScopeNote, effectiveBoundaryRoot, isInside } from './boundary.ts';
+import {
+  POWERSHELL_UTF8_HEADER,
+  decodeConsoleText,
+  decodeText,
+  utf8ConsoleEnv,
+  type DecodedText,
+} from '../util/bytes-text.ts';
 import type { ToolContext, ToolDefinition, ToolHandlerResult } from './types.js';
 import {
   TOOL_ERROR_CODES,
@@ -285,8 +298,24 @@ export interface PwshToolOptions {
    * 不传则退回"自己探一次 PATH 上的 pwsh"（CLI 窄路径与单测）。
    */
   depsProbe?: PowerShellDepProbe | undefined;
+  /**
+   * 托管 Python 的自包含 pip 配置路径（`<数据Dir>/tools/python/pip.ini`，由宿主给出——
+   * tools 层不知道 dataDir 在哪，与 `depsProbe` 同一条分工）。
+   *
+   * 给了它并且**文件真的在盘上**时，`lang:'python'` 那一段脚本的子进程会带上
+   * `PIP_CONFIG_FILE=<它>`（镜像 / 超时 / 代理都写在那一个文件里，于是她的 pip 配置自包含）。
+   * **另两档（`pwsh` / `node`）一个字节都不加**——那对它们毫无意义，设上就是污染别人的环境。
+   */
+  pythonPipConfigFile?: string | undefined;
+  /**
+   * 非 pwsh 那两档的**解释器候选接缝**（宿主注入；见 `LangDepProbe`）。
+   *
+   * 给了它就有"**PATH 优先、托管兜底**"：先用机器上本来就有的那份（名字链 `python3` /
+   * `python`，走 PATH），**一个都没有**时才用框架自装目录里那一份。
+   * 不给 = 与 v52 逐字相同的纯 PATH 行为（CLI 窄路径与大多数单测）。
+   */
+  langProbe?: LangDepProbe | undefined;
 }
-
 export interface PwshToolDefinition extends ToolDefinition {
   /** 当前探测结果（缓存；宿主启动时读版本与路径记 session/start） */
   probe(): Promise<PowerShellProbe>;
@@ -618,46 +647,90 @@ export function truncateOutput(
 }
 
 /**
+ * 子进程输出 → 文本。**判据已收口到 `util/bytes-text.ts`**（`decodeConsoleText`）：
+ * 严格 UTF-8 → 严格 UTF-16 BOM → 严格 GB18030 → 混编码时"谁留下的无法映射字符更少"。
+ *
+ * 为什么需要回落（2026-10-16；392 条回执的来源就是这个）：
+ * 命令本体走 base64 + `Invoke-Expression`，所以子进程（python / node / 老的 exe）**从我们这里
+ * 拿到的编码始终是 UTF-8**；但**它写回来的字节**取决于它自己的控制台代码页——中文 Windows 上
+ * 常是 GBK（cp936）。`SCRIPT_HEADER` 里那几条设置管得住 PowerShell 自己的输出流，管不住
+ * 子进程：那是一个独立进程、自己决定往管道里写什么字节。于是 `setEncoding('utf8')` 把 GBK
+ * 字节解成一串 `U+FFFD`，而且**原有的字节在字符串化那一刻就已经丢了**——事后无从补救。
+ *
+ * 所以捕获层存**原始字节**，解码推迟到这里，一次读完再判。
+ *
+ * ⚠ **判据是"哪个无法映射的字符少"，不是"猜内容"**：我们不改写、不纠正任何字符。
+ * 2026-10-18 起还有一件事变了：**绝不静默产出 U+FFFD**——真到两档都失败时，
+ * 回执会写明"按 X 解、N 处无法映射"（见 `composeContent` 的 `[编码]` 段）。
+ */
+export function decodeConsole(bytes: Uint8Array): string {
+  return decodeConsoleText(bytes).text;
+}
+
+/** 解码的完整读数（`decodeConsole` 只要文本，回执要能说出"按什么解、有没有损"） */
+export function decodeConsoleResult(bytes: Uint8Array): DecodedText {
+  return decodeConsoleText(bytes);
+}
+
+/**
  * 有界文本缓冲：保留头 headLimit + 尾 tailLimit，中间丢弃并计数。
  * 两个用途合一的理由：结束标记**总是最后写出**，所以它必然落在保留下来的尾部里，
  * 边界解析与内存保护用同一个结构即可，不需要两套累积逻辑。
+ *
+ * **内部存原始字节**（2026-10-16）：`push` 收 `Buffer`（暂存字符串时按 UTF-8 转字节），
+ * `text()` / `window()` 在**读的那一刻**才解码，于是 {@link decodeConsole} 的
+ * "UTF-8 不行就 GBK"这一次判断能看见完整的字节序列。头/尾两道闸按**字节**计
+ * （与 `MAX_CAPTURE_CHARS` 的语义差一个常数因子：UTF-8 中文 3 字节/字，这个上限本来就是
+ * 内存保护、不是精确配额，收紧方向是安全的）。
  */
 export class BoundedText {
   readonly #headLimit: number;
   readonly #tailLimit: number;
-  #head = '';
-  #tail = '';
+  #head: Buffer = Buffer.alloc(0);
+  #tail: Buffer = Buffer.alloc(0);
   #dropped = 0;
+  /** 最近一次读出的解码读数（回执靠它说"按什么解、有没有损"） */
+  #decode: DecodedText | null = null;
 
   constructor(limit = MAX_CAPTURE_CHARS) {
     this.#headLimit = Math.floor(limit / 2);
     this.#tailLimit = limit - this.#headLimit;
   }
 
-  push(chunk: string): void {
+  push(chunk: Buffer | string): void {
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+    if (bytes.length === 0) return;
     if (this.#head.length < this.#headLimit) {
-      this.#head += chunk;
+      this.#head = Buffer.concat([this.#head, bytes]);
       if (this.#head.length > this.#headLimit) {
         // 头写满：溢出部分滚进尾部，此后头不再增长
-        this.#tail = this.#head.slice(this.#headLimit);
-        this.#head = this.#head.slice(0, this.#headLimit);
+        this.#tail = this.#head.subarray(this.#headLimit);
+        this.#head = this.#head.subarray(0, this.#headLimit);
       }
       return;
     }
-    this.#tail += chunk;
+    this.#tail = Buffer.concat([this.#tail, bytes]);
     if (this.#tail.length > this.#tailLimit) {
       this.#dropped += this.#tail.length - this.#tailLimit;
-      this.#tail = this.#tail.slice(-this.#tailLimit);
+      this.#tail = this.#tail.subarray(-this.#tailLimit);
     }
   }
 
+  /** 捕获层丢弃的**字节数**（展示层那句话说的是"字"，量纲差一个常数因子，见类注释） */
   get droppedChars(): number {
     return this.#dropped;
   }
 
   /** 保留下的文本（中间被丢弃时是头尾直接相接，省略说明由展示层负责） */
   text(): string {
-    return this.#head + this.#tail;
+    const decoded = decodeConsoleText(Buffer.concat([this.#head, this.#tail]));
+    this.#decode = decoded;
+    return decoded.text;
+  }
+
+  /** {@link text} 那一次的完整解码读数（`text()` 没被调用过时为 null） */
+  get decode(): DecodedText | null {
+    return this.#decode;
   }
 
   /**
@@ -665,7 +738,7 @@ export class BoundedText {
    * 为什么不是 `#tail` 单独一段：短输出时尾部为空（全在头部），那样永远找不到标记。
    */
   window(): string {
-    const all = this.#head + this.#tail;
+    const all = this.text();
     return all.length <= MARKER_WINDOW_CHARS ? all : all.slice(-MARKER_WINDOW_CHARS);
   }
 
@@ -717,7 +790,20 @@ function toCommandBase64(command: string): string {
  */
 const SCRIPT_HEADER = [
   "$ErrorActionPreference='Continue'",
-  '[Console]::OutputEncoding=[Text.Encoding]::UTF8',
+  // 编码那几条**从 `util/bytes-text.ts` 取**（2026-10-18 收口）：全仓只有那一处定义
+  // "把控制台逼成 UTF-8"的三条设置，别的 spawn 也引同一份，不存在两处各写一套而漂移。
+  //
+  // ⚠ v52 删掉了这里的 `[Console]::SetError([Console]::Out)`（**一处知情的口径变更**）：
+  // 它当年的作用是"把 PowerShell 的 error stream 并进 stdout，否则错误会被序列化成
+  // `<# CLIXML …>` XML（模型完全读不懂）"。加了 `lang` 之后这条口径站不住了——
+  // IRMIA 2026-10-12 的第 1 条要求是"**三种 lang 都返回同一套 stdout / stderr / exit code / 耗时**"，
+  // 而 python / node 的 stderr 天然是独立流（强行合并等于把两档的报错混进正文）。
+  // 合并 stdout 之后，`Write-Error` 的文本会落在**正文**里，而另两档落在 `[stderr]` 段里
+  // ⇒ 同一件事在三个档三种位置，正是她不想记的那套东西。
+  // 所以：**stderr 就是 stderr**（`composeContent` 逐档同一个 `[stderr]` 段头）。
+  // CLIXML 那一层没有丢：`stripClixml` 照旧按锚定剥离（5.1 在非控制台句柄上仍会输出它），
+  // `ERROR_FLUSH` 那份逐条回显也不再需要（错误本来就在 stderr 上，回显只会变成第二份）。
+  ...POWERSHELL_UTF8_HEADER,
 ].join('\n');
 
 /** 把命令包进 try/catch（catch 留空：错误已经在 stderr 上，catch 只负责不中断会话） */
@@ -895,7 +981,55 @@ async function removeTmpDirIfEmpty(dir: string): Promise<void> {
 }
 
 /**
- * 解释器探测（python / node）：跑一次 `--version`，成功即认定可用。
+ * **解释器候选的两槽结论**（只有 python 有"托管"这回事：`node` 不在外部依赖清单里，
+ * 它由机器自己装 —— 所以这个接缝只回答 python）。
+ *
+ * 为什么要有这个接缝：`tools` 层不知道 dataDir 与配置在哪（那是宿主的事），而"本机有没有
+ * 可用的 python、在哪"这件事由 `src/deps/` 统一回答。**探测一次、结论传进来**：
+ * `deps` 回答"两处各有什么"，这里回答"先用哪一个、用不了怎么办"。
+ *
+ * 为什么是**两槽**而不是一个"答案"（用户 2026-10-17 翻正的那一次）：
+ * 上一版宿主直接把赢家交给工具，而当时的口径是"托管优先"——于是"PATH 上有一个现成的"
+ * 这件事在工具层根本看不见。现在工具自己定顺序（见 `resolveInterpreter`），
+ * 就必须同时拿到两处**各自**的候选，否则"PATH 优先"只能靠重新探一遍 PATH 来实现。
+ *
+ * ⚠ **PATH 优先、托管兜底**（用户的原话：「**Python 和 pip 不应该是默认要求装的，
+ * 而是有就用 PATH 里的。没有的话就要求装。**」）：
+ *   · `pathSlot`   = 机器上本来那一份（PATH 上的裸名，或 `deps.paths.python` 指的路径）；
+ *   · `managedSlot`= 框架自装目录 `<数据Dir>/tools/python/` 里那一份（**兜底**；
+ *     一键安装的落点，本来是给"这台机器一个 python 都没有"的机器准备的）。
+ *
+ * `pipConfigFile` 只在**真的用到托管那一份**时才有值（`<数据Dir>/tools/python/pip.ini`，
+ * 引导步骤写的）——系统那份旁边没有我们的 pip.ini，硬塞过去就是改掉她自己的 pip 配置。
+ */
+export interface LangDepProbeOutcome {
+  /** PATH / 用户指定那一槽的候选；两处都没有时 null */
+  pathSlot: string | null;
+  /** 框架自装目录里那一槽的候选（完整路径）；托管没装时 null */
+  managedSlot: string | null;
+  /** 用到 `managedSlot` 时随之生效的托管 pip 配置；否则 null */
+  pipConfigFile: string | null;
+}
+
+/** 宿主注入的解释器候选接缝（`undefined` = 与 v52 逐字相同的纯 PATH 行为） */
+export type LangDepProbe = () => Promise<LangDepProbeOutcome>;
+
+/**
+ * 解析出来的解释器：`exe` / `version` 之外还带上**它是哪一份**。
+ *
+ * `managed` 那一格是给回执用的（用户 2026-10-17：「回执里要说清**用的是哪一个 python**
+ * ——PATH 的还是托管的」）：只写路径时，`C:\...\tools\python\python.exe` 与
+ * `C:\Python311\python.exe` 要人去分辨，而"这一次到底用了谁"是这个工具必须自己说清的事。
+ */
+interface ResolvedInterpreter {
+  exe: string;
+  version: string;
+  pipConfigFile: string | null;
+  /** true = 用的是框架托管那一份（`<数据Dir>/tools/<名字>/` 下那个） */
+  managed: boolean;
+}
+
+/** 解释器探测（python / node）：跑一次 `--version`，成功即认定可用。
  *
  * 探测结果**按语言缓存**（进程生命周期内一次）：与 `detectPowerShell` 的缓存同一条纪律
  * ——"这台机器有没有 python"在一次会话里不会变，而每次调用都起一个进程问版本是纯浪费。
@@ -923,16 +1057,18 @@ async function probeInterpreter(exe: string): Promise<string | null> {
       killTree(child.pid);
       finish(null);
     }, INTERPRETER_PROBE_TIMEOUT_MS);
-    let out = '';
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (data: string) => { out += data; });
+    // **收原始字节**（2026-10-18）：版本串本身是 ASCII，但这条命令的 stderr 里可能带着
+    // 发行版自己写的中文诊断（cp936 字节）。同一个函数产出的文本会被拿去判"这是哪个解释器"，
+    // 拿不准就会把另一门语言认成 python——那比一句乱码贵得多。
+    const outChunks: Buffer[] = [];
+    child.stdout.on('data', (data: Buffer) => { outChunks.push(data); });
     child.stdout.on('error', () => undefined);
     // 有的解释器把版本写 stderr（node 早期版本、部分 python 发行版），两路一起收
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (data: string) => { out += data; });
+    child.stderr.on('data', (data: Buffer) => { outChunks.push(data); });
     child.stderr.on('error', () => undefined);
     child.on('error', () => finish(null));
     child.on('close', () => {
+      const out = decodeText(Buffer.concat(outChunks)).text;
       const version = out.trim().split(/\r?\n/, 1)[0]?.trim() ?? '';
       finish(version === '' ? null : version);
     });
@@ -970,16 +1106,17 @@ function probeVersion(exe: string): Promise<string | null> {
       finish(null);
     }, PROBE_TIMEOUT_MS);
 
-    let out = '';
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (data: string) => {
-      out += data;
+    // **收原始字节**（2026-10-18）：同 `probeInterpreter`，版本串走同一条判定链
+    const outChunks: Buffer[] = [];
+    child.stdout.on('data', (data: Buffer) => {
+      outChunks.push(data);
     });
     child.stdout.on('error', () => undefined);
     child.stderr.on('data', () => undefined);
     child.stderr.on('error', () => undefined);
     child.on('error', () => finish(null));
     child.on('close', () => {
+      const out = decodeText(Buffer.concat(outChunks)).text;
       const version = out.trim().split(/\r?\n/, 1)[0]?.trim() ?? '';
       finish(version === '' ? null : version);
     });
@@ -1140,6 +1277,14 @@ export interface ExecOutcome {
    * 缺省 null = 没量到（不该出现，只是别编一个数出来）。
    */
   elapsedMs?: number | null;
+  /**
+   * 捕获层这次是按什么编码把字节解成文本的（2026-10-18）。
+   *
+   * 为什么必须带出来：回执要能说出"这份输出不是 UTF-8，是按 GB18030 解的、有 N 处无法映射"。
+   * **宁可说出来，不许装作没事**——历史那 14,759 条 pwsh 乱码回执全部是"解错了却什么都不说"。
+   * 缺省 undefined = 这一趟还没解过（空输出等），此时不提。
+   */
+  decode?: { encoding: string; replaced: number; lossy: boolean } | undefined;
 }
 
 function emptyOutcome(patch: Partial<ExecOutcome> = {}): ExecOutcome {
@@ -1157,13 +1302,42 @@ function emptyOutcome(patch: Partial<ExecOutcome> = {}): ExecOutcome {
   };
 }
 
+/**
+ * 两路缓冲的解码读数，取"**更有损**"的那一份。
+ *
+ * 只看 stdout 会把 stderr 上的乱码藏起来（PowerShell 的报错就在 stderr 上）。
+ * 两边都是合法 UTF-8 时返回 `{ encoding: 'utf8' }` —— `composeContent` 见到它就一个字都不说。
+ */
+function decodeOf(...buffers: readonly BoundedText[]): ExecOutcome['decode'] {
+  const readings = buffers.map((buffer) => buffer.decode).filter((value): value is DecodedText => value !== null);
+  if (readings.length === 0) return undefined;
+  const worst = readings.find((value) => value.lossy)
+    ?? readings.find((value) => value.encoding !== 'utf8')
+    ?? readings[0];
+  if (worst === undefined) return undefined;
+  return { encoding: worst.encoding, replaced: worst.replaced, lossy: worst.lossy };
+}
+
 /** 把捕获结果整理成给模型看的文本：输出 + stderr + 状态行（退出码 · 耗时）+ 截断说明 */
 export function composeContent(outcome: ExecOutcome): string {
   const blocks: string[] = [];
-  const stdout = normalizeNewlines(stripClixml(outcome.stdout));
+  // ANSI 剥除（2026-10-16）：**所有 pwsh 回执出站前都走这一处**——它是三档（pwsh / python /
+  // node）唯一的共同出口，也是回执进上下文（或写进 jobs 输出文件）之前的最后一站。
+  //
+  // 为什么提到这里：原来只有 CLIXML 那条路（`decodeClixmlErrors`）剥 ANSI，于是**同一台机器上
+  // 同一个命令，报错走 CLIXML 就干净、走 stdout 就带着 `ESC[31;1m` 一类的装饰**进她的上下文。
+  // 那些字节她读不了、只占位置（这正是"减少输入"要治的东西之一）。
+  //
+  // 复用 `ANSI_RE`、**不新写正则**：它是这个仓库里"ANSI 颜色序列"的唯一定义，两处各写一份
+  // 迟早漂成"CLIXML 那条剥得掉、这条剥不掉"。
+  //
+  // 位置在 `stripClixml` / `decodeClixmlErrors` **之外**：那两处各按 CLIXML 的锚点先解包，
+  // 解出来的文本再统一过这一道（`decodeClixmlErrors` 内部那次剥除保留——它自己也要保证
+  // 输出干净，重复剥一次无副作用）。
+  const stdout = normalizeNewlines(stripClixml(outcome.stdout).replace(ANSI_RE, ''));
   // stderr 走**解码**（不是丢弃）：PowerShell 的错误在管道上会被 CLIXML 包一层，
   // 而另两档的报错是纯文本——三档要同一套读数，见 decodeClixmlErrors 的注释
-  const stderr = normalizeNewlines(decodeClixmlErrors(outcome.stderr));
+  const stderr = normalizeNewlines(decodeClixmlErrors(outcome.stderr).replace(ANSI_RE, ''));
 
   if (stdout.trim() !== '') {
     blocks.push(truncateOutput(stdout).text);
@@ -1177,6 +1351,19 @@ export function composeContent(outcome: ExecOutcome): string {
     blocks.push(
       `[注] 输出过大，捕获阶段已丢弃中间 ${outcome.droppedChars} 字；`
       + '如需完整内容，请把结果写入文件后再分段读取。',
+    );
+  }
+  // 编码那段实话（2026-10-18）：子进程输出不是 UTF-8 时**必须说**，否则她看到的是一串
+  // 看着像字、其实是另一种解读的字符。正常路径（合法 UTF-8）这一段完全不出现。
+  const decoding = outcome.decode;
+  if (decoding !== undefined && decoding.encoding !== 'utf8') {
+    const loss = decoding.lossy ? `，其中 ${decoding.replaced} 处无法映射` : '';
+    const advice = decoding.lossy
+      ? '要保真请看原始字节（例如把输出写进文件后用 safe_read），或让命令自己显式按 UTF-8 输出。'
+      : '字节没丢，只是这份字节本身不是 UTF-8。';
+    blocks.push(
+      `[编码] 子进程输出不是 UTF-8，已按 ${decoding.encoding} 解码${loss}：`
+      + `上面的非 ASCII 字符是"同一份字节的另一种解读"${advice}`,
     );
   }
   // 状态行：**三档（pwsh / python / node）逐字同一套**（IRMIA 2026-10-12 的第 1 条：
@@ -1270,10 +1457,10 @@ class PersistentSession {
     this.#child = child;
     this.#dead = false;
 
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (data: string) => this.#onData(generation, 'stdout', data));
-    child.stderr.on('data', (data: string) => this.#onData(generation, 'stderr', data));
+    // 收**原始字节**（不下 `setEncoding('utf8')`）：解码推迟到读的那一刻，见 `decodeConsole`
+    // ——子进程按控制台代码页（中文 Windows 上常是 GBK）写回来的字节，只有拿得到字节才救得回来。
+    child.stdout.on('data', (data: Buffer) => this.#onData(generation, 'stdout', data));
+    child.stderr.on('data', (data: Buffer) => this.#onData(generation, 'stderr', data));
     // stdin 的 EPIPE 是"会话刚死、写还在路上"的正常竞态，不能让它变成未捕获异常
     child.stdin.on('error', () => undefined);
     child.stdout.on('error', () => undefined);
@@ -1283,7 +1470,7 @@ class PersistentSession {
     return restarted;
   }
 
-  #onData(generation: number, channel: 'stdout' | 'stderr', data: string): void {
+  #onData(generation: number, channel: 'stdout' | 'stderr', data: Buffer): void {
     if (generation !== this.#generation) return; // 上一代会话的迟到数据
     const round = this.#round;
     if (round === null) return;
@@ -1303,6 +1490,7 @@ class PersistentSession {
       exitCode: code,
       sessionLost: true,
       droppedChars: round.stdout.droppedChars + round.stderr.droppedChars,
+      decode: decodeOf(round.stdout, round.stderr),
     }));
   }
 
@@ -1335,6 +1523,7 @@ class PersistentSession {
         stderr,
         exitCode: Number(stdoutMatch[1]),
         droppedChars: round.stdout.droppedChars + round.stderr.droppedChars,
+        decode: decodeOf(round.stdout, round.stderr),
       }));
     };
 
@@ -1405,6 +1594,7 @@ class PersistentSession {
         stderr: round.stderr.text(),
         timedOut: true,
         droppedChars: round.stdout.droppedChars + round.stderr.droppedChars,
+        decode: decodeOf(round.stdout, round.stderr),
       }));
     }, request.timeoutMs);
 
@@ -1416,6 +1606,7 @@ class PersistentSession {
         stderr: round.stderr.text(),
         aborted: true,
         droppedChars: round.stdout.droppedChars + round.stderr.droppedChars,
+        decode: decodeOf(round.stdout, round.stderr),
       }));
     };
     if (request.signal.aborted) onAbort();
@@ -1475,27 +1666,48 @@ interface SpawnedChild {
 }
 
 /**
- * 子进程的环境：**强制 UTF-8 输出**（`PYTHONIOENCODING` / `PYTHONUTF8`）。
+ * 子进程的环境：**强制 UTF-8 输出**（`PYTHONIOENCODING` / `PYTHONUTF8`），
+ * 外加 **只给 `lang:'python'` 那一档**的 `PIP_CONFIG_FILE`。
  *
- * 为什么必须有（v52 实测踩到）：Windows 上 python 的 stdout 默认走**控制台代码页**
+ * 为什么必须有 UTF-8 那两句（v52 实测踩到）：Windows 上 python 的 stdout 默认走**控制台代码页**
  * （这台机器是 GBK/936），于是 `print("中文")` 出来的字节以 utf-8 解码后是乱码
  * （实测回执里就是 `�������`）。PowerShell 那条路早就用 `[Console]::OutputEncoding=UTF8`
  * 抹平了同一件事（文件头第 3 条），python 这一档缺的就是那一句的等价物。
  * node 的 `console.log` 本来就写 utf-8，这两个环境变量对它无害。
+ *
+ * `pipConfigFile` 是用户 2026-10-16 点名的加分项（「让她的 pip 配置**自包含**」）：
+ * 托管 Python 的引导步骤会在 `<数据Dir>/tools/python/pip.ini` 写一份配置（镜像 / 超时 /
+ * 代理的落点都在这一个文件里），**靠这个变量指过去才生效**——不设时 pip 读的是
+ * 用户级 `%APPDATA%\pip\pip.ini`，那是**用户的**配置，框架不去改它、也不该假装自己改了。
+ *
+ * **只给 python 档**（`lang: 'pwsh' | 'node'` 时一个字节都不加）：`PIP_CONFIG_FILE` 对
+ * PowerShell 与 node 毫无意义，给它们也设上就是**污染别人的环境**——而环境是会被子进程
+ * 里的任何东西读到的（`$env:PIP_CONFIG_FILE` / `process.env.PIP_CONFIG_FILE`）。
+ * 这一条有专门用例钉着（见 test/admin-pwsh.test.ts 的 pip 环境那一组）。
+ *
+ * 2026-10-18：那两句 UTF-8 相关变量的**构造**收口到 `util/bytes-text.ts` 的
+ * `utf8ConsoleEnv`（别的 spawn 也引同一份），这里只负责"只给 python 档补 pip 配置"。
  */
-function utf8Env(): NodeJS.ProcessEnv {
-  return { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
+export function scriptEnv(lang: PwshLang, pipConfigFile: string | null = null): NodeJS.ProcessEnv {
+  const base: NodeJS.ProcessEnv = utf8ConsoleEnv();
+  if (lang === 'python' && pipConfigFile !== null) base['PIP_CONFIG_FILE'] = pipConfigFile;
+  return base;
 }
 
 /** 起一个独立子进程；**永不抛出**（spawn 的同步异常折成 `failure` 文本） */
-function spawnChild(exe: string, args: readonly string[], workdir: string): SpawnedChild {
+function spawnChild(
+  exe: string,
+  args: readonly string[],
+  workdir: string,
+  env: NodeJS.ProcessEnv = scriptEnv('pwsh'),
+): SpawnedChild {
   try {
     return {
       child: spawn(exe, [...args], {
         cwd: workdir,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
-        env: utf8Env(),
+        env,
       }),
       failure: null,
     };
@@ -1543,14 +1755,14 @@ function superviseChild(spawned: SpawnedChild, options: {
         stderr: stderr.text(),
         droppedChars: stdout.droppedChars + stderr.droppedChars,
         elapsedMs: Date.now() - startedAt,
+        decode: decodeOf(stdout, stderr),
         ...patch,
       }));
     };
 
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (data: string) => stdout.push(data));
-    child.stderr.on('data', (data: string) => stderr.push(data));
+    // 同持久会话那条路：收原始字节，读数时再解码（`decodeConsole`）
+    child.stdout.on('data', (data: Buffer) => stdout.push(data));
+    child.stderr.on('data', (data: Buffer) => stderr.push(data));
     child.stdout.on('error', () => undefined);
     child.stderr.on('error', () => undefined);
     // 'error' 事件（ENOENT 等）与 spawn 的同步异常是两条路，都要落到 spawnFailed
@@ -1597,6 +1809,11 @@ export interface ScriptRunRequest {
   timeoutMs: number;
   signal: AbortSignal;
   /**
+   * 非 pwsh 那两档的**托管解释器结论**（宿主注入；见 `LangDepProbe`）。
+   * 不给 = 直接走名字链（PATH），与 v52 的行为逐字相同。
+   */
+  langProbe?: LangDepProbe | undefined;
+  /**
    * PowerShell 档要探测出来的 shell；**另两档不用它**（各探各的解释器），可以不传。
    *
    * 为什么是可选而不是必填：python / node 那两档一个 PowerShell 字节都不用——
@@ -1604,6 +1821,12 @@ export interface ScriptRunRequest {
    * （见 handler 里那段"lazy 探测"的注释）。
    */
   probe?: PowerShellProbe | undefined;
+  /**
+   * 托管 Python 那份自包含 pip 配置（`<数据Dir>/tools/python/pip.ini`）。
+   * **只在 `lang: 'python'` 时**作为 `PIP_CONFIG_FILE` 传进子进程；另两档一个字节都不加。
+   * `null` = 没有（没装托管 Python / 文件不存在）⇒ 不设这个变量。
+   */
+  pipConfigFile?: string | null | undefined;
   onWarning: (message: string) => void;
 }
 
@@ -1613,6 +1836,12 @@ export interface ScriptRunOutcome extends ExecOutcome {
   interpreter: string | null;
   /** 解释器的版本行（探测得到时），回执里贴给她看 */
   interpreterVersion: string | null;
+  /**
+   * 用的是不是**框架托管那一份**（`<数据Dir>/tools/<名字>/` 下那个）。
+   * `null` = 这一档没走解释器解析（`pwsh` 档用的是 shell 探测结论）。
+   * 回执那一行 `[lang]` 靠它说清"PATH 上那个还是托管那个"。
+   */
+  interpreterManaged: boolean | null;
   /** 脚本落盘路径（跑完已删除；回执里给出来是为了让她能定位"是哪一段脚本"） */
   scriptPath: string | null;
 }
@@ -1632,15 +1861,20 @@ export async function runScriptFile(request: ScriptRunRequest): Promise<ScriptRu
     ...emptyOutcome(),
     interpreter: null,
     interpreterVersion: null,
+    interpreterManaged: null,
     scriptPath: null,
   };
 
   const dir = tmpScriptDirOf(request.workdir);
   const scriptPath = tmpScriptPathOf(request.workdir, request.lang);
 
-  // 解释器：pwsh 用本工具探测出来的 shell（必填），另两档按各自的名字链探（结果缓存）
+  // 解释器：pwsh 用本工具探测出来的 shell（必填），另两档按"**PATH 优先、托管兜底**"解析
   let exe: string;
   let version: string | null;
+  /** 用的是不是框架托管那一份（回执里要说清，见 `ScriptRunOutcome.interpreterManaged`） */
+  let interpreterManaged: boolean | null = null;
+  /** python 档这一次要带的 `PIP_CONFIG_FILE`（null = 不带） */
+  let managedPipConfig: string | null = null;
   if (request.lang === 'pwsh') {
     const shell = request.probe;
     if (shell === undefined) {
@@ -1649,18 +1883,31 @@ export async function runScriptFile(request: ScriptRunRequest): Promise<ScriptRu
     exe = shell.exe;
     version = shell.version;
   } else {
-    const resolved = await resolveInterpreter(request.lang);
+    const resolved = await resolveInterpreter(request.lang, request.langProbe);
     if (resolved === null) {
       return {
         ...base,
+        // 找不到时的回执（用户 2026-10-16 点名要的三件事都在这一句里）：
+        //   ① **试过什么**（`python3 / python`）——不然她只能瞎试；
+        //   ② **框架能替你装**（设置页「外部依赖」一键装，装完要复检）——这不是环境定局；
+        //   ③ **装好之后能干什么**（`lang:'python'` 里跑 `-m pip install` 自己扩能力）——
+        //      那正是用户要 pip 的理由，回执里不说清就等于没人知道这条路存在。
         stderr: `找不到可用的 ${LANG_SPECS[request.lang].label} 解释器（试过：`
           + `${LANG_INTERPRETERS[request.lang].join(' / ')}）。`
-          + '这一段脚本没有执行；请让人在这台机器上装一个，或改用 lang 的其它取值。',
+          + '这一段脚本没有执行。两条出路：① 改用 lang 的其它取值；'
+          + `② 去 GUI 设置页「外部依赖」把它**一键装上**（框架会装到数据目录下并当场复检，不必重启）`
+          + (request.lang === 'python'
+            ? '——装好之后你就能在 `lang:\'python\'` 里跑 `-m pip install <包>` 给自己扩能力。'
+            : '。'),
         spawnFailed: true,
       };
     }
     exe = resolved.exe;
     version = resolved.version;
+    interpreterManaged = resolved.managed;
+    // 托管结论带回来的 pip 配置**只在真的用托管那一份时**才有值（它是那个解释器旁边那份
+    // `pip.ini`）；宿主静态给的（`pythonPipConfigFile`）作为兜底——它只在文件真的存在时才有值。
+    managedPipConfig = resolved.pipConfigFile;
   }
 
   try {
@@ -1695,13 +1942,16 @@ export async function runScriptFile(request: ScriptRunRequest): Promise<ScriptRu
     const args: string[] = request.lang === 'pwsh'
       ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath]
       : [scriptPath];
-    const spawned = spawnChild(exe, args, request.workdir);
+    // 环境按 `lang` 分档：python 档带着自包含的 `PIP_CONFIG_FILE`（**只这一档**），
+    // 另两档用不带的。两个来源的优先级：**托管结论带回来的** > 宿主静态给的兜底。
+    const pipConfigFile = managedPipConfig ?? request.pipConfigFile ?? null;
+    const spawned = spawnChild(exe, args, request.workdir, scriptEnv(request.lang, pipConfigFile));
     const outcome = await superviseChild(spawned, {
       exe,
       timeoutMs: request.timeoutMs,
       signal: request.signal,
     });
-    return { ...outcome, interpreter: exe, interpreterVersion: version, scriptPath };
+    return { ...outcome, interpreter: exe, interpreterVersion: version, interpreterManaged, scriptPath };
   } finally {
     await removeTmpScript(scriptPath, request.onWarning);
     await removeTmpDirIfEmpty(dir);
@@ -1725,11 +1975,52 @@ export function resetInterpreterProbeCache(): void {
   interpreterCache.clear();
 }
 
-/** 按名字链找一个可用解释器（找不到返回 null，由调用方如实报错，不降级） */
-async function resolveInterpreter(lang: Exclude<PwshLang, 'pwsh'>): Promise<{ exe: string; version: string } | null> {
-  for (const name of LANG_INTERPRETERS[lang]) {
+/**
+ * 找一个可用解释器：**PATH 优先、托管兜底**（找不到返回 null，由调用方如实报错，不降级）。
+ *
+ * 顺序就是用户 2026-10-17 的口径（「**Python 和 pip 不应该是默认要求装的，而是有就用
+ * PATH 里的。没有的话就要求装。**」）：
+ *   ① 机器上本来那一份（名字链 `python3` / `python`，走 PATH）；
+ *   ② 一个都没有时才用框架自装目录里那一份（`managedSlot`，一键安装的落点）。
+ *
+ * 为什么必须先试 PATH 再问托管槽：托管那一份是**框架自己装的**，只在"这台机器什么都没有"
+ * 时才是这个人的选择。反过来先试它，就变成"装过一次框架的 python 之后，她原来那个
+ * 3.11.5 永远轮不到"——而那正是用户要翻掉的那件事。
+ *
+ * 两处都试过还是 null ⇒ 调用方如实报"这台机器上没有 python"（绝不偷偷换 PowerShell 去跑）。
+ */
+async function resolveInterpreter(
+  lang: Exclude<PwshLang, 'pwsh'>,
+  managed?: LangDepProbe | undefined,
+): Promise<ResolvedInterpreter | null> {
+  // 宿主那份结论只回答 python（node 不在外部依赖清单里），`lang !== 'python'` 时根本不问。
+  // 拿它**只拿两槽候选**，顺序由下面两段定——宿主给"答案"的话，"PATH 优先"就落不了地。
+  let slots: LangDepProbeOutcome = { pathSlot: null, managedSlot: null, pipConfigFile: null };
+  if (managed !== undefined && lang === 'python') {
+    try {
+      slots = await managed();
+    } catch {
+      // 宿主那份结论抛错不该让整档能力不可用：如实退回名字链（下面那段）
+    }
+  }
+
+  // ① **PATH 优先**：机器上本来就装好的那些（官方安装器 / 商店版 / 系统包的 node）。
+  //    第一发用宿主给的那一槽（它可能就是 `deps.paths.python` 指的那个位置），
+  //    然后是本工具自己的名字链——`probeInterpreterCached` 只认**真的能跑起来**的，
+  //    所以"PATH 上有名字但起不来"会继续往下试，而不是当场判无解。
+  const pathNames = slots.pathSlot === null
+    ? [...LANG_INTERPRETERS[lang]]
+    : [slots.pathSlot, ...LANG_INTERPRETERS[lang]];
+  for (const name of pathNames) {
     const found = await probeInterpreterCached(name);
-    if (found !== null) return found;
+    if (found !== null) return { ...found, pipConfigFile: null, managed: false };
+  }
+
+  // ② **托管兜底**：框架装的那一份（`<数据Dir>/tools/python/` 下、复检过的）。
+  //    走到这里意味着 PATH 上一个都没起来 —— 它旁边那份 `pip.ini` 这时才该生效。
+  if (slots.managedSlot !== null) {
+    const found = await probeInterpreterCached(slots.managedSlot);
+    if (found !== null) return { ...found, pipConfigFile: slots.pipConfigFile, managed: true };
   }
   return null;
 }
@@ -1787,6 +2078,32 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
 
   let session: PersistentSession | null = null;
   let backgroundSeq = 0;
+  /** 托管 Python 那份 `pip.ini` 解析了没有（一次解析、之后记住结论） */
+  let pipConfigResolved = false;
+  let pipConfigFile: string | null = null;
+
+  /**
+   * 托管 Python 的自包含 pip 配置（`<数据Dir>/tools/python/pip.ini`）。
+   *
+   * **只对 `lang:'python'` 那一档生效**，而且**文件真的在盘上**才算——那时才把它作为
+   * `PIP_CONFIG_FILE` 传进那段 python 子进程（见 `scriptEnv`）。三条理由：
+   *   · 不设时 pip 读的是**用户级** `%APPDATA%\pip\pip.ini`：那是用户的配置，
+   *     框架不去改它，但也不该让"她的 pip 配置是自包含的"这句话落空；
+   *   · 文件不存在时不设（给 pip 指一个不存在的配置文件没有任何好处）；
+   *   · **一次 stat 的代价，结论记住**：文件是引导步骤写的，装完就不会自己消失。
+   */
+  const pythonPipConfig = (): string | null => {
+    if (pipConfigResolved) return pipConfigFile;
+    pipConfigResolved = true;
+    const candidate = options.pythonPipConfigFile;
+    if (candidate === undefined || candidate === null || candidate === '') return (pipConfigFile = null);
+    try {
+      pipConfigFile = statSync(candidate).isFile() ? candidate : null;
+    } catch {
+      pipConfigFile = null;
+    }
+    return pipConfigFile;
+  };
 
   const probe = (): Promise<PowerShellProbe> => {
     probePromise ??= detectPowerShell(
@@ -2012,6 +2329,9 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
         timeoutMs: maxBackgroundMs,
         signal: new AbortController().signal,
         ...(resolved === undefined ? {} : { probe: resolved }),
+        // 后台档也带上（它同样是 python 那一段脚本，解释器与 pip 配置该与前台一致）
+        ...(options.langProbe === undefined ? {} : { langProbe: options.langProbe }),
+        pipConfigFile: pythonPipConfig(),
         onWarning: warn,
       }).then((outcome) => finishBackground(jobId, outcome, call.command));
 
@@ -2043,6 +2363,10 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
         timeoutMs: call.timeoutMs,
         signal: ctx.signal,
         ...(resolved === undefined ? {} : { probe: resolved }),
+        // 托管解释器结论（python 优先用它；node 档同样走它，只是 pip 配置用不上）
+        ...(options.langProbe === undefined ? {} : { langProbe: options.langProbe }),
+        // 宿主静态给的兜底 pip 配置（托管结论里带回来的那个优先，见 runScriptFile）
+        pipConfigFile: pythonPipConfig(),
         onWarning: warn,
       });
       outcome = scriptRun;
@@ -2085,8 +2409,14 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
     // 只说 shell 会让她以为这段 python 是被 PowerShell 跑的。
     notes.push(await shellLine());
     if (scriptRun !== null) {
+      // 「用的是哪一个 python」由这一行说清（用户 2026-10-16 要路径、2026-10-17 要"哪一份"）：
+      // PATH 上那个与托管那个都可能是完整路径，光看路径要人去分辨——所以来源也写出来。
+      // `null`（没走解释器解析，或没找到）时不加尾巴：那时路径本身就是全部信息。
+      const origin = scriptRun.interpreterManaged === null
+        ? ''
+        : (scriptRun.interpreterManaged ? '（框架托管那份）' : '（系统 PATH 上那份）');
       notes.push(
-        `[lang] ${call.lang} · ${scriptRun.interpreter ?? '解释器未找到'}`
+        `[lang] ${call.lang} · ${scriptRun.interpreter ?? '解释器未找到'}${origin}`
         + `${scriptRun.interpreterVersion === null ? '' : ` ${scriptRun.interpreterVersion}`}`
         + `（整段脚本写进临时文件执行，跑完已删除：${scriptRun.scriptPath ?? '(未落盘)'}；`
         + '这一档每次都是新进程，不继承持久会话的 cwd 与变量）',
@@ -2121,8 +2451,8 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
   return {
     name: PWSH_TOOL_NAME,
     description:
-      '把整段脚本交给它跑（多行/引号/中文不用转义）：lang 选 pwsh(默认)/python/node，'
-      + 'pwsh 保持会话 cwd 与变量、另两档每次新进程。超时 60s，输出头 8k 尾 2k。',
+      '把整段脚本交给它跑（多行/引号/中文不用转义）：lang 选 pwsh（默认，保持会话 cwd 与变量）'
+      + '/python/node（每次新进程）。工作目录默认是仓库根；超时 60s，输出头 8k 尾 2k。',
     parameters: {
       type: 'object',
       properties: {
@@ -2149,7 +2479,7 @@ export function createPwshTool(options: PwshToolOptions = {}): PwshToolDefinitio
           // `Set-Location` 过的目录，在下一档里还算数——两者都不算数，实测用例钉着。
           description: 'pwsh(默认) / python / node；后两档每次新进程、cwd 不跟 shell 会话',
         },
-        workdir: { type: 'string', description: '工作目录；省略则用会话当前目录（首轮=工作根）' },
+        workdir: { type: 'string', description: '工作目录；省略则用会话当前目录（首轮=仓库根）' },
         timeoutMs: {
           type: 'integer',
           description: `超时毫秒数（${PWSH_MIN_TIMEOUT_MS}..${PWSH_MAX_TIMEOUT_MS}），默认 ${PWSH_TIMEOUT_MS}`,

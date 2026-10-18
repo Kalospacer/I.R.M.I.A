@@ -494,7 +494,7 @@ test('doctor ④：缓存内容真的不同时仍报损坏（剔掉 watermark �
 test('I11：工具输出里的日志原文不算泄漏——她自己翻日志是常事', async (t) => {
   // 一次实测误报（2026-10-01 turn 20）：她跑 doctor，列出五条"整条 internal 事件出现在请求体里"
   // 的 LEAK（budget/rollover、turn/start、step/start…），照着追了一遍，全是假的。
-  // 根因是这条不变量把**工具输出**也算进了"请求体文本"——而她 rg_search / safe_read
+  // 根因是这条不变量把**工具输出**也算进了"请求体文本"——而她 grep / safe_read
   // 读事件日志时，日志原文（含整行 internal 事件）会合法地进上下文。判据该问的是
   // "渲染层有没有把 internal 事件当成上下文内容放进去"，与她用工具读到了什么无关。
   const diffHash = 'a'.repeat(64);

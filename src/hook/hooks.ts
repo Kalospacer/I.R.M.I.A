@@ -36,6 +36,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { killProcessTree } from '../process/kill-tree.ts';
+import { decodeText, utf8ConsoleEnv } from '../util/bytes-text.ts';
 import type { Projection } from '../log/types.js';
 import type {
   ToolHookDecision, ToolHookRequest, ToolResultView,
@@ -205,7 +206,10 @@ export const defaultHookSpawner: HookSpawner = (task) => {
     shell: true,
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: task.env,
+    // 钩子的输出是要被判读的文本：让子进程按 UTF-8 写（见 util/bytes-text.ts）。
+    // **不在这里合并 `process.env`**：`task.env` 默认就是 `process.env`（见 HookEngine 的
+    // `options.env ?? process.env`），注入替身时那些用例要的是"只给这一份"。
+    env: utf8ConsoleEnv(task.env),
   });
 
   const outHandlers: Array<(chunk: string) => void> = [];
@@ -214,17 +218,26 @@ export const defaultHookSpawner: HookSpawner = (task) => {
   let pending = '';
   let closed = false;
 
+  // **收原始字节、在 close 时一次解码**（2026-10-18 收口）：钩子是用户自己的脚本，
+  // 中文 Windows 上它往管道里写的很可能是 GBK（cp936）字节。原来的
+  // `buf.toString('utf8')` 会在字节变字符串那一刻把非法字节换成 U+FFFD，之后再无补救；
+  // 而且逐块解码还会把跨块的多字节字符切成两半。钩子本来就只是"跑完读输出"，
+  // 攒字节再判一次是最简单也最准的做法（与 pwsh 的 BoundedText 同一思路）。
+  const outChunks: Buffer[] = [];
+  const errChunks: Buffer[] = [];
   child.stdout?.on('data', (buf: Buffer) => {
-    const text = buf.toString('utf8');
-    for (const handler of outHandlers) handler(text);
+    if (!closed) outChunks.push(buf);
   });
   child.stderr?.on('data', (buf: Buffer) => {
-    const text = buf.toString('utf8');
-    for (const handler of errHandlers) handler(text);
+    if (!closed) errChunks.push(buf);
   });
   const settle = (code: number | null): void => {
     if (closed) return;
     closed = true;
+    const out = decodeText(Buffer.concat(outChunks)).text;
+    const err = decodeText(Buffer.concat(errChunks)).text;
+    if (out !== '') for (const handler of outHandlers) handler(out);
+    if (err !== '') for (const handler of errHandlers) handler(err);
     for (const handler of closeHandlers) handler(code);
   };
   child.once('close', settle);

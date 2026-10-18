@@ -51,8 +51,8 @@
  * 纯类型导入写 `.js`。
  */
 
-import type { DsClient, DsRequest, DsStreamResult } from '../model/ds-client.js';
-import { isDsClientError } from '../model/ds-client.ts';
+import type { DsClient, DsRequest, DsStreamCallbacks, DsStreamResult } from '../model/ds-client.js';
+import { isDsClientError, isReasoningEchoRejection } from '../model/ds-client.ts';
 import type { MachineFacts, MaintenanceWindowNote, RenderImageRef, RenderPersona, RenderedRequest, TurnBlockFacts, UsageFacts } from '../model/render.js';
 import { RENDER_VERSION, clipTaskTitle, render, renderWake, stateBytesOf, wakeTitle } from '../model/render.ts';
 import { DEFAULT_STATE_BUDGET_BYTES } from '../config/config.ts';
@@ -90,6 +90,8 @@ import type { WarnExemptJudge } from '../channel/warn-exempt.ts';
 import { ASK_HUMAN_BLOCKED_BY, hasPendingSystemAsk, pendingAgentAsks } from './plan-mode.ts';
 import type { ListForModelOptions, ToolDefinition, ToolModelSpec } from '../tools/registry.js';
 import type { ToolRegistry } from '../tools/registry.js';
+// 唯一一把 token 尺（值导入走 .ts）：`budget/consumed` 的输出构成拆分用它量，口径注释见 log/types.ts
+import { estimateTokens } from '../tools/registry.ts';
 import type { HookRunner } from '../hook/hooks.js';
 // 本轮可信级别的**唯一来源**（`runtime/trust.ts` 的 `trustOfBatch`）：循环层不判它、只把它记进账
 import type { TurnTrust } from './trust.js';
@@ -264,6 +266,23 @@ export function repeatCallReminder(count: RepeatCount): string {
  * 抖动误杀；取更大等于把"再烧三次 10 秒"当默认。
  */
 export const FAILURE_STREAK_MAX = 3;
+
+/**
+ * 推理进度上报（`step/reasoning-progress`，2026-10-17 加）的两个节拍窗口，单位毫秒：
+ * **本步前 120 秒每 5 秒一条，之后每 15 秒一条**。
+ *
+ * 依据（不是拍的，是量的）：近两个日志分片里 221 个"有推理的 step"——
+ * p50 = 4.5 s、p90 = 16.6 s、p99 = 152.5 s、最大 225.3 s，>60 s 的只占 1.4%。
+ * ⇒ 5 秒这一拍对**一半以上的步一条都不发**，洪水只可能出现在尾部；而尾部正是
+ * "那一行空着"的现场（用户实测 turn 2115：153 秒里界面手上一个字都没有）。
+ * 40 分钟的极端一步：平铺 5 秒是 480 条，这条曲线是 175 条 / 约 30 KB
+ * （t=5,10,…,115 共 23 条；之后 t=135,150,…,2400 共 152 条——120 秒那一拍窗口刚切成 15 秒、
+ * 距上一条只有 5 秒，于是被跳过，这正是"距上一条够久才发"的应有之义）。
+ * 完整理由与"为什么不补尾条"见 `TurnRunner.reasoningProgressReporter`。
+ */
+export const REASONING_PROGRESS_FAST_MS = 5_000;
+export const REASONING_PROGRESS_SLOW_MS = 15_000;
+export const REASONING_PROGRESS_FAST_WINDOW_MS = 120_000;
 
 /**
  * **"什么算同一个目标"的唯一判据**——工具层与循环层都不许再判一遍。
@@ -491,6 +510,18 @@ export interface AgentLoopDeps {
   boundaryRoot?: string | null;
   /** 外部取消（shutdown）：透传给模型请求与工具执行 */
   signal?: AbortSignal;
+  /**
+   * **这条取消是谁要的**（2026-10-16 加，可选）。
+   *
+   * `AbortSignal` 上只有"被取消了"这一个事实，而取消有两条来路、处置完全相反：
+   *   · `'signal'`（缺省 / 关机、宿主取消）—— 输入**退回队列**，下次启动接着做（原口径）；
+   *   · `'stop'`（用户在通道里按下 `/stop`）—— 输入**不退回**（`input/discarded{by:'owner'}`），
+   *     他要的就是"停下来，别自己重来"。
+   *
+   * 判据只能由**按下去的那一处**给（`real-loop` 的 `stoppedByOwner`）：循环层从信号上
+   * 反推不出这个区别。缺省 ⇒ 一律按 `'signal'`（老宿主、子代理链、测试的行为一个字节不变）。
+   */
+  signalCause?: () => 'stop' | 'signal';
   /**
    * 「有人插话」计数读取器：返回一个**只增不减**的计数，本 turn 里人每开口一次加一。
    *
@@ -722,10 +753,11 @@ export interface AgentLoopDeps {
    * 与「换一个 scoped 日志句柄」相比，它不动日志本身的语义（seq 分配与 append 仍是全局单一）。
    * 不传即全部可见：顶层 turn 的默认口径，与未引入子代理时逐字节一致。
    *
-   * 顶层那条路（`real-loop`）现在也用它挡第二类事件：**整条就是一条指令的 `wake/manual`**
-   * （`/compact`、`/handoff`、以及打错的那些）。指令是给框架的，不是对她说的话——她要看见的是
-   * 指令的**效果**（摘要 / 交接笔记），不是用户按了哪个按钮（见 `slash-commands.ts` 的
-   * `isSlashCommandEvent`）。`replay` 用同一条判据重建，所以重建结果与当时仍然逐字节一致。
+   * 顶层那条路（`real-loop`）现在也用它挡第二类事件：**框架指令**——整条就是一条指令的
+   * `wake/manual`（`/compact`、`/handoff`、以及打错的那些），以及用户单聊里的 `/stop`。
+   * 指令是给框架的，不是对她说的话——她要看见的是指令的**效果**（摘要 / 交接笔记 / 停下来），
+   * 不是用户按了哪个按钮（见 `slash-commands.ts` 的 `isFrameworkCommandEvent`）。
+   * `replay` 用同一条判据重建，所以重建结果与当时仍然逐字节一致。
    */
   eventFilter?: (event: AppEvent) => boolean;
   /**
@@ -913,6 +945,11 @@ export interface RequestDerivation {
   maintenanceWindow?: MaintenanceWindowNote | null;
   /** 联络事实（状态层素材，见 AgentLoopDeps.contact） */
   contact?: ContactFacts | null;
+  /**
+   * **同一 turn 上一步完整的那一层此刻层**（v66 引入，v69 换口径；见 `RenderInput.previousNowLayer`）：
+   * 逐字段比对、逐字节不变的那些这一次不发。缺省 null ⇒ 每个字段都发。
+   */
+  previousNowLayer?: string | null;
   /** 本机事实（此刻层 `本机：` 素材，见 AgentLoopDeps.machine）：宿主算好，循环层只转手 */
   machine?: MachineFacts | null;
   /** 用度事实（此刻层 `用度：` 素材，见 AgentLoopDeps.usage）：投影 + 生效上限，宿主算好 */
@@ -1110,12 +1147,15 @@ export function deriveRequest(input: RequestDerivation): RenderedRequest {
     // 为什么挪进去：上下文归因要把 input 的每一段都数清楚，插播是最后一段——在装配点之外
     // 追加，归因的"合计"就会比真正的请求少一段（2026-10-03）。
     softHint: input.softHint ?? null,
+    // 上一步的此刻层（v66）：由 `TurnRunner` 逐 step 现取（见 `previousNow`），
+    // 渲染层据此逐字段比对、逐字节不变的那些不发。缺省 null ⇒ 每个字段都发
+    // （重放/子代理/诊断那些旧调用点因此与引入这一版之前逐字节相同）。
+    previousNowLayer: input.previousNowLayer ?? null,
   });
   return rendered;
 }
 
 // ──────────────────────────────── 主入口 ────────────────────────────────
-
 /**
  * 跑一个 turn：认领一批输入 → step 循环（模型 → 工具）→ 返回结构化结局。
  *
@@ -1193,6 +1233,23 @@ export class TurnRunner {
   private readonly failureGuard = new FailureStreakGuard();
 
   /**
+   * **上一步完整的那一层此刻层**（v66 引入；v69 换口径）：给下一步逐字段比对用
+   * （`RenderInput.previousNowLayer`）。
+   *
+   * 为什么放在这里而不是宿主（`real-loop`）：它的生命周期是**一个 turn 的一个 step**，
+   * 而 `TurnRunner` 正是"一轮一个实例"的那个东西（`runTurn` 每次新建）——跨 turn 自然重置，
+   * 不需要任何人记得清空。宿主那一侧做不到这一点：`deps` 是**每轮装配一次**的，
+   * 在那儿存就成了"跨轮残留"，而"上一步"跨了一轮就毫无意义（时刻、步数、任务卡全变了）。
+   *
+   * 取值口径（v69）：**`RenderedRequest.nowLayerFull`**——上一步"本来该说的每一行"，
+   * **未经增量裁剪**。⚠ 不能取 `input` 里那一条此刻层 item（v66 的做法）：那是裁剪后的，
+   * 被省掉的字段在下一步的基线里就不存在了 ⇒ 判据落到"上一步没有它 ⇒ 发它" ⇒ 同一行
+   * **隔步重发**（实测第 1/3/5 步），"整轮只发一次"永远做不到。
+   * 也不是"重新渲染一遍上个时刻"：这一格与真正发出去的那一份同一次调用产出，不落库、不进历史。
+   */
+  private previousNow = '';
+
+  /**
    * **本 runner 上一次记账的那一拍**（`accountStep` 末尾存）。
    *
    * 为什么必须是它、而不是从 `this.events` 现取（2026-10-11 修，BUG-2）：
@@ -1228,6 +1285,18 @@ export class TurnRunner {
    */
   private static lastToolInventory: { registry: ToolRegistry; lines: ToolInventoryLine[] } | null = null;
 
+  /**
+   * 本 runner 累计看到的**重试次数**（`DsClient` 的重试是多播的，见 `subscribeRetry`）。
+   *
+   * 为什么记在 runner 上：`runTurn` 每轮新建一个 runner，而 `DsClient` 是进程级单例——
+   * 每一轮订阅一次、这一轮结束时退订（`run()` 的 finally）。于是这一格天然是"本轮"的，
+   * 与 `previousAuditedCall`（同一份本轮状态）同一条纪律。
+   */
+  private retryCount = 0;
+  private readonly unsubscribeRetry: (() => void) | null;
+  /** 重试计数走的是**订阅通道**吗（否则退回 `error.attempts - 1`，见 `failStep`） */
+  private readonly retrySubscribed: boolean;
+
   constructor(deps: AgentLoopDeps, wakeEvents: readonly AppEvent[]) {
     this.deps = deps;
     this.wakeEvents = dedupeBySeq(wakeEvents);
@@ -1239,9 +1308,32 @@ export class TurnRunner {
     // 这里刻意不做 `?? workspaceRoot` 这种归一：三态的判读只允许发生在 tools/boundary.ts，
     // 循环层一旦掺一脚，就又多出一个"哪一处说了算"的问题。
     this.boundaryRoot = deps.boundaryRoot;
+    /**
+     * 重试计数通道（2026-10-16 接通，替掉 `accountStep` 里那条 TODO）。
+     *
+     * `subscribeRetry` 是**多播 + 可退订**的：不能把回调塞进 `DsClient` 的构造参数——
+     * 那是进程级的，第一轮的那个闭包会被永久钉在上面（见 `retryListeners` 的注释）。
+     * 订阅挂在 runner 上、在 `run()` 的 finally 里摘掉，所以"谁在听"跟着轮次走。
+     */
+    this.unsubscribeRetry = typeof deps.ds.subscribeRetry === 'function'
+      ? deps.ds.subscribeRetry(() => { this.retryCount += 1; })
+      : null;
+    // 测试替身与子代理链的假客户端没有这个口（它们不是 `DsClient` 实例）：
+    // 那时 `failStep` 退回 `error.attempts - 1`——老口径，行为一个字节不变。
+    this.retrySubscribed = this.unsubscribeRetry !== null;
   }
 
   async run(): Promise<TurnEndReason> {
+    try {
+      return await this.runOnce();
+    } finally {
+      // 退订重试通道：`DsClient` 是进程级的，不退订就是"每一轮都往这张表上多挂一个闭包"
+      // （长跑进程里这就是一条只增不减的内存泄漏，而且后面每一轮的重试都会被重复计数）。
+      this.unsubscribeRetry?.();
+    }
+  }
+
+  private async runOnce(): Promise<TurnEndReason> {
     const reason = await this.runInner();
     // 压缩点：本 turn 已结算，但可见历史仍然超过阈值——把交接笔记写成 compaction/summary，
     // 让它成为下一轮请求里的「早期历史」（闸蔽点后的事件逐字节保留）
@@ -1294,8 +1386,15 @@ export class TurnRunner {
     return reason;
   }
 
-  private async runInner(): Promise<TurnEndReason> {
-    await this.syncEvents();
+  /**
+   * 这次取消算谁的（见 `AgentLoopDeps.signalCause`）。缺省 `'signal'`——
+   * 子代理链、诊断与所有既有测试都不传它，行为与引入这一格之前逐字相同。
+   */
+  private abortCause(): 'stop' | 'signal' {
+    return this.deps.signalCause?.() ?? 'signal';
+  }
+
+  private async runInner(): Promise<TurnEndReason> {    await this.syncEvents();
     // turn 号 = 日志中已出现的最大 turn + 1（§2 编号规则），绝不回退复用旧号。
     // 子代理的事件视图是隔离的（看不见主日志已有的 turn），全局下限由 turnBase 给出。
     this.turn = Math.max(this.maxTurn(), this.deps.turnBase ?? 0) + 1;
@@ -1330,7 +1429,7 @@ export class TurnRunner {
       // 刹车优先于智能：每 step 边界重新判定（§4.6）
       const verdict = this.deps.budget?.checkBeforeStep(this.projection) ?? null;
       if (verdict !== null) return this.endTurn(verdict);
-      if (this.deps.signal?.aborted === true) return this.endTurn({ kind: 'aborted', cause: 'signal' });
+      if (this.deps.signal?.aborted === true) return this.endTurn({ kind: 'aborted', cause: this.abortCause() });
 
       this.step += 1;
       const outcome = await this.runStep(firstStep);
@@ -1345,6 +1444,14 @@ export class TurnRunner {
   private async runStep(firstStep: boolean): Promise<TurnEndReason | null> {
     // 重新对齐日志：本 step 的请求必须由日志派生（别人写进来的事件也要看得见）
     await this.syncEvents();
+    // **这一 step 的实测起跳点**（2026-10-16 加）：失败路径原来把 `durationMs` 写死 0
+    // （`failStep` 里那一行），于是"这一步花了多久才失败"在日志上永远是 0——
+    // 而 180s 那批事故全靠这个字段才认出"精确贴着 180s"是**我们自己的定时器**。
+    // 计时点取在 `syncEvents` **之后**：那一段是日志 IO，不是模型调用。
+    const stepStartedMs = Date.now();
+    // 重试计数基线：成功路径原先恒写 0（见 accountStep 的注释）。本轮订阅把所有重试累加，
+    // 这里取一次快照，这一 step 的 retryCount = 之后新增的那些。
+    const retriesBeforeStep = this.retryCount;
     // **送进这一份请求的输入＝她看见了**：中途插进来的唤醒在这里销账（见 claimDeliveredInputs）
     this.claimDeliveredInputs();
     const step = this.step;
@@ -1355,6 +1462,10 @@ export class TurnRunner {
     const softHint = mergeHints(this.deps.budget?.softHint?.(this.projection) ?? null, this.drainHookContext());
 
     const request = this.deriveAt({ wakeEvent, step, now, model, softHint });
+    // 记下**上一步完整的那一层**（v69；v66 起是"真正发出去的那一层"）：下一步据此逐字段
+    // 比对、不变的不发。取的是渲染结果里的 `nowLayerFull`（**未经增量裁剪**的原文）——
+    // 取裁剪后的那一份，被省掉的字段下一步就会当成"上一步没有它"重发一遍（隔步重发）。
+    this.previousNow = request.nowLayerFull;
     this.write('step/start', {
       turn: this.turn,
       step,
@@ -1366,22 +1477,38 @@ export class TurnRunner {
 
     let result: DsStreamResult;
     try {
-      result = await this.deps.ds.stream(toDsRequest(request, this.lane, this.deps.signal));
+      // 第二参数是**上游 delta 的口**（`DsStreamCallbacks`，见 ds-client.ts:231-242 与 :917）：
+      // 它是"已经生成了多少字"唯一的实时来源——在此之前一个 delta 都不落事件，界面那行
+      // 「已想 X 字」在整段落库之前只能是「…」（实测 turn 2115 空了 153 秒）。
+      // 接上它只读计数、不碰正文：载荷里没有也不许有正文的任何片段（见 StepReasoningProgress）。
+      result = await this.deps.ds.stream(
+        toDsRequest(request, this.lane, this.deps.signal),
+        this.reasoningProgressReporter(step),
+      );
     } catch (error) {
-      return this.failStep(step, error);
+      return this.failStep(step, error, { firstStep, startedMs: stepStartedMs, retriesBefore: retriesBeforeStep });
     }
 
-    // 中断只留「已推送的部分」（schema §3 / M2-9）：文本落库，toolCalls 一律丢弃——
-    // 被截断的 arguments 拿去执行就是「拿着半个参数做有副作用的事」。
-    const interrupted = result.interrupted === true;
+    // **失败判据的唯一来源**（客户端合同，见 `DsStreamResult.failure` 的注释）：
+    // `failure !== null` ⇔ 这次调用没有正常收尾 —— 上游终态 `response.failed` 与"没收到终态"
+    // （断流 / 超时 / 调用方中断）两类都落在这一格里。
+    // **不要在这里再组合 `status` / `interrupted` 判第二遍**：那正是 2026-10-17 修掉的 P0
+    // 的形状——客户端用 status/failure 表达终态失败，循环层只认 interrupted，于是终态 failed
+    // 走了"成功收尾"（半截调用被拿去执行、turn 记 completed、输入不退回）。
+    const failure = result.failure;
+    const failed = failure !== null;
     const text = result.text.length > 0 ? result.text : null;
-    const calls: ToolCallRequest[] = interrupted ? [] : result.toolCalls.map(cloneCall);
+    // 没跑完的调用一律丢弃（schema §3 / M2-9）：被截断的 arguments 拿去执行就是
+    //「拿着半个参数做有副作用的事」——上游终态 failed 与断流同一条纪律。
+    const calls: ToolCallRequest[] = failed ? [] : result.toolCalls.map(cloneCall);
 
     const assistant: Record<string, unknown> = {
       text,
       toolCalls: calls.map(call => ({ callId: call.callId, name: call.name, arguments: call.arguments })),
     };
-    if (interrupted) assistant['interrupted'] = true;
+    // 落库那格沿用既有的 `interrupted` 语义（"已推送的部分，别当完整回答读"）：
+    // 终态 failed 同样没说完，标记一致；不新增事件字段 ⇒ 不动 RENDER_VERSION。
+    if (failed) assistant['interrupted'] = true;
     this.write('message/assistant', assistant, { sync: true });
     if (text !== null && text.trim() !== '') this.spoke = true;
 
@@ -1389,7 +1516,7 @@ export class TurnRunner {
       // 思维链只供复盘（渲染层剥离，缓存铁律 3），丢了不影响正确性：按观测类写入
       this.write('message/reasoning', { turn: this.turn, step, text: result.reasoning }, { sync: false });
     }
-    this.accountStep(step, result, interrupted, model, request);
+    this.accountStep(step, result, failed, model, request, this.retryCount - retriesBeforeStep);
 
     // 单步刹车（§4.6 单 step 层）：超出上限的调用不执行，返回值是被拦下的条数
     let overLimit = 0;
@@ -1412,13 +1539,15 @@ export class TurnRunner {
         ?? { kind: 'budget-exhausted', layer: 'step' };
     }
 
-    if (interrupted) {
-      const code = result.failure?.code ?? 'stream_interrupted';
-      if (code === 'aborted') return { kind: 'aborted', cause: 'signal' };
+    if (failed) {
+      // 外部取消不是错误（aborted 结局）。其余——含上游终态 `response.failed`——都走既有的
+      // error 收尾：`endTurn` 退输入队列（下一轮完整重试）、`budget/consumed.finishReason='failed'`
+      // 让 `failStreak` 涨（到阈值告警/暂停唤醒），与 `failStep` 同一个失败处置。
+      if (failure.code === 'aborted') return { kind: 'aborted', cause: this.abortCause() };
       return {
         kind: 'error',
-        message: result.failure?.message ?? '流式输出在完成前中断，本轮内容不完整',
-        code,
+        message: failure.message === '' ? '模型这次没有正常收尾（未收到正常终态）' : failure.message,
+        code: failure.code,
       };
     }
     // 输出被截断与"说完了"是两件事（schema §2）：截断优先作为结局，即使本步还带着工具调用
@@ -1426,6 +1555,50 @@ export class TurnRunner {
       return { kind: 'max-tokens', outputTokens: result.usage.outputTokens };
     }
     return calls.length === 0 ? { kind: 'completed' } : null;
+  }
+
+  /**
+   * 本步的**推理进度读数**（后端 (b) 实时字数）：给 `ds.stream()` 挂一个只管计数的口。
+   *
+   * 它做什么：在 `onReasoningDelta` 里累加 `delta.length`——**只取长度，delta 原文当场丢掉**，
+   * 写出去的那条事件里不许有正文的任何片段（见 `StepReasoningProgress` 的纪律 ①）。
+   *
+   * 节拍（`chars` 变了、且距上一条够久才发一条；流停住 ⇒ 一条都不发）：
+   *   · 本步前 {@link REASONING_PROGRESS_FAST_WINDOW_MS} 之内：≥{@link REASONING_PROGRESS_FAST_MS}；
+   *   · 之后：≥{@link REASONING_PROGRESS_SLOW_MS}。依据见那两个常量的注释。
+   *
+   * **每步归零是天然的**：计数器是本方法的局部量，`runStep` 每个 step 新建一次。
+   * **不补尾条**：流一结束，同一次 `runStep` 里紧随其后的 `message/reasoning` 就是真值，
+   * 补一条只多字节、还制造"live 后到把 counted 顶掉"的次序风险。
+   *
+   * **已知偏差（有意留的）**：`DsClient` 内部重试同一次 `stream()` 时本计数器**跨尝试累加**，
+   * 而落库的 `result.reasoning` 是**最后一次尝试**的正文 ⇒ 极端下（第一次尝试吐了字之后被掐、
+   * 重试成功）这条读数会大于最终落库的 `chars`。由那条真值覆盖修正。不按 attempt 归零的理由
+   * （重试通道是进程级多播、不带 lane，别的 lane 的重试会把我们的数误归零）见
+   * `StepReasoningProgress` 的"已知偏差"那一节。
+   */
+  private reasoningProgressReporter(step: number): DsStreamCallbacks {
+    const startedMs = Date.parse(this.deps.now());
+    let chars = 0;
+    let lastReported = -1;
+    let lastAtMs = startedMs;
+    return {
+      onReasoningDelta: (delta: string): void => {
+        if (delta.length === 0) return;
+        chars += delta.length;
+        if (chars === lastReported) return;
+        const nowMs = Date.parse(this.deps.now());
+        const windowMs = nowMs - startedMs < REASONING_PROGRESS_FAST_WINDOW_MS
+          ? REASONING_PROGRESS_FAST_MS
+          : REASONING_PROGRESS_SLOW_MS;
+        if (nowMs - lastAtMs < windowMs) return;
+        lastReported = chars;
+        lastAtMs = nowMs;
+        // 观测类（`sync: false`），与 message/reasoning 同档：它不承诺外部世界的任何变化。
+        // 不必等落盘就能到界面——SSE 尾部泵走 `EventLog.get`，那个函数先查内存缓冲。
+        this.write('step/reasoning-progress', { turn: this.turn, step, chars }, { sync: false });
+      },
+    };
   }
 
   // ── 压缩（交接笔记 → compaction/summary） ──
@@ -1773,7 +1946,13 @@ export class TurnRunner {
   // ── 记账 ──
 
   /**
-   * 模型调用成功返回后的预算归账（缓存命中拆分对齐 §4.13 观测闭环）。
+   * 模型调用**返回后**的预算归账（缓存命中拆分对齐 §4.13 观测闭环）。
+   *
+   * 抛错那条路走 `failStep`（连 usage 都没回来 ⇒ 记 0）；本方法盖的是"调用有返回"的两种：
+   * 正常收尾，以及**没跑完**（`failed`：上游终态 failed / 断流 / 超时）。后者有 usage 就照记
+   * ——记账口径是"服务端说了多少记多少"，不是"失败了就记 0"（同 `channel/injection-judge.ts`
+   * 的 `account`：失败也记，`usage` 缺失才记 0）。`finishReason` 由 {@link finishReasonOf}
+   * 从同一个 `failed` 得出，`fold` 据此涨/清零 `failStreak`。
    *
    * 用量里还带上 `reasoningTokens`（思维链 token，2026-10-06 起落库）：它**已经含在
    * `outputTokens` 里**，所以只是观测——账本口径一个字都没改（`state/fold.ts` 不看它）。
@@ -1804,9 +1983,10 @@ export class TurnRunner {
   private accountStep(
     step: number,
     result: DsStreamResult,
-    interrupted: boolean,
+    failed: boolean,
     fallbackModel: string,
     request: RenderedRequest,
+    retryCount: number,
   ): void {
     const usage = result.usage;
     const inputTokens = usage.inputTokens;
@@ -1845,6 +2025,11 @@ export class TurnRunner {
     const contextOut = this.deps.trust === undefined
       ? request.context
       : { ...request.context, trust: this.deps.trust };
+    // **这一拍属于哪一档价**（纯观测，2026-10-16 加）：判据是**事件时间戳的北京时间**。
+    // 取上面那次 `deps.now()` 的同一个值（`ts`）——与 `write` 内部再取一次的那个 `ts` 同源
+    // （生产上两者可能差几毫秒，跨档边界那一毫秒不改变结论）；刻意**不**把这个值塞给 `write`，
+    // 那会改掉既有 `ts` 的取法。判不出来（`ts` 不是 ISO）⇒ 这一格**不写**，不猜。
+    const tier = priceTierOf(ts);
     const data: Record<string, unknown> = {
       turn: this.turn,
       step,
@@ -1857,10 +2042,26 @@ export class TurnRunner {
       // 思维链 token（观测字段，已含在 outputTokens 里，不参与预算算式）。
       // **每次都写**：这一档没产思维链就是 0——见 log/types.ts 的字段注释。
       reasoningTokens: usage.reasoningTokens,
+      // 输出构成拆分（纯观测，两格同一把尺 `estimateTokens`，**每次都写**；口径、三者关系与
+      // 实测残差逐字见 log/types.ts 的字段注释）。
+      // 量的是**模型这一拍吐出来的**：正文全文 + 每个 `function_call` 的 arguments 之和——
+      // 含中断时已收的那半截（它照样计费），所以中断拍这两格与"执行了的调用"对不上是**口径差异**。
+      outputTextTokens: estimateTokens(result.text),
+      outputToolArgTokens: result.toolCalls.reduce((sum, call) => sum + estimateTokens(call.arguments), 0),
+      // 计价档：'peak' 高峰 / 'off' 空闲半价。**没有节假日日历 ⇒ 法定节假日会被误判成 peak**
+      // （只按"周一至周五 + 时段"判，见 log/types.ts 的字段注释）。
+      ...(tier === null ? {} : { tier }),
       durationMs: result.durationMs,
-      // 成功路径没有重试计数通道（DsClient 只把 attempts 挂在外抛错误上）；M3 接 onRetry 回填
-      retryCount: 0,
-      finishReason: finishReasonOf(result, interrupted),
+      /**
+       * 这一 step 里发生了几次重试（2026-10-16 接通，原来恒为 0）。
+       *
+       * 怎么来的：`DsClient` 的重试是多播的（`subscribeRetry`），`TurnRunner` 在构造时订阅、
+       * 每 step 取一次差额。**成功路径也要能看见重试**——原来只有抛错那条路带得到
+       * `error.attempts`，于是"这一拍重试了 3 次但还是成了"在账本上完全没有痕迹，
+       * 而它恰恰是"服务端在抖"最早的信号。
+       */
+      retryCount: Math.max(0, retryCount),
+      finishReason: finishReasonOf(result, failed),
       tokensTodayAccum: this.projection.budget.tokensToday + inputTokens + usage.outputTokens,
       // 归因事实 + 那一格纯观测的 `trust`（宿主给了才有，见上面那段注释）
       context: contextOut,
@@ -1875,8 +2076,32 @@ export class TurnRunner {
     this.previousAuditedCall = audit;
   }
 
-  /** 模型调用抛错：分类 → 结局。失败也必须记账，否则 §4.6 的失败刹车永远看不到连续失败 */
-  private failStep(step: number, error: unknown): TurnEndReason {
+  /**
+   * 模型调用抛错：分类 → 结局。失败也必须记账，否则 §4.6 的失败刹车永远看不到连续失败。
+   *
+   * ───────────── 超时型失败的两种结局（2026-10-16 加）─────────────
+   *
+   * 用户报的那个循环是这么转起来的：180s 总时限掐断一条**正在活跃输出**的流
+   * （实测已累积 10 万字符推理）→ `timeout` 在可重试类别里 → 这一轮整轮失败 →
+   * `input/requeued` 把输入退回队列 → 下一轮**从第 1 步重跑同一个请求** → 再撞同一堵墙。
+   * 现在按"退回到什么状态"分两种（判据是**这是不是本轮第一步**）：
+   *
+   *   · **首步超时** ⇒ 这一轮**还什么都没做**（没有工具调用、没有任何副作用），退回去
+   *     是"再给一次完整机会"，与其它整轮失败走同一条路（`turn-error`）；
+   *   · **非首步超时** ⇒ 这一轮**已经花掉的工作不作废**：她的上下文里已经有它的输出与
+   *     工具结果，重跑一遍只会把同一段活干第二次（今天那个循环就是这么滚起来的）。
+   *     所以这里只把**结局**标成失败，让 turn 走既有失败路径（不做重投）。
+   *
+   * ⚠️ **两条路都不"原样重发同一个请求"**：重投是**下一轮**的事（那时上一条请求早已结束），
+   * 而 `kind` 一律是 `error`（不是 `rate-limited` 那种"服务端让我等一会儿再来"）——
+   * 于是"同一秒里再发一次同样的请求"这条路径在超时这一支上根本不存在。
+   * 退回的输入照旧累计 `claimCount`，到 `MAX_CLAIM_COUNT` 进死信（跨重启成立，判据从日志读）。
+   */
+  private failStep(
+    step: number,
+    error: unknown,
+    context: { firstStep: boolean; startedMs: number; retriesBefore: number } | undefined,
+  ): TurnEndReason {
     const known = isDsClientError(error);
     const code = known ? error.code : 'UNKNOWN_MODEL_ERROR';
     // 服务端原话要带出来：400 的响应体里往往写着真正的原因（哪个字段不合法），
@@ -1884,6 +2109,24 @@ export class TurnRunner {
     const detail = known ? (error.detail ?? null) : null;
     const base = error instanceof Error ? error.message : String(error);
     const message = detail === null || detail === '' ? base : `${base}；服务端原话：${detail}`;
+    // **400 的一种可判别指纹**（2026-10-17 加，纯观测）：判据只认**服务端原话**（`detail`），
+    // 不认我们自己拼的文案——它回答的是"服务端说为什么拒"，而 `base` 是我们写的话。
+    // 判据唯一实现在 `ds-client.ts` 的 `isReasoningEchoRejection`（大小写/标点/距离都在那里定）；
+    // 这里只把结论装进结局，**不改** kind / code / 重试语义 / 退不退输入。
+    const reasoningEcho = isReasoningEchoRejection(detail);
+    // **实测耗时**（原来写死 0）。缺 context 的调用点（子代理/诊断那几条）退回 0 而不是编一个数。
+    const durationMs = context === undefined ? 0 : Math.max(0, Date.now() - context.startedMs);
+    // 重试计数：优先取本 step 期间**订阅通道**上的真实次数（`DsClient.subscribeRetry`）；
+    // 通道不可用时退回 `error.attempts - 1`——它说的正是"这一条请求在客户端里重试了几次"，
+    // 与订阅计数同义（`attempts` 是内层 `withRetry` 耗尽时标上的）。
+    // 缺 context 的调用点（子代理/诊断那几条）仍按老口径给这个数，行为与从前逐字相同。
+    const retryCount = context === undefined
+      ? (known ? Math.max(0, error.attempts - 1) : 0)
+      : (this.retrySubscribed ? Math.max(0, this.retryCount - context.retriesBefore) : (known ? Math.max(0, error.attempts - 1) : 0));
+    const timeoutKind = known && error.kind === 'timeout' ? code : null;
+    // 计价档：失败那一步也判（同一条判据、同一个函数）——它说的是"这次调用落在哪一档"，
+    // 与成没成功无关；判不出来就不写这一格（见 log/types.ts 的 `tier` 注释）。
+    const tier = priceTierOf(this.deps.now());
     this.write('budget/consumed', {
       turn: this.turn,
       step,
@@ -1895,8 +2138,12 @@ export class TurnRunner {
       cacheMissTokens: 0,
       // 调用抛错 ⇒ 服务端连 usage 都没回来，思考 token 只能是 0（字段照写，不留空）
       reasoningTokens: 0,
-      durationMs: 0,
-      retryCount: known ? Math.max(0, error.attempts - 1) : 0,
+      // 输出构成拆分：一个字都没回来 ⇒ 两格照写 0（与 outputTokens / reasoningTokens 同一条理由）
+      outputTextTokens: 0,
+      outputToolArgTokens: 0,
+      ...(tier === null ? {} : { tier }),
+      durationMs,
+      retryCount,
       finishReason: 'failed',
       tokensTodayAccum: this.projection.budget.tokensToday,
     }, { sync: false });
@@ -1906,17 +2153,47 @@ export class TurnRunner {
     if (known && error.kind === 'rate_limited') {
       return { kind: 'rate-limited', retryAfterMs: error.retryAfterMs ?? 0 };
     }
-    if (known && error.kind === 'aborted') return { kind: 'aborted', cause: 'signal' };
-    return { kind: 'error', message, code };
+    if (known && error.kind === 'aborted') return { kind: 'aborted', cause: this.abortCause() };
+    // 超时型的可读原因：说清**是**超时、是哪只闸（静默 / 硬顶）、以及"退不退"这件事由谁决定。
+    // 用户今天看到的是一条 `timeout` 加一次静默重投；现在这一句直接写进 `turn/end.reason.message`。
+    if (timeoutKind !== null) {
+      const first = context?.firstStep === true;
+      const scope = first
+        ? '这是本轮第一步：这一轮还什么都没做，输入退回队列，下一轮是完整的一次重试'
+        : '这不是第一步：本轮已经做过的事不作废，输入**不退回**、也不原样重发同一个请求';
+      return {
+        kind: 'error',
+        code,
+        message: `${message}（超时型失败 · ${scope}）`,
+        retry: first ? 'next-turn' : 'none',
+      };
+    }
+    return {
+      kind: 'error',
+      message,
+      code,
+      // 只在认得出来时出现：别的 400（图片格式、参数不合法…）与老日志一样，**没有这一格**
+      ...(reasoningEcho ? { reasoningEcho: true as const } : {}),
+    };
   }
 
+  /**
+   * 整轮失败时把输入退回去（2026-10-02 补，用户报的一处洞）：模型/服务端拒了请求
+   *（例如缺配对的 tool_call 被 400 打回），这一轮认领的输入不该就此消失——她连"有人叫过我"
+   * 都看不到第二次。退回去是"还有一次完整机会"，与崩溃恢复走同一条路（`input/requeued`），
+   * 认领次数照样累计；到 MAX_CLAIM_COUNT 就进死信（毒消息保护：一条必然失败的输入
+   * 不该把守护进程拖进"拉起→失败→拉起"的循环）。
+   *
+   * **被用户急停时是唯一的例外**（2026-10-16）：`{kind:'aborted', cause:'stop'}` 意味着
+   * 用户按了 `/stop`——他刚刚要求的是"**停下来**"，这时把输入退回队列等于**立刻重投**
+   * （下一拍又会开一个 turn 去干同一件活），正是他报的那件事（「我重启了又 tm 重投了」）。
+   * 所以那一支走 {@link discardClaimedOnStop}：不退回，记 `input/discarded{by:'owner'}`。
+   */
   private endTurn(reason: TurnEndReason): TurnEndReason {
-    // **整轮失败时把输入退回去**（2026-10-02 补，用户报的一处洞）：模型/服务端拒了请求
-    //（例如缺配对的 tool_call 被 400 打回），这一轮认领的输入不该就此消失——她连"有人叫过我"
-    // 都看不到第二次。退回去是"还有一次完整机会"，与崩溃恢复走同一条路（`input/requeued`），
-    // 认领次数照样累计；到 MAX_CLAIM_COUNT 就进死信（毒消息保护：一条必然失败的输入
-    // 不该把守护进程拖进"拉起→失败→拉起"的循环）。
-    if (reason.kind === 'error') this.requeueOnTurnError();
+    // `retry: 'none'` = 本轮失败但**不退回输入**（见 TurnEndReason 那一格的注释：
+    // 非首步超时走这一支——已经花掉的工作不作废，也不原样重发同一个请求）
+    if (reason.kind === 'error' && reason.retry !== 'none') this.requeueOnTurnError();
+    if (reason.kind === 'aborted' && reason.cause === 'stop') this.discardClaimedOnStop();
     this.write('turn/end', { turn: this.turn, reason, spoke: this.spoke }, { sync: true });
     this.log.flush();
     return reason;
@@ -1938,6 +2215,7 @@ export class TurnRunner {
           inputSeq: wakeSeq,
           claimCount: nextCount,
           lastError: '整轮失败（模型或服务端拒了请求）反复认领，不再自动重试',
+          reason: 'claim-limit',
         }, { sync: true });
         continue;
       }
@@ -1949,6 +2227,33 @@ export class TurnRunner {
     }
     if (wakeSeqs.length > 0) {
       this.write('input/requeued', { wakeSeqs, claimCounts, sources, reason: 'turn-error' }, { sync: true });
+    }
+  }
+
+  /**
+   * 用户急停（`/stop`）时，本轮已认领的输入**不退回**，而是记成"用户有意作废"
+   *（`input/discarded{by:'owner'}`，2026-10-16 加）。
+   *
+   * 为什么不是"退回队列"（那是 `endTurn` 里所有其他失败分支的做法）：
+   * 用户按 `/stop` 要的正是**现在停、别再自动重来**。退回队列的下一步就是"下一拍再开一个
+   * turn 干同一件活"，而他原话里的痛点就是「我重启了又 tm 重投了」。作废是**可逆**的
+   * ——事件日志只增不改，他随时可以照 `wakeSeq` 把那条输入重新捡起来，但它**不会自己回来**。
+   *
+   * 三处用词是刻意的：
+   *   · `reason` 写"用户按下 /stop"，不是"失败"——这不是故障，是人的决定；
+   *   · `by: 'owner'` 与 `web/server.ts` 那条人工丢弃同形（`input/discarded.by` 的既有取值）；
+   *   · **认领次数照抄**（`claimedCounts` 里那个数），与死信那条记录说的是同一个数——
+   *     人回看时"它试了几次"不能有两个答案。
+   */
+  private discardClaimedOnStop(): void {
+    if (this.claimedCounts.size === 0) return;
+    for (const [wakeSeq, claimCount] of this.claimedCounts) {
+      this.write('input/discarded', {
+        inputSeq: wakeSeq,
+        claimCount,
+        reason: '用户按下 /stop：这一轮当场停下，输入不再自动重投（要接着做由人重新入队）',
+        by: 'owner',
+      }, { sync: true });
     }
   }
 
@@ -2274,6 +2579,8 @@ export class TurnRunner {
       // 而判据要的正是"现在几点 + 上一条压缩判定读到多少 token + 上次窗口是什么时候"。
       maintenanceWindow: this.deps.maintenanceWindow ?? null,
       contact: this.deps.contact ?? null,
+      // 上一步的此刻层（v69：**完整的那一层**，见 `previousNow` 那一格）。空串 = 没有参照 ⇒ 每个字段都发。
+      previousNowLayer: this.previousNow === '' ? null : this.previousNow,
       // 本机与用度：宿主在**每个 turn 装配 deps 时**算一次（与 contact 同节奏）——磁盘 statfs
       // 与进程 uptime 是会失败的 IO，不适合每个 step 都做一遍；用度是"今日累计"，一拍一算是够的。
       machine: this.deps.machine ?? null,
@@ -2787,15 +3094,58 @@ function toDsRequest(rendered: RenderedRequest, lane: ModelLane, signal: AbortSi
   return request;
 }
 
+/**
+ * `budget/consumed.finishReason` 的**唯一判据**（`fold` 只看它决定 `failStreak` 涨还是清零）。
+ *
+ * `failed` 由循环层从客户端合同里**一次**取来（`DsStreamResult.failure !== null`，
+ * 见 `runStep` 里那段注释），本函数不再回头看 `status` / `interrupted`：
+ *   · 正常收尾 ⇒ `'completed'`（`max_output_tokens` 截断单独一档）；
+ *   · 外部取消 ⇒ `'aborted'`（不是模型失败，不涨 `failStreak`）；
+ *   · 其余没跑完（断流 / 超时 / 上游终态 `failed`）⇒ `'failed'`。
+ */
 function finishReasonOf(
   result: DsStreamResult,
-  interrupted: boolean,
+  failed: boolean,
 ): 'completed' | 'max_output_tokens' | 'failed' | 'aborted' {
   if (result.incompleteReason === 'max_output_tokens') return 'max_output_tokens';
-  if (result.failure !== null) return result.failure.code === 'aborted' ? 'aborted' : 'failed';
-  if (interrupted) return 'aborted';
-  if (result.status === 'failed') return 'failed';
-  return 'completed';
+  if (!failed) return 'completed';
+  return result.failure?.code === 'aborted' ? 'aborted' : 'failed';
+}
+
+// ──────────────────── 计价档（高峰 / 空闲）────────────────────
+
+/**
+ * 北京时间相对 UTC 的固定偏移：**中国全境单一时区、不实行夏令时**，所以 +8 是个常量，
+ * 不需要时区库（`Intl` 也能算，但这里要的是"永不随宿主环境变"）。
+ */
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+/**
+ * 这一刻属于**计价的哪一档**（`budget/consumed.tier` 的唯一判据，纯函数）：
+ *
+ *   · `'peak'`（高峰全价）：**周一至周五 09:00–12:00 与 14:00–18:00**（北京时间，左闭右开）；
+ *   · `'off'`（空闲半价）：**其余全部**——12:00–14:00 午间、18:00–次日 09:00、周六与周日整天。
+ *
+ * 实现上只做一件事：把 ISO 时间戳（尾巴带 `Z` 或带 `+08:00` 都吃）**显式 +8 小时**，
+ * 再用 `getUTC*` 读北京墙上钟。**刻意不用 `getHours()` / `getDay()`**：那两个读的是**宿主时区**，
+ * 同一份日志换台机器、或换个 `TZ` 环境变量就会得出另一个结论——判据不能建立在环境上。
+ *
+ * ⚠ **没有节假日日历 ⇒ 法定节假日会被误判成 `'peak'`**（调休上班的周六同理会被判成 `'off'`）：
+ * 本函数**只按"周一至周五 + 时段"判定**，不含任何节假日表。别拿它当"当天一定全价/一定半价"读
+ * ——详见 `log/types.ts` 的 `tier` 字段注释。要精确就得先把日历接进来。
+ *
+ * 解析不出时间戳（不是 ISO）返回 `null` ⇒ 调用方**不写这一格**（判不出就不猜）。
+ */
+export function priceTierOf(ts: string): 'peak' | 'off' | null {
+  const ms = Date.parse(ts);
+  if (!Number.isFinite(ms)) return null;
+  const beijing = new Date(ms + BEIJING_OFFSET_MS);
+  const day = beijing.getUTCDay(); // 0 = 周日 … 6 = 周六
+  if (day === 0 || day === 6) return 'off';
+  const minutes = beijing.getUTCHours() * 60 + beijing.getUTCMinutes();
+  const morning = minutes >= 9 * 60 && minutes < 12 * 60;
+  const afternoon = minutes >= 14 * 60 && minutes < 18 * 60;
+  return morning || afternoon ? 'peak' : 'off';
 }
 
 function cloneCall(call: { callId: string; name: string; arguments: string }): ToolCallRequest {

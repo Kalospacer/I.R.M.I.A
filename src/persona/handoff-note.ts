@@ -28,9 +28,9 @@
  * 纯类型导入写 `.js`。
  */
 
-import type { AppEvent } from '../log/types.js';
+import type { AppEvent, WakeJob } from '../log/types.js';
 import { formatExact } from '../format/units.ts';
-import { renderExternalEvent, renderWake, wakeTitle } from '../model/render.ts';
+import { reasoningEchoOf, renderExternalEvent, renderWake, wakeTitle } from '../model/render.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
@@ -270,6 +270,31 @@ function oneLine(text: string): string {
   return text.replace(/\s+/gu, ' ').trim();
 }
 
+/**
+ * `wake/job` 的**回读线索**（P1-15，2026-10-17 修）：标题（`wakeTitle`，已含 jobId / 命令 / 退出码）
+ * 之外再补一句"输出全文在哪、多大"。
+ *
+ * 为什么必须补：压缩把这段历史遮蔽之后，笔记是唯一替代品——旧写法只抄 `wake/job` 的标题，
+ * 于是"任务跑完了、结果是什么、要去哪儿重读"三件事里只有第一件留下来。她只能凭印象继续。
+ *
+ * **不抄正文**（`outputExcerpt` 最长 2,000 字，笔记总预算只有 4,096 token）：折叠前正文已经在
+ * 可见历史里，折叠后需要的是**路**，不是第二份正文。这条线索的成本实测 13–20 token/条
+ * （路径长短决定；判据在 `test/handoff-note.test.ts` 的 P1-15 用例里，用 before/after 的 token 差钉住）。
+ *
+ * 纯函数：只读事件自带的字段，不碰文件系统——确定性（同一批事件任何时候渲染同一字节串）。
+ */
+function jobRereadHintOf(data: WakeJob['data']): string {
+  const file = typeof data.outputFile === 'string' ? data.outputFile.trim() : '';
+  if (file === '') {
+    // 没有可回读的文件时**如实说**（别让"没有输出"被读成"没有发生过"）
+    return data.outputExcerpt === undefined ? ' · 没有留下输出正文' : ' · 没有留下可回读的文件';
+  }
+  const bytes = typeof data.outputBytes === 'number' && data.outputBytes > 0
+    ? ` ${formatExact(data.outputBytes)} 字节`
+    : '';
+  return ` · 全文${bytes}在 ${file}（safe_read 重读）`;
+}
+
 const WAKE_TYPES = new Set<string>([
   'wake/timer', 'wake/file', 'wake/webhook', 'wake/manual',
   'wake/heartbeat', 'wake/intention', 'wake/job',
@@ -319,7 +344,9 @@ export function collectHandoffEntries(
     if (WAKE_TYPES.has(e.type)) {
       const entry: HandoffEntry = {
         seq: e.seq, ts: e.ts, kind: 'wake',
-        text: `[唤醒] ${oneLine(wakeTitle(e, payloads))}`,
+        // P1-15：`wake/job` 除了标题，还带一条"全文在哪儿"的回读线索（见 jobRereadHintOf）。
+        // 折叠之后连这句话都没有，她就只剩"任务完成了"这个印象、没有任何回读的路。
+        text: `[唤醒] ${oneLine(wakeTitle(e, payloads))}${e.type === 'wake/job' ? jobRereadHintOf(e.data) : ''}`,
       };
       // 心跳是纯粹的"还在、没事"信号：同一份状态重复多少次都只留最新一次
       if (e.type === 'wake/heartbeat') entry.stateKey = 'wake:heartbeat';
@@ -675,6 +702,15 @@ export function mechanicalSummaryText(coveredCount: number): string {
  *   ② 手工 `/compact` 那一拍量出来干脆是 0（刚跑完的那一轮落在上一个 turn/end 之后）。
  * 真正决定"这次折叠值不值"的是**将要发生变化的那些字节**：从上一个遮蔽点起、还没进任何
  * 笔记的全部可见历史。折叠把这一整段换成一份笔记，收益就是它的规模。
+ *
+ * **思维链按帽计入**（与 {@link estimateHistoryTokens} 同一份判据、同一顶帽子）：v68 把
+ * `message/reasoning` 改成 model 可见之后，`historyTextOf` 对它是**全文**——闸门于是把"折叠能省
+ * 多少"算**大**了（更容易放行一次其实不够本的折叠）。真正进请求、真正会被折掉的只有
+ * {@link reasoningEchoOf} 挑出的那几条带帽尾巴，而它认的遮蔽点就是 `fromSeq`（与渲染层同一处），
+ * 所以这里改吃同一个纯函数：**闸门读数与"这次折叠真能省掉的那几个字节"一致**。
+ * **方向**：旧口径只会**高估**收益（同一份日志的读数改后因此变小），等于偷偷把
+ * `RECENT_TAIL_TOKENS` 这条线往下挪——这正是不许留的那一种偏差。
+ * 与阈值那一侧同理，**它不进请求体任何字节** ⇒ `RENDER_VERSION` **不递**。
  */
 export function estimateMaskedTokens(
   events: readonly AppEvent[],
@@ -682,12 +718,24 @@ export function estimateMaskedTokens(
   toSeq: number,
 ): number {
   const payloads = timerPayloadsOf(events);
+  // 思维链**按帽计入**：seq → 实际会进请求的正文（截断过的那条已带说明行）。
+  // 帽外的一条都不算——渲染层对它们一个字节都不推，这里也就一个 token 都不该算进收益。
+  // `fromSeq` 就是参照点（渲染层的遮蔽点），所以这两处挑出来的是**同一批字符串**。
+  const echoed = new Map(
+    reasoningEchoOf(events, fromSeq).map(entry => [entry.seq, entry.text] as const),
+  );
   let tokens = 0;
   for (const e of events) {
     if (e.seq <= fromSeq || e.seq > toSeq) continue;
     if (e.visibility !== 'model') continue;
     // 摘要自身不计（与 estimateHistoryTokens 同一条）：它遮蔽别的段，不该被算进被遮蔽量
     if (e.type === 'compaction/summary') continue;
+    // reasoning 走帽子那一条路（见函数注释），其余层照旧按 `historyTextOf` 全文量
+    if (e.type === 'message/reasoning') {
+      const text = echoed.get(e.seq);
+      if (text !== undefined) tokens += estimateTokens(text);
+      continue;
+    }
     tokens += estimateTokens(historyTextOf(e, payloads));
   }
   return tokens;
@@ -697,6 +745,23 @@ export function estimateMaskedTokens(
  * 可见历史规模（token 估算）：未被 `compaction/summary` 遮蔽的 model 可见事件之和。
  * 运行期用它判定"要不要压缩"——阈值一过就写摘要，写完历史立刻变短（遮蔽生效），
  * 于是自然形成"积累到阈值才压一次"的节奏，而不是每轮都压。
+ *
+ * **思维链按帽计入**（2026-10-17，`2e16303` 的同源副作用）：v68 把 `message/reasoning` 从
+ * `internal` 改成 `model` 之后，它成了可见历史的一部分，必须计入——但**必须按渲染层那顶帽子**
+ * （`model/render.ts` 的 `REASONING_ECHO_POLICY`：最近 3 条、单条正文 ≤ 20,000 字符），
+ * 因为**真正发出去的只有那点帽内的尾巴**，不是整窗思维链全文。
+ *
+ * 为什么这一条不能省（修之前的实测口径）：按全文累计的话，实测每请求窗口的思维链全文
+ * **p50 ≈ 192k 字符**，而实际回传只有最近 3 条带帽后的 **≈2,056 token/请求（= inputTokens
+ * p50 的 2.55%）**。差额全进了这个估算器 ⇒ 历史被高估一大截 ⇒ **压缩比 v67 早得多、频繁得多**，
+ * 每一次都白花一次 handoff 生成 + 下一次请求全 miss（这正是这一笔要修的账）。
+ *
+ * **不改任何阈值数值、也不动触发时机那一侧的逻辑**：这里只把"reasoning 算多少"换成渲染层
+ * 实际会发出去的那个量。**它不进请求体任何字节** ⇒ `RENDER_VERSION` **不递**。
+ *
+ * 判据只有一处：{@link reasoningEchoOf}（同一个纯函数，渲染层回传的也是它挑出来的那几条）。
+ * 所以"估算器算的"与"请求里真有的"是**同一批字符串**——用例拿 `render().input` 的 reasoning
+ * item 逐字数对齐（`test/handoff-note.test.ts` 的 v68 那一组）。
  *
  * @param coveredUpToSeq **显式遮蔽点覆盖**（2026-10-06 加）：给了它就按它算，不看日志里
  *   已有的摘要。运行期需要这个覆盖，因为它在"这条摘要还没写下去"的时刻就要知道
@@ -718,6 +783,12 @@ export function estimateHistoryTokens(
     covered = coveredUpToSeq;
   }
   const payloads = timerPayloadsOf(events);
+  // 思维链**按帽计入**：seq → 实际会进请求的正文（截断过的那条已带说明行）。
+  // 窗口外的一条都不算——渲染层对它们**一个字节都不推**（不是"推个空的"），
+  // 这里也就一个 token 都不该算。同一顶帽子、同一个纯函数，没有第二份判据。
+  const echoed = new Map(
+    reasoningEchoOf(events, covered).map(entry => [entry.seq, entry.text] as const),
+  );
   let tokens = 0;
   for (const e of events) {
     if (e.seq <= covered) continue;
@@ -727,6 +798,12 @@ export function estimateHistoryTokens(
     // 实测上下文涨到 50k（阈值 32k）仍然没压过，每轮都在为同一批历史付费。
     if (e.visibility !== 'model') continue;
     if (e.type === 'compaction/summary') continue;
+    // reasoning 走帽子那一条路（见函数注释），其余层照旧按 `historyTextOf` 全文量
+    if (e.type === 'message/reasoning') {
+      const text = echoed.get(e.seq);
+      if (text !== undefined) tokens += estimateTokens(text);
+      continue;
+    }
     tokens += estimateTokens(historyTextOf(e, payloads));
   }
   return tokens;
@@ -737,6 +814,10 @@ function historyTextOf(e: AppEvent, payloads: Map<string, unknown>): string {
   switch (e.type) {
     case 'message/user': return e.data.text;
     case 'message/assistant': return e.data.text ?? '';
+    // **这一支现在两个消费者都不走到**：`estimateHistoryTokens` 与 `estimateMaskedTokens` 都先把
+    // reasoning 交给 `reasoningEchoOf`（同一顶帽子），不经过这里。留全文是给未来新消费者一个
+    // **不撒谎**的默认值（算"多了"，不是悄悄算成 0）——真加第三个消费者时，得当场想清楚它
+    // 该不该读那顶帽子，而不是指望这行兜底。
     case 'message/reasoning': return e.data.text;
     // **他的消息也占上下文**（2026-10-02 补）：漏掉 `wake/channel` 与漏掉 reasoning 是同一类错
     // ——被遮蔽区间之外的历史被低估，压缩就迟迟不触发，每一轮都在为同一批历史付费

@@ -68,14 +68,22 @@ const AT_LINE = THRESHOLD * MAINTENANCE_COMPACTION_RATIO;
  * 为什么在测试里再抄一遍、而不是 import `render.ts` 那个常量：这一条是**文案锁**——
  * 两边各写一份，谁改了哪边都会红。import 进来就变成"拿实现断言实现"，改一个字也照样绿。
  * 口径与既有的 `维护窗口：…` 那一句同源（下面"不变量"那一段里也是逐字写的）。
+ *
+ * **v70（P1-04）只加了一格字段名**：正文前面那五个字 `维护窗口：`。它不是这句话的一部分，
+ * 而是此刻层的**行首标签**（`nowFieldsOf` 认标签 ⇒ 这一行第 2 步起才不再重发）。
+ * 所以下面分成两格：`AUTONOMOUS_BODY` 是**正文**（v53 的逐字草稿，一个字节没动），
+ * `AUTONOMOUS` 是它在那一刻层里的**整行**（标签 + 正文）。
  */
-const AUTONOMOUS = [
+const AUTONOMOUS_BODY = [
   '[自主时段] 现在没人打扰你，这是你自己的时间。可以考虑做些事，包括但不限于：',
   '复盘今天（发生了什么事、他今天怎么样、你应过什么）· 想更远的事（你和他要一起做成什么、',
   '有什么建议值得给他）· 只是想说句话——不必等到有事。',
   '资源不用省，你觉得该做就做；但要有产出：写进你自己的文件，或者说给他听。',
   '没有新东西、没有实际进展，就到此为止——不必为了显得忙而继续。',
 ].join('\n');
+
+/** 那一刻层里的**整行**：v70 起带行首标签（正文原样跟在后面） */
+const AUTONOMOUS = `维护窗口：${AUTONOMOUS_BODY}`;
 
 /** 一个"什么都没发生"的基线信号：不在夜里、空拍为 0、历史远在压缩线之下、从没给过窗口 */
 const COLD: MaintenanceSignals = {
@@ -186,9 +194,9 @@ describe('维护窗口 · 长时间空拍（6 拍）', () => {
   });
 });
 
-// ────────── ②b 两档文案（v53）：只有压缩临近还说"维护窗口"，夜里/空拍是「自主时段」 ──────────
+// ────────── ②b 两档文案（v53）：只有压缩临近还讲"整理文档"，夜里/空拍是「自主时段」 ──────────
 
-describe('维护窗口 · 两档文案（v53：同一行两档，不是两条）', () => {
+describe('维护窗口 · 两档文案（v53：同一行两档，不是两条；v70：2/3 档补行首标签）', () => {
   test('压缩临近 ⇒ 旧那一句（含词表里那个词）；夜里/空拍 ⇒ 「自主时段」那一段', () => {
     const compaction = at({ historyTokens: AT_LINE });
     assert.ok(compaction!.text.startsWith(`维护窗口：${MAINTENANCE_WINDOW_REASONS[0]}`),
@@ -197,8 +205,10 @@ describe('维护窗口 · 两档文案（v53：同一行两档，不是两条）
     for (const patch of [{ localHour: 3 }, { idleTicks: MAINTENANCE_IDLE_TICKS }] as Array<Partial<MaintenanceSignals>>) {
       const hit = at(patch);
       assert.equal(hit!.text, AUTONOMOUS, `这一档该换成「自主时段」：${JSON.stringify(patch)}`);
-      assert.equal(hit!.text.includes('维护窗口'), false, '换过档的这一行**不许**再出现"维护窗口"');
-      assert.equal(hit!.text.includes('现在适合整理你自己的那些文档'), false, '也不许把旧文案留在后面');
+      // v53 的口径落在**正文**上：换过档的这一行正文不许再讲"维护窗口"那件事
+      assert.equal(AUTONOMOUS_BODY.includes('现在适合整理你自己的那些文档'), false, '也不许把旧文案留在后面');
+      // v70（P1-04）：整行必须以行首标签开头——那是"第 2 步起不发"的唯一开关
+      assert.equal(hit!.text.startsWith('维护窗口：'), true, `2/3 档也要有行首标签：${hit!.text.slice(0, 20)}`);
     }
   });
 
@@ -221,7 +231,11 @@ describe('维护窗口 · 两档文案（v53：同一行两档，不是两条）
       maintenanceWindow: { text: AUTONOMOUS, reason: 'late-night', atMs: NOON_MS, day: '2026-10-12' },
     });
     assert.equal(text.split('[自主时段]').length - 1, 1, '同一轮只许出现一行');
-    assert.equal(text.includes('维护窗口'), false, '这一档出现时，"维护窗口"那一句一个字节都没有');
+    // v70（P1-04）：这一档现在是**行首 `维护窗口：[自主时段] …`**——标签是字段名，
+    // 正文仍是 v53 那段（"维护窗口"这四个字在**正文**里照旧不出现，落点是下面这一条）。
+    assert.ok(text.includes('\n维护窗口：[自主时段] '), `2/3 档必须带行首标签：\n${text}`);
+    assert.equal(AUTONOMOUS_BODY.includes('维护窗口'), false, '正文里照旧没有"维护窗口"这四个字');
+    assert.equal(text.includes('现在适合整理你自己的那些文档'), false, '也不许把压缩那一档的正文串进来');
     // 反面参照：压缩临近那一档仍走老文案（两档是**同一个字段**的两种取值）
     const compaction = nowLayerText({
       maintenanceWindow: { text: `维护窗口：${MAINTENANCE_WINDOW_REASONS[0]}——现在适合整理。`,
@@ -424,7 +438,8 @@ describe('维护窗口 · 常驻规则与信号同源（用户点名要的那条
     // v61：这些段**不再进 `SELF_BRIEF`**（用户新稿把它们并进了自己的 §§5/8）⇒ 旧口径的
     // "在 SELF_BRIEF 里只出现一次"改为**容器自洽 + 新结构不变**两条：容器里各一次，
     // 而装置自述本身仍是 11 节（结构锁在 `self-brief.test.ts`）。
-    assert.equal(SELF_BRIEF.split('\n## ').length - 1, 11, 'v61：装置自述按 `##` 分节，仍是 11 节');
+    assert.equal(SELF_BRIEF.split('\n## ').length - 1, 17,
+      'v65：用户重排后按 `##` 分节共 17 节（自述 10 + 工作规范 7）');
     assert.ok(memory!.endsWith(REAL_RETREAT_TEXT), 'H（退要是真的退）就是 ⑦ 段的段末');
     // **改动 J**：那句框架定性要留，且位置是"I 那两块之后、H 之前"（用户点明的落点）。
     assert.ok(memory!.includes(FRAMEWORK_DEFAULT_TEXT), 'J 那句框架定性必须在 ⑦ 段里');
@@ -459,8 +474,8 @@ describe('维护窗口 · 常驻规则与信号同源（用户点名要的那条
     for (let i = 1; i < TAIL.length; i += 1) {
       assert.ok(memory!.indexOf(TAIL[i - 1]!) < memory!.indexOf(TAIL[i]!), `第 ${i} 段与第 ${i + 1} 段的先后顺序`);
     }
-    assert.equal(SELF_BRIEF.split('\n## ').length - 1, 11,
-      'v61：装置自述换成按 `##` 分节（11 节）；旧"18 段"口径随用户新稿退场（见 render.ts v61 那一篇）');
+    assert.equal(SELF_BRIEF.split('\n## ').length - 1, 17,
+      'v65：用户重排后按 `##` 分节共 17 节（自述 10 + 工作规范 7）；旧"18 段"口径已随 v61 退场');
 
     // 用户那句话的五层意思，逐条落在文本里
     assert.ok(MAINTENANCE_RULE_TEXT.includes('只有你在维护'), '① 唯一维护源是她');
@@ -491,7 +506,7 @@ describe('维护窗口 · 常驻规则与信号同源（用户点名要的那条
       '时机那一句的最终措辞（逐字）');
   });
 
-  test('这一句进的是 instructions ⇒ 必须与 `RENDER_VERSION` 的递增同批（v51 落它、v63 是当前代）', () => {
+  test('这一句进的是 instructions ⇒ 必须与 `RENDER_VERSION` 的递增同批（v51 落它、v71 是当前代）', () => {
     // 判据：它落在 `renderInstructions` 拼出来的那一段里（最大公共前缀）
     //
     // 这个锁**跟着 `RENDER_VERSION` 走**（不是"钉死 51"）：v51 是落这一句的那一代，
@@ -503,10 +518,32 @@ describe('维护窗口 · 常驻规则与信号同源（用户点名要的那条
     // ＋ 日程页照用户批注重做（周历只画用户向、清单里她的内务降级），
     // v60 是装置自述补"助理的站位 + 那页是给用户看的"那一段（`ASSISTANT_STANCE_TEXT`），
     // **v61 是记忆那一批：固定块里换成"框架推荐 top-6"（省 644 token/轮）
-    // ＋ `memory_read` 扩三个入口 ＋ 腾挪 −37 ＋ `ask_human` 断装配**（2026-10-15）
+    // ＋ `memory_read` 扩三个入口 ＋ 腾挪 −37 ＋ `ask_human` 断装配**（2026-10-15），
+    // v65 是装置自述大改（删 §11 / 删两处"必须说话" / 工作规范重排 / 新增"人类的偏好"，净减 384 token），
+    // **v66 是此刻层结构压缩 + 会话清单窗口 + `read_channel` 列会话簿**（2026-10-16 用户定的方向：
+    // 总体以减少输入为优化目标）——① 把此刻层里"一轮之内不变"的那几件挪进固定块、
+    // ② 此刻层逐字段增量（不变的不发）、③ 会话清单加窗口（私聊常驻 / 群聊 7 天回过话或 1 小时被 @）、
+    // ④ `read_channel` 的 `sid` 变可选（不给就列会话簿）。
+    // **v67 是 `read_channel` 的描述与行为对齐**（2026-10-17：行为在 `fceeffe` 已换成"默认只给
+    // 上次查看之后的增量"，描述还停在旧口径）——只动 `tools` 段一处说明，
+    // `instructions` 这一段一个字节没改（见 `render.ts` 的 v67 那一篇）。
+    // **v68 是思维链按帽回传**（2026-10-17：`message/reasoning` 从 internal 改成 model，渲染层只回传
+    // 最近 3 步、单条正文 ≤ 20,000 字符）——动的是 `input` 的历史段，`instructions` 仍一个字节没改；
+    // 换代照旧递增（与 v51 那一笔无关，这一句本身没动）。
+    // **v69 是此刻层逐字段增量的两处失真修复 + `write_persona` 描述门槛 4KB→2KB**（2026-10-17 晚：
+    // 切分只认登记过的标签并剥掉尾随分隔换行；基线改成"上一步**完整**的那一层"
+    // `RenderedRequest.nowLayerFull`）——动的是 `input` 的尾段与 `tools` 段的一句描述，
+    // `instructions` 这一段一个字节没改；换代照旧递增（理由同上：模板字节变了）。
+    // **v70 是此刻层"必须看见"的三样 + 维护窗口 2/3 档的行首标签 + 窗口改写读数**（2026-10-18，
+    // REVIEW 那四条 P1）——动的是 `input` 尾段（第 ≥2 步的此刻层字节），`instructions` 仍一个
+    // 字节没改；换代照旧递增。
+    // **v71 是给 `cdc6b92`（脱敏）补的账**（2026-10-18）：那一笔把 `SELF_BRIEF` 正文里 4 位尾号
+    // 换成了占位值，**等长替换**（`SELF_BRIEF` 9226 字符、`tokens` / `bytes` 一个数没动），
+    // 但它落在 `instructions`（最大公共前缀）⇒ **整份请求头部字节变了** ⇒ 必须换代，
+    // 否则 `replay` 会拿"renderVersion 一致"掩盖"字节已经不同"（判据与实测见 `render.ts` 的 v71 那一篇）。
     // ——当前这一代就是它。换代之后这个数要一起改，而**改它的理由必须是"换了一代"**——
     // 所以断言里那句理由写成"当前这一代就是它"，免得下一个人把它读成"这句话只许属于 51"。
-    assert.equal(RENDER_VERSION, '63', 'instructions 那一段换代就必须递增：一次设计内的全 miss');
+    assert.equal(RENDER_VERSION, '71', '模板换代就必须递增：一次设计内的全 miss');
     const rendered = render(renderInput());
     // v61：装置自述**逐字置换**后，这一句的落点从旧的 ⑦ 段容器搬进新稿的 §6（口径不变、措辞是
     // 用户的原文）⇒ 这条按新正文重锚，**不是放宽**：它照样要求"这一口径真的进 instructions"。

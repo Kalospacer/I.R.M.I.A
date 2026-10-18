@@ -845,12 +845,18 @@ test('F6 真循环：本机与用度被算进此刻层（宿主算好 → 渲染
     return hit;
   };
 
-  // 本机：平台与工作根是这台机器上必然拿得到的（uptime 是纯计算），磁盘按"读得到就写、读不到就省"
+  // 本机：平台与工作根是这台机器上必然拿得到的（uptime 是纯计算），磁盘按"读得到就写、读不到就省"。
+  //
+  // 2026-10-16 改判：`本机：未知` 这半句**不再可能出现**（拿不到真值就整行不写，见 render.ts 的
+  // `machineLine` 与此刻层那一处）。所以判据从"不等于未知"换成**正面判据**：真循环那一行必须
+  // 真的带着平台与进程时间——旧写法在"整行不写"之后会退化成一个恒真的空断言。
   const machine = line('本机：');
-  assert.notEqual(machine, '本机：未知', `真循环必须把本机事实接上：${machine}`);
   assert.match(machine, /进程已运行 /, '进程已运行多久要算出来（她据此知道自己重启过没有）');
+  assert.ok(!machine.endsWith('未知'), `真循环必须把本机事实接上：${machine}`);
+  assert.ok(machine.length > '本机：'.length + 2, `那一行不许是空壳：${machine}`);
   assert.ok(machine.includes(`工作根 ${join(harness.dir, 'workspace')}`), `工作根要如实：${machine}`);
   assert.ok(!machine.includes('NaN'), machine);
+  assert.ok(!text.includes('本机：未知'), `拿不到真值就不写这一行，绝不写"未知"：\n${text}`);
 
   // 用度（v24）：**正常情况下整行不出现**（用户 2026-10-02："这个默认不出现，
   // 在作为告警信息时出现"）。这里正是那条口径的接线验收：默认配置下 0 tok / 无样本 / 0 失败，

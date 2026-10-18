@@ -68,8 +68,8 @@ function channelWake(text: string, messageId = LONG_MESSAGE_ID): AppEvent {
   return evt('wake/channel', {
     channel: 'qq-official',
     chatType: 'c2c',
-    person: 'E7FEC35E951B5CCF8BA66793BF6B1314',
-    chatId: 'E7FEC35E951B5CCF8BA66793BF6B1314',
+    person: '00000000000000000000000000000001',
+    chatId: '00000000000000000000000000000001',
     text,
     messageId,
     msgSeq: 1,
@@ -143,7 +143,7 @@ test('① 300+ 字符的 ROBOT1.0_ 消息 id：标题是那句人话，不含任
   for (const banned of ['ROBOT1.0_', '[external_event', '[/external_event]', 'source=', 'msg=', 'person=', 'chat=']) {
     assert.equal(title.includes(banned), false, `标题里不许有 ${banned}：${title}`);
   }
-  assert.equal(title.includes('E7FEC35E951B5CCF8BA66793BF6B1314'), false, 'openid 也不进标题');
+  assert.equal(title.includes('00000000000000000000000000000001'), false, 'openid 也不进标题');
 
   // 任务卡那一行会把它裁到 80 字：裁完**正文照样看得见**（裁掉的是她自己的话的后半截，不是 id）
   const clipped = clipTaskTitle(title);
@@ -226,8 +226,8 @@ test('③ 渠道唤醒端到端：她的任务卡标题是那句人话（v45 起
   rig.append('wake/channel', {
     channel: 'qq-official',
     chatType: 'c2c',
-    person: 'E7FEC35E951B5CCF8BA66793BF6B1314',
-    chatId: 'E7FEC35E951B5CCF8BA66793BF6B1314',
+    person: '00000000000000000000000000000001',
+    chatId: '00000000000000000000000000000001',
     text: HUMAN_SENTENCE,
     messageId: LONG_MESSAGE_ID,
     msgSeq: 1,
@@ -293,8 +293,8 @@ test('⑤ 界面预览的标题与运行期同一个口径：都出自 wakeTitle
   writeAssets(rig, ONE_ASSET);
 
   const wake = rig.append('wake/channel', {
-    channel: 'qq-official', chatType: 'c2c', person: 'E7FEC35E951B5CCF8BA66793BF6B1314',
-    chatId: 'E7FEC35E951B5CCF8BA66793BF6B1314', text: HUMAN_SENTENCE,
+    channel: 'qq-official', chatType: 'c2c', person: '00000000000000000000000000000001',
+    chatId: '00000000000000000000000000000001', text: HUMAN_SENTENCE,
     messageId: LONG_MESSAGE_ID, msgSeq: 1, dedupeKey: LONG_MESSAGE_ID,
   });
   await rig.tick();

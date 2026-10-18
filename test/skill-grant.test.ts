@@ -15,8 +15,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { applyGrant, grantPathOf, grantsDirOf, parseGrantRequest } from '../src/grant/mcp-grant.ts';
-import { SKILL_FILE_NAME, SkillManager } from '../src/skill/skills.ts';
+import {
+  applyGrant, grantPathOf, grantReceiptLine, grantWakeNoteOf, grantsDirOf, parseGrantRequest, wakeForGrant,
+} from '../src/grant/mcp-grant.ts';
+import { CATALOG_HEADER, SKILL_FILE_NAME, SkillManager } from '../src/skill/skills.ts';
+import { sha256Hex } from '../src/tools/fs/text-codec.ts';
 import { makeRealWakeRig } from './fixtures/real-wake-rig.ts';
 import type { AppEvent } from '../src/log/types.ts';
 
@@ -253,4 +256,158 @@ test('③e 单子在审阅期间被改过（指纹对不上）⇒ 拒执行，�
   });
   assert.equal(applied.state, 'skipped-stale');
   assert.equal(existsSync(join(rig.dir, 'skills', 'morning-review')), false, '拒执行 = 一个文件都不建');
+});
+
+// ──────────────────── ④ 通知与回执：**与 MCP 那一条同一处代码路径** ────────────────────
+
+/** 台子上那条 `wake/manual{via:'grant'}`（没有时失败——否则下面的断言会静默测空气） */
+function grantWakeOf(events: readonly AppEvent[]): { note: string; via: string; dedupeKey: string } {
+  const found = events.filter(
+    (event) => event.type === 'wake/manual' && (event.data as { via?: unknown }).via === 'grant',
+  );
+  assert.equal(found.length, 1, '一次决定恰好一条 via=grant 的唤醒');
+  return found[0]!.data as { note: string; via: string; dedupeKey: string };
+}
+
+test('④a 批准装：通知走的是**与 MCP 同一条**路（wake/manual · via=grant），措辞是技能那一支', async (t) => {
+  const rig = await makeRealWakeRig();
+  t.after(rig.dispose);
+  writeGrantFile(rig.dir, 's-1', installFile({
+    files: [{ path: 'scripts/run.js', content: 'console.log(1)\n' }],
+  }));
+  rig.append('wake/manual', { note: '一拍' });
+  await rig.tick();
+  const requested = (await eventsOf(rig)).find((event) => event.type === 'grant/requested')!;
+
+  const exec = await applyGrant({
+    dataDir: join(rig.dir, 'data'), configPath: join(rig.dir, 'config.json'),
+    id: 's-1', requestedHash: requested.data.contentHash, skillsRoot: rig.dir,
+  });
+  assert.equal(exec.state, 'ok');
+
+  // **与 `grant-decide` 端点逐字同一个调用**（那条路也是 wakeForGrant → appendSync wake/manual model）
+  const facts = {
+    id: 's-1',
+    kind: 'skill-install' as const,
+    name: 'morning-review',
+    outcome: 'approved' as const,
+    reason: null,
+    exec,
+    scriptCount: requested.data.skillScriptNames?.length ?? 0,
+  };
+  const seq = wakeForGrant({
+    facts,
+    nowMs: Date.parse('2026-10-11T03:00:00.000Z'),
+    append: (data) => rig.append('wake/manual', data).seq,
+    onError: (message) => assert.fail(`唤醒不该发不出去：${message}`),
+  });
+  assert.equal(typeof seq, 'number', '她必须真的被叫醒一次（不许只在日志里留一行）');
+
+  const wake = grantWakeOf(await eventsOf(rig));
+  assert.equal(wake.via, 'grant', '与 MCP 批准同一条 via（界面据此渲染成框架卡片）');
+  assert.match(wake.dedupeKey, /^grant-/u, '幂等键与 MCP 那条同一种形状（决定的身份 + 5 秒时间片）');
+  // 技能那一支的措辞：说清落地在哪、信任门、**索引什么时候变**、脚本有没有被跑
+  assert.match(wake.note, /装一个技能「morning-review」/u);
+  assert.match(wake.note, /已被批准并且执行成功/u);
+  assert.match(wake.note, /skill\/installed/u, '信任门那条凭据要说清（不写它等于装了但看不见）');
+  assert.match(wake.note, /下一次归集/u, '索引什么时候变要与 MCP 同一口径（缓存保护）');
+  assert.match(wake.note, /没有执行/u, '它带脚本 ⇒ 必须说清框架一个都没跑（用户点名的安全项）');
+  assert.equal(wake.note.includes('MCP server'), false, '技能那一支不许说成 MCP server（同一入口、不同措辞）');
+  // 回执那一行（HTTP 应答里那一格）是同一件事的一行版
+  const receipt = grantReceiptLine(facts);
+  assert.match(receipt, /装进技能根/u);
+  assert.match(receipt, /信任门/u);
+
+  // ── 同一处代码路径的**正面证据**：MCP 那一支喂同一个 `wakeForGrant`，产出同形状的 via/键 ──
+  const mcpSeq = wakeForGrant({
+    facts: {
+      id: 'g-1', kind: 'mcp-add', name: 'obscura', outcome: 'approved',
+      reason: null, exec: { state: 'ok', landed: 'obscura' },
+    },
+    nowMs: Date.parse('2026-10-11T03:00:00.000Z'),
+    append: (data) => rig.append('wake/manual', data).seq,
+    onError: (message) => assert.fail(`唤醒不该发不出去：${message}`),
+  });
+  assert.equal(typeof mcpSeq, 'number');
+  const events = await eventsOf(rig);
+  const grantWakes = events.filter(
+    (event) => event.type === 'wake/manual' && (event.data as { via?: unknown }).via === 'grant',
+  );
+  assert.equal(grantWakes.length, 2, '两条决定各一条唤醒（via 都是 grant：同一处代码路径）');
+  assert.match((grantWakes[1]!.data as { note: string }).note, /加 MCP server「obscura」/u);
+  // 三态都有话说：驳回 / 成功 / 失败
+  const failed = grantWakeNoteOf({ ...facts, exec: { state: 'failed', failure: '写技能目录失败：EACCES' } });
+  assert.match(failed, /已被批准，但执行没有成功/u);
+  assert.match(failed, /EACCES/u);
+});
+
+test('④b 驳回：有回执且**不装**（那句话是人的决定，不是"没人理"）', async (t) => {
+  const rig = await makeRealWakeRig();
+  t.after(rig.dispose);
+  writeGrantFile(rig.dir, 's-5', installFile());
+  rig.append('wake/manual', { note: '一拍' });
+  await rig.tick();
+
+  const facts = {
+    id: 's-5', kind: 'skill-install' as const, name: 'morning-review',
+    outcome: 'rejected' as const, reason: '不想让它常驻', exec: { state: 'not-applicable' as const },
+  };
+  const seq = wakeForGrant({
+    facts,
+    nowMs: Date.parse('2026-10-11T03:05:00.000Z'),
+    append: (data) => rig.append('wake/manual', data).seq,
+    onError: (message) => assert.fail(`唤醒不该发不出去：${message}`),
+  });
+  assert.equal(typeof seq, 'number');
+  const wake = grantWakeOf(await eventsOf(rig));
+  assert.match(wake.note, /装一个技能「morning-review」.*被驳回了/u);
+  assert.match(wake.note, /他写的理由是：「不想让它常驻」/u);
+  assert.match(wake.note, /这是否决/u, '要说清"别再自己做"（与 MCP 那一支逐字同款的那句）');
+  assert.match(grantReceiptLine(facts), /人驳回了这张申请单，理由是：不想让它常驻/u);
+  // 驳回 = 一个文件都不建（"有回执"与"真没装"两半都要在）
+  assert.equal(existsSync(join(rig.dir, 'skills', 'morning-review')), false);
+});
+
+test('④c 她申请 ⇒ 落"待批准"；批准之前，她读到的技能索引里没有它', async (t) => {
+  const rig = await makeRealWakeRig({
+    skills: (baseRoot) => new SkillManager({ baseRoot, out: () => undefined }),
+  });
+  t.after(rig.dispose);
+  // 先有一个过了信任门的技能（索引里那一行），再让她申请装一个新的
+  const alphaDir = join(rig.dir, 'skills', 'alpha-search');
+  mkdirSync(alphaDir, { recursive: true });
+  const alphaText = '---\nname: alpha-search\ndescription: 先有的那个技能：搜网页与站内内容，查资料时用。\n---\n\n正文。\n';
+  writeFileSync(join(alphaDir, SKILL_FILE_NAME), alphaText, 'utf8');
+  rig.append('skill/installed', {
+    name: 'alpha-search', path: 'skills/alpha-search', by: 'human', contentHash: sha256Hex(alphaText),
+  });
+  writeGrantFile(rig.dir, 's-6', installFile());
+
+  rig.append('wake/manual', { note: '一拍' });
+  await rig.tick();
+
+  const events = await eventsOf(rig);
+  // ① 待批的记录在（她递的单子被框架拾起来了），并且**只有**待批这一半
+  const requested = events.find((event) => event.type === 'grant/requested')!;
+  assert.equal(requested.data.kind, 'skill-install');
+  assert.equal(requested.data.by, 'agent');
+  assert.ok(events.some((event) => event.type === 'human/asked'), '用户界面上那张卡在');
+  assert.equal(events.some((event) => event.type === 'grant/resolved'), false, '还没批 ⇒ 没有结局');
+  // ② 批准之前，她那一眼（长期记忆层里的技能索引）里没有它。
+  //    只看**索引那一段**：待批那条提问本身会作为「她在等一个人点头」进她的上下文
+  //    （`human/asked` 是 model 可见），所以"名字出现在整份 input 里"是正常的——
+  //    判据是"索引里没有它"，不是"她不知道自己在等什么"。
+  const request = rig.requests[0]!.request;
+  const first = (request.input as Array<{ role?: string; content?: unknown }>)[0]!;
+  const layer = typeof first.content === 'string' ? first.content : '';
+  const at = layer.indexOf(CATALOG_HEADER);
+  const segment = at < 0 ? '' : (layer.slice(at).split('\n\n')[0] ?? '');
+  assert.match(segment, /- alpha-search: /u, '已生效的那个技能要在索引里（否则这条断言是空的）');
+  assert.equal(segment.includes('morning-review'), false, '批准之前她读到的技能索引里没有它');
+  // ③ 盘上也没有（"待批准 ≠ 装上了"）
+  assert.equal(existsSync(join(rig.dir, 'skills', 'morning-review')), false);
+  // ④ 快照里同样没有（索引的字节由快照决定，两处一起说清）
+  const snapshot = events.find((event) => event.type === 'skill/index');
+  assert.ok(snapshot !== undefined);
+  assert.equal((snapshot.data as { text: string }).text.includes('morning-review'), false);
 });

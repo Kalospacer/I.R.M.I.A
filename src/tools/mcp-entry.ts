@@ -361,7 +361,7 @@ function anyToolFieldTruncated(infos: readonly McpToolInfo[], withDescription: b
  * 所以这里只**读**一个数、只**说**一个数：不给就是不给，绝不因为数字大而截断或拒绝。
  *
  * 超限时的外置（`offloadIfLarge`）是**另一条既有路径**，与本函数无关：它管的是"单条结果太大"，
- * 管的是**格式**不是**取舍**，而且外置之后她仍然能 `read_blob` 把全文取回来。
+ * 管的是**格式**不是**取舍**，而且外置之后她仍然能按指针里的路径用 `safe_read` 把全文取回来（v64 起 `read_blob` 已删）。
  */
 export function disclosureCostLine(itemCount: number, estimate: number): string {
   return `\n（本次披露 ${itemCount} 件，约 ${estimate} token；这不是预算闸门，只是让你知道这一次花了多少。）`;
@@ -572,6 +572,16 @@ export function createMcpEntryTool(options: CreateMcpEntryToolOptions): ToolDefi
           // 第一层也适用"怎么看得更少"（用户批 ④a 时点名的）：一行一个 server 已是最省那一屏，
           // 说清这一点，免得她为了"省"去猜有没有第二档
           MCP_SERVER_LIST_HINT,
+          // **技能也是同一条申请路**（2026-10-11，用户的第 ② 条：她也能申请装 skill）。
+          // 为什么这句话挂在这里而不是只在"没有 server"那一支：那一支在她加了第一个 MCP 之后
+          // 就再也不会出现，而"她能申请装技能"这件事不该随 MCP 的有无而消失
+          // ——这一件工具是她唯一会来问"怎么加东西"的地方（技能那侧没有工具，也不该有：
+          // `tools` 段是冻结前缀，加一件就要动一次 `RENDER_VERSION` 与整段缓存）。
+          // 只在接线给了申请单目录时才说（没接线就不编路径），且它只是**回执**、不进 `tools` 段。
+          ...(options.grantsDir === undefined ? [] : [
+            `（**技能同一条路**：往 ${options.grantsDir}\\ 里放一份申请单，kind 写 "skill-install" 或 `
+            + '"skill-remove"；装的话再给 name / description / body / files[]。这一件工具只管 MCP。）',
+          ]),
         ];
         // 这一层的"件"是**server 数**：披露成本那半句与第二层同构（外部稿「能借 3」）
         const estimate = estimateTokens([head, ...lines].join('\n'));

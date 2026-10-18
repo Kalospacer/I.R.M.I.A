@@ -297,8 +297,11 @@ void main() {
     for (final label in ['本周安排', '等待触发', 'Agent 自主工作', '待分享想法']) {
       final card = find.byKey(ValueKey('schedule-stat-$label'));
       expect(card, findsOneWidget, reason: '缺一张卡：$label');
-      // 压小之后每张卡都在 72 逻辑像素以内（上一版 ~93：内边距 12 + 23 号数字）
-      expect(tester.getSize(card).height, lessThan(72), reason: '$label 那张卡还是太大');
+      // 压小之后每张卡都在 74 逻辑像素以内（上一版 ~93：内边距 12 + 23 号数字）。
+      // 74 而不是原来的 72：2026-10-17 把「说明」那一档的行高从 M3 的 16 提到 design_tokens
+      // 的 12/18（Type.caption），那张卡的注脚因此高了 1 像素。这条断言的意图是"约 2/3 高、
+      // 别占掉半屏"，不是钉死某个像素——所以放 2 像素的余量。
+      expect(tester.getSize(card).height, lessThan(74), reason: '$label 那张卡还是太大');
       expect(tester.getSize(card).height, greaterThan(45), reason: '$label 被压得看不见了');
     }
     expect(find.text('她的草稿还没有落盘'), findsOneWidget, reason: '注脚要留着');

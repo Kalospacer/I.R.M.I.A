@@ -1,11 +1,24 @@
+// 本页文案**已经全部**落在 lib/i18n/app_strings.dart（`overview*` 那一族）：页面里不再有
+// 中文字面量，`gui/test/copy_coverage_test.dart` 的闸门盯着这件事。加一句话 = 往文案表加一条
+// （中英各一处），页面里只许 `IrmiaStrings.of(context).xxx`。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:async';
-import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 
 import '../app.dart';
 import '../format.dart';
+// 重启那条路（请求 + 三态判据）与托盘共用一份，见 lib/restart_action.dart 的文件头
+import '../i18n/app_strings.dart';
+import '../i18n/strings_scope.dart';
+// 「配置引导」= 请求打开首次引导卡（手动那条通道，不碰首次判据）
+import '../onboarding_request.dart';
+import '../restart_action.dart';
 import '../theme.dart';
+// 新写的间距/字号/圆角一律走令牌（本轮新增的「配置引导」按钮就是这么摆的）
+import '../theme/design_tokens.dart';
 import '../ui_kit.dart';
 import 'page_chrome.dart';
 
@@ -119,7 +132,7 @@ class _OverviewPageState extends State<OverviewPage> {
             ? [for (final item in list) _SessionRow.from(item)]
             : null;
         // 非对象/缺字段当"读失败"而不是"没有会话"：说"没有"是断言，得先真的读到
-        sessionsError = sessions == null ? '返回的数据不是会话清单' : null;
+        sessionsError = sessions == null ? IrmiaStrings.of(context).overviewSessionsNotList : null;
         sessionsLoading = false;
       });
     } catch (err) {
@@ -140,7 +153,7 @@ class _OverviewPageState extends State<OverviewPage> {
       if (!mounted) return;
       setState(() {
         notes = list is List ? [for (final item in list) _FrameworkNote.from(item)] : null;
-        notesError = notes == null ? '返回的数据不是提示清单' : null;
+        notesError = notes == null ? IrmiaStrings.of(context).overviewNotesNotList : null;
         notesLoading = false;
       });
     } catch (err) {
@@ -154,10 +167,11 @@ class _OverviewPageState extends State<OverviewPage> {
 
   @override
   Widget build(BuildContext context) {
+    final s = IrmiaStrings.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const PageHeader(title: '运行情况', subtitle: '当前状态、用量与待确认项'),
+        PageHeader(title: s.navOverview, subtitle: s.overviewSubtitle),
         Expanded(
           child: RefreshIndicator(
             onRefresh: load,
@@ -165,13 +179,19 @@ class _OverviewPageState extends State<OverviewPage> {
               padding: const EdgeInsets.fromLTRB(26, 16, 26, 30),
               children: [
                 if (loading) const _Loading() else if (error != null) _ErrorBlock(message: error!, onRetry: load) else ...[
-                  _HeroCard(state: widget.state, stats: stats, onRestart: _restart, onGoto: _goto),
+                  _HeroCard(
+                    state: widget.state,
+                    stats: stats,
+                    onRestart: _restart,
+                    onConfigGuide: _openConfigGuide,
+                    onGoto: _goto,
+                  ),
                   if (_reviewItems.isNotEmpty) _ReviewCard(key: _reviewKey, items: _reviewItems, onResolve: _resolve),
                   const SizedBox(height: 16),
                   _Tiles(stats: stats, proj: proj),
                   if (_advice.isNotEmpty) ...[
                     const SizedBox(height: 18),
-                    const _SectionTitle('建议'),
+                    _SectionTitle(IrmiaStrings.of(context).overviewSectionAdvice),
                     CappedChildren(children: [for (final item in _advice) _adviceCardFor(item)]),
                   ],
                   const SizedBox(height: 16),
@@ -196,7 +216,7 @@ class _OverviewPageState extends State<OverviewPage> {
                     onRetry: _loadNotes,
                   ),
                   const SizedBox(height: 18),
-                  const _SectionTitle('最近事件'),
+                  _SectionTitle(IrmiaStrings.of(context).overviewSectionRecent),
                   _RecentList(stats: stats, onWake: () => unawaited(_restart())),
                 ],
               ],
@@ -224,9 +244,9 @@ class _OverviewPageState extends State<OverviewPage> {
       }
     }
     if (stats?['personaIsSeed'] == true) {
-      out.add(const _Advice(
+      out.add(_Advice(
         id: 'persona-seed',
-        title: '人格资产未初始化：IDENTITY.md 仍为模板，先补全身份与语气。',
+        title: IrmiaStrings.of(context).overviewPersonaSeedAdvice,
       ));
     }
     return out;
@@ -290,7 +310,7 @@ class _OverviewPageState extends State<OverviewPage> {
   void _gotoReview() {
     final target = _reviewKey.currentContext;
     if (target == null) {
-      IrmiaToast.show(context, '现在没有待确认的调用', kind: ToastKind.info);
+      IrmiaToast.show(context, IrmiaStrings.of(context).overviewNoPendingCalls, kind: ToastKind.info);
       return;
     }
     unawaited(Scrollable.ensureVisible(target, duration: IrmiaTheme.durCard, alignment: 0.08));
@@ -331,95 +351,33 @@ class _OverviewPageState extends State<OverviewPage> {
 
   /// **重启前后端**（用户 2026-10-04：原来这里是"立即唤醒"，那个功能已经没用了）。
   ///
-  /// 界面把自己的可执行路径一起发过去——脚本不该猜界面装在哪；给了路径它就连界面一起重启。
-  /// 服务端会用 WMI 起一个**分离的**进程去跑 tools/restart-agent.ps1（本进程不能自己重启
-  /// 自己），并延迟到"回执已经能说清楚"之后才动手。
+  /// 2026-10-17 起：请求与判据都在 `lib/restart_action.dart`——**与托盘那一项走同一个函数、
+  /// 同一套三态**（改之前两条路一套严一套松，现场与根因见那个文件的文件头）。
   ///
-  /// **反馈要说实话**（用户 2026-10-05：「点了没有反馈」+「所谓的'重启前后端'也没有重启
-  /// 前端」；2026-10-07：「界面文案不许撒谎」「不许用猜的确认」）：
-  /// 服务端那句 `note` 是**唯一一处**判据（`restartNote`），三种结局的话**各不相同**，
-  /// 而且都带凭据（真实新 pid、端口那一档）：
-  ///   · `scriptStarted == false` ⇒ "重启未能执行"——脚本根本没跑起来，**后端没有被重启**；
-  ///   · `scriptOk == false`      ⇒ "重启失败"（进程没起 / 端口没就绪，附真 pid 与端口）；
-  ///   · `scriptOk == true`       ⇒ 成功，附"真实新 pid … · 端口已就绪"；
-  ///   · `scriptOk == null`       ⇒ "已发出但结局还没确认"（说不知道，不冒充成功）。
-  /// 所以这里**原样贴服务端那句话**，只按结局挑图标；界面不自己另算一份结论
-  /// （同一件事有两份判据，迟早会有两种说法）。
-  ///
-  /// 回执先给一条**如实的**即时反馈，等后端回来之后再补一条"已就绪"——
-  /// 否则那段时间里人不知道点没点上（这正是"点了没有反馈"的现场）。
+  /// 这里只负责两件界面上的事：把话接到 toast 上、把"她回来了没有"接到 `state.online` 上。
+  /// 其余（发哪个请求、什么算成功、等多久、等不到说什么）一律不在本页判断——
+  /// 同一件事有两份判据，迟早会有两种说法，而这个坑刚刚才踩过。
   Future<void> _restart() async {
-    try {
-      final result = await widget.state.api.post(
-        '/api/commands/restart',
-        {'guiExe': Platform.resolvedExecutable},
-        confirm: 'restart',
-      );
-      if (!mounted) return;
-      final map = result is Map ? result : const {};
-      final gui = map['gui'] == true;
-      // 老服务端没有这三个字段 ⇒ 按"结局未确认"读：那时确实什么也确认不了
-      final started = map['scriptStarted'] != false;
-      final scriptOk = map['scriptOk'] == true
-          ? true
-          : (map['scriptOk'] == false ? false : null);
-      final note = map['note']?.toString() ??
-          (started ? '重启已发出，但服务端没有给出结论' : '重启未能执行：脚本没有留下回执。');
-      if (!started || scriptOk == false) {
-        // 这两档是**失败**：脚本没跑起来 / 跑了但某一环失败。服务端那句话本身就是给人读的
-        IrmiaToast.show(context, note, kind: ToastKind.error);
-        return;
-      }
-      if (scriptOk == null) {
-        // 结局未确认：不许说"正在重启"（那是过去那种"屏幕上说在重启、实际什么都没发生"）
-        IrmiaToast.show(context, note);
-        unawaited(_announceReady());
-        return;
-      }
-      final pid = map['backendPid'];
-      final port = map['port']?.toString() ?? '';
-      final evidence = <String>[
-        if (pid is int && pid > 0) '真实新 pid $pid',
-        if (port == 'ready') '端口已就绪',
-      ].join(' · ');
-      IrmiaToast.show(
-        context,
-        // toast 是纯文本，没有加粗：这里别写 Markdown 记号（`**…**` 会原样显示出来）
-        gui
-            ? '正在重启前后端（后端 + 界面，约 20 秒）${evidence.isEmpty ? '' : '：$evidence'}'
-            : '正在重启后端（约 20 秒）${evidence.isEmpty ? '' : '：$evidence'}'
-                '：界面不在本次动作范围内，它只是重连回来',
-      );
-      // 等它回来：`state.online` 在后端断开时转 false、回来后转 true（同一个心跳）。
-      // 只等一次"回来"，最多约 90 秒——超时也如实说，不假装"已就绪"。
-      unawaited(_announceReady());
-    } catch (err) {
-      if (mounted) {
-        IrmiaToast.show(context, '重启失败：$err', kind: ToastKind.error);
-      }
-    }
-  }
-
-  /// 后端回来之后补一句"已就绪"（最多等约 90 秒；等不到就说等不到）。
-  Future<void> _announceReady() async {
-    final state = widget.state;
-    var sawOffline = false;
-    for (var i = 0; i < 90; i += 1) {
-      await Future<void>.delayed(const Duration(seconds: 1));
-      if (!mounted) return;
-      if (!state.online) sawOffline = true;
-      if (sawOffline && state.online) {
-        IrmiaToast.show(context, '已就绪：后端回来了', kind: ToastKind.success);
-        return;
-      }
-    }
-    if (!mounted) return;
-    IrmiaToast.show(
-      context,
-      sawOffline ? '后端还没回来（等了 90 秒）：看一眼 data/restart-trace.log' : '后端没有断开过：这次请求可能没生效',
-      kind: ToastKind.error,
+    final strings = IrmiaStrings.read(context);
+    await performRestart(
+      api: widget.state.api,
+      strings: strings,
+      say: (message, kind) {
+        if (!mounted) return;
+        IrmiaToast.show(context, message, kind: kind);
+      },
+      online: () => widget.state.online,
+      alive: () => mounted,
     );
   }
+
+  /// **配置引导**（用户 2026-10-17 ③）：把首次引导那张卡**手动**打开一次。
+  ///
+  /// 走 `onboarding_request.dart` 那条通道：卡是顶层的东西（`OnboardingHost` 包住整个壳），
+  /// 本页只发一个"请打开"的请求。手动打开**不碰** `onboarding-done` 那个首次判据
+  /// （见 `onboarding.dart` 的 `_openManually`），所以随时开、随时关，不会把
+  /// "第一次启动该弹一次"这件事消费掉，也不会改动任何现有配置（卡里没改过就不写盘）。
+  void _openConfigGuide() => requestOnboarding();
 
   // ──────────────── 定时器卡片上那颗「撤销」 ────────────────
 
@@ -435,10 +393,9 @@ class _OverviewPageState extends State<OverviewPage> {
     if (timerId.isEmpty || cancellingTimer != null) return;
     final yes = await confirm(
       context,
-      title: '撤销这个定时器？',
-      body: '定时器 $timerId 会被取消：它到点不会再把她叫起来。\n'
-          '这次撤销写进日志（timer/cancelled），撤错了只能让她重新排一个。',
-      confirmLabel: '撤销',
+      title: IrmiaStrings.of(context).overviewTimerCancelTitle,
+      body: IrmiaStrings.of(context).overviewTimerCancelBody(timerId),
+      confirmLabel: IrmiaStrings.of(context).overviewTimerCancel,
       danger: true,
     );
     if (!yes || !mounted) return; // 取消 = 什么都没决定：一个请求都不发
@@ -451,15 +408,17 @@ class _OverviewPageState extends State<OverviewPage> {
       await widget.state.api.post('/api/commands/timer-cancel', {'timerId': timerId});
       if (!mounted) return;
       setState(() => cancellingTimer = null);
-      IrmiaToast.show(context, '已撤销定时器 $timerId：到点不会再醒', kind: ToastKind.success);
+      IrmiaToast.show(context, IrmiaStrings.of(context).overviewTimerCancelled(timerId),
+          kind: ToastKind.success);
       await load();
     } catch (err) {
       if (!mounted) return;
       setState(() {
         cancellingTimer = null;
-        timerActionError = '撤销 $timerId 失败：$err';
+        timerActionError = IrmiaStrings.of(context).overviewTimerCancelFailed(timerId, '$err');
       });
-      IrmiaToast.show(context, '撤销失败：$err', kind: ToastKind.error);
+      IrmiaToast.show(context, IrmiaStrings.of(context).overviewTimerCancelToastFailed('$err'),
+          kind: ToastKind.error);
     }
   }
 
@@ -473,7 +432,8 @@ class _OverviewPageState extends State<OverviewPage> {
       await load();
     } catch (err) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('标记失败：$err')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(IrmiaStrings.of(context).overviewMarkFailedToast('$err'))));
       }
     }
   }
@@ -487,9 +447,9 @@ class _OverviewPageState extends State<OverviewPage> {
   /// 重投一条死信 → `POST /api/commands/requeue {inputSeq}`（认领计数由服务端归零）。
   Future<void> _requeue(int inputSeq) => _deadAction(
         inputSeq: inputSeq,
-        verb: '重投',
+        verb: IrmiaStrings.of(context).overviewDeadRequeue,
         path: '/api/commands/requeue',
-        done: '已重投 seq $inputSeq：它回到队列，下一拍重新认领',
+        done: IrmiaStrings.of(context).overviewDeadRequeued(inputSeq),
       );
 
   /// 丢弃一条死信 → `POST /api/commands/discard {inputSeq}`。
@@ -498,20 +458,21 @@ class _OverviewPageState extends State<OverviewPage> {
   /// 这条输入不会被重投、也不会被执行；而它**仍留在事件日志里**——日志是唯一真相源，
   /// 这个动作只是让它退出待处理。
   Future<void> _discard(int inputSeq) async {
+    // 文案在**问之前**取好：`confirm` 之后 `context` 已经跨过 await 了
+    final s = IrmiaStrings.read(context);
     final yes = await confirm(
       context,
-      title: '丢弃这条死信？',
-      body: 'seq $inputSeq 不会被重投，也不会被执行——它就此退出待处理。\n'
-          '这次决定会写进日志：那条输入本身仍留在事件日志里，日后可以查。',
-      confirmLabel: '确认丢弃',
+      title: s.overviewDeadDiscardTitle,
+      body: s.overviewDeadDiscardBody(inputSeq),
+      confirmLabel: s.overviewDeadDiscardConfirm,
       danger: true,
     );
     if (!yes) return; // 取消 = 什么都没决定：一个请求都不发
     await _deadAction(
       inputSeq: inputSeq,
-      verb: '丢弃',
+      verb: s.overviewDeadDiscard,
       path: '/api/commands/discard',
-      done: '已丢弃 seq $inputSeq：它不会再被执行，日志里仍留着那条输入',
+      done: s.overviewDeadDiscarded(inputSeq),
       // 短语 = 命令名（`restart` / `set-key` / `skill-remove` 那族的惯例）。服务端若把
       // `discard` 登记成"不需要短语"（与 requeue 同级：只推进状态、不改能力边界），这个头
       // 会被忽略；登记成需要时正好对上（表允许客户端多声明，见 CONFIRM_PHRASES 的注释）。
@@ -536,8 +497,10 @@ class _OverviewPageState extends State<OverviewPage> {
       await load();
     } catch (err) {
       if (!mounted) return;
-      setState(() => deadActionError = '$verb seq $inputSeq 失败：$err');
-      IrmiaToast.show(context, '$verb失败：$err', kind: ToastKind.error);
+      setState(() => deadActionError =
+          IrmiaStrings.of(context).overviewDeadActionFailed(verb, inputSeq, '$err'));
+      IrmiaToast.show(context, IrmiaStrings.of(context).overviewDeadActionToastFailed(verb, '$err'),
+          kind: ToastKind.error);
     }
   }
 
@@ -571,11 +534,14 @@ class _ErrorBlock extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('无法获取运行数据', style: TextStyle(color: IrmiaTheme.danger, fontWeight: FontWeight.w600)),
+          Text(IrmiaStrings.of(context).overviewLoadFailedTitle, style: TextStyle(color: IrmiaTheme.danger, fontWeight: FontWeight.w600)),
           const SizedBox(height: 6),
           Text(message, style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant)),
           const SizedBox(height: 12),
-          OutlinedButton(onPressed: () => unawaited(onRetry()), child: const Text('重试')),
+          OutlinedButton(
+            onPressed: () => unawaited(onRetry()),
+            child: Text(IrmiaStrings.of(context).retry),
+          ),
         ],
       ),
     );
@@ -583,10 +549,20 @@ class _ErrorBlock extends StatelessWidget {
 }
 
 class _HeroCard extends StatelessWidget {
-  const _HeroCard({required this.state, required this.stats, required this.onRestart, required this.onGoto});
+  const _HeroCard({
+    required this.state,
+    required this.stats,
+    required this.onRestart,
+    required this.onConfigGuide,
+    required this.onGoto,
+  });
   final AppState state;
   final Map<String, dynamic>? stats;
   final Future<void> Function() onRestart;
+
+  /// 「配置引导」：打开首次引导卡（`OnboardingHost` 那张），可随时关掉
+  final VoidCallback onConfigGuide;
+
   final void Function(String pageId) onGoto;
 
   @override
@@ -637,7 +613,40 @@ class _HeroCard extends StatelessWidget {
               ],
             ),
           ),
-          FilledButton(onPressed: () => unawaited(onRestart()), child: const Text('重启前后端')),
+          // 两颗按钮：左边「配置引导」（次要动作，描边），右边「重启前后端」（主行动，填充）。
+          // 位置照用户 ③ 的原话："重启前后端按钮旁边"。
+          //
+          // 间距/圆角走 design_tokens（[Space.x2] / [Shape.radiusControl] / [Type.caption]），
+          // 不写魔法数字：这一排按钮将来在别的卡片里复用时不至于又各差 1px。
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              OutlinedButton.icon(
+                key: const ValueKey('overview-config-guide'),
+                onPressed: onConfigGuide,
+                icon: const Icon(Icons.school_outlined, size: 16),
+                label: Text(IrmiaStrings.of(context).overviewConfigGuide),
+                style: OutlinedButton.styleFrom(
+                  // 与旁边那颗同一条圆角与内边距规矩。
+                  // ⚠ 这里**不许**写 `textStyle:`（`test/button_typography_test.dart` 锁着）：
+                  // ButtonStyle.textStyle 不与上下文合并，页面里写一次就让按钮落到兜底字体，
+                  // 同一个界面出现两种字形。字号归主题（IrmiaTheme 的 buttonText）管。
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(Shape.radiusControl),
+                  ),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: Space.x3,
+                    vertical: Space.x2,
+                  ),
+                ),
+              ),
+              const SizedBox(width: Space.x2),
+              FilledButton(
+                onPressed: () => unawaited(onRestart()),
+                child: Text(IrmiaStrings.of(context).trayRestart),
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -663,7 +672,7 @@ class _ReviewCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('待确认 ${items.length} 项',
+          Text(IrmiaStrings.of(context).overviewPendingCount(items.length),
               style: const TextStyle(color: IrmiaTheme.warn, fontWeight: FontWeight.w600)),
           const SizedBox(height: 6),
           for (final item in items.take(3))
@@ -684,12 +693,12 @@ class _ReviewCard extends StatelessWidget {
                   ),
                   TextButton(
                     onPressed: () => onResolve(item['callId']?.toString() ?? '', 'succeeded'),
-                    child: const Text('标记成功'),
+                    child: Text(IrmiaStrings.of(context).overviewMarkSucceeded),
                   ),
                   TextButton(
                     style: TextButton.styleFrom(foregroundColor: IrmiaTheme.danger),
                     onPressed: () => onResolve(item['callId']?.toString() ?? '', 'failed'),
-                    child: const Text('标记失败'),
+                    child: Text(IrmiaStrings.of(context).overviewMarkFailed),
                   ),
                 ],
               ),
@@ -736,8 +745,9 @@ class _Tiles extends StatelessWidget {
             // 与日志页的 `_num()` 各写一遍——用户报的"同一个数两种写法"就是这么来的。
             value: formatCompact(tokens),
             // 卡面印紧凑写法、悬停给真数：`2705.9k` 那种写法既不统一、也没解决"看不到真数"
-            tooltip: '今日用量 ${budgetTokensTooltip(tokens)}',
-            label: '今日用量',
+            tooltip: IrmiaStrings.of(context)
+                .overviewTodayUsageTooltip(budgetTokensTooltip(tokens)),
+            label: IrmiaStrings.of(context).overviewTodayUsage,
             metric: kBudgetMetricLabel,
             series: tokenSeries,
           ),
@@ -746,14 +756,14 @@ class _Tiles extends StatelessWidget {
         Expanded(
           child: _Tile(
             value: rate == null ? '–' : '${((rate as num) * 100).round()}%',
-            label: '缓存命中率',
+            label: IrmiaStrings.of(context).overviewCacheHitRate,
             series: hitSeries,
           ),
         ),
         const SizedBox(width: 12),
-        Expanded(child: _Tile(value: '$pending', label: '待确认')),
+        Expanded(child: _Tile(value: '$pending', label: IrmiaStrings.of(context).overviewPending)),
         const SizedBox(width: 12),
-        Expanded(child: _Tile(value: '$fail', label: '连续失败')),
+        Expanded(child: _Tile(value: '$fail', label: IrmiaStrings.of(context).overviewFailStreak)),
       ],
     );
   }
@@ -885,7 +895,7 @@ class _Advice {
   final String actLabel;
 
   /// 落在卡面上的那一行：`标题：细节`（没有细节时就只有标题）
-  String get text => body.isEmpty ? title : '$title：$body';
+  String text(AppStrings s) => body.isEmpty ? title : s.overviewAdviceLine(title, body);
 
   static _Advice from(Object? raw) {
     final map = raw is Map ? raw.cast<String, dynamic>() : const <String, dynamic>{};
@@ -914,7 +924,8 @@ class _DeadLetter {
   final String at;
 
   /// 行首一句：`seq 42 · 认领 3 次 · 09-30 03:12`（时刻读不出来就不摆那一段）
-  String get line => 'seq $seq · 认领 $claimCount 次${at.isEmpty ? '' : ' · ${_noteStamp(at)}'}';
+  String line(AppStrings s) =>
+      s.overviewDeadLetterLine(seq, claimCount, at.isEmpty ? null : _noteStamp(at));
 
   static _DeadLetter from(Object? raw) {
     final map = raw is Map ? raw.cast<String, dynamic>() : const <String, dynamic>{};
@@ -973,7 +984,7 @@ class _AdviceCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(advice.text, style: const TextStyle(fontSize: 13.5)),
+          Text(advice.text(IrmiaStrings.of(context)), style: const TextStyle(fontSize: 13.5)),
           if (onAct != null) ...[
             const SizedBox(height: 6),
             // 按钮文案是**服务端给的**（`actLabel`）：四个动作的名字由产出建议的那一侧定，
@@ -988,7 +999,7 @@ class _AdviceCard extends StatelessWidget {
                   minimumSize: const Size(0, 30),
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
-                child: Text(advice.actLabel.isEmpty ? '去处理' : advice.actLabel),
+                child: Text(advice.actLabel.isEmpty ? IrmiaStrings.of(context).overviewActFallback : advice.actLabel),
               ),
             ),
           ],
@@ -1022,9 +1033,9 @@ class _AdviceCard extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final rows = <Widget>[];
     if (deadLetters.isEmpty) {
-      rows.add(const Padding(
-        padding: EdgeInsets.only(top: 6),
-        child: HintLine('没读到死信明细，刷新一次再看看。'),
+      rows.add(Padding(
+        padding: const EdgeInsets.only(top: 6),
+        child: HintLine(IrmiaStrings.of(context).overviewDeadLettersUnread),
       ));
     } else {
       for (final dead in deadLetters) {
@@ -1034,7 +1045,7 @@ class _AdviceCard extends StatelessWidget {
             children: [
               Expanded(
                 child: Text(
-                  dead.line,
+                  dead.line(IrmiaStrings.of(context)),
                   style: TextStyle(
                     fontSize: 12,
                     color: scheme.onSurfaceVariant,
@@ -1046,13 +1057,13 @@ class _AdviceCard extends StatelessWidget {
               TextButton(
                 key: ValueKey('dead-requeue-${dead.seq}'),
                 onPressed: onRequeue == null ? null : () => onRequeue!(dead.seq),
-                child: const Text('重投'),
+                child: Text(IrmiaStrings.of(context).overviewDeadRequeue),
               ),
               TextButton(
                 key: ValueKey('dead-discard-${dead.seq}'),
                 style: TextButton.styleFrom(foregroundColor: IrmiaTheme.danger),
                 onPressed: onDiscard == null ? null : () => onDiscard!(dead.seq),
-                child: const Text('丢弃'),
+                child: Text(IrmiaStrings.of(context).overviewDeadDiscard),
               ),
             ],
           ),
@@ -1137,7 +1148,7 @@ class _SessionRow {
     );
   }
 
-  String get typeLabel => _chatTypeLabel(chatType);
+  String typeLabel(AppStrings s) => _chatTypeLabel(s, chatType);
 
   bool get isGroup => chatType == 'group' || chatType == 'group-at';
 
@@ -1145,23 +1156,23 @@ class _SessionRow {
   ///
   /// 群聊退回**会话的 openid**（`chatId`）而不是最后说话的那位：`person` 是"最近发言的人"，
   /// 拿它当群名等于把门牌换成路人（她会以为那个群就是那个人）。单聊两者本来就是同一个 id。
-  String get displayName {
+  String displayName(AppStrings s) {
     if (name != null) return name!;
     for (final candidate in isGroup ? [chatId, person, sid] : [person, chatId, sid]) {
       if (candidate.isNotEmpty) return candidate;
     }
-    return '未知会话';
+    return s.overviewUnknownSession;
   }
 }
 
 /// 会话类型显示词：与频道页 `_chatTypes`、`src/channel/sessions.ts` 的 `CHAT_TYPE_LABELS`
 /// 同一套词。认不出的类型原样显示——不猜成"群聊"，那会把频道说成群。
-String _chatTypeLabel(String chatType) => switch (chatType) {
-      'c2c' => '单聊',
-      'group-at' => '群聊@',
-      'group' => '群聊',
-      'guild' => '频道',
-      _ => chatType.isEmpty ? '类型未知' : chatType,
+String _chatTypeLabel(AppStrings s, String chatType) => switch (chatType) {
+      'c2c' => s.overviewChatTypeDirect,
+      'group-at' => s.overviewChatTypeGroupAt,
+      'group' => s.overviewChatTypeGroup,
+      'guild' => s.overviewChatTypeGuild,
+      _ => chatType.isEmpty ? s.overviewChatTypeUnknown : chatType,
     };
 
 /// 「外部会话」卡：她有几个群聊 / 几个单聊 / 合计多少条没看，以及每个会话攒了多少。
@@ -1192,7 +1203,7 @@ class _ExternalSessionsCard extends StatelessWidget {
     final unread = list.fold<int>(0, (sum, row) => sum + row.unread);
 
     return _Card(
-      title: '外部会话',
+      title: IrmiaStrings.of(context).overviewExternalSessions,
       // 用户 ② 指定的文案：只讲这张卡收什么、消息去哪。
       // 这里原先挂着一句接口限制（"官方接口只推单聊与 @ 她的群消息——群里没 @ 的话到不了这里"），
       // 它是**防误读**用的：不写它，"没有积累的消息"会被读成"她都看过了"，而真相可能是那些话
@@ -1202,24 +1213,24 @@ class _ExternalSessionsCard extends StatelessWidget {
       // 2026-10-04 改准：原来是"消息**自动**存入信箱"——那也是我们这一侧单方面做不到的一句，
       // 它把"官方 Bot 先把事件推给我们"这个前提说成了自动成立的事实（用户已确认根因就在平台侧的
       // 权限/订阅设置）。改成"推给我们的"——进信箱这件事我们照旧做，推不推照实说是平台的事。
-      note: '经由消息适配器添加的会话。平台推给我们的消息存入信箱，由 Agent 自行查看。',
+      note: IrmiaStrings.of(context).overviewExternalSessionsNote,
       children: [
         if (loading)
-          const StateBlock.loading(hint: '正在读外部会话…')
+          StateBlock.loading(hint: IrmiaStrings.of(context).overviewExternalSessionsLoading)
         else if (error != null)
           StateBlock.error(
-            message: '外部会话读取失败：$error',
-            hint: '状态与用量不受影响；读到数据后这张卡会自己出现。',
+            message: IrmiaStrings.of(context).overviewExternalSessionsError('$error'),
+            hint: IrmiaStrings.of(context).overviewExternalSessionsErrorHint,
             onRetry: () => unawaited(onRetry()),
             padding: _inCardBlockPadding,
           )
         else ...[
           Text(
             [
-              '$groups 个群聊',
-              '$singles 个单聊',
-              if (others > 0) '$others 个其它',
-              '合计 $unread 条未读',
+              IrmiaStrings.of(context).overviewGroupsCount(groups),
+              IrmiaStrings.of(context).overviewSinglesCount(singles),
+              if (others > 0) IrmiaStrings.of(context).overviewOthersCount(others),
+              IrmiaStrings.of(context).overviewUnreadTotal(unread),
             ].join(' · '),
             style: TextStyle(
               fontSize: 12,
@@ -1236,7 +1247,7 @@ class _ExternalSessionsCard extends StatelessWidget {
           // 平台没推非 @ 群消息）。所以把"信箱里是空的"与"要官方 Bot 先推给我们"一起写出来：
           // 这句话的任务是防误读，宁可长一点，也不能让人把"没送到"当成"没有"。
           if (unread == 0)
-            _hintLine('没有积累的消息（信箱里是空的；群里没 @ 她的消息，要官方 Bot 先推给我们才进得来）。')
+            _hintLine(IrmiaStrings.of(context).overviewNoAccumulatedMessages)
           else
             CappedChildren(children: [
               for (var i = 0; i < list.length; i += 1) _SessionLine(row: list[i], divider: i > 0),
@@ -1266,7 +1277,7 @@ class _SessionLine extends StatelessWidget {
         children: [
           Expanded(
             child: Text(
-              row.displayName,
+              row.displayName(IrmiaStrings.of(context)),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               // 有未读的行名字加重：徽章在一行末尾，扫一列时先看到的是名字
@@ -1274,10 +1285,10 @@ class _SessionLine extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 10),
-          _Badge(row.typeLabel, tone: scheme.onSurfaceVariant),
+          _Badge(row.typeLabel(IrmiaStrings.of(context)), tone: scheme.onSurfaceVariant),
           const SizedBox(width: 8),
           Text(
-            '来过 ${row.messages} 条',
+            IrmiaStrings.of(context).overviewMessagesSeen(row.messages),
             style: TextStyle(
               fontSize: 11.5,
               color: scheme.onSurfaceVariant,
@@ -1287,7 +1298,7 @@ class _SessionLine extends StatelessWidget {
           // 0 条不摆徽章：0 不是信息，是噪音（摆上去会让每行都挂个橙点，真正有未读的那行就不显眼了）
           if (row.unread > 0) ...[
             const SizedBox(width: 8),
-            _Badge('未读 ${row.unread}', tone: IrmiaTheme.warn),
+            _Badge(IrmiaStrings.of(context).overviewUnreadBadge(row.unread), tone: IrmiaTheme.warn),
           ],
         ],
       ),
@@ -1405,11 +1416,11 @@ class _FrameworkNote {
   bool get fromFramework => kind != 'injection';
 
   /// 等级词。写出来而不只靠颜色：色盲、截图、单色打印都不能丢信息（copy-guide §二的精神）
-  String get levelLabel => switch (level) {
-        'critical' => '严重',
-        'warn' => '警告',
-        'info' => '提示',
-        _ => level.isEmpty ? '未知等级' : level,
+  String levelLabel(AppStrings s) => switch (level) {
+        'critical' => s.overviewLevelCritical,
+        'warn' => s.overviewLevelWarn,
+        'info' => s.overviewLevelInfo,
+        _ => level.isEmpty ? s.overviewLevelUnknown : level,
       };
 
   /// 徽章文案：类别 + （告警才有的）等级。其余三类只摆类别词——
@@ -1418,10 +1429,10 @@ class _FrameworkNote {
   /// **已恢复的那条原始告警写「已恢复 · 历史」**（用户 2026-10-05 的第三条意见）：
   /// 它说的是"这条曾经是严重的事故，现在已经好了"，而不是"现在正严重着"。
   /// 徽章上必须一眼分得出来——否则人扫一眼列表仍然以为那件事还挂着。
-  String get badgeText {
-    if (historical) return label.isEmpty ? '已恢复 · 历史' : '$label · 已恢复 · 历史';
-    if (!isAlarm) return label.isEmpty ? '框架提示' : label;
-    return label.isEmpty ? levelLabel : '$label · $levelLabel';
+  String badgeText(AppStrings s) {
+    if (historical) return s.overviewHistoricalBadge(label);
+    if (!isAlarm) return label.isEmpty ? s.overviewFrameworkNote : label;
+    return label.isEmpty ? levelLabel(s) : '$label · ${levelLabel(s)}';
   }
 
   /// 等级取色：与设置页徽章同一套语义色，不另造色板；认不出的等级走中性灰。
@@ -1441,20 +1452,20 @@ class _FrameworkNote {
 
   /// 来源一行：哪个会话、谁、判定来自哪一级；框架自身的事没有会话。
   /// 名字解析不出就退回 openid（与外部会话卡、与 `render.ts` 同一条纪律：不编名字）。
-  String get sourceLine {
+  String sourceLine(AppStrings s) {
     if (fromFramework) {
-      return fingerprint == null ? '来源：框架自身' : '来源：框架自身 · $fingerprint';
+      return s.overviewSourceFramework(fingerprint);
     }
     final who = name ?? person;
     final judge = switch (by) {
-      'rule' => '规则判定',
-      'model' => '模型判定',
+      'rule' => s.overviewJudgedByRule,
+      'model' => s.overviewJudgedByModel,
       _ => '',
     };
     return [
-      '来源：${who.isEmpty ? (sid.isEmpty ? '未知会话' : sid) : who}',
+      s.overviewSourceChat(who.isEmpty ? (sid.isEmpty ? s.overviewUnknownSession : sid) : who),
       if (name != null && person.isNotEmpty) person, // 有名字时把 openid 也摆出来，对得上日志
-      if (chatType.isNotEmpty) _chatTypeLabel(chatType),
+      if (chatType.isNotEmpty) _chatTypeLabel(s, chatType),
       if (judge.isNotEmpty) judge,
     ].join(' · ');
   }
@@ -1492,22 +1503,22 @@ class _FrameworkNotesCard extends StatelessWidget {
     final history = [for (final note in list) if (note.historical) note];
     final ordered = [...current, ...history];
     return _Card(
-      title: '框架提示',
+      title: IrmiaStrings.of(context).overviewFrameworkNote,
       // 用户 ②：这张卡不要副标题（原来那句是"外部消息里的注入迹象，以及框架自己发出的告警。"）。
       // 每条提示自己带类别徽章与来源，标题已经说清这是什么地方。
       children: [
         if (loading)
-          const StateBlock.loading(hint: '正在读框架提示…')
+          StateBlock.loading(hint: IrmiaStrings.of(context).overviewFrameworkNotesLoading)
         else if (error != null)
           StateBlock.error(
-            message: '框架提示读取失败：$error',
-            hint: '运行不受影响；注入预警与告警仍照常记录在事件日志里。',
+            message: IrmiaStrings.of(context).overviewFrameworkNotesError('$error'),
+            hint: IrmiaStrings.of(context).overviewFrameworkNotesErrorHint,
             onRetry: () => unawaited(onRetry()),
             padding: _inCardBlockPadding,
           )
         else if (list.isEmpty)
           // 空是常态：没判出迹象、没发过告警，就是一切照常。摆一张空表反而像漏了什么
-          _hintLine('没有需要你知道的事。')
+          _hintLine(IrmiaStrings.of(context).overviewNoFrameworkNotes)
         else
           CappedChildren(children: [
             for (var i = 0; i < ordered.length; i += 1) _NoteLine(note: ordered[i], divider: i > 0),
@@ -1538,7 +1549,7 @@ class _NoteLine extends StatelessWidget {
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _Badge(note.badgeText, tone: note.tone(scheme)),
+              _Badge(note.badgeText(IrmiaStrings.of(context)), tone: note.tone(scheme)),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(note.title,
@@ -1557,7 +1568,7 @@ class _NoteLine extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 5),
-          Text(note.sourceLine,
+          Text(note.sourceLine(IrmiaStrings.of(context)),
               style: TextStyle(fontSize: 11.5, height: 1.5, color: scheme.onSurfaceVariant)),
           // 框架说的那句话（reason）与它引的外人原话（quotes）分开摆：
           // "她当时看到了什么"是这段话的全部意义——光有结论没法判断该不该管
@@ -1591,7 +1602,7 @@ class _QuoteBlock extends StatelessWidget {
         border: Border(left: BorderSide(color: scheme.outlineVariant, width: 2)),
       ),
       child: Text(
-        '「$text」',
+        IrmiaStrings.of(context).overviewQuote(text),
         style: TextStyle(
           fontFamily: 'monospace',
           fontSize: 11.5,
@@ -1707,14 +1718,14 @@ class _TimersCard extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final error = actionError;
     return _Card(
-      title: '定时器',
-      note: '她自己布防的唤醒（timer 工具的 action=set）。到点会把她叫起来，撤销只对还没触发的那些有效。',
+      title: IrmiaStrings.of(context).overviewTimers,
+      note: IrmiaStrings.of(context).overviewTimersNote,
       children: [
         if (timers.isEmpty)
-          _hintLine('眼下没有排着的定时器。')
+          _hintLine(IrmiaStrings.of(context).overviewNoTimers)
         else ...[
           Text(
-            '${timers.length} 个在等',
+            IrmiaStrings.of(context).overviewTimersWaiting(timers.length),
             style: TextStyle(
               fontSize: 12,
               color: scheme.onSurfaceVariant,
@@ -1725,7 +1736,7 @@ class _TimersCard extends StatelessWidget {
             const SizedBox(height: 6),
             StateBlock.error(
               message: error,
-              hint: '可能是它已经触发或已经被撤掉了；刷新一次看最新清单。',
+              hint: IrmiaStrings.of(context).overviewTimersErrorHint,
               padding: _inCardBlockPadding,
             ),
           ],
@@ -1765,7 +1776,11 @@ class _TimerLine extends StatelessWidget {
     final at = '${timer['at'] ?? ''}';
     final cron = '${timer['cron'] ?? ''}';
     // 周期条（cron）没有 `at`：它的到期时刻由 TimerStore 每次触发后重排，投影里只有表达式。
-    final when = at.isNotEmpty ? _noteStamp(at) : (cron.isNotEmpty ? '周期 $cron' : '时刻未知');
+    final when = at.isNotEmpty
+        ? _noteStamp(at)
+        : (cron.isNotEmpty
+            ? IrmiaStrings.of(context).overviewTimerCron(cron)
+            : IrmiaStrings.of(context).overviewTimerUnknownTime);
     final payload = _timerPayloadText(timer['payload']);
 
     return Container(
@@ -1791,7 +1806,7 @@ class _TimerLine extends StatelessWidget {
                   ),
                   if (at.isNotEmpty && cron.isNotEmpty) ...[
                     const SizedBox(width: 8),
-                    _Badge('周期', tone: scheme.onSurfaceVariant),
+                    _Badge(IrmiaStrings.of(context).overviewTimerRecurring, tone: scheme.onSurfaceVariant),
                   ],
                 ]),
                 const SizedBox(height: 2),
@@ -1805,7 +1820,7 @@ class _TimerLine extends StatelessWidget {
                   Padding(
                     padding: const EdgeInsets.only(top: 2),
                     child: Text(
-                      '唤醒内容：$payload',
+                      IrmiaStrings.of(context).overviewTimerPayload(payload),
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(fontSize: 12, height: 1.5, color: scheme.onSurfaceVariant),
@@ -1823,7 +1838,7 @@ class _TimerLine extends StatelessWidget {
               minimumSize: const Size(0, 30),
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
             ),
-            child: const Text('撤销'),
+            child: Text(IrmiaStrings.of(context).overviewTimerCancel),
           ),
         ],
       ),
@@ -1845,8 +1860,11 @@ String _timerPayloadText(Object? payload) {
   if (payload == null) return '';
   final text = payload is String ? payload : _timerPayloadSummary(payload);
   final flat = text.replaceAll(RegExp(r'\s+'), ' ').trim();
-  return flat.length <= 80 ? flat : '${flat.substring(0, 79)}…';
+  return flat.length <= 80 ? flat : '${flat.substring(0, 79)}$_ellipsis';
 }
+
+/// 截断用的省略号：它是标点、不是句式（两种语言都还是它，所以不进文案表）。
+const _ellipsis = '…';
 
 /// 对象型 payload 的取词次序：`note` → `why` → `toString()`（都不在才退回）。
 /// 单独一个纯函数：取词次序本身就是这一批的判据，用例直接钉它。
@@ -1894,10 +1912,10 @@ class _RecentList extends StatelessWidget {
     if (events.isEmpty) {
       return GuideBar(
         icon: Icons.history_rounded,
-        text: '还没有事件记录。',
-        actionLabel: '立即唤醒',
+        text: IrmiaStrings.of(context).overviewRecentEmpty,
+        actionLabel: IrmiaStrings.of(context).overviewRecentEmptyAction,
         onAction: onWake,
-        hint: '唤醒或外部消息写入后，这里列出最近发生的事。',
+        hint: IrmiaStrings.of(context).overviewRecentEmptyHint,
       );
     }
 

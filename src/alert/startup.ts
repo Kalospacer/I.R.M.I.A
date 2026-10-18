@@ -85,9 +85,76 @@ export async function notifyStartupRecovery(
   notifier: AlertNotifier,
   input: StartupRecoveryInput,
 ): Promise<NotifyOutcome | null> {
+  return (await notifyStartupRecoveryDetailed(notifier, input)).outcome;
+}
+
+/** 启动告警的回执：`outcome` 与 {@link notifyStartupRecovery} 同一个，另加一格"是不是被窗口压掉了" */
+export interface StartupRecoveryReceipt {
+  /** 告警回执；null = 上次正常退出，这一条根本没发 */
+  outcome: NotifyOutcome | null;
+  /**
+   * 这条告警被**限流窗口有意丢弃**了（不是失败）。
+   *
+   * 为什么要单独一格：被限流时 `outcome.ok` 也是 true（`notifier.ts` 的口径：有意丢弃不算失败），
+   * 于是调用方照着 ok 写"已发出"就是在撒谎。窗口内**账照旧**（同一条事实日志里早有一条
+   * `alarm/sent`），但**没有再推一条给人**——这两件事必须能分开说。
+   */
+  suppressed: boolean;
+}
+
+/**
+ * 同 {@link notifyStartupRecovery}，但把"被窗口压掉了"也如实带出去。
+ *
+ * 判据不另写一份：notifier 在窗口内会把这条**有意丢弃**并让 `stats().suppressed` 加一，
+ * 调用前后差一即是被压。自己再算一遍 `now - last < rateLimitMs` 就会与 notifier 的口径分岔
+ * （窗口毫秒由 `setRateLimitMin` 热更，第二份判据必然跟不上）。
+ */
+export async function notifyStartupRecoveryDetailed(
+  notifier: AlertNotifier,
+  input: StartupRecoveryInput,
+): Promise<StartupRecoveryReceipt> {
   const alert = buildStartupRecoveryAlert(input);
-  if (alert === null) return null;
-  return notifier.alert(alert);
+  if (alert === null) return { outcome: null, suppressed: false };
+  const before = notifier.stats().suppressed;
+  const outcome = await notifier.alert(alert);
+  return { outcome, suppressed: notifier.stats().suppressed > before };
+}
+
+// ──────────────────────────────── 发告警之前：把限流窗口重建回来 ────────────────────────────────
+
+/**
+ * 日志里"能顺序读到事件"的那个口子（真实实现就是 `EventLog.readAll()`）。
+ *
+ * 为什么声明成结构类型而不是 `EventLog`：这一层只需要读，而 `EventLog` 还带着写句柄、
+ * 索引与分片策略——把它当依赖传进来，测试就得先造一份真日志才能验一条排序。
+ */
+export interface StartupAlertLogSource {
+  readAll(): AsyncIterable<AppEvent>;
+}
+
+/**
+ * **先恢复限流窗口，再发启动告警**（P1-20，2026-10-18）。
+ *
+ * 病：`notifier.restore(日志)` 原先只发生在真循环的 `warmUp` 里，而启动告警在**那之前**就发了
+ * ⇒ "同一类告警 30 分钟内只发一次"这条承诺在**启动告警自己身上**失效。一个必然崩溃的进程被
+ * 守护脚本反复拉起时，每重启一次就多一条——而"限流"正是为这种循环准备的。
+ *
+ * 修：把 `alarm/sent` 先折进窗口（`notifier.restore`，与 `warmUp` 是同一个入口），再发告警。
+ * 只挑 `alarm/sent`：`foldAlarms` 与 `foldStalls` 两份状态都只读这一种事件（`notifier.ts`），
+ * 所以"读全量再过滤"与"读全量再折"结论逐字相同，而过滤后留在内存里的只有告警那一小截。
+ *
+ * @returns 折进窗口的 `alarm/sent` 条数（0 = 日志里一条告警都没有，这条路无事可做）
+ */
+export async function restoreStartupAlertWindow(
+  notifier: AlertNotifier,
+  log: StartupAlertLogSource,
+): Promise<number> {
+  const alarms: AppEvent[] = [];
+  for await (const event of log.readAll()) {
+    if (event.type === 'alarm/sent') alarms.push(event);
+  }
+  notifier.restore(alarms);
+  return alarms.length;
 }
 
 // ══════════════════════════════ 启动时补写「已恢复」 ══════════════════════════════

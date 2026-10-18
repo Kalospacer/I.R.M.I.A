@@ -1,9 +1,16 @@
+// TODO(i18n): 本文件还有 206 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/pages/extensions_page.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:async';
 
 import 'package:flutter/material.dart';
 
 import '../app.dart';
 import '../theme.dart';
+// 间距走 design_tokens（[Space.x2]）：MCP 那一行把开关推到右边缘靠的是布局原语，
+// 但"推到哪里"要与卡片内边距同一套刻度——两处各写一个 8 迟早漂移。
+import '../theme/design_tokens.dart';
 import '../ui_kit.dart';
 import '../ui_state.dart';
 import 'page_chrome.dart';
@@ -755,7 +762,13 @@ class _ExtensionsPageState extends State<ExtensionsPage> {
     final running = _int(view['runningCount']);
     // 她的申请单（2026-10-11）：待批的摆在服务卡**之前**——那是要人动手的事；
     // 已答复的收在最后，供"她申请过什么、谁批的、批完落地没有"回看。
-    final grants = _maps(data['grants']?['items']);
+    //
+    // 顺序在**这一处**定：最新在最上面（用户 2026-10-18："申请单历史自上而下的顺序
+    // 应该是由时间最近的到最远的"）。三段（待批 / 还没进待批 / 已答复）都是从这一份
+    // 列表里挑的子集，所以倒序只写一次、三段一致；渲染处只认这份列表的顺序，
+    // 因此 `_card` 里那个"最多摆 8 行再收进查看全部"的 `CappedChildren`
+    // 折叠出来的第一页也是**最新的那 8 条**（排序先于切页）。
+    final grants = _grantsNewestFirst(_maps(data['grants']?['items']));
     final pending = [
       for (final grant in grants)
         if (grant['outcome'] == null && grant['picked'] == true) grant,
@@ -991,36 +1004,72 @@ class _ExtensionsPageState extends State<ExtensionsPage> {
       cardKey: ValueKey('mcp-$name'),
       bottom: expanded ? 14 : 10,
       children: [
+        /**
+         * 折叠态那一行：左组（状态点 + 服务名 + 徽章）｜尾巴一组（开关 + 固定间距 + 展开箭头）。
+         *
+         * **尾巴整组贴住卡片内容区右边缘**：它右边再没有别的孩子，而尾巴自己是一个
+         * `Row(mainAxisSize: min)`（按内容量占宽，不抢剩余空间）——所以它的右边缘
+         * = 内容区右边缘 = 卡片右边缘 - `padding.right`（[_mcpShell] 那个 `8`）- 描边 1px
+         * （`Container` 会把 decoration 那圈边框的宽度加进内边距）。三个服务行因此纵向
+         * 对齐：开关一列、箭头一列（用户 2026-10-18 圈出来的就是这块空白）。
+         *
+         * 改之前这里写的是 `Flexible(名字) + Spacer`，看着像"把尾巴推右"，其实推不动：
+         * Row 的剩余空间是**按 flex 分给所有弹性孩子**的，名字与 Spacer 各拿一半；名字那一半
+         * 用不完，多出来的落在行尾 ⇒ 开关停在内容区中间偏右、右边空出一大片。现在只留
+         * **一个**弹性孩子（下面那个 `Expanded`）吃掉全部剩余，行尾就没有"用不完的一半"了；
+         * 名字再长也只会自己省略号，挤不走尾巴。
+         *
+         * 三个细节：
+         *   · 顺序仍是 `[开关][箭头]`（与改之前逐字相同——不为了对齐好看去动用户的肌肉记忆）；
+         *   · 开关与箭头之间是**固定间距**（`Space.x1`），不是"剩下的空间"：尾巴内部没有
+         *     弹性孩子，间距写几就是几；
+         *   · 没有任何写死的像素偏移（`Positioned(left: …)` 那种）：对外只声明"这是尾巴那一组"。
+         */
         Row(
           children: [
             BreathDot(kind: kind, size: 8),
-            const SizedBox(width: 8),
-            Flexible(
-              child: Text('$name  ·  ${_mcpLabel[state] ?? state}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600)),
+            const SizedBox(width: Space.x2),
+            // 左组：名字与两枚徽章。唯一的弹性孩子 ⇒ 吃满全部剩余宽度。
+            Expanded(
+              child: Row(
+                children: [
+                  Flexible(
+                    child: Text('$name  ·  ${_mcpLabel[state] ?? state}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600)),
+                  ),
+                  const SizedBox(width: Space.x2),
+                  if (!enabled) _badge('已停用', scheme.onSurfaceVariant),
+                  // 徽章的数**与展开里那份清单同源**（老后端只给"此刻注册的"计数，见 `badgeCount`）：
+                  // 徽章写 3 件、下面列了 5 件，这一页就没人信了
+                  if (tools.badgeCount > 0) _badge('${tools.badgeCount} 件工具', scheme.primary),
+                ],
+              ),
             ),
-            const SizedBox(width: 8),
-            if (!enabled) _badge('已停用', scheme.onSurfaceVariant),
-            // 徽章的数**与展开里那份清单同源**（老后端只给"此刻注册的"计数，见 `badgeCount`）：
-            // 徽章写 3 件、下面列了 5 件，这一页就没人信了
-            if (tools.badgeCount > 0) _badge('${tools.badgeCount} 件工具', scheme.primary),
-            const Spacer(),
-            Switch(
-              value: enabled,
-              onChanged: (value) => unawaited(_toggleMcpServer(name, value)),
+            // 尾巴：`mainAxisSize.min` ⇒ 按内容量占宽（开关 + 固定间距 + 箭头），
+            // 不参与分剩余空间；它右边没有孩子，所以整组自然贴在内容区右边缘。
+            // 判据见 test/extensions_page_test.dart 的"三行开关同一列 + 尾巴右边缘 = 内容区右边"。
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Switch(
+                  value: enabled,
+                  onChanged: (value) => unawaited(_toggleMcpServer(name, value)),
+                ),
+                const SizedBox(width: Space.x1),
+                _iconAction(context,
+                    icon: expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                    tooltip: expanded ? '折叠这个服务' : '展开这个服务',
+                    onPressed: () => setState(() {
+                          if (expanded) {
+                            expandedServers.remove(name);
+                          } else {
+                            expandedServers.add(name);
+                          }
+                        })),
+              ],
             ),
-            _iconAction(context,
-                icon: expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
-                tooltip: expanded ? '折叠这个服务' : '展开这个服务',
-                onPressed: () => setState(() {
-                      if (expanded) {
-                        expandedServers.remove(name);
-                      } else {
-                        expandedServers.add(name);
-                      }
-                    })),
           ],
         ),
         // 折叠态也看得到"它有什么、什么时候取的"（展开才看得到的话，这一页就还得先点一下才知道）
@@ -2054,3 +2103,52 @@ typedef _SectionDef = ({String id, String title, IconData icon, String blurb});
 
 /// 列表行的状态点（kind 给 BreathDot）与一行摘要
 typedef _Stat = ({String kind, String summary});
+
+// ──────────────────── 申请单的顺序（她递的单子：最新在最上面） ────────────────────
+
+/// 一张申请单的"时间"。
+///
+/// 判据取自服务端给的那两格，界面**不自己算**：
+///   · 已经有结局的（`outcome != null`）⇒ `outcomeAt`——卡片上显示的时刻正是这一格；
+///   · 还没有结局的 ⇒ `requestedAt`——她递单子的那一刻。
+/// 两格都读不出来（老后端没有 / 空串 / 不是字符串 / 不是 ISO 时间）⇒ `null`：
+/// 没有时间的在倒序里就是"最远"的那一头，**排在最后**，不许因为"null 最小"冒到最上面。
+DateTime? _grantTimeOf(Map<String, dynamic> grant) {
+  final keys = grant['outcome'] != null
+      ? const ['outcomeAt', 'requestedAt']
+      : const ['requestedAt', 'outcomeAt'];
+  for (final key in keys) {
+    final raw = grant[key];
+    if (raw is! String) continue;
+    final at = DateTime.tryParse(raw.trim());
+    if (at != null) return at;
+  }
+  return null;
+}
+
+/// 申请单列表排成**由时间最近的到最远的**（用户 2026-10-18 的原话）。
+///
+/// 为什么排在这里（数据装配处）而不是渲染处：
+///   · 待批、还没进待批、已答复三段共用这一份列表——在渲染里反向遍历只能改到其中一段，
+///     另一段就与它对不上了；这里排一次，三段一致；
+///   · `_card` 里的 [CappedChildren] 摆满 8 行就收口、其余进「查看全部」，
+///     顺序必须在切页**之前**定，否则第一页留着的是最旧的那几条。
+///
+/// 同一时刻的两条保持服务端给的先后（`seq` 兜底）：`List.sort` **不稳定**，只按时间比
+/// 会让相等的那两条随机换位——页面 20 秒轮询一次，人就会看见它们来回跳。
+List<Map<String, dynamic>> _grantsNewestFirst(List<Map<String, dynamic>> items) {
+  final rows = <({Map<String, dynamic> grant, DateTime? at, int seq})>[
+    for (var i = 0; i < items.length; i++)
+      (grant: items[i], at: _grantTimeOf(items[i]), seq: i),
+  ];
+  rows.sort((a, b) {
+    if (a.at == null || b.at == null) {
+      if (a.at != null) return -1;
+      if (b.at != null) return 1;
+      return a.seq.compareTo(b.seq);
+    }
+    final byTime = b.at!.compareTo(a.at!); // 倒序：新的在前
+    return byTime != 0 ? byTime : a.seq.compareTo(b.seq);
+  });
+  return [for (final row in rows) row.grant];
+}

@@ -270,7 +270,7 @@ function oneBotEvent(seq: number, attachments: Array<{ type: string; url?: strin
       channel: 'onebot',
       chatType: 'group-at',
       person: '10001',
-      chatId: '953245617',
+      chatId: '123456780',
       text: '看看这两张，第二张是重点',
       messageId: `m${seq}`,
       msgSeq: seq,

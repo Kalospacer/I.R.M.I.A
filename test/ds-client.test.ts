@@ -285,6 +285,97 @@ test('流中断：保留已收部分并标 interrupted，不抛错（M2-9）', a
   assert.ok(result.failure !== null);
 });
 
+// ──────────────────────── 终态失败（response.failed） ────────────────────────
+
+/**
+ * P0（2026-10-17 修）：`response.failed` 是**上游宣告的终态失败**，不是"成功收尾"。
+ *
+ * 客户端的合同（循环层只认这一格，见 `DsStreamResult.failure` 的注释）：
+ * **`failure !== null` ⇔ 这次调用没有正常收尾**。所以这里钉的是判据落地，不是文案：
+ *   · `status` 是上游说的 failed，`interrupted` 是 false（终态事件明明收到了）；
+ *   · `failure` 必须非 null、码文来自终态事件里的 error；
+ *   · 已收的正文、半截调用、usage 一样都不许因为"失败"就被丢掉——客户端如实交付，
+ *     丢不丢 toolCalls 是循环层的纪律（`agent-loop.test.ts` 那一侧钉）。
+ */
+test('response.failed：终态失败必须落进 failure，已收部分与 usage 照留', async (t) => {
+  const mock = await startMock(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(sseFrame('response.output_text.delta', { item_id: 'msg_1', output_index: 0, delta: '我先看' }));
+    res.write(
+      sseFrame('response.output_item.added', {
+        output_index: 1,
+        item: { id: 'fc_1', type: 'function_call', call_id: 'call_1', name: 'read_file', arguments: '' },
+      }),
+    );
+    res.write(sseFrame('response.function_call_arguments.delta', { item_id: 'fc_1', delta: '{"file_pa' }));
+    res.write(
+      sseFrame('response.failed', {
+        response: {
+          id: 'resp_failed',
+          status: 'failed',
+          model: 'deepseek-v4-pro',
+          error: { code: 'server_error', message: '上游在这次生成里崩了' },
+          usage: {
+            input_tokens: 321,
+            input_tokens_details: { cached_tokens: 300 },
+            output_tokens: 21,
+            output_tokens_details: { reasoning_tokens: 7 },
+          },
+        },
+      }),
+    );
+    res.end();
+  });
+
+  const client = new DsClient({ baseUrl: mock.url, apiKey: 'sk-test' });
+  const result = await client.stream({ lane: 'heavy', input: '看日志' }, {});
+
+  assert.equal(result.status, 'failed', '上游自己报的终态是 failed');
+  assert.equal(result.interrupted, false, '终态事件收到了 ⇒ 不是"没收到终态"');
+  assert.deepEqual(
+    result.failure,
+    { code: 'server_error', message: '上游在这次生成里崩了' },
+    '失败判据必须落在 failure 上（非 null）',
+  );
+  assert.equal(result.text, '我先看', '已推送的正文照样交付');
+  assert.deepEqual(result.toolCalls, [{ callId: 'call_1', name: 'read_file', arguments: '{"file_pa' }]);
+  assert.deepEqual(result.usage, { inputTokens: 321, outputTokens: 21, cachedTokens: 300, reasoningTokens: 7 });
+});
+
+test('response.failed 没带 error 对象：failure 仍然非 null（补一条有码有文的原因）', async (t) => {
+  // 真实 SSE 里出现过只有 status 的失败包：判据不许因此变成"成功"
+  const mock = await startMock(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(sseFrame('response.failed', { response: { id: 'resp_bare', status: 'failed', usage: {} } }));
+    res.end();
+  });
+
+  const client = new DsClient({ baseUrl: mock.url, apiKey: 'sk-test' });
+  const result = await client.stream({ lane: 'heavy', input: 'x' }, {});
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.interrupted, false);
+  assert.equal(result.failure?.code, 'response_failed');
+  assert.match(result.failure?.message ?? '', /failed/u);
+});
+
+test('流在终态事件前干净结束：failure 非 null（没有正常收尾就不许是 null）', async (t) => {
+  // 连接正常关闭、但服务端一个终态事件都没发：不是"成功"，也不是上游宣告的 failed
+  const mock = await startMock(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(sseFrame('response.output_text.delta', { item_id: 'msg_1', delta: '说到一半' }));
+    res.end();
+  });
+
+  const client = new DsClient({ baseUrl: mock.url, apiKey: 'sk-test' });
+  const result = await client.stream({ lane: 'heavy', input: 'x' }, {});
+
+  assert.equal(result.interrupted, true);
+  assert.equal(result.status, 'incomplete', '没有终态可报 ⇒ status 不许写成 failed');
+  assert.equal(result.failure?.code, 'stream_interrupted');
+  assert.equal(result.text, '说到一半');
+});
+
 // ──────────────────────────────── 错误分类 ────────────────────────────────
 
 test('429 尊重 Retry-After：退避取服务端提示，第三次成功', async (t) => {

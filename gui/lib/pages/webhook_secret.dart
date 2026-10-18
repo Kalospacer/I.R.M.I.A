@@ -1,3 +1,7 @@
+// TODO(i18n): 本文件还有 10 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/pages/webhook_secret.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 /// 「这串凭据只显示这一次」那张对话框（B9：设置页「外部回调」卡上的动作回执）。
 ///
 /// ## 为什么它必须是一个"读完就没了"的框

@@ -49,11 +49,17 @@ type ScriptItem =
   | { text: string; usage?: Partial<DsUsage> }
   | { throws: unknown };
 
+/**
+ * 模型脚本：数组按调用顺序消费；函数则按请求现算（P1-13 的用例要"不管分几次调用，
+ * 合并一律回 NOOP、日记一律回正文"，写死条数会把用例钉在分块算法上）。
+ */
+type Script = ScriptItem[] | ((request: DsRequest) => ScriptItem);
+
 function messageItem(text: string): DsOutputItem {
   return { type: 'message', id: 'm-memory', text };
 }
 
-async function makeHarness(t: TestContext, script: ScriptItem[]): Promise<Harness> {
+async function makeHarness(t: TestContext, script: Script): Promise<Harness> {
   const root = mkdtempSync(join(tmpdir(), 'irmia-memory-'));
   t.after(() => { rmSync(root, { recursive: true, force: true }); });
   const dataDir = join(root, 'data');
@@ -62,13 +68,18 @@ async function makeHarness(t: TestContext, script: ScriptItem[]): Promise<Harnes
   t.after(() => { void log.close(); });
   const projection = fold([]);
   const requests: DsRequest[] = [];
-  const queue = [...script];
+  const queue = Array.isArray(script) ? [...script] : null;
+  const nextItem = (request: DsRequest): ScriptItem => {
+    if (queue === null) return (script as (request: DsRequest) => ScriptItem)(request);
+    const next = queue.shift();
+    if (next === undefined) throw new Error('脚本耗尽：模型调用次数超出预期');
+    return next;
+  };
   const ds: MemorySummarizer = {
     modelFor: () => 'fake-light',
     generate: async (request: DsRequest): Promise<DsResponse> => {
       requests.push(request);
-      const next = queue.shift();
-      if (next === undefined) throw new Error('脚本耗尽：模型调用次数超出预期');
+      const next = nextItem(request);
       if ('throws' in next) throw next.throws;
       return {
         status: 'completed',
@@ -305,5 +316,189 @@ describe('memory-maintain 合并与四操作', () => {
     const facts = h.readFacts();
     assert.equal((facts.match(/已经作废的旧结论/g) ?? []).length, 1, 'invalid 条目不重复标注');
     assert.equal((facts.match(/早就归档的条目/g) ?? []).length, 1, '归档区条目不二次移动');
+  });
+});
+
+// ──────────────────────────────── P1-13 / P1-14 ────────────────────────────────
+//
+// 出处 `D:\IrmiaAgent\_ops-review-stable\REVIEW.md` 第 38–39 行：
+//   · P1-13 每日记忆整理只喂 episode **头 4,000 字**（原文 80%+ 永不提炼、原件还被移出索引）
+//   · P1-14 整理任务「只回 summary、ops 为空」被判成功（兜底被跳过、episode 照样归档）
+// 判据都用**真实调用**量：分块后的请求体（喂进去的字节）与 episodes/ 的盘上事实（原件在不在）。
+
+/** 一次合并请求的正文（不是日记）；返回 null 表示这不是合并调用 */
+function mergeInputOf(request: DsRequest): string | null {
+  const text = request.text;
+  if (text?.type !== 'json_schema' || text.name !== 'memory_operations') return null;
+  return typeof request.input === 'string' ? request.input : JSON.stringify(request.input);
+}
+
+function isDiaryRequest(request: DsRequest): boolean {
+  const text = request.text;
+  return text?.type === 'json_schema' && text.name === 'diary_entry';
+}
+
+/**
+ * 造一份"大日子"流水账：开头 / 中段 / 结尾各一个哨兵，中间塞够 20,000+ 字的碎行。
+ * 三个哨兵是**旧写法（只取头 4,000 字）必然丢掉中段与结尾**的证据。
+ */
+function longEpisode(): { body: string; marks: { head: string; mid: string; tail: string } } {
+  const marks = {
+    head: 'HEAD 开头：用户决定把部署窗口挪到周六凌晨。',
+    mid: 'MID 中段：备份脚本的触发时刻从周三改到了周四。',
+    tail: 'TAIL 结尾：最终结论是旧咖啡机换成新的了。',
+  };
+  const lines: string[] = [marks.head];
+  for (let i = 1; i < 1000; i += 1) {
+    if (i === 500) lines.push(marks.mid);
+    if (i === 999) {
+      lines.push(marks.tail);
+      continue;
+    }
+    lines.push(`- 流水账第 ${i} 行：那天只是在等构建，没什么大事。`);
+  }
+  return { body: `${lines.join('\n')}\n`, marks };
+}
+
+describe('memory-maintain P1-13 分块喂：大日子不再只喂头 4,000 字', () => {
+  test('P1-13 正：24,000 字全文喂进去（喂入 == 原文）、分块调用、提示写明「这是节选，全文 N 字」', async (t) => {
+    const { body, marks } = longEpisode();
+    assert.ok(body.length > 20_000, `样本必须远大于旧的 4,000 字上限（实际 ${body.length}）`);
+    const h = await makeHarness(t, request => isDiaryRequest(request)
+      ? { text: diaryPayload('今天把一整天的流水账都过了一遍。') }
+      : { text: opsPayload([{ op: 'NOOP', reason: '这一段只是进度，不值得记' }], '流水账读完了，没有新事实。') });
+    h.writeEpisode('2026-02-05', body);
+    const lines: string[] = [];
+
+    const result = await maintainMemory(h.dataDir, h.options({ out: line => lines.push(line) }));
+
+    const mergeInputs = h.requests.map(mergeInputOf).filter((input): input is string => input !== null);
+    assert.ok(mergeInputs.length >= 2, `这份流水账必须分块喂（实测 ${mergeInputs.length} 次合并调用）`);
+    const fed = mergeInputs.join('\n');
+    for (const [where, mark] of Object.entries(marks)) {
+      assert.ok(fed.includes(mark), `${where} 那一截必须喂进模型（旧写法只取开头 4,000 字，中段/结尾必丢）`);
+    }
+
+    // 读数：喂进去的字数 / 原文总字数。相等就是"一个字都没裁"（也证明没有重复喂同一段）
+    assert.equal(result.mergeFedChars, body.length, '喂入字数必须等于原文');
+    assert.equal(result.mergeTotalChars, body.length);
+    assert.equal(result.ops.noop, mergeInputs.length, '每块都回了 NOOP（显式判断）⇒ 也算提出了操作');
+    assert.deepEqual(result.archived, ['2026-02-05.md'], '每一段都被模型过过 ⇒ 原件可以归档');
+
+    // 提示里必须说清这是节选（P1-13 的原文要求），而不是悄悄只给一段
+    assert.match(fed, new RegExp(`全文 ${body.length} 字`, 'u'));
+    assert.match(fed, /这是节选，不是全文/u);
+    // 旧写法的痕迹（clip 的"…（已截断 N 字符）"）一个字都不该出现
+    assert.equal(fed.includes('已截断'), false, '新路径没有"只取头"这一步');
+    assert.ok(
+      lines.some(line => line.includes(`喂入 ${body.length}/${body.length} 字`)),
+      `日志里要能读到「喂入/原文」这对读数，实际日志：${lines.join(' | ')}`,
+    );
+  });
+
+  test('P1-13 反：多份流水账里靠后的那份大日子不再被整体裁掉（旧写法连它的头都保不住）', async (t) => {
+    const { body, marks } = longEpisode();
+    const h = await makeHarness(t, request => isDiaryRequest(request)
+      ? { text: diaryPayload('今天收了两天的账。') }
+      : { text: opsPayload([{ op: 'NOOP', reason: '只是流水' }], '读完了。') });
+    h.writeEpisode('2026-02-03', '- 两天前的碎事：买了咖啡豆。\n');
+    h.writeEpisode('2026-02-04', body);
+
+    const result = await maintainMemory(h.dataDir, h.options());
+
+    const fed = h.requests.map(mergeInputOf).filter((input): input is string => input !== null).join('\n');
+    assert.ok(fed.includes('买了咖啡豆'), '靠前的短流水账照常喂进去');
+    assert.ok(fed.includes(marks.tail), '靠后的长流水账的结尾也必须喂进去（旧写法按日期升序拼接后整段被裁）');
+    assert.equal(result.mergeFedChars, result.mergeTotalChars, '两份原文合计 = 喂进去的字数');
+    assert.deepEqual(result.archived.sort(), ['2026-02-03.md', '2026-02-04.md']);
+  });
+
+  test('P1-13 日记素材：长流水账取「头 + 尾」并写明节选，不再只给前 4,000 字', async (t) => {
+    const { body, marks } = longEpisode();
+    const h = await makeHarness(t, request => isDiaryRequest(request)
+      ? { text: diaryPayload('写完了。') }
+      : { text: opsPayload([{ op: 'NOOP', reason: '只是流水' }], '读完了。') });
+    h.writeEpisode('2026-02-05', body);
+
+    await maintainMemory(h.dataDir, h.options());
+
+    const diary = h.requests.find(isDiaryRequest);
+    assert.ok(diary !== undefined, '日记调用必须发生');
+    const diaryInput = typeof diary.input === 'string' ? diary.input : '';
+    assert.ok(diaryInput.includes(marks.head), '日记素材要有开头');
+    assert.ok(diaryInput.includes(marks.tail), '日记素材也要有结尾（旧写法只给前 4,000 字）');
+    assert.match(diaryInput, new RegExp(`节选：全文 ${body.length} 字`, 'u'), '节选必须自报全文多少字');
+  });
+});
+
+describe('memory-maintain P1-14 空 ops 不算成功：不归档原件', () => {
+  test('P1-14 正：只回 summary、ops 为空 ⇒ 判失败：不写兜底、不归档原件、reason 明说没提出可写项', async (t) => {
+    // 正是 REVIEW 里那一种回包：**只有 summary**，operations 连字段都没有
+    const h = await makeHarness(t, request => isDiaryRequest(request)
+      ? { text: diaryPayload('这一天没整理出什么。') }
+      : { text: JSON.stringify({ summary: '这三天没什么大事。' }) });
+    h.writeEpisode('2026-02-05', '- 用户说周六凌晨做部署演练\n');
+    ensureMemorySeeds(h.dataDir); // 先落种子，才能对"整理前后 facts.md 逐字节不变"下判断
+    const factsBefore = h.readFacts();
+
+    const result = await maintainMemory(h.dataDir, h.options());
+
+    assert.equal(result.ran, true);
+    assert.equal(result.emptyOpsCalls, 1, '一次空 ops 回包要留下读数');
+    assert.deepEqual(result.keptForRetry, ['2026-02-05.md'], '原件点名保留，等下次重试');
+    assert.deepEqual(result.archived, [], '**不许归档**（否则就是"整理成功、记忆消失"）');
+    assert.deepEqual(result.ops, { add: 0, update: 0, invalidate: 0, noop: 0 }, '空 ops 不产生任何操作');
+    assert.match(result.reason, /没提出任何可写项/u, '必须明确说"这次没提出可写项"，不能报成功');
+    assert.match(result.reason, /2026-02-05\.md/u, 'reason 要点名哪份原件被留下');
+
+    // 兜底也**不写**：facts.md 逐字节不变（每天重复追加同一条原文会污染记忆）
+    assert.equal(h.readFacts(), factsBefore, '空 ops 不写兜底、facts.md 一个字都不动');
+    // 原件仍在 episodes/ 里（下次整理还会读到它）
+    assert.deepEqual(readdirSync(join(h.memDir, 'episodes')).sort(), ['2026-02-05.md']);
+  });
+
+  test('P1-14 反：空 ops 留下的原件，下一次整理重试成功 ⇒ 补写事实并归档', async (t) => {
+    let mergeCalls = 0;
+    const h = await makeHarness(t, request => {
+      if (isDiaryRequest(request)) return { text: diaryPayload('整理了一次。') };
+      mergeCalls += 1;
+      return mergeCalls === 1
+        ? { text: JSON.stringify({ operations: [], summary: '这次没提出来。' }) }
+        : {
+          text: opsPayload([
+            { op: 'ADD', section: 'stable', entry: '用户把部署窗口挪到了周六凌晨' },
+          ], '这次补上了。'),
+        };
+    });
+    h.writeEpisode('2026-02-05', '- 用户说周六凌晨做部署演练\n');
+
+    const first = await maintainMemory(h.dataDir, h.options());
+    assert.deepEqual(first.archived, []);
+    assert.deepEqual(first.keptForRetry, ['2026-02-05.md']);
+    assert.equal(h.readFacts().includes('部署窗口'), false, '第一次没有事实可写');
+
+    // 同一天再整理一次（等价于下一次定时任务的"重试"）：模型这次给了 ADD
+    const second = await maintainMemory(h.dataDir, h.options());
+    assert.equal(second.emptyOpsCalls, 0);
+    assert.deepEqual(second.archived, ['2026-02-05.md'], '重试成功后才归档');
+    assert.deepEqual(second.keptForRetry, []);
+    assert.ok(h.readFacts().includes('用户把部署窗口挪到了周六凌晨'), '重试把上一次没提炼的事实补上了');
+    assert.ok(h.readFacts().includes('(source: episode 2026-02-05)'));
+  });
+
+  test('P1-14 边界：ops 里只有 NOOP（显式判断「不值得记」）⇒ 算成功、原件归档', async (t) => {
+    // 区分"模型没提出可写项"（失败、不归档）与"模型明确说这段不值得记"（成功、归档）：
+    // NOOP 是操作枚举的一部分，是**显式结论**，不是"什么都没说"。
+    const h = await makeHarness(t, request => isDiaryRequest(request)
+      ? { text: diaryPayload('无事。') }
+      : { text: opsPayload([{ op: 'NOOP', reason: '只是寒暄' }], '没有值得记的。') });
+    h.writeEpisode('2026-02-05', '- 嗯。\n');
+
+    const result = await maintainMemory(h.dataDir, h.options());
+
+    assert.equal(result.emptyOpsCalls, 0);
+    assert.equal(result.ops.noop, 1);
+    assert.deepEqual(result.archived, ['2026-02-05.md'], '显式 NOOP 是判断，不是空回包');
+    assert.deepEqual(result.keptForRetry, []);
   });
 });

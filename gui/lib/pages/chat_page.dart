@@ -1,9 +1,20 @@
+// TODO(i18n): 本文件还有 6 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/pages/chat_page.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:async';
 import 'dart:convert';
 
+// `ValueListenable` / `ValueNotifier`：那一行进度只重画自己，靠的就是它
+// （见 ChatPageState.thinkingNow —— 换 setState 会把整页重建）
+// （`FontFeature` 那个等宽数字特性由 material.dart 一并带出来，不用另 import `dart:ui`）
+import 'package:clock/clock.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../i18n/app_strings.dart';
+import '../i18n/strings_scope.dart';
 import '../markdown.dart';
 import '../theme.dart';
 import '../ui_kit.dart';
@@ -17,14 +28,14 @@ import 'page_chrome.dart';
 /// （彼此真的按打字速度隔开），不来自把一句完整的话一个字一个字挤出来——后者只是慢。
 ///
 /// **历史能一直往上翻**（修订清单 ⑮）：界面上不再只有最近一屏，滚到顶会再往前取一页，
-/// 直到日志开头那行状态说"没有更早的记录了"。做法与代价见 [_ChatPageState._loadEarlier]
-/// 与 [_ChatPageState._anchorKey]。
+/// 直到日志开头那行状态说"没有更早的记录了"。做法与代价见 [ChatPageState._loadEarlier]
+/// 与 [ChatPageState._anchorKey]。
 class ChatPage extends StatefulWidget {
   const ChatPage({super.key, required this.state});
   final AppState state;
 
   @override
-  State<ChatPage> createState() => _ChatPageState();
+  State<ChatPage> createState() => ChatPageState();
 }
 
 /// 右侧那一列的卡片宽度：**通道卡、框架提醒卡、上下文分界卡共用**。
@@ -46,11 +57,67 @@ const int _kHistoryPage = 200;
 ///
 /// 它是一条**兜底**而不是一个"待补的洞"：新来源（`via: 'compact'` 之类）第一次出现时，
 /// 界面照旧把它摆成框架卡片，只是标签先落到这个词——**界面一行都不用改**。
+///
+/// i18n：这个常量是**中文那一份的字面值**，留给既有用例与其它引用点；界面渲染走
+/// `s.tagFrameworkNotice`（见 [frameworkNoticeLabel]）。两处不许漂——`test/i18n_test.dart`
+/// 有一条钉着"`ZhStrings` 与这些常量逐字相同"。
 const String kFrameworkNoticeLabel = '框架通报';
+
+/// 历史**读失败**时那一屏的标题。
+///
+/// 与空态的「会话尚未开始」是两句话：那句说"读成功、确实没有记录"，这句说"没读到"。
+/// 对外可见（用例按这句话断言错误态真的出现了）。界面渲染走 `s.historyErrorTitle`。
+const String kHistoryErrorTitle = '会话记录读取失败';
+
+/// 「思考中」那一行槽位的高度（逻辑像素）。
+///
+/// 为什么要它：那一行出现/消失时**不许推动别的元素**（用户 2026-10-16 明写），
+/// 所以它住在一个**定高的常驻槽位**里——不在想的时候那里就是一个空槽。
+/// 取 20 的依据：那一行正文走主题的 `bodySmall`（本机 12px、行高 1.2 ⇒ 约 14.4），
+/// 加一点上下呼吸留白就是 20；再高会在"她不在想"的整段时间里白占纵向空间，
+/// 再低则会在某些字体缩放下把字挤到贴着输入框。
+const double _kThinkingSlotHeight = 20;
+
+/// 「跳到最新」那颗按钮的直径。26 的依据：它是**低调**的浮动按钮（用户 2026-10-16 ②），
+/// 与输入框那颗 44 的发送按钮不是一级——但小到这个尺寸仍然一眼认得出是个按钮。
+/// 命中区不由它决定：外层的 `IconButton` 自带 48 的最小命中区（见 [ChatPageState._thinkingSlot]）。
+const double _kJumpButtonSize = 26;
+
+/// 「服务端说这一轮结束了」那道对账的宽限期（毫秒）：**600**。
+///
+/// 为什么需要它（见 [ChatPageState.reconcileThinking]）：`turn/start` 是**本机**先从事件流
+/// 看到的，而"她确实在跑"这件事要等下一次 `GET /api/stats/dashboard` 的响应才成立
+/// （那份响应的节奏见 `gui/lib/app.dart` 的 `kTurnReadMs`＝250ms）。若不等这一下，
+/// 一条刚落下的 `turn/start` 会立刻撞上"上一拍响应里 `openTurn` 还是 null"而被误杀，
+/// 那一行就会在"她刚开口"的瞬间闪一下又没。
+///
+/// 为什么是 600：够放下**两次** dashboard 读数（250ms × 2 ＝ 500ms）再加一次网络开销；
+/// 同时它**不是**"猜她多久会停"——真相仍旧只有服务端那一份响应说了算，这个窗口只决定
+/// "这一读要等多久才算数与她对上"，所以它小到不掩盖任何事实。
+const int kThinkingServerGraceMs = 600;
+
+/// 宽限期的**覆盖值**（毫秒）；null = 用 [thinkingServerGraceMs]。
+///
+/// 做法照 `gui/lib/app.dart` 的 `turnSignalDebounceMsOverride`：**给测试用**。
+/// 为什么用例侧需要一个覆盖口子：真机 600ms 的窗口在 `tester.pump` 的假时钟下
+/// 与"几拍 UI 布局"是同一个尺度——用例要先让那一行立起来（那几拍就把 600ms 走完了），
+/// 于是"宽限期内该不该收"这条**没法用真值测到**。把窗口放宽，用例就能明确地
+/// 分两次读：一次在窗口内（不许收）、一次把时间推过窗口（必须收）。真机上没人设它。
+int? thinkingServerGraceMsOverride;
+
+/// 宽限期的实际取值：覆盖优先
+int get thinkingServerGraceMs => thinkingServerGraceMsOverride ?? kThinkingServerGraceMs;
+
+/// 「在底部」的容差（像素）。
+///
+/// 为什么不判 `pixels >= maxScrollExtent` 那么死：惯性滚动与 `animateTo` 收尾都会停在
+/// 差几个像素的地方，判死的话"我明明在底部"也会亮着提示点。取 24 是半行文字的高度——
+/// 小于它，人眼仍旧觉得"这就是最新"；大于它就会把"往上翻了一屏还亮着"当成在底部。
+const double _kAtBottomSlack = 24;
 
 /// 框架通报（`wake/manual` 里 `via` 有值的那一类）在卡片头上写什么标签。
 ///
-/// **判据不在这里**——"是不是框架通报"只看 `via` 有没有值，那一处在 [_ChatPageState._consume]
+/// **判据不在这里**——"是不是框架通报"只看 `via` 有没有值，那一处在 [ChatPageState._consume]
 /// 里（`via.isNotEmpty`，一处，别在别处再写第二遍）。这张表只负责"这一种来源叫什么名字"：
 /// 认不出来的一律叫 [kFrameworkNoticeLabel]，于是**新增一种 `via` 不必回来改界面**。
 ///
@@ -58,16 +125,16 @@ const String kFrameworkNoticeLabel = '框架通报';
 /// 毛病——`'mcp'` 补上时没人回来改，那条框架通报就落进了"有 note = 用户的话"那一支
 /// （用户 2026-10-09 的截图：他自己"说"了一段 MCP 通报）。文案会改、来源会加，
 /// 只有"是不是框架通报"这一层是稳定的。
-String frameworkNoticeLabel(String via) {
+String frameworkNoticeLabel(String via, {AppStrings strings = const ZhStrings()}) {
   switch (via) {
     // 界面的 /dream 动作：那条 note 是框架替她拼的整理指令
     case 'dream':
-      return '做梦';
+      return strings.eventDream;
     // MCP 声明面被改（加/删/改 server）：正文是"哪些 server 变了、现在几个"
     case 'mcp':
-      return 'MCP 声明变更';
+      return strings.eventMcpDeclChanged;
     default:
-      return kFrameworkNoticeLabel;
+      return strings.tagFrameworkNotice;
   }
 }
 
@@ -113,7 +180,7 @@ class _BubbleItem {
 
   /// 通道消息：`channel` / `chatType` / `chatId` 是拼 sid 用的三件套，**别在这里就把
   /// 发送者名字定下来**——名字来自 `/api/sessions`，那张表是单独取、可能后到的
-  /// （见 [_ChatPageState._contacts]）。
+  /// （见 [ChatPageState._contacts]）。
   _BubbleItem.channel({
     required this.text,
     required this.channel,
@@ -210,7 +277,7 @@ class _BubbleItem {
   ///
   /// 为什么必须是"自己那一次"：话题是逐条事件写下来的，一张卡只该记它被叫的那一次算出来的
   /// 结论；读"最新"的话，新话题一来旧卡也跟着改——那不是刷新，是改写当时看到过的东西。
-  /// 由 [_ChatPageState._consume] 在 `channel/topic` 到达时**认领**给最近一张还没拿到话题的卡。
+  /// 由 [ChatPageState._consume] 在 `channel/topic` 到达时**认领**给最近一张还没拿到话题的卡。
   String? topic;
 
   /// 提及卡（kind == mention 时有效）：那个会话的 sid 与类型。
@@ -246,7 +313,7 @@ class _BubbleItem {
 
   /// 名字与参数**不是 final**：往上翻历史时可能"回执先到、调用后到"——回执落在先取到的那一页，
   /// 对应的 `tool/call` 在更早那一页里，那时回填这两个字段，而不是再立一个块
-  /// （同一个 callId 画成两块，看着像她调了两次）。见 [_ChatPageState._consume]。
+  /// （同一个 callId 画成两块，看着像她调了两次）。见 [ChatPageState._consume]。
   String? toolName;
   String? toolArgs;
   /// 回执到达时写入；null 表示还在跑
@@ -256,7 +323,7 @@ class _BubbleItem {
   bool expanded = false;
 }
 
-class _ChatPageState extends State<ChatPage> {
+class ChatPageState extends State<ChatPage> {
   final items = <_BubbleItem>[];
 
   /// messageId → 判定结论（`injection/flagged` 折出来的）。**不上屏**，只给示警卡当回退：
@@ -273,6 +340,70 @@ class _ChatPageState extends State<ChatPage> {
   StreamSubscription<Map<String, dynamic>>? sub;
   Timer? _retry;
   bool loadingHistory = true;
+
+  /// 历史读失败的原因（null = 没失败）。
+  ///
+  /// **必须与"空历史"分开**：读不到时 `items` 也是空的，过去两者都落到「会话尚未开始」，
+  /// 于是把"读不到"说成了"没有"，而且**再也没有第二次请求**。有了它，空态只在读成功
+  /// 之后才说；读失败时显式落到错误态 + 一个重试入口（见 [loadHistory] 与 [build]）。
+  String? _historyError;
+
+  /// 她这一轮跑到哪儿了——**只喂「思考中」那一行**（见 [_thinkingSlot]）。
+  ///
+  /// 为什么走 `ValueNotifier` 而不是 `setState`：这一行的读数**一条 turn 里能变几十次**
+  /// （每段推理、每一步），而 `setState` 会把整页重建（消息流里几千个 widget 都在那一棵树上）。
+  /// 用户这一条的硬要求就是"只让这一行重建"⇒ 变化只走这个可监听对象，
+  /// 由 [ThinkingRow] 自己订阅它（见 [_publishThinking]）。
+  ///
+  /// **公开**（state 类是私有的，所以挂在 widget 上给用例读，见 [ChatPage.thinking]）：
+  /// 节流用例要数"那一行被放行了多少次"，而这是它唯一的入口。
+  final thinkingNow = ValueNotifier<ThinkingProgress?>(null);
+
+  /// 正在攒的那一份（未被节流放行的都先落在这里）
+  ThinkingProgress? _pendingThinking;
+
+  /// 那一行**这一次出现**的时刻（本机时钟）；不在想的时候是 null。
+  ///
+  /// 只给 [reconcileThinking] 的宽限期用：`turn/start` 是本机先看到的，服务端那份响应
+  /// 可能还停在上一拍，没有宽限期的话"她刚开口"会被对账误杀。
+  DateTime? _thinkingStartedAt;
+
+  /// 测试接线柱：把"这一行是什么时候立起来的"往前拨，越过那个宽限期。
+  ///
+  /// 为什么需要它：宽限期是**抗新轮误杀**的（真机上是 600ms），而"她早停了、
+  /// `turn/end` 又丢了"这条要测的场景必须**先等过它**——用例里没有别的办法把那一行
+  /// 的时间往回拨（`DateTime` 只能靠时钟，而时钟一走，那些"刚开口"的断言就跟着变了）。
+  /// **真机上没人设它**，所以它不是配置项，与 `gui/lib/app.dart` 的
+  /// `turnSignalDebounceMsOverride` / `gateGraceSecondsOverride` 同一条先例。
+  set thinkingStartedAtForTest(DateTime? value) => _thinkingStartedAt = value;
+
+  /// 上一份**放行上屏**的时刻（本机单调时钟，毫秒）——节流窗口的起点
+  int _thinkingShownAtMs = 0;
+
+  /// 节流窗口到了之后补一次的那一拍（见 [_kThinkingThrottleMs]）
+  Timer? _thinkingFlush;
+
+  /// 视图**此刻在不在最底部**（在 [_kAtBottomSlack] 的容差内）。
+  ///
+  /// 它是「跳到最新」那颗按钮要不要露出来的判据，也是"新内容该不该亮提示点"的一半。
+  /// 初值 false：首帧还没有 `ScrollMetrics`（`hasClients` 为假），量不出来就别假装在底部；
+  /// [_onScroll] 第一次真跑起来就会把它纠正。
+  bool _atBottom = false;
+
+  /// 不在底部时又来了新内容 ⇒ 那颗按钮上亮一个小点。
+  ///
+  /// 清掉的时机只有两个：人点了「跳到最新」，或者他自己滚回了底部（`_onScroll` 里）。
+  /// **不因"又来了更新的内容"而重置**——它说的是"你有没看的东西"，不是"刚刚又来了"。
+  bool _jumpHint = false;
+
+  /// 上一次量到的滚动范围（判"内容变长了"用；见 [_onScroll] 里那段）
+  double _lastMaxExtent = 0;
+
+  /// 帧后补量已经排上了没有（见 [_remeasureAfterGrowth]）
+  bool _remeasureQueued = false;
+
+  /// 正在量（[_onScroll] 的防重入闸：它可能由帧后回调触发，而它自己又会 `setState`）
+  bool _inScrollMeasure = false;
 
   /// 列表的**锚点**：进页面时那一屏（`CustomScrollView` 的 `center`，见 [build]）。
   ///
@@ -292,6 +423,17 @@ class _ChatPageState extends State<ChatPage> {
   /// 内容相同的两条真事件该各画一次。清屏（重新取历史）时这个集合要一起清，
   /// 否则同一批事件会被判成"见过"而整屏空白。
   final _seenSeqs = <int>{};
+
+  /// 事件流里**最后见过的那条 seq**（null = 一条都还没见过）——断线重连的补拉锚点。
+  ///
+  /// 为什么要记它：服务端**本来就支持断线补拉**（`src/web/server.ts` 的 `openStream`：
+  /// 带 `Last-Event-ID` 就从 `lastId + 1` 把漏掉的那一段重发一遍），而这里过去一次都没传，
+  /// 于是断线窗口里的事件**永久丢**——里面最要命的是工具回执（块永远停在「正在执行…」）
+  /// 与 `turn/end`。做法照 `gui/lib/app.dart` 的 `_lastEventSeq`（同一份口径）。
+  ///
+  /// **只增不减**：补拉来的旧事件、往上翻出来的更早一页，都不许把锚点往回带，
+  /// 否则每补一次都要从头再补一遍。
+  int? _lastEventSeq;
 
   /// `items` 里前多少条是"往上翻"翻出来的：它们住在锚点**前面**那个 sliver 里。
   int _olderCount = 0;
@@ -332,8 +474,9 @@ class _ChatPageState extends State<ChatPage> {
     widget.state.removeListener(_onStateChange);
     sub?.cancel();
     _retry?.cancel();
-    scroll.removeListener(_onScroll);
-    scroll.dispose();
+    _thinkingFlush?.cancel();
+    thinkingNow.dispose();
+    scroll.removeListener(_onScroll);    scroll.dispose();
     input.dispose();
     inputFocus.dispose();
     super.dispose();
@@ -341,6 +484,55 @@ class _ChatPageState extends State<ChatPage> {
 
   void _onStateChange() {
     if (widget.state.online && !_contactsLoaded) unawaited(_loadContacts());
+    reconcileThinking();
+  }
+
+  /// 那一行收掉：清账 + 收掉待发的那一拍 + 立刻隐藏（**唯一**的收口，两条路共用）。
+  ///
+  /// 两条路：① 事件流里那条 `turn/end`（正常路径）；② 服务端读数说这一轮已经结束
+  /// （[reconcileThinking]：`turn/end` **没到**时的兜底）。走同一个出口，
+  /// 免得"哪条路该不该取消那个 250ms 补发"变成两处各判一次。
+  void _endThinking() {
+    _pendingThinking = null;
+    _thinkingStartedAt = null;
+    _thinkingFlush?.cancel();
+    _thinkingFlush = null;
+    _publishThinking(null, force: true);
+  }
+
+  /// 服务端读数说"这一轮已经结束了" ⇒ 把那一行收掉（`turn/end` **丢了**时的兜底）。
+  ///
+  /// ★ 为什么必须有这一条（用户 2026-10-16 ②「待机时那个思考标志还在」，实测根因）：
+  /// 那一行的显隐**只认事件**——只有 `turn/end` 会让它收掉。而事件流是会断的：
+  /// SSE 重连时断线窗口里那条 `turn/end` **补不回来**（`api.events()` 只在调用方显式传
+  /// `lastEventId` 时才带 `Last-Event-ID`，而过去两处调用都没传；服务端的补拉链路本来是
+  /// 现成的，见 `src/web/server.ts` 的 `openStream`）。于是一条丢掉的 `turn/end` 会让
+  /// 那一行**永远挂着**——而左上那行字（判据取自响应）却能自己好，这就是"两处不一致"的来源。
+  ///
+  /// 判据仍然**只有服务端一处**：`openTurn == null`（服务端认为没有未收尾的 turn）
+  /// **且** `thinking == false`（它没在跑）。界面不猜时间窗、不看进程在不在。
+  ///
+  /// 为什么要那个短宽限期（[thinkingServerGraceMs]）：`turn/start` 是**本机**先看到的，
+  /// 服务端那份响应可能还停在上一拍（`openTurn == null`）——没有宽限期的话，
+  /// 她刚开口那 250ms 里那一行会被这条对账**误杀**成"没在想"。
+  ///
+  /// 公开（而不是私有）：`ChatPageState` 是公开类型，用例要能驱动"服务端那一读之后
+  /// 这一页怎么对账"这条链（见 `test/chat_progress_test.dart` 的 ② 那一组）。
+  void reconcileThinking() {
+    final pending = _pendingThinking;
+    if (pending == null) return;
+    final state = widget.state;
+    // 服务端说"还在跑" ⇒ 一点都不用动（哪怕本地这一行的读数偏小）
+    if (state.thinking || state.openTurn != null) return;
+    // 服务端说"没在跑、也没有开着的 turn"：先给它一个短宽限期再落实
+    final startedAt = _thinkingStartedAt;
+    if (startedAt == null) return;
+    if (clock.now().difference(startedAt) < Duration(milliseconds: thinkingServerGraceMs)) {
+      return;
+    }
+    if (!mounted) return;
+    _endThinking();
+    setState(() {});
   }
 
   /// `_consume` 往哪儿落：平时是 `items` 末尾，往上翻的那一批落进 [_prependSink]。
@@ -357,12 +549,89 @@ class _ChatPageState extends State<ChatPage> {
   /// [_anchorKey] 保证，所以"滚到头 → 内容变多"可以做到无感；到没到头这件事交给
   /// 列表上方那行状态说（[_historyNote]）。
   ///
-  /// 为什么留 48 的余量：滚轮一格就是 120，等真的贴到 `minScrollExtent` 才判断的话，
-  /// 位置停在顶端不再变化，监听器根本不会被叫到（这是"到顶没反应"的经典原因）。
-  void _onScroll() {
-    if (!scroll.hasClients) return;
+  /// 视图此刻贴没贴到底部（**[_kAtBottomSlack] 容差内**）。
+  ///
+  /// 判据只有这一处：`pixels` 与 `maxScrollExtent` 的差。容差不是"宽松"而是**必需**——
+  /// 惯性滚动与 `animateTo` 收尾都停在差几个像素的地方；判成等号的话，
+  /// 一个明明在看最新的人会被当成"他翻上去了"（于是提示点亮着不走）。
+  ///
+  /// 还没有 `ScrollMetrics`（首帧、或列表短到滚不动）时算**在底部**：
+  /// 那时候没有"上面还有没看的"这回事，按钮不该露出来。
+  bool _atBottomNow() {
+    if (!scroll.hasClients) return true;
     final position = scroll.position;
-    if (position.pixels <= position.minScrollExtent + 48) unawaited(_loadEarlier());
+    return position.pixels >= position.maxScrollExtent - _kAtBottomSlack;
+  }
+
+  /// 内容新增了一条之后补量一次（下一帧）。
+  ///
+  /// **为什么光靠 [_onScroll] 不够**（实测撞出来的一个真 bug）：`ScrollPosition` 只在
+  /// **位置真的变了**的时候通知监听器。列表短到滚不动时（内容还没超出一屏）位置永远是 0，
+  /// 于是她说话、内容长出来，`_onScroll` 一次都不会被叫到——那颗按钮上的提示点就永远不亮。
+  /// 而"她刚开口那几句"恰好就是这种时候。
+  ///
+  /// 也不能只靠"`maxScrollExtent` 变大了"来判新增：内容装得下时它压根不变（上面那一条），
+  /// 而装得下正是"她刚开始说话"的常态。所以**新增这件事由调用方直接告诉它**，
+  /// 不靠量出来的差值反推。
+  ///
+  /// 排到帧后而不是当帧量：`_consume` 只是往列表里塞了数据，新内容的布局要等这一帧画完
+  /// 才知道。
+  void _remeasureAfterAdded() {
+    if (_remeasureQueued) return;
+    _remeasureQueued = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        _remeasureQueued = false;
+        return;
+      }
+      // **先量完再放闸**：`_onScroll` 自己会 `setState`，而 `setState` 会让这一页重画、
+      // 内容可能又长了一点点——闸在这里就放下的话，那一拍会撞上防重入直接返回，
+      // 于是"内容变长了"这件事量不到（实测：提示点因此永远不亮）。
+      _onScroll(added: true);
+      _remeasureQueued = false;
+    });
+  }
+
+  /// 量一次"在不在底部 / 内容长没长"，并按结果更新那颗按钮。
+  ///
+  /// 两侧入口都走这里：用户滚动（[scroll] 的监听器，[added] 为 false）与
+  /// 内容新增（[_remeasureAfterAdded]，[added] 为 true）。
+  /// 两条都要——只看滚动会漏掉"列表短到滚不动"那一段（见上），只看新增则漏掉
+  /// "人自己滚上去/滚回来"。
+  ///
+  /// [added] = 这一次量之前确实多了一条内容：人不在底部 ⇒ 该亮提示点。
+  /// 不这么传的话只能靠 `maxScrollExtent` 变大来猜，而"装得下"时它不变（那正是最常见的一段）。
+  ///
+  /// 为什么留 48 的余量（这一段是既有的）：滚轮一格就是 120，等真的贴到 `minScrollExtent`
+  /// 才判断的话，位置停在顶端不再变化，监听器根本不会被叫到（"到顶没反应"的经典原因）。
+  void _onScroll({bool added = false}) {
+    // 帧后补量那一拍是从 `setState` 里排出来的，而它自己又可能 `setState`：
+    // 加一道闸，免得在布局期间绕回来（那会抛 "setState during build"）
+    if (_inScrollMeasure) return;
+    _inScrollMeasure = true;
+    try {
+      final position = scroll.hasClients ? scroll.position : null;
+      if (position != null &&
+          position.pixels <= position.minScrollExtent + 48) {
+        unawaited(_loadEarlier());
+      }
+      // 量不到滚动范围（列表空着、或短到没有 Scrollable）⇒ 按"在底部"算：
+      // 那时候没有"上面还有没看的"这回事
+      final maxExtent = position?.maxScrollExtent ?? 0;
+      final pixels = position?.pixels ?? maxExtent;
+      final grew = maxExtent > _lastMaxExtent + 1;
+      _lastMaxExtent = maxExtent;
+      final atBottom = pixels >= maxExtent - _kAtBottomSlack;
+      // 人自己滚回底部 = 他把东西看完了 ⇒ 收掉那个提示点（与"点了跳到最新"同一条出口）
+      final hint = atBottom ? false : (_jumpHint || grew || added);
+      if (atBottom == _atBottom && hint == _jumpHint) return; // 只在真的变了才重画
+      setState(() {
+        _atBottom = atBottom;
+        _jumpHint = hint;
+      });
+    } finally {
+      _inScrollMeasure = false;
+    }
   }
 
   /// 列表上方那行状态（**不是一条消息**，所以不加壳、不成卡）。null = 没有话说。
@@ -374,8 +643,9 @@ class _ChatPageState extends State<ChatPage> {
   ///
   /// 代价如实说：它只在人真的滚到最上面时才看得见（那正是需要它的时候）。
   String? get _headNote {
-    if (_earlierFailed) return '更早的记录读取失败，向上滚动重试';
-    if (!_hasEarlier && items.isNotEmpty) return '没有更早的记录了';
+    final s = IrmiaStrings.read(context);
+    if (_earlierFailed) return s.earlierFailed;
+    if (!_hasEarlier && items.isNotEmpty) return s.noEarlier;
     return null;
   }
 
@@ -397,12 +667,21 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> loadHistory() async {
     // 别名与历史一起取：两者到齐才画得对（边到边画会让卡片先显示「未命名会话」再翻名字）
     unawaited(_loadContacts());
+    // 重试入口：先把上一轮的错误态收掉、回到 loading（第一拍本来就在 loading 里，不额外重建）
+    if (_historyError != null) {
+      setState(() {
+        _historyError = null;
+        loadingHistory = true;
+      });
+    }
     try {
       final data = await widget.state.api.get('/api/events?limit=60');
       final events = (data is Map ? (data['events'] as List?) : null) ?? const [];
       // 历史也走同一条消费路径（call/result 照样配对），只是不播进场动画
       items.clear();
       _seenSeqs.clear(); // 与 items 同生共死：重取历史时它们是"新"的
+      // 补拉锚点同理：这一份历史要是比上一份短，旧锚点会让重连从半空开始
+      _lastEventSeq = null;
       _earliestSeq = null;
       _olderCount = 0;
       _atHead = false;
@@ -410,10 +689,23 @@ class _ChatPageState extends State<ChatPage> {
         _consume(raw.cast<String, dynamic>());
       }
       if (!mounted) return;
-      setState(() => loadingHistory = false);
-      _scrollToEnd();
-    } catch (_) {
-      if (mounted) setState(() => loadingHistory = false);
+      setState(() {
+        loadingHistory = false;
+        _historyError = null;
+      });
+      // 进页面那一次**只在底部**（不是每次来新内容都跟）：人刚打开这一页，
+      // 他要看的就是最新那几句。之后一律不自动跟随（见 [_jumpToLatest]）。
+      _jumpToLatest();
+    } catch (err) {
+      // 读不到 **不是**"没有"：留住原因、显式落到错误态，等人在那里点「重试」。
+      // 过去这一格只写 `loadingHistory = false`，于是界面把"读不到"说成「会话尚未开始」，
+      // 而且永远不再请求第二次——那是把一种故障说成了一种事实。
+      if (mounted) {
+        setState(() {
+          loadingHistory = false;
+          _historyError = '$err';
+        });
+      }
     }
   }
 
@@ -495,22 +787,42 @@ class _ChatPageState extends State<ChatPage> {
 
   void connectStream() {
     sub?.cancel();
-    sub = widget.state.api.events().listen(
+    // **补拉锚点**：把最后收到的那条 seq 交给服务端（见 [_lastEventSeq]）。
+    // 服务端据此从 `lastId + 1` 重发到尾部，断线窗口里的事件因此还能到——
+    // 不传的话那一段永久丢，工具块会永远停在「正在执行…」。
+    sub = widget.state.api.events(lastEventId: _lastEventSeq).listen(
       (event) {
+        // 她跑到哪儿了：**只在这条实时链路上采**，不走 [_consume]。
+        // 理由是实测出来的那条：`loadHistory()` 与 [_loadEarlier] 也调 `_consume`，
+        // 把采集挂进去的话，一进页面就会拿**历史里那些** turn/reasoning 事件算出一份
+        // 假的"她正在想第 N 步、已想 X 字"（翻页时更糟：翻到哪一年的旧账就报哪一年）。
+        _trackThinking(event);
+        // **先量位置、再吃事件**：`_consume` 会把内容变长，而内容一变长，
+        // "离底部还有多远"就跟着变大——那时候再量，一个本来贴在底部的人会被误判成
+        // "他往上翻了"（于是第一次来新内容就不再跟随了）。所以这一读必须在前面。
+        final wasAtBottom = _atBottomNow();
         final added = _consume(event);
         if (!mounted) return;
         setState(() {});
-        // 只有真的添了新东西才滚到底：回执是原地更新的，不该把正在看的人拽走
-        if (added) _scrollToEnd();
+        // **不自动滚动**（用户 2026-10-16 ①）：她说话、回执原地更新、工具卡片刷新，
+        // 一律不许把视图拽到底——人正在往回看的时候被拽走，正是他要修的那件事。
+        // 新内容到达这件事改由「跳到最新」那颗按钮说（不在底部时亮一个小点，见 [_onScroll]）。
+        // 只剩"他本来就在看最新"这一种情况跟着走：那是他自己停在底部的选择，跟着滚不打扰他。
+        if (added && wasAtBottom) _jumpToLatest();
+        // 内容新增了一条：下一帧补量一次（列表短到滚不动时 `_onScroll` 不会被叫到，
+        // 那正是"她刚开口"的时候——见 [_remeasureAfterAdded]）
+        if (added) _remeasureAfterAdded();
       },
       onError: (_) {
-        // 断线重连：3 秒后重试（SSE 由服务端 Last-Event-ID 补拉）
+        // 断线重连：3 秒后重连，并把最后收到的 seq 当 `Last-Event-ID` 交出去
+        // （见 [_lastEventSeq]），服务端据此补发断线窗口里漏掉的那一段。
         _retry?.cancel();
         _retry = Timer(const Duration(seconds: 3), () {
           if (mounted) connectStream();
         });
       },
       onDone: () {
+        // 同上：正常收流也走同一条重连路，锚点照旧带上（补拉是幂等的，按 seq 去重）
         _retry?.cancel();
         _retry = Timer(const Duration(seconds: 3), () {
           if (mounted) connectStream();
@@ -561,6 +873,9 @@ class _ChatPageState extends State<ChatPage> {
   ///
   /// 返回 true 表示**新增了一条**——回执是原地更新已有块的，不该把正在看的人拽到末尾。
   bool _consume(Map<String, dynamic> event) {
+    // 事件处理器里取文案：**不登记依赖**（read 而不是 of）。这些字是"发生过的事"
+    // 的记录，落进 items 之后就不再跟着语言变——与她的发言正文同一档。
+    final s = IrmiaStrings.read(context);
     // 往上翻的游标：**每条事件都记**，包括不上屏的那些——翻的是日志的位置，
     // 不是"画了几条"。少记一条就会在下一页里把它重复画出来。
     final seq = event['seq'];
@@ -571,6 +886,8 @@ class _ChatPageState extends State<ChatPage> {
       // 历史那一份与流里那一份（或翻页接缝）会各画一遍。闸门放在最前面：
       // 连游标都不必再更新，那条早就记过了。
       if (!_seenSeqs.add(value)) return false;
+      // 断线补拉的锚点（见 [_lastEventSeq]）：每条事件都记、只增不减
+      if (_lastEventSeq == null || value > _lastEventSeq!) _lastEventSeq = value;
       if (_earliestSeq == null || value < _earliestSeq!) _earliestSeq = value;
     }
     final data = (event['data'] as Map?)?.cast<String, dynamic>() ?? const {};
@@ -599,7 +916,7 @@ class _ChatPageState extends State<ChatPage> {
         if (via.isNotEmpty) {
           _sink.add(_BubbleItem.text(
             side: 'sys',
-            text: frameworkNoticeLabel(via),
+            text: frameworkNoticeLabel(via, strings: s),
             detail: note.isEmpty ? null : note,
             ts: ts,
           ));
@@ -612,8 +929,8 @@ class _ChatPageState extends State<ChatPage> {
           final person = (data['person']?.toString() ?? '').trim();
           _sink.add(_BubbleItem.text(
             side: 'sys',
-            text: '手动唤醒',
-            detail: person.isEmpty ? null : '来自 $person',
+            text: s.manualWake,
+            detail: person.isEmpty ? null : s.fromWho(person),
             ts: ts,
           ));
           return true;
@@ -683,8 +1000,8 @@ class _ChatPageState extends State<ChatPage> {
         // 所以只在这里添一张卡，别往末尾插（那会把它挪到"最新"的位置上，正好说反）。
         final manual = _isManualReset(event);
         _sink.add(_BubbleItem.boundary(
-          text: manual ? '上下文在此处清空' : '上下文在此处压缩',
-          detail: manual ? '到此为止的往来不再计入她的上下文' : '到此为止的往来被交接笔记替代，不再逐条计入',
+          text: manual ? s.contextClearedHere : s.contextCompactedHere,
+          detail: manual ? s.contextClearedHereDetail : s.contextCompactedHereDetail,
           ts: ts,
         ));
         return true;
@@ -729,12 +1046,14 @@ class _ChatPageState extends State<ChatPage> {
         if (reason.isEmpty && quotes.isEmpty) return false;
         final who = (data['who']?.toString() ?? '').trim();
         final person = (data['person']?.toString() ?? '').trim();
-        final where = (data['chatType']?.toString() ?? '') == 'c2c' ? '单聊' : '群聊';
+        final where = (data['chatType']?.toString() ?? '') == 'c2c'
+            ? s.chatTypeDirect
+            : s.chatTypeGroup;
         final by = ((data['by']?.toString() ?? '') == 'model' || fallback?.by == 'model')
-            ? '模型判定'
-            : '规则命中';
+            ? s.byModel
+            : s.byRule;
         final source = [
-          if (who.isNotEmpty) '来自 $who',
+          if (who.isNotEmpty) s.fromWho(who),
           where,
           if (person.isNotEmpty && person != who) person,
           by,
@@ -783,7 +1102,10 @@ class _ChatPageState extends State<ChatPage> {
         // 内容为空时拿 error.message 顶上：失败原因才是人最想看的，不能只写「出错」
         final content = (data['content']?.toString() ?? '').trim();
         final errMessage = (data['error'] as Map?)?['message']?.toString();
-        block.toolResult = content.isEmpty ? (errMessage ?? '') : content;
+        // **上屏前剥掉终端装饰**（用户 2026-10-16 ③：截图里那行 `[32;1mName[0m…`）。
+        // 剥在**入口**而不是画的时候：折叠态与展开态读的是同一份 `toolResult`，
+        // 只修一处的话"展开全部"里那串颜色码照旧露着（而且它还算进"共 N 字"）。
+        block.toolResult = sanitizeToolOutput(content.isEmpty ? (errMessage ?? '') : content);
         final ms = data['durationMs'];
         block.toolDurationMs = ms is num ? ms.toInt() : null;
         return false;
@@ -794,8 +1116,8 @@ class _ChatPageState extends State<ChatPage> {
         final at = _hhmm(data['scheduledAt']?.toString() ?? '');
         _sink.add(_BubbleItem.text(
           side: 'sys',
-          text: '定时任务触发',
-          detail: [if (id.isNotEmpty) id, if (at.isNotEmpty) '原定 $at'].join(' · '),
+          text: s.schedulerFire,
+          detail: [if (id.isNotEmpty) id, if (at.isNotEmpty) s.scheduledAt(at)].join(' · '),
           ts: ts,
         ));
         return true;
@@ -805,7 +1127,7 @@ class _ChatPageState extends State<ChatPage> {
         final content = (data['content']?.toString() ?? '').trim();
         _sink.add(_BubbleItem.text(
           side: 'sys',
-          text: '意图唤醒',
+          text: s.intentWake,
           detail: content.isEmpty ? null : content,
           ts: ts,
         ));
@@ -815,7 +1137,7 @@ class _ChatPageState extends State<ChatPage> {
         final id = (data['jobId']?.toString() ?? '').trim();
         _sink.add(_BubbleItem.text(
           side: 'sys',
-          text: '后台任务进展',
+          text: s.backgroundProgress,
           detail: id.isEmpty ? null : id,
           ts: ts,
         ));
@@ -824,16 +1146,269 @@ class _ChatPageState extends State<ChatPage> {
       case 'wake/heartbeat':
         return false; // 心跳不打扰
       case 'human/answered':
-        _sink.add(_BubbleItem.text(side: 'sys', text: '人工答复已记录', ts: ts));
+        _sink.add(_BubbleItem.text(side: 'sys', text: s.humanReplyRecorded, ts: ts));
         return true;
       case 'review/resolved':
         final ok = data['outcome'] == 'succeeded';
-        _sink.add(_BubbleItem.text(side: 'sys', text: ok ? '已标记成功' : '已标记失败', ts: ts));
+        _sink.add(_BubbleItem.text(side: 'sys', text: ok ? s.markedOk : s.markedFailed, ts: ts));
         return true;
       default:
         return false;
     }
   }
+
+  // ── 「思考中 · 第 N 步 · 已想 X 字 · 用时 M:SS」那一行（用户 2026-10-16「加一行紧凑进度」） ──
+  //
+  // 三样读数**各有出处**，一处都不许自己算：
+  //   · 步号 ← `step/start` 的 `data.step`（`src/log/types.ts` 的 StepStart，服务端就在这条里给步号）；
+  //   · 字数 ← `message/reasoning` 的 `data.text` 长度累加（ReasoningMessage{ turn, step, text }）。
+  //     ★ 这条事件是 `internal` 可见性，但 **SSE 不过滤 visibility**（`src/web/server.ts` 的
+  //     `pump()`/`broadcast()` 把每条都广播出去；`EVENT_VISIBILITY` 只管"进不进她的上下文"），
+  //     所以界面收得到——本机实测确认过这一点，累计字数才有数据源；
+  //   · 计时 ← `turn/start` 到达的那一刻（本机时钟起算，不读服务端时间戳：
+  //     它是"这一轮已经想了多久"的读数，跟人手机上那个秒表同一条口径）。
+  // 停止：`turn/end` 到达 ⇒ 整行隐藏（不是显示"空闲"）。
+
+  /// 节流窗口：**最多 4 次/秒**。
+  ///
+  /// 为什么是 250ms：一条 turn 里 `message/reasoning` 是**成串**来的（每段推理一条），
+  /// 一步里几十条很常见。一条一变的话，这一行每秒要重画几十次——而它显示的
+  /// "已想 X 字 / 用时 M:SS"这两格**每秒变一次就够了**（字数跳一个字、秒数跳一秒，
+  /// 人眼都跟不上更快的）。250ms 同时是后端那条 SSE 尾部泵的节奏（`SSE_POLL_MS`），
+  /// 比它更快也没有新数据可看。
+  ///
+  /// 代价如实说：她刚开口那一下最多晚 250ms 上屏（那一拍由 [_thinkingFlush] 补齐，
+  /// 不会丢）。
+  static const _kThinkingThrottleMs = 250;
+
+  /// 一条实时事件 → 更新那一行（**只在这条链路上采**，见 [connectStream] 的注释）
+  void _trackThinking(Map<String, dynamic> event) {
+    final type = event['type']?.toString();
+    if (type == null) return;
+    final data = (event['data'] as Map?)?.cast<String, dynamic>() ?? const {};
+    switch (type) {
+      case 'turn/start': {
+        final turn = _intOf(data['turn']) ?? 0;
+        // 同一轮的重复 start 不清账（SSE 重连会由服务端补拉，见 Last-Event-ID）
+        if (_pendingThinking != null && _pendingThinking!.turn == turn) return;
+        _pendingThinking = ThinkingProgress(turn: turn, step: 0, chars: 0, since: clock.now());
+        break;
+      }
+      case 'step/start': {
+        final current = _pendingThinking;
+        if (current == null) return;
+        // 步号**单调不减**：SSE 补拉时旧事件可能后到，回退会让那行数字往回跳
+        final step = _intOf(data['step']) ?? current.step;
+        if (step <= current.step) return;
+        // **每步重置字数**（用户 2026-10-16 ① 的后端口径）：推理正文是**按步**发的一条，
+        // 所以"已想 X 字"说的是**这一步**想了多少——不重置的话它会一路累加到几十万字，
+        // 那个数不对应任何一件事（她这一步实际生成了多少，才是可核对的读数）。
+        _pendingThinking = current.copyWith(
+          step: step,
+          chars: 0,
+          phase: ThinkCharsPhase.pending,
+        );
+        break;
+      }
+      case 'message/reasoning': {
+        final text = data['text']?.toString() ?? '';
+        final current = _pendingThinking;
+        if (current == null) {
+          // 没有 `turn/start` 的现场：界面是在一轮中途打开的、或者 SSE 重连只补到了
+          // 后面这一段（那时流里第一条就不是 turn/start）。**由这条事件自己把这一轮立起来**
+          // ——不然"她在想"这件事整轮都不会上屏，而那恰好是最该看见的时候。
+          //
+          // 代价说清楚：计时从**这一刻**起算，所以这个读数会比她真实那一轮偏小
+          // （前面那段我们没看见，编不出来）。宁可偏小也不给一个假的大数。
+          // 而**字数不受影响**：这条事件带的就是那一步推理的**整段正文**
+          // （后端一步只发一条，见 [ThinkCharsPhase] 的注释），所以它是真读数。
+          if (text.isEmpty) return;
+          _pendingThinking = ThinkingProgress(
+            turn: _intOf(data['turn']) ?? 0,
+            step: _intOf(data['step']) ?? 0,
+            chars: text.length,
+            since: clock.now(),
+            phase: ThinkCharsPhase.counted,
+          );
+          break;
+        }
+        // 步号**单调递增**：补拉来的旧事件不许把它往回带。
+        // 字数只在**同步**里累加：跨步的旧事件不许把上一步的字数加到这一步头上。
+        final eventStep = _intOf(data['step']);
+        final sameStep = eventStep == null || eventStep == current.step;
+        // ★ 实时读数（[ThinkCharsPhase.live]）**不是能往上加的底数**：它说的不是"已经落库了多少正文"，
+        // 而是后端对**同一整段**正文的进度估计（delta 之和，见 `step/reasoning-progress`）。
+        // 能当底数的只有**已经落库的正文**（[ThinkCharsPhase.counted] 那一态）；
+        // 否则 3000（live）+ 3100（这一步的真值）= 6100 就成了一个比真值还大的假读数
+        // ——而这一格的全部意义就是"这个数是真的"。（后端一步只发一条，这条累加是给
+        // 重复/补拉留的冗余；补拉那条另由 `_consume` 按 seq 去重。）
+        final base = sameStep && current.phase != ThinkCharsPhase.live ? current.chars : 0;
+        final chars = base + text.length;
+        final step = eventStep == null || eventStep <= current.step ? current.step : eventStep;
+        _pendingThinking = current.copyWith(
+          chars: chars,
+          step: step,
+          // 收到正文 ⇒ 这一格**有真数**了（哪怕这一段是补拉来的上一段的尾巴）
+          phase: ThinkCharsPhase.counted,
+        );
+        break;
+      }
+      case 'turn/end':
+        // 这一轮结束：整行隐藏（不是显示"空闲"）。同步收掉待发的那一拍，
+        // 否则它会在一轮结束之后再把这一行点亮 250ms
+        _endThinking();
+        return;
+      // 后端 (b) 的实时读数（`step/reasoning-progress`，2026-10-17）：推理正文**落库之前**
+      // 那一段唯一能让「已想 X 字」是真的东西。载荷只有 `{turn, step, chars}`——**一个字的正文都没有**，
+      // 所以这一格显示的是"到这一刻生成了多少字"，不是她想过的任何一句话。
+      //
+      // 它就是 [ThinkCharsPhase.live] 留的那个口：**只在这一处接线**，那一行的文案、宽度补位
+      // 与 250ms 节流一个字都不动（[thinkingLine] 只看 `phase != pending`）。
+      case 'step/reasoning-progress': {
+        final chars = _intOf(data['chars']) ?? 0;
+        // 0 不是读数：那一格宁可说「…」。沿用"任何时刻都不许出现「已想 0 字」"那条口径。
+        if (chars <= 0) return;
+        final step = _intOf(data['step']);
+        final current = _pendingThinking;
+        if (current == null) {
+          // 这一轮是**中途打开**的（或 SSE 重连只补到了后面这一段）：没有 `turn/start`。
+          // 照上面 `message/reasoning` 那条的先例，**由它自己把这一轮立起来**——不然这条事件
+          // 白到手，那一行还是空的，而"她想了很久"恰恰是最该看见的时候。
+          // 代价与那条逐字相同：计时从这一刻起算，宁可偏小也不编一个假的大数。
+          _pendingThinking = ThinkingProgress(
+            turn: _intOf(data['turn']) ?? 0,
+            step: step ?? 0,
+            chars: chars,
+            since: clock.now(),
+            phase: ThinkCharsPhase.live,
+          );
+          break;
+        }
+        // **真值优先**：`message/reasoning` 已经把这一步的真数落下来了，就不许被一条实时读数顶回去
+        // （补拉时旧事件可能后到；两边的数也可能差一点：它是 delta 之和，真值是落库的整段）。
+        if (current.phase == ThinkCharsPhase.counted) return;
+        // 步号单调：跨步的旧事件不许把上一步的字数搬到这一步头上（与上面那条同一条口径）
+        if (step != null && step != current.step) return;
+        _pendingThinking = current.copyWith(chars: chars, phase: ThinkCharsPhase.live);
+        break;
+      }
+      default:
+        return;
+    }
+    // 这一行**新出现**的时刻（对账那道宽限期的起点，见 [reconcileThinking]）。
+    // 只在"本来没有 → 现在有"那一下记，不每来一条事件重写：否则一条不断的流会让
+    // 宽限期永远不过期，那正好是"靠猜时间窗"的翻版。
+    _thinkingStartedAt ??= clock.now();
+    _publishThinking(_pendingThinking);
+  }
+
+  /// 把攒下的那一份放行上屏（**节流**：[_kThinkingThrottleMs] 之内最多一次）。
+  ///
+  /// 被压住的那一次**不丢**：排一拍在窗口末尾补发（[_thinkingFlush]），
+  /// 所以"她刚开口"那一下最多晚 250ms，而不是被合并掉。
+  void _publishThinking(ThinkingProgress? next, {bool force = false}) {
+    if (next == null) {
+      thinkingNow.value = null;
+      _thinkingShownAtMs = 0;
+      return;
+    }
+    if (force) {
+      _thinkingShownAtMs = clock.now().millisecondsSinceEpoch;
+      thinkingNow.value = next;
+      return;
+    }
+    final now = clock.now().millisecondsSinceEpoch;
+    final wait = _kThinkingThrottleMs - (now - _thinkingShownAtMs);
+    if (wait <= 0) {
+      _thinkingShownAtMs = now;
+      thinkingNow.value = next;
+      return;
+    }
+    _thinkingFlush?.cancel();
+    _thinkingFlush = Timer(Duration(milliseconds: wait), () {
+      _thinkingFlush = null;
+      final pending = _pendingThinking;
+      if (pending == null) return; // 这一轮已经结束了
+      _thinkingShownAtMs = clock.now().millisecondsSinceEpoch;
+      thinkingNow.value = pending;
+    });
+  }
+
+  int? _intOf(Object? value) => value is num ? value.toInt() : null;
+
+  /// 「跳到最新」那颗按钮（用户 2026-10-16 ②）。
+  ///
+  /// 它为什么**必须**存在：①把自动滚动关掉之后，没有它就是"她说了什么，人永远不知道"
+  /// （用户的原话就是这一层意思）——这一颗是那一条的配套，不是装饰。
+  ///
+  /// 形态：圆形、`surfaceContainer` 底 + `outlineVariant` 细描边 + `onSurfaceVariant` 箭头。
+  /// 三个都是**现有主题 token**（明暗两套都有值），一个新颜色都没造——
+  /// 用户这一条的要求是"低调"：它是辅助读数，不该跟主按钮抢注意力（发送键用的是 `primary` 填充）。
+  ///
+  /// 为什么底色是 `surfaceContainer` 而不是透明：这一页的背景就是 `surface`，
+  /// 透明填充会让箭头孤零零地浮在消息流上方、看不出是个可点的东西。`surfaceContainer`
+  /// 是**同一套里最浅的那一层**（本页别处也用它托图标按钮，见对话卡那几处），
+  /// 抬一层就够"这是个按钮"，离"抢眼"还很远。
+  ///
+  /// 尺寸 26（见 [_kJumpButtonSize]）：比输入框那颗 44 小一档，明确不是一级动作。
+  /// 命中区不受它限制——`IconButton` 自带 Material 的最小命中尺寸（48），
+  /// 而外层槽位 `clipBehavior: Clip.none` 让它不被 20 高的槽裁掉。
+  Widget _jumpToLatestButton() {
+    final scheme = Theme.of(context).colorScheme;
+    final s = IrmiaStrings.of(context);
+    return Tooltip(
+      message: _jumpHint ? s.jumpToLatestNew : s.jumpToLatest,
+      child: SizedBox(
+        width: _kJumpButtonSize,
+        height: _kJumpButtonSize,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            IconButton(
+              // 内边距归零，把按钮画满这 26：默认的 padding 会把它缩成一个小图标
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(),
+              style: IconButton.styleFrom(
+                backgroundColor: scheme.surfaceContainer,
+                side: BorderSide(color: scheme.outlineVariant),
+                shape: const CircleBorder(),
+              ),
+              onPressed: _jumpToLatest,
+              icon: Icon(Icons.arrow_downward_rounded, size: 15, color: scheme.onSurfaceVariant),
+            ),
+            if (_jumpHint) _jumpHintDot(scheme),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 那颗按钮上的**小提示点**（不在底部、而且有新内容到达时才亮）。
+  ///
+  /// 用主题强调色 `primary` 的小细点，**不用红点**：红在这一页的语义是"出错"
+  /// （工具失败、注入预警），拿它说"有新消息"会让人以为出了事。
+  ///
+  /// 位置：贴在按钮右上角外侧一点。画在 26×26 的盒子里、**不占额外布局**——
+  /// 它亮起来也不会把箭头挤小、不会把那一行撑高（`Positioned` 不影响尺寸）。
+  Widget _jumpHintDot(ColorScheme scheme) => Positioned(
+        right: 1,
+        top: 1,
+        child: SizedBox(
+          // 立**尺寸**而不是给 `Container` 加 border 约束：`Container` 会把 border 算进
+          // 自己的 constraints（6+border 不等于 6），于是这个点的实际大小取决于描边怎么写。
+          // 定死 6 + 里面画一个带描边的圆，外面量到的就恒是 6。
+          width: 6,
+          height: 6,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: scheme.primary,
+              shape: BoxShape.circle,
+              // 一圈底色的描边：小点落在按钮边缘时不会与描边糊成一团
+              border: Border.all(color: scheme.surface, width: 1),
+            ),
+          ),
+        ),
+      );
 
   /// 找同一个 callId 已经画出来的那个工具块：回执要找它（原地更新），
   /// 往上翻时后到的 `tool/call` 也要找它（回填名字与参数，见上面那条注释）。
@@ -864,9 +1439,9 @@ class _ChatPageState extends State<ChatPage> {
     try {
       await widget.state.api.post('/api/commands/reset-context', const {});
       if (!mounted) return;
-      IrmiaToast.show(context, '上下文已清空，后面的对话从零开始', kind: ToastKind.success);
+      IrmiaToast.show(context, IrmiaStrings.read(context).toastContextCleared, kind: ToastKind.success);
     } catch (err) {
-      if (mounted) IrmiaToast.show(context, '清空失败：$err', kind: ToastKind.error);
+      if (mounted) IrmiaToast.show(context, IrmiaStrings.read(context).toastClearFailed('$err'), kind: ToastKind.error);
     }
   }
 
@@ -879,21 +1454,37 @@ class _ChatPageState extends State<ChatPage> {
     try {
       await widget.state.api.post('/api/commands/dream', const {});
       if (!mounted) return;
-      IrmiaToast.show(context, '叫她去做梦了——整理完会写进记忆，日志页能看到', kind: ToastKind.success);
+      IrmiaToast.show(context, IrmiaStrings.read(context).toastDream, kind: ToastKind.success);
     } catch (err) {
-      if (mounted) IrmiaToast.show(context, '触发失败：$err', kind: ToastKind.error);
+      if (mounted) IrmiaToast.show(context, IrmiaStrings.read(context).toastTriggerFailed('$err'), kind: ToastKind.error);
     }
   }
 
-  void _scrollToEnd() {
+  /// **唯一**会滚到底的那条路（用户 2026-10-16 ①）。
+  ///
+  /// 默认不自动跟随：她说话、工具卡片更新、往上翻历史——一律**不许**把视图拽走
+  /// （原话：「chat 界面，不要 agent 一说话就往下滚动到最新。改成默认不自动滚动」）。
+  /// 所以这里只被两处调：**用户自己发消息**（`send`：那是他的动作，符合直觉），
+  /// 以及他按了「跳到最新」那颗按钮。
+  ///
+  /// 平滑而不是瞬间跳：滚动位置本身是"我正在看哪儿"的读数，瞬移会让人失去方位感
+  /// （`animateTo` + `easeOut` 与这颗按钮的语义一致：它是"带我过去"，不是"刷新"）。
+  void _jumpToLatest() {
+    // 提示点与"在底部"当场结清：这是人的意图，不等滚动结束那几帧。
+    // （帧后那次补量会把 `_atBottom` 按真实位置再校准一遍——滚到底之后它仍旧是 true。）
+    if (_jumpHint || !_atBottom) {
+      setState(() {
+        _jumpHint = false;
+        _atBottom = true;
+      });
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (scroll.hasClients) {
-        scroll.animateTo(
-          scroll.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 220),
-          curve: Curves.easeOut,
-        );
-      }
+      if (!mounted || !scroll.hasClients) return;
+      scroll.animateTo(
+        scroll.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOut,
+      );
     });
   }
 
@@ -943,19 +1534,22 @@ class _ChatPageState extends State<ChatPage> {
     }
     // 乐观渲染：先上屏，wake/manual 事件回来时由去重逻辑跳过重复
     setState(() => items.add(_BubbleItem.text(side: 'me', text: text)));
-    _scrollToEnd();
+    // **用户自己发消息 ⇒ 滚到底一次**（用户 2026-10-16 ① 定的唯一例外）：
+    // 他把话递出去了，接下来该看的就是她那一边的回应，停在半截没有意义。
+    _jumpToLatest();
     try {
       final res = await widget.state.api.post('/api/commands/wake', {'note': text});
       // 幂等键撞上时服务端会静默丢弃（fold 层不写任何事件）——那与"她正在想"在界面上
       // 长得一模一样，所以回执里带了 deduped，这里必须让人看见。
       if (mounted && res is Map && res['deduped'] == true) {
         setState(() => items.removeWhere((e) => e.side == 'me' && e.text == text && e.ts == null));
-        IrmiaToast.show(context, '这句和刚发过的完全一样，被当成同一条忽略了——过几秒再发一次就行',
+        IrmiaToast.show(context, IrmiaStrings.read(context).toastDuplicateSend,
             kind: ToastKind.info);
       }
     } catch (err) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('发送失败：$err')));
+        ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(IrmiaStrings.read(context).toastSendFailed('$err'))));
       }
     }
   }
@@ -963,18 +1557,23 @@ class _ChatPageState extends State<ChatPage> {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final s = IrmiaStrings.of(context);
     final note = _headNote;
     // 锚点前面那一份（往上翻出来的更早内容）有多长；宽度变化时别让它越界
     final olderCount = _olderCount.clamp(0, items.length);
     return Column(
       children: [
-        const PageHeader(title: '聊天', subtitle: '会话、消息来源与人工唤醒'),
+        PageHeader(title: s.chatTitle, subtitle: s.chatSubtitle),
         Expanded(
           child: loadingHistory
               ? const Center(child: CircularProgressIndicator())
-              : items.isEmpty
-                  ? _EmptyGuide(onCompose: inputFocus.requestFocus)
-                  : CustomScrollView(
+              // 读失败 ≠ 没有历史：**只有在真的读成功之后**才允许说「会话尚未开始」
+              // （见 [ChatPageState._historyError] 与 [_HistoryErrorState]）
+              : _historyError != null && items.isEmpty
+                  ? _HistoryErrorState(error: _historyError!, onRetry: loadHistory)
+                  : items.isEmpty
+                      ? _EmptyGuide(onCompose: inputFocus.requestFocus)
+                      : CustomScrollView(
                       controller: scroll,
                       // 锚点：这一屏在视口里的位置固定，往上插内容时屏幕不动（见 _anchorKey）
                       center: _anchorKey,
@@ -1011,6 +1610,46 @@ class _ChatPageState extends State<ChatPage> {
                       ],
                     ),
         ),
+        // **给「思考中」那一行留的定高槽位**（用户 2026-10-16「加一行紧凑进度」）。
+        //
+        // 为什么是"常驻的空槽"而不是"出现时插一行"：用户这一条明写「不许造成跳动：
+        // 出现/消失时其它元素不许移位」。插一行会把输入框与整个消息流往下推 20 像素，
+        // 而这件事在"她开口/收口"的瞬间正好发生——那正是人盯着屏幕的时候。
+        // 同样的理由这一页已经吃过一次（见 [_headNote] 的注释：实测差了 36 像素）。
+        //
+        // 所以高度**恒定**：不在想的时候这里就是一个 20 像素的空槽（代价如实说：
+        // 常驻占 20px 纵向空间），在想的时候内容在里面淡入——几何一个字都不变。
+        //
+        // 槽里住两样东西（同一行、左右两端）：
+        //   · 左：「思考中 · 第 N 步 · 已想 X 字 · 用时 M:SS」（[ThinkingRow]，只重画自己）；
+        //   · 右：「跳到最新」那颗按钮（[_jumpToLatestButton]）。
+        // 两样都**在输入框上方的槽内**、贴右留 18 与输入框同一条基线——所以既不挡住
+        // 输入框，也不压住消息内容（槽本来就在滚动区外面）。
+        SizedBox(
+          height: _kThinkingSlotHeight,
+          child: Padding(
+            // 左边与输入框那条基线对齐（输入框在下面那个 Container 的 18 padding 里）
+            padding: const EdgeInsets.symmetric(horizontal: 18),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: ThinkingRow(progress: thinkingNow),
+                  ),
+                ),
+                // 贴右那一格是**定宽**的：它不出现时留在原地的也是一个 26 宽的空气泡，
+                // 所以「思考中」那一行的可用宽度在按钮出现/消失时一个字都不变。
+                SizedBox(
+                  width: _kJumpButtonSize,
+                  child: Center(
+                    child: _atBottom ? null : _jumpToLatestButton(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
         Container(
           padding: const EdgeInsets.fromLTRB(18, 12, 18, 16),
           child: Row(
@@ -1021,7 +1660,7 @@ class _ChatPageState extends State<ChatPage> {
                   focusNode: inputFocus,
                   onSubmitted: (_) => unawaited(send()),
                   decoration: InputDecoration(
-                    hintText: '输入消息…（/reset 清空上下文、/dream 叫她整理记忆）',
+                    hintText: s.composerHint,
                     filled: true,
                     fillColor: scheme.surface,
                     contentPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
@@ -1065,6 +1704,470 @@ class _ChatPageState extends State<ChatPage> {
   }
 }
 
+/// 她这一轮跑到哪儿了——喂「思考中 · 第 N 步 · 已想 X 字 · 用时 M:SS」那一行。
+///
+/// 每个字段的出处见 [ChatPageState._trackThinking]。**不可变**：每次更新换一个新对象，
+/// 于是 `ValueNotifier` 认得出"变了"（原地改字段的话它比较的是同一个引用，那一行不会重画）。
+@immutable
+class ThinkingProgress {
+  const ThinkingProgress({
+    required this.turn,
+    required this.step,
+    required this.chars,
+    required this.since,
+    this.phase = ThinkCharsPhase.pending,
+  });
+
+  /// 第几轮（`turn/start` 的 `turn`）——只用来认"换了一轮没有"，不显示
+  final int turn;
+
+  /// 第几步（`step/start` 的 `step`）
+  final int step;
+
+  /// 这一轮的推理正文字数。**它的口径由 [phase] 标着**（见 [ThinkCharsPhase]：
+  /// 待生成时这里是 0，而那一格显示的是占位而不是这个 0）。
+  final int chars;
+
+  /// 这一轮开始想的时刻（`turn/start` 到达那一刻，本机时钟）
+  final DateTime since;
+
+  /// 这个字数是"还没生成"还是"已经落库的真值"（见 [ThinkCharsPhase]）
+  final ThinkCharsPhase phase;
+
+  ThinkingProgress copyWith({int? step, int? chars, ThinkCharsPhase? phase}) => ThinkingProgress(
+        turn: turn,
+        step: step ?? this.step,
+        chars: chars ?? this.chars,
+        since: since,
+        phase: phase ?? this.phase,
+      );
+
+  /// 已经想了多久（至少 0：本机时钟被人改过也不显示负数）。
+  ///
+  /// ★ 读 `clock.now()` 而**不是** `DateTime.now()`（2026-10-16 为「用时每秒走」这条改的）：
+  /// 两者在真机上**完全等价**（`clock` 包默认就转发到 `DateTime.now()`），差别只在用例里——
+  /// `flutter_test` 会把 `clock.now()` 接管成一只**随 `tester.pump(时长)` 前进的假时钟**，
+  /// 而 `DateTime.now()` 读的是真实墙钟、`pump` 推不动它。
+  /// 没有这一改，"那一行每秒自己走"就**没法用用例钉住**（只能靠真窗口肉眼看），
+  /// 而那正是这次要修的东西。代价：多一个显式声明的 dev 依赖（见 pubspec.yaml 的注释）。
+  Duration get elapsed {
+    final value = clock.now().difference(since);
+    return value.isNegative ? Duration.zero : value;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is ThinkingProgress &&
+      other.turn == turn &&
+      other.step == step &&
+      other.chars == chars &&
+      other.since == since &&
+      other.phase == phase;
+
+  @override
+  int get hashCode => Object.hash(turn, step, chars, since, phase);
+}
+
+/// 「已想 X 字」那一格**此刻说的是什么数**（用户 2026-10-16 ①）。
+///
+/// ★ 为什么需要这个字段（查清的事实，不是猜的）：
+/// 后端的推理正文是**一步跑完才发一条整段**（`src/runtime/agent-loop.ts:1451-1454`：
+/// `await this.deps.ds.stream(...)` 返回之后才写 `message/reasoning`，`text` 是整段
+/// `result.reasoning`；上游 `src/model/ds-client.ts:913` 那些 `reasoning_text.delta`
+/// **一个都不写进事件日志**）。所以在她想的那 153 秒里（实测 turn 2115：
+/// `step/start` @11:41:57 → 那条 62,854 字的 `message/reasoning` @11:44:30），
+/// 界面手上**一个字都没有**。
+///
+/// 旧写法把"手上 0 个字"直接念成「已想 0 字」——那是个**读数**，而它不真。
+/// 现在按"这个数是怎么来的"分三态，**只有 [counted] / [live] 才报数**。
+///
+/// ★ 三态里的 [live] 是**给后端那条 (b) 留的接口**（用户 2026-10-16 已批：
+/// "那一格改成**有进度事件就用它**、没有就显示落库后的真值"）：
+/// 将来后端每 N 秒发一条只含"已生成多少字"的 internal 事件时，界面**只改一处**——
+/// 在那个事件的 handler 里把 `phase` 置成 [live]、把 `chars` 置成它给的字数；
+/// [thinkingLine] 与这一格的样子**一个字都不用动**（它只看 `phase != pending`）。
+/// 在那条事件落地之前，[live] 永远不会出现，界面照旧走 [pending] → [counted]。
+enum ThinkCharsPhase {
+  /// 这一步的推理正文**还没落库**：她确实在想，但"已经想了多少字"此刻**无从得知**
+  /// （后端还没有任何一条带正文、也没发过进度事件）。这一态下那一格显示「…」，不显示 0。
+  pending,
+
+  /// **后端进度事件给的实时字数**（那条 (b) 还没落地，所以这一态暂时不会出现）。
+  /// 它说的是"到这一刻已经生成了多少字"，会**一路涨**——与 [counted] 的区别只是"谁给的"。
+  live,
+
+  /// 这一步的推理正文**已经落库**（收到过一条 `message/reasoning`）：
+  /// [ThinkingProgress.chars] 是**真读数**（各条 `text.length` 之和），
+  /// 且它是**这一步的最终值**（那一步已经跑完了）。
+  counted,
+}
+
+/// 把字数写成给人看的短写：`980` / `6.2 万字` / `112 万字`。
+///
+/// 为什么上万就换单位：一步推理实测能到 6 万字以上（turn 2115 step 1 = 62,854 字），
+/// 五位数会把那一行撑宽、而"62,854"对人眼不是个能一眼读懂的量级。
+/// 保留一位小数（`6.2 万字`）：量级一眼可读，又不至于把 61,000 与 69,000 说成同一个数。
+///
+/// i18n：口径**按语言不同**（中文按"万"分档、英文按"k"分档），实现在
+/// `AppStrings.compactChars`；这里保留原来的签名给既有用例，等价于中文那份。
+String formatThinkingChars(int chars) => const ZhStrings().compactChars(chars);
+
+
+/// 把时长写成 `M:SS`（例：`0:07` / `1:20` / `12:03`）。
+///
+/// 为什么是这个形状：它是**读数**不是文案——秒一直走，超一小时也照走（`61:05` 而不是
+/// `1:01:05`），这样那一行永远不会因为多出一个小时位而变宽。分不补零、秒补零，
+/// 于是宽度只在 9:59→10:00 那一次变一格，而数字是等宽的（见 [ThinkingRow]），
+/// 不会左右抖。
+String formatThinkingElapsed(Duration d) {
+  final total = d.inSeconds < 0 ? 0 : d.inSeconds;
+  final minutes = total ~/ 60;
+  final seconds = total % 60;
+  return '$minutes:${seconds.toString().padLeft(2, '0')}';
+}
+
+/// 那一行自己：**只重画这一行**（用户 2026-10-16：「只让这一行重建」）。
+///
+/// 数据从 [ChatPageState.thinkingNow] 来（本对象自己订阅它），
+/// 所以消息流那一棵树不参与——这是"不整页 setState"的落点。
+///
+/// 出现/消失：**尺寸恒定**。外层的槽位（[ChatPage] 的 `_thinkingSlot`）是定高的，
+/// 这一行**从不改自己的尺寸**，所以输入框与消息流的几何**一个像素都不动**
+/// （用户这一条的硬要求：不许造成跳动）。
+///
+/// ★ **整行同进同出**（用户 2026-10-16 ②「停了之后这个思考符号还是存在」，实测根因）：
+/// 上一版把"隐藏"做成了两件**互相独立**的事——
+///   · 文字由外层的 `AnimatedOpacity(opacity: showing ? 1 : 0)` 淡出；
+///   · 三个点 [`BreathingDots`] 有**自己的** `AnimationController`，逐点画 `Opacity(0.25…1)`。
+/// 而那个淡出被**冻在了 1.000**（实测：`turn/end` 之后 `FadeTransition.opacity.value == 1.000`
+/// 一路不变，三个点的 `Opacity` 还是 `[0.96, 0.73, 0.51]` ⇒ 屏上就只剩"•••"）。
+/// 为什么冻住：淡出与"把点的动效停掉"是**同一个 `TickerMode` 开关**驱动的
+/// （旧代码是 `TickerMode(enabled: showing)` **包着** `AnimatedOpacity`）——
+/// 一藏起来，那个把透明度从 1 推到 0 的 ticker 当场被自己关掉，于是它永远走不到 0。
+/// 文字看着"没了"只是因为它的内容被置成了空串（不是被淡出的）。
+///
+/// 现在的写法（三条，缺一不可）：
+///   ① **一个** [AnimationController] 驱动**整行**（点、间距、文字）的淡入淡出；
+///   ② [Offstage] 兜底：`offstage: opacity == 0` ⇒ 隐藏时整棵子树**一个像素都不画**
+///      （不靠"透明度是 0 所以大概看不见"这种推断；它同时是 [Look] 那条"不许移位"的保证——
+///      这一行不参与尺寸计算，外层定高槽位兜着几何）；
+///   ③ 点的呼吸动效由 [BreathingDots.running] 显式起停，**不再借 `TickerMode`**——
+///     那条开关与①的淡出抢同一个 ticker，正是这一版要甩掉的坑。
+class ThinkingRow extends StatefulWidget {
+  const ThinkingRow({super.key, required this.progress});
+
+  final ValueListenable<ThinkingProgress?> progress;
+
+  @override
+  State<ThinkingRow> createState() => _ThinkingRowState();
+}
+
+class _ThinkingRowState extends State<ThinkingRow> with SingleTickerProviderStateMixin {
+  /// 每秒一格：只为把「用时」推着走（[ThinkingProgress.elapsed] 读的是本机时钟）
+  Timer? _tick;
+
+  /// 当刻那一份进度（`null` = 她不在想）。**订阅式读进字段**，理由见类注释那条机关。
+  ThinkingProgress? _progress;
+
+  /// 整行的淡入淡出（**唯一**的显隐驱动）
+  late final AnimationController _fade = AnimationController(
+    vsync: this,
+    duration: IrmiaTheme.durCard,
+    value: widget.progress.value == null ? 0 : 1,
+  );
+
+  /// 淡出到底了没有——只有它到 0 才允许 [Offstage] 收掉绘制
+  bool _atRest = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _progress = widget.progress.value;
+    _atRest = _progress == null;
+    _fade.addStatusListener(_onFadeStatus);
+    widget.progress.addListener(_onProgress);
+    _syncTicker();
+  }
+
+  @override
+  void dispose() {
+    widget.progress.removeListener(_onProgress);
+    _fade.removeStatusListener(_onFadeStatus);
+    _fade.dispose();
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  /// 淡出结束时收掉绘制（`dismissed` = 停在 0）
+  void _onFadeStatus(AnimationStatus status) {
+    final rest = status == AnimationStatus.dismissed;
+    if (rest != _atRest && mounted) setState(() => _atRest = rest);
+  }
+
+  /// 进度变了：收下新值 + 起停秒表 + 推动整行的淡入淡出 + 重画
+  void _onProgress() {
+    if (!mounted) return;
+    final showing = widget.progress.value != null;
+    setState(() => _progress = widget.progress.value);
+    _syncTicker();
+    if (showing) {
+      // 淡入：**立刻**把 offstage 拿掉（那是"要画了"），透明度由控制器推上去
+      if (_atRest) setState(() => _atRest = false);
+      _fade.forward();
+    } else {
+      _fade.reverse();
+    }
+  }
+
+  /// 看得见就走秒、看不见就停
+  void _syncTicker() {
+    final showing = _progress != null;
+    if (showing == (_tick != null)) return;
+    if (showing) {
+      _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else {
+      _tick?.cancel();
+      _tick = null;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    // 字号/颜色**都从主题来**（不硬编码尺寸）：与消息流里那几行小字
+    // （`_noteRow` / `_headNote`）同一档——那是这一页已有的"读数"长相。
+    final base = Theme.of(context).textTheme.bodySmall ?? const TextStyle(fontSize: 12);
+    final style = base.copyWith(
+      // 次要文本：明暗两套都不用挑色（`onSurfaceVariant` 在 IrmiaTheme 里两套都有值）
+      color: scheme.onSurfaceVariant,
+      height: 1.2,
+      // **数字等宽**（用户 2026-10-16 的排版要求：字数跳动时那行别左右抖）。
+      // 用 OpenType 的 `tnum` 特性而不是换字体：字号/字形跟着主题那套字体栈走，
+      // 只把数字换成同宽的字形——`0:07` → `0:08`、`9 字` → `10 字` 时宽度不变。
+      // 代价如实说：这一页的字体是 `Microsoft YaHei UI`（`IrmiaTheme.windowsUiFont`），
+      // 它认不认 `tnum` 要**在真窗口里看**才知道（见报告里"没实测清单"）——
+      // 不认也只是退化成原来那样，不会画错。
+      fontFeatures: const [FontFeature.tabularFigures()],
+    );
+    // **不用 `ValueListenableBuilder`**：它内部缓存 `child`，`value` 没变时不会重建那个
+    // `Text` ——而"每秒那一拍"正好就是 value 没变、只有时间过去了（见类注释那条机关）。
+    // 这里直接在 `build` 里建树：每一次 `setState`（进度变 / 秒表到点）都真的重算一次
+    // `thinkingLine`，而它读 `clock.now()`，所以「用时」真的在走。
+    final value = _progress;
+    final showing = value != null;
+    return AnimatedBuilder(
+      // 整行（点 + 间距 + 文字）**同一个**透明度：这就是"同进同出"
+      animation: _fade,
+      builder: (context, child) {
+        final opacity = _fade.value;
+        return Offstage(
+          // ★ 隐藏时**不画任何东西**（见类注释的②）：`opacity == 0` 才是"真的没了"，
+          // 而不是"透明度是 0、大概看不见"。`offstage` 不参与尺寸与绘制 ⇒ 几何照旧由
+          // 外层那个定高槽位兜着（"不许移位"这条不受影响）。
+          offstage: _atRest || opacity == 0,
+          child: Opacity(
+            opacity: opacity,
+            child: child,
+          ),
+        );
+      },
+      // `child` 只在这里建一次：每秒那一拍不重建这棵子树，只有透明度在动
+      child: IgnorePointer(
+        child: Row(
+          children: [
+            // 点的呼吸动效由它自己按 `running` 起停（不再借 `TickerMode`：那条开关
+            // 正是上一版把淡出冻在 1.000 的原因，见类注释）
+            BreathingDots(running: showing),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                value == null ? '' : thinkingLine(value),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: style,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 那一行的正文（单独拎出来是为了能直接对字符串做用例）。
+///
+/// 全角空格分隔而不是 `·`：四个读数里有两处是"标签 + 数字"，用 `·` 会让分隔符与
+/// "第 N 步"里的字挤成一片；全角空格在中文小字里既分得开、又不抢眼（不新造符号）。
+///
+/// ★ 「已想 X 字」那一格的**两态**（用户 2026-10-16 ①「这里不能是实时的吗？」）：
+/// 后端一步跑完才发整段推理正文，所以等待期间**没有数可报**。那时显示「已想 …」
+/// （明确说"还没数"），收到那一步的 `message/reasoning` 之后才显示真数
+/// （`6.2 万字`）。**任何时刻都不显示「已想 0 字」**——那是个假读数。
+/// 这一格**报不报数**：只有"有数"那两态才显示字数，[ThinkCharsPhase.pending] 显示占位。
+bool reportsChars(ThinkCharsPhase phase) => phase != ThinkCharsPhase.pending;
+
+String thinkingLine(ThinkingProgress p, {AppStrings strings = const ZhStrings()}) {
+  // 步号与字数补到固定宽度：她一步里字数会一直涨（`48` → `152`），
+  // 不补的话那一行的长度会一跳一跳地变——配上等宽数字，补位让"抖"降到只剩进制那一次
+  final step = p.step.toString().padLeft(2, ' ');
+  final chars = reportsChars(p.phase)
+      // 有数就报数（`live` 是后端进度事件给的，`counted` 是落库后的真值——同一格同一形状）
+      ? strings.compactChars(p.chars).padLeft(4, ' ')
+      // 没数就说没数：`…` 是"还没生成"，不是 0
+      : '   …';
+  // 四个格子 + 语言各自的分隔符（中文全角空格、英文半角双空格），语序也在 strings 里
+  return [
+    strings.thinkingLabel,
+    strings.thinkingStep(step),
+    strings.thinkingChars(chars),
+    strings.thinkingElapsed(formatThinkingElapsed(p.elapsed)),
+  ].join(strings.thinkingGap);
+}
+
+/// 进行中指示：**三个点依次淡入淡出**（用户 2026-10-16：「克制的进行中指示」）。
+///
+/// 为什么不是旋转 spinner：转圈是"未知等待"的语法（网络请求、加载中），
+/// 而这里发生的事**有进度**（步号、字数、秒数都在走），转圈会和那三个读数打架；
+/// 而且转圈在低帧率下会明显地"一格一格"。
+///
+/// 为什么是 1.5 秒一轮、相位差 0.18：慢到不像在催人，又快到"它是活的"一眼看得出来；
+/// 相位差小于 0.15 时三个点看起来是一起闪，大于 0.25 就散成了三件不相干的事。
+/// 透明度只在 0.25↔1.0 之间走（不闪到全透明）：那是呼吸，不是闪烁。
+///
+/// ★ 动效的起停**由 [running] 显式控制**（用户 2026-10-16 ② 的修法之一）。
+/// 上一版是把这一格包在 `TickerMode(enabled: showing)` 里"顺手"停掉的——那条开关与
+/// 父级那个淡出抢**同一个** ticker，结果淡出被自己关掉、冻在 1.000，三个点就留在了屏上
+/// （见 [ThinkingRow] 的类注释）。所以这里不借 `TickerMode`：看得见才 `repeat()`，
+/// 看不见就 `stop()`（停在原地即可——整行的透明度已经是 0，它画不画都一样，
+/// 但**不转**这条纪律要保住：屏幕上看不见的东西不该继续占着每一帧）。
+class BreathingDots extends StatefulWidget {
+  const BreathingDots({super.key, required this.running});
+
+  /// 要不要转。`false` ⇒ 控制器停住（不占帧），不是把自己藏起来。
+  final bool running;
+
+  @override
+  State<BreathingDots> createState() => _BreathingDotsState();
+}
+
+class _BreathingDotsState extends State<BreathingDots>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1500),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.running) _controller.repeat();
+  }
+
+  @override
+  void didUpdateWidget(BreathingDots old) {
+    super.didUpdateWidget(old);
+    if (old.running == widget.running) return;
+    if (widget.running) {
+      _controller.repeat();
+    } else {
+      _controller.stop();
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  /// 第 [index] 个点在进度 [t]（0..1 循环）时的透明度
+  static double _opacityAt(double t, int index) {
+    final phase = (t + index * 0.18) % 1.0;
+    // 前 40% 淡入、后 60% 淡出（不对称：亮起来快一点，落下去慢一点，看着更"呼吸"）
+    final wave = phase < 0.4 ? phase / 0.4 : 1 - (phase - 0.4) / 0.6;
+    return 0.25 + 0.75 * wave.clamp(0.0, 1.0);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      // 与那一行小字（bodySmall 约 16px）等高：槽位的高度就按它定，行内不再撑高
+      width: 18,
+      height: 16,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, _) => Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            for (var i = 0; i < 3; i += 1)
+              Opacity(
+                opacity: _opacityAt(_controller.value, i),
+                child: Container(
+                  width: 4,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: scheme.onSurfaceVariant,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 历史**读失败**时那一屏：说清"没读到"，并给一个能再来一次的入口。
+///
+/// 为什么不复用 [_EmptyGuide] 那句「会话尚未开始」：那是**读成功、确实没有记录**。
+/// 读失败是另一种事实——重试就可能好，说成"还没有"等于把故障说成了现状。
+/// 所以这里带 [error] 原文（排障要看得出是哪一种失败）与一颗「重试」。
+class _HistoryErrorState extends StatelessWidget {
+  const _HistoryErrorState({required this.error, required this.onRetry});
+
+  /// 失败原因（异常原文；给人排障，不是给她的口吻）
+  final String error;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final s = IrmiaStrings.of(context);
+    final detail = error.trim();
+    return Center(
+      key: const ValueKey('history-error'),
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.cloud_off_rounded, size: 40, color: IrmiaTheme.danger),
+            const SizedBox(height: 16),
+            Text(s.historyErrorTitle,
+                style: TextStyle(
+                    fontSize: 15, fontWeight: FontWeight.w600, color: scheme.onSurface)),
+            const SizedBox(height: 8),
+            Text(detail.isEmpty ? s.historyErrorMessage : detail,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, height: 1.6, color: scheme.onSurfaceVariant)),
+            const SizedBox(height: 18),
+            OutlinedButton.icon(
+              key: const ValueKey('history-retry'),
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh_rounded, size: 16),
+              label: Text(s.retry),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// 空会话引导：界面提示走专业语气，下一步动作直接落在输入框上
 class _EmptyGuide extends StatelessWidget {
   const _EmptyGuide({required this.onCompose});
@@ -1074,6 +2177,7 @@ class _EmptyGuide extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final s = IrmiaStrings.of(context);
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(32),
@@ -1084,17 +2188,17 @@ class _EmptyGuide extends StatelessWidget {
             const Center(child: HerFace(size: 56, radius: 18)),
             const SizedBox(height: 16),
             Center(
-              child: Text('会话尚未开始',
+              child: Text(s.chatEmptyTitle,
                   style: TextStyle(
                       fontSize: 15, fontWeight: FontWeight.w600, color: scheme.onSurface)),
             ),
             const SizedBox(height: 14),
             GuideBar(
               icon: Icons.chat_bubble_outline_rounded,
-              text: '还没有会话记录。',
-              actionLabel: '输入消息',
+              text: s.chatEmptyMessage,
+              actionLabel: s.chatEmptyAction,
               onAction: onCompose,
-              hint: '在下方输入框发送内容后，会话与来源显示在此。',
+              hint: s.chatEmptyHint,
             ),
           ],
         ),
@@ -1129,6 +2233,7 @@ class _BubbleRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final s = IrmiaStrings.of(context);
 
     if (item.kind == _ItemKind.tool) {
       return Padding(
@@ -1164,7 +2269,7 @@ class _BubbleRow extends StatelessWidget {
         padding: EdgeInsets.only(top: continues ? 6 : 14, bottom: 2),
         child: Align(
           alignment: Alignment.centerRight,
-          child: _NoticeCard(item: item, tag: '上下文分界'),
+          child: _NoticeCard(item: item, tag: s.tagContextBoundary, cardKey: 'boundary-card'),
         ),
       );
     }
@@ -1192,7 +2297,7 @@ class _BubbleRow extends StatelessWidget {
         padding: EdgeInsets.only(top: continues ? 6 : 14, bottom: 2),
         child: Align(
           alignment: Alignment.centerRight,
-          child: _NoticeCard(item: item, tag: '注入预警'),
+          child: _NoticeCard(item: item, tag: s.tagInjection, cardKey: 'injection-card'),
         ),
       );
     }
@@ -1203,7 +2308,13 @@ class _BubbleRow extends StatelessWidget {
     if (item.side == 'sys') {
       return Padding(
         padding: EdgeInsets.only(top: continues ? 6 : 14, bottom: 2),
-        child: Align(alignment: Alignment.centerRight, child: _NoticeCard(item: item)),
+        child: Align(
+            alignment: Alignment.centerRight,
+            child: _NoticeCard(
+              item: item,
+              tag: s.tagFrameworkReminder,
+              cardKey: 'notice-card',
+            )),
       );
     }
 
@@ -1290,7 +2401,8 @@ class _ToolBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final status = _toolStatus(item.toolStatus, scheme);
+    final s = IrmiaStrings.of(context);
+    final status = _toolStatus(item.toolStatus, scheme, s);
     final name = item.toolName ?? 'tool';
     // speak / report 是她**说话**的出口：标签形态，与别的工具分开
     final isSpeech = name == 'speak' || name == 'report';
@@ -1300,7 +2412,10 @@ class _ToolBlock extends StatelessWidget {
     // 「不能复用原来 mcp 的卡片吗？就只改个显示的名字而已」。
     final label = isSpeech ? '<$name>' : _mcpToolLabel(name, item.toolArgs);
     final args = (item.toolArgs ?? '').trim();
-    final result = (item.toolResult ?? '').trim();
+    // 入口（`_consume`）已经剥过一次；这里再剥一次是**兜底**：`toolResult` 也可能由
+    // 别处写进来（`_findToolBlock` 那条往上翻的回填路），漏一处就会在界面上重新露出颜色码。
+    // 对已经干净的正文它是一个恒等变换（正则都不匹配），代价可以忽略。
+    final result = sanitizeToolOutput(item.toolResult ?? '').trim();
     final folding = result.length > 180 || result.contains('\n');
 
     return TweenAnimationBuilder<double>(
@@ -1355,7 +2470,7 @@ class _ToolBlock extends StatelessWidget {
                           ),
                         ],
                         const SizedBox(height: 8),
-                        _result(scheme, status, result, folding),
+                        _result(scheme, status, result, folding, s),
                       ],
                     ),
                   ),
@@ -1418,9 +2533,9 @@ class _ToolBlock extends StatelessWidget {
     );
   }
 
-  Widget _result(ColorScheme scheme, _ToolStatus status, String result, bool folding) {
+  Widget _result(ColorScheme scheme, _ToolStatus status, String result, bool folding, AppStrings s) {
     if (item.toolStatus == null) {
-      return Text('正在执行…', style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant));
+      return Text(s.toolExecuting, style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant));
     }
     if (result.isEmpty) {
       return Text(status.label, style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant));
@@ -1452,7 +2567,7 @@ class _ToolBlock extends StatelessWidget {
           GestureDetector(
             onTap: onToggle,
             child: Text(
-              item.expanded ? '收起' : '展开全部（${result.length} 字）',
+              item.expanded ? s.collapse : s.expandAll(result.length),
               style: TextStyle(fontSize: 11, color: scheme.primary, fontWeight: FontWeight.w600),
             ),
           ),
@@ -1471,7 +2586,7 @@ class _ToolBlock extends StatelessWidget {
 /// 而通道消息不是谁在界面里说的——它是**外面递进来的一条输入**，和工具调用是同一类东西
 /// （外面来的东西摆右边）。挂在她的气泡上还会读成"她刚说了这么一句"，正好说反。
 ///
-/// 为什么名字取不到时不退回 openid：见 [_ChatPageState._chanSenderOf]。
+/// 为什么名字取不到时不退回 openid：见 [ChatPageState._chanSenderOf]。
 class _ChannelBlock extends StatelessWidget {
   const _ChannelBlock({required this.item, required this.sender, required this.onToggle});
 
@@ -1482,12 +2597,13 @@ class _ChannelBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final s = IrmiaStrings.of(context);
     // 识别不出的 chatType 不猜（可能是平台新加的会话类型），退回通道名——通道名恒有。
     // `mentionsMe` 参与判词：群里**没 @ 但喊了她的名字**也叫提及（关键词），而它的事件
     // chatType 是普通的 `group`——只看 chatType 的话，这张卡会写成「群聊消息」，
     // 看起来就像"群里的普通消息直接进了对话流"（用户 2026-10-02 正是这么问的）。
-    final category = _chatTypeLabel(item.chatType, mentionsMe: item.mentionsMe)
-      ?? _channelFallbackLabel(item.channel);
+    final category = _chatTypeLabel(item.chatType, mentionsMe: item.mentionsMe, s: s)
+      ?? _channelFallbackLabel(item.channel, s);
     // 色条说的是"这条冲谁来"：@ 她 / 喊她的名字 / 单聊是**点名找她**（主色），群里的背景音用灰。
     // 工具块那条色条说的是状态（跑/成/挂）——同一种形状，两种含义，位置与粗细一致。
     final directed = item.chatType == 'c2c' || item.chatType == 'group-at' || item.mentionsMe;
@@ -1547,7 +2663,7 @@ class _ChannelBlock extends StatelessWidget {
                             // 卡片宽度定死（420）之后，Expanded 也正好把时刻顶到右边。
                             Expanded(
                               child: Text(
-                                _adapterLabel(item.channel),
+                                _adapterLabel(item.channel, s),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
@@ -1561,7 +2677,7 @@ class _ChannelBlock extends StatelessWidget {
                         ),
                         const SizedBox(height: 5),
                         // 发送者：**别名**（人在「消息适配器 → 会话联系人」里填的那个）。
-                        // 取不到也**不退回 openid**，见 [_ChatPageState._chanSenderOf]。
+                        // 取不到也**不退回 openid**，见 [ChatPageState._chanSenderOf]。
                         Text(
                           sender,
                           maxLines: 1,
@@ -1599,7 +2715,7 @@ class _ChannelBlock extends StatelessWidget {
                           GestureDetector(
                             onTap: onToggle,
                             child: Text(
-                              item.expanded ? '收起' : '展开全部（${text.length} 字）',
+                              item.expanded ? s.collapse : s.expandAll(text.length),
                               style: TextStyle(
                                   fontSize: 11, color: scheme.primary, fontWeight: FontWeight.w600),
                             ),
@@ -1613,7 +2729,7 @@ class _ChannelBlock extends StatelessWidget {
                         // 信息适当保持距离可以保证美观"——留一口气，但不留出一行的空。
                         const SizedBox(height: 5),
                         Text(
-                          '已接收：$sender（${_sidOf(item) ?? item.chatId ?? '—'}）',
+                          s.receivedFrom(sender, _sidOf(item) ?? item.chatId ?? s.dash),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(fontSize: 10.5, color: scheme.onSurfaceVariant),
@@ -1662,7 +2778,7 @@ bool _isManualReset(Map<String, dynamic> event) {
 /// 你打的话、外面递进来的通道消息、框架的提醒。这样"哪句是她的"一眼就分得出来，
 /// 而三种"不是她说的"内部再靠形状分（气泡 / 通道卡 / 提醒卡）。
 class _NoticeCard extends StatelessWidget {
-  const _NoticeCard({required this.item, this.tag = '框架提醒'});
+  const _NoticeCard({required this.item, required this.tag, this.cardKey = 'notice-card'});
 
   final _BubbleItem item;
 
@@ -1673,7 +2789,10 @@ class _NoticeCard extends StatelessWidget {
   /// 注入预警专用：徽章换成危险色，正文上方多一行标题（"外部消息里有想指挥她的迹象"）。
   /// 用户 2026-10-02：「注入预警应该更醒目，用危险的颜色」——它是这一列里唯一一件
   /// **框架替她留意到的事**，与"她说了什么/别人说了什么"不是一个量级。
-  bool get _isInjection => tag == '注入预警';
+  /// 定位件（用例按它找卡）。**与标签分开**：标签会随语言变，定位件不许变。
+  final String cardKey;
+
+  bool get _isInjection => cardKey == 'injection-card';
 
   @override
   Widget build(BuildContext context) {
@@ -1686,11 +2805,7 @@ class _NoticeCard extends StatelessWidget {
       // 三种标签共用一个组件，但定位件保留三个名字：分界那一条的用例按 boundary-card 找、
       // 提醒那一条按 notice-card 找、注入预警按 injection-card 找——合并组件不该顺手把
       // 别人的定位件拆掉。
-      key: ValueKey(switch (tag) {
-        '框架提醒' => 'notice-card',
-        '注入预警' => 'injection-card',
-        _ => 'boundary-card',
-      }),
+      key: ValueKey(cardKey),
       // 不再是一行小灰字（用户 ⑬："有点小且单薄，放点人类可能希望关注的信息"）：
       // 卡片 + 徽章 + 第二行细节，与通道卡片同一族的体量。
       // 宽度与通道卡**同一个常数**（用户 ⑮："应该和这个一样长"——右边那一列要齐）。
@@ -1755,6 +2870,8 @@ class _NoticeCard extends StatelessWidget {
 
 /// 注入预警卡的标题：**界面常量**（与 ask 卡同一条防伪口径）——别人发的消息改不动它，
 /// 与运行情况页「框架提示」里那一行逐字相同（两处说的是同一件事，措辞不该分叉）。
+/// 注入预警卡上的标题（中文那份的字面值；界面走 s.injectionCardTitle）。
+/// 用例按这个常量断言「标题是界面常量，与运行情况页同一句」。
 const kInjectionCardTitle = '外部消息里有想指挥她的迹象';
 
 /// 引用片段：外部原文。左侧一条竖线把它与框架的结论分开
@@ -1810,7 +2927,8 @@ class _ChannelBadge extends StatelessWidget {
   }
 }
 
-/// 别名取不到时写什么。**不写 openid**：见 [_ChatPageState._chanSenderOf]。
+/// 别名取不到时写什么。**不写 openid**：见 [ChatPageState._chanSenderOf]。
+/// 发送者兜底名（中文那份的字面值；界面走 s.unnamedSender）。
 const kUnnamedSender = '未命名会话';
 
 /// 提及卡（群里有人叫她）：**框架注入的提醒**，不是通道消息。
@@ -1833,6 +2951,7 @@ class _MentionNoticeCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final s = IrmiaStrings.of(context);
     final talking = (topic ?? '').trim();
     return Container(
       key: const ValueKey('mention-card'),
@@ -1853,7 +2972,7 @@ class _MentionNoticeCard extends StatelessWidget {
             children: [
               Icon(Icons.alternate_email, size: 13, color: scheme.primary),
               const SizedBox(width: 6),
-              _ChannelBadge(text: '群聊提及', tone: scheme.primary),
+              _ChannelBadge(text: s.groupMention, tone: scheme.primary),
               const Spacer(),
               if (item.ts != null)
                 Text(_hhmm(item.ts!),
@@ -1861,13 +2980,13 @@ class _MentionNoticeCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 5),
-          Text('$sender 里有人提到了你',
+          Text(s.mentionsYou(sender),
               style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600)),
           const SizedBox(height: 5),
           Text(item.text, style: TextStyle(fontSize: 12.5, height: 1.6, color: scheme.onSurface)),
           if (talking.isNotEmpty) ...[
             const SizedBox(height: 4),
-            Text('那边在聊：$talking',
+            Text(s.talkingAbout(talking),
                 style: TextStyle(fontSize: 11.5, height: 1.5, color: scheme.onSurfaceVariant)),
           ],
         ],
@@ -1881,14 +3000,14 @@ class _MentionNoticeCard extends StatelessWidget {
 /// `mentionsMe` 参与判词：群里**没 @ 但正文里喊了她的名字**（关键词提及）也叫提及——
 /// 它的事件 `chatType` 是普通的 `group`，只看 chatType 就会写成「群聊消息」，
 /// 看起来像"群里的普通消息直接进了对话流"。
-String? _chatTypeLabel(String? chatType, {bool mentionsMe = false}) {
+String? _chatTypeLabel(String? chatType, {bool mentionsMe = false, AppStrings s = const ZhStrings()}) {
   switch (chatType) {
     case 'c2c':
-      return '单聊消息';
+      return s.directMessage;
     case 'group-at':
-      return '群聊提及';
+      return s.groupMention;
     case 'group':
-      return mentionsMe ? '群聊提及' : '群聊消息';
+      return mentionsMe ? s.groupMention : s.groupMessage;
     default:
       return null;
   }
@@ -1899,14 +3018,14 @@ String? _chatTypeLabel(String? chatType, {bool mentionsMe = false}) {
 /// 与 [_channelFallbackLabel] 不是一回事：那个是**会话类型认不出时**的兜底标记
 /// （"QQ 消息"），这个是**恒要显示**的适配器名——屏幕上同时可能有两条通道，
 /// 光看"单聊消息"分不出是哪一条送来的。
-String _adapterLabel(String? channel) {
+String _adapterLabel(String? channel, AppStrings s) {
   switch (channel) {
     case 'qq-official':
-      return 'QQ 官方 Bot';
+      return s.qqOfficialBot;
     case 'onebot':
       return 'OneBot';
     default:
-      return channel == null || channel.isEmpty ? '外部通道' : channel;
+      return channel == null || channel.isEmpty ? s.externalChannel : channel;
   }
 }
 
@@ -1914,14 +3033,14 @@ String _adapterLabel(String? channel) {
 ///
 /// 通道名也认不出（后端加了新通道，或者事件里根本没带）就写「外部消息」——
 /// 那时我们确实只知道"它是外面递进来的"。
-String _channelFallbackLabel(String? channel) {
+String _channelFallbackLabel(String? channel, AppStrings s) {
   switch (channel) {
     case 'qq-official':
-      return 'QQ 消息';
+      return s.qqMessage;
     case 'onebot':
-      return 'OneBot 消息';
+      return s.oneBotMessage;
     default:
-      return '外部消息';
+      return s.externalMessage;
   }
 }
 
@@ -1979,30 +3098,30 @@ class _ToolStatus {
 /// `errorOn`（深色模浅红），理由是深色底上的对比度；用户 2026-10-05 只圈了气泡与发送键
 /// 两处，并问"改其他的干嘛"——所以这里原样退回。四色在明暗两模下都不随主题漂移
 /// （见 [IrmiaTheme.ok] 那一段的说明），要动它得先问用户。
-_ToolStatus _toolStatus(String? status, ColorScheme scheme) {
+_ToolStatus _toolStatus(String? status, ColorScheme scheme, AppStrings s) {
   switch (status) {
     case null:
       return _ToolStatus(
-          color: scheme.primary, icon: Icons.autorenew_rounded, label: '运行中', spinning: true);
+          color: scheme.primary, icon: Icons.autorenew_rounded, label: s.toolRunning, spinning: true);
     case 'ok':
-      return const _ToolStatus(color: IrmiaTheme.ok, icon: Icons.check_rounded, label: '完成');
+      return _ToolStatus(color: IrmiaTheme.ok, icon: Icons.check_rounded, label: s.toolDone);
     case 'error':
-      return const _ToolStatus(color: IrmiaTheme.danger, icon: Icons.close_rounded, label: '出错');
+      return _ToolStatus(color: IrmiaTheme.danger, icon: Icons.close_rounded, label: s.toolError);
     case 'timeout':
-      return const _ToolStatus(
-          color: IrmiaTheme.warn, icon: Icons.hourglass_bottom_rounded, label: '超时（结果未知）');
+      return _ToolStatus(
+          color: IrmiaTheme.warn, icon: Icons.hourglass_bottom_rounded, label: s.toolTimeout);
     case 'denied':
-      return const _ToolStatus(
-          color: IrmiaTheme.warn, icon: Icons.shield_outlined, label: '被策略拒绝');
+      return _ToolStatus(
+          color: IrmiaTheme.warn, icon: Icons.shield_outlined, label: s.toolDenied);
     case 'unknown':
-      return const _ToolStatus(
-          color: IrmiaTheme.sleep, icon: Icons.help_outline_rounded, label: '结局未知');
+      return _ToolStatus(
+          color: IrmiaTheme.sleep, icon: Icons.help_outline_rounded, label: s.toolUnknown);
     case 'aborted':
-      return const _ToolStatus(
-          color: IrmiaTheme.sleep, icon: Icons.remove_circle_outline_rounded, label: '未派发');
+      return _ToolStatus(
+          color: IrmiaTheme.sleep, icon: Icons.remove_circle_outline_rounded, label: s.toolNotDispatched);
     case 'over-limit':
-      return const _ToolStatus(
-          color: IrmiaTheme.warn, icon: Icons.speed_rounded, label: '超出单步上限');
+      return _ToolStatus(
+          color: IrmiaTheme.warn, icon: Icons.speed_rounded, label: s.toolOverStepCap);
     default:
       return _ToolStatus(color: IrmiaTheme.sleep, icon: Icons.circle_outlined, label: status);
   }
@@ -2125,10 +3244,89 @@ String _short(Object? value) {
 /// 压成一行并限长（折叠态用：工具结果的信息密度比排版好看重要）
 String _oneline(String text, int max) {
   final flat = text.replaceAll(RegExp(r'\s+'), ' ').trim();
-  return flat.length > max ? '${flat.substring(0, max)}…' : flat;
+  if (flat.length <= max) return flat;
+  return '${_headByRunes(flat, max)}…';
+}
+
+/// 取前 [max] 个**字符**，绝不切开一个代理对（surrogate pair）。
+///
+/// `substring` 按 UTF-16 码元切：`max` 正好落在一个 emoji / 生僻字的中间时，
+/// 结果里会留一个孤立的高代理——Flutter 画它就是一个"豆腐块"。
+/// 这不是理论问题：她的输出里 emoji 与中文都不少，而 240 这个常数又恰好会切到。
+String _headByRunes(String text, int max) {
+  if (text.length <= max) return text;
+  final runs = text.runes.toList(growable: false);
+  if (runs.length <= max) return text;
+  return String.fromCharCodes(runs.take(max));
 }
 
 String _duration(int ms) => ms < 1000 ? '${ms}ms' : '${(ms / 1000).toStringAsFixed(1)}s';
+
+// ─────────────────────────── 工具输出里的终端装饰（ANSI） ───────────────────────────
+
+/// 完整的 ANSI 转义序列（**带 ESC**）。
+///
+/// 三支，都是终端里真实存在的形态：
+///   · `\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)` —— OSC（如设置窗口标题 `ESC]0;…BEL`），
+///     它用 BEL 或 `ESC \` 收尾，**不吃掉后面正常文字**；
+///   · `\u001b\[[0-9;?]*[ -/]*[@-~]` —— CSI：SGR（颜色/加粗，`m` 收尾）与光标/擦除
+///     （`H` / `J` / `K` …）都在这一支里。**不限 `m`**：`ESC[2K` 这种只是没有颜色，
+///     留在正文里一样是乱码；
+///   · `\u001b[@-Z\\-_]` —— 两字符的 Fe 转义（`ESC c` 复位之类）。
+final RegExp _ansiEscapeRe =
+    RegExp('\u001b\\][^\u0007\u001b]*(?:\u0007|\u001b\\\\)|\u001b\\[[0-9;?]*[ -/]*[@-~]|\u001b[@-Z\\\\-_]');
+
+/// **丢了 ESC 的** SGR 残渣：`[32;1m` / `[0m` 这种形式。
+///
+/// 为什么非要单独认它：用户截图里那行就是 `[32;1mName[0m[32;1mMode[0m…`——**前面没有 ESC**。
+/// 产生它的现场很常见：着色在管道里被谁剥掉了控制字符、或者输出经过了只认 `\u001b[` 的
+/// 清洗（`src/tools/pwsh.ts:560` 的 `ANSI_RE` 只管 CLIXML 那一支，正文不走它）。
+/// 只认带 ESC 的那一支的话，人看到的仍是一屏 `[32;1m`。
+///
+/// 判据（这条决定了它会不会误伤正文）：**参数全是数字/分号、以 `m` 收尾**，
+/// 且**左边不是 `]`**。
+///
+/// 最后那半条是实测补上的，而且**不能收紧到"左边必须是空白"**：
+/// 着色输出里最常见的正是紧贴文字的那个复位码（`Name[0m`、`Mode[0m`）——
+/// 按空白卡的话它们全都漏掉，用户截图里那行就修不干净（实测：第一批样例里
+/// `[0m` 一个都没剥掉）。
+///
+/// 所以只挡一种形状：`[1m](url)`——markdown 链接正文的结尾 `]` 后面紧跟自己那一对方括号。
+/// 实测不加它时 `see [docs](http://x) and [1m]` 会被吃掉两个字符。
+///
+/// 于是 `[exit code: 0]`、`[stderr]`、`[sh…` 一个都不匹配（含字母、或不以 `m` 结尾），
+/// 而她真的想看的正文照旧留着。
+final RegExp _bareSgrRe = RegExp(r'(?<!\])\[[0-9;]{1,16}m');
+
+/// 裸控制字符：退格、响铃、`\r`（`\t` / `\n` 留给排版）。
+///
+/// 它们不带 ESC 也能进正文（终端里 `\b` 是"擦掉一格"），原样画出来是一个方块或一段空白。
+final RegExp _bareControlRe = RegExp('[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]');
+
+/// 工具输出上屏前**剥掉终端装饰**（用户 2026-10-16 ③）。
+///
+/// 做什么：把 ANSI 转义序列（SGR 颜色/加粗、光标控制、OSC）与裸控制字符去掉，
+/// 换行与制表符留着（它们是排版，不是装饰）。
+///
+/// 边界：剥的是**装饰**，不是内容——`[exit code: 0]`、`[stderr]` 这类服务端写的状态行
+/// 一个字都不动（见 [_bareSgrRe] 的判据）。真要吃不准的形态（例如她输出的 markdown
+/// 里恰好有 `[1m`），代价也只是少显示两个字符，不会把正文吃掉。
+///
+/// 为什么不改服务端：那是另一条线（`src/**`），而且这是**显示**层的事——
+/// 日志里留着原始字节是对的（复盘时要看得见她到底收到了什么），
+/// 只有"画给人看"这一层该剥。服务端现有那条 `ANSI_RE`（`src/tools/pwsh.ts:560`）
+/// 只覆盖 CLIXML 那一支，正文不走它。
+String sanitizeToolOutput(String raw) {
+  if (raw.isEmpty) return raw;
+  // **顺序有讲究**：`\r` 必须先折成换行，再剥控制字符。
+  // 反过来的话它已经被当控制字符删掉了，`进度 10%\r进度 20%` 会被粘成一行看不懂的东西
+  // （终端里那个 `\r` 是"回到行首重写"，当分隔符看才对）。
+  final normalized = raw.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+  return normalized
+      .replaceAll(_ansiEscapeRe, '')
+      .replaceAll(_bareSgrRe, '')
+      .replaceAll(_bareControlRe, '');
+}
 
 String _hhmm(String iso) {
   final dt = DateTime.tryParse(iso)?.toLocal();

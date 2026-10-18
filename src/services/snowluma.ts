@@ -33,6 +33,7 @@ import { createConnection } from 'node:net';
 import { isAbsolute, join, resolve } from 'node:path';
 
 import { killProcessTree } from '../process/kill-tree.ts';
+import { createUtf8Stream, decodeText } from '../util/bytes-text.ts';
 
 /** 服务状态机的取值（GUI 直接显示，所以用词要人能看懂） */
 export type ManagedServiceState =
@@ -515,8 +516,10 @@ export function parseNetstatListenLine(line: string): { port: number; pid: numbe
 function listenEntries(run?: () => string): Array<{ port: number; pid: number }> {
   let text: string;
   try {
+    // netstat 的正文是 ASCII，但**表头**在中文 Windows 上是 GBK（cp936）字节。这里只取
+    // 命中行，可 `encoding:'utf8'` 会把表头换成替换字符——一条给人看的判据不该靠"恰好没用到"。
     text = run === undefined
-      ? execFileSync('netstat', ['-ano'], { encoding: 'utf8', timeout: 5_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 })
+      ? decodeText(execFileSync('netstat', ['-ano'], { timeout: 5_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 })).text
       : run();
   } catch {
     return [];
@@ -669,9 +672,13 @@ function processFactsOf(pids: readonly number[]): Map<number, { startedAt?: stri
     + ' | ForEach-Object { "$($_.ProcessId)`t$($_.CreationDate.ToString(\'o\'))`t$($_.CommandLine)" }';
   let text: string;
   try {
-    text = execFileSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], {
-      encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
+    // **收原始字节**（2026-10-18）：这条命令读的是进程命令行——含中文路径/参数是常态，
+    // 而 Windows PowerShell 往管道里写的是控制台代码页（中文机器 936）。`encoding:'utf8'`
+    // 会把它换成 U+FFFD，而这段文本要拿去判"这个 pid 是不是协议端"。
+    const bytes = execFileSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], {
+      timeout: 20_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
     });
+    text = decodeText(bytes).text;
   } catch {
     return out;
   }
@@ -955,8 +962,16 @@ export class ManagedProtocolService {
     this.child = child;
     this.stopping = false;
 
+    // 流式解 + **行缓冲**：逐块 `toString('utf8').split('\n')` 有两个病——
+    // ① 跨块的多字节字符会被切成两半（变成替换字符）；
+    // ② 被管道切开的半行会被当完整行送去抹口令 ⇒ **口令只有半截能匹配上，剩下的就漏出去了**。
+    const stream = createUtf8Stream();
+    let pendingLine = '';
     const relay = (chunk: Buffer): void => {
-      for (const line of chunk.toString('utf8').split(/\r?\n/u)) {
+      pendingLine += stream.push(chunk);
+      const parts = pendingLine.split(/\r?\n/u);
+      pendingLine = parts.pop() ?? '';
+      for (const line of parts) {
         if (line.trim() === '') continue;
         this.noteLine(line);
         // 先抹口令再往外送：留痕要留，口令不能跟着留（见 redactor 的注释）

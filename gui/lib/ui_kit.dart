@@ -1,8 +1,13 @@
+// TODO(i18n): 本文件还有 24 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/ui_kit.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import 'her_name.dart';
+import 'i18n/strings_scope.dart';
 import 'theme.dart';
 
 /// Irmia GUI 交互基元（来源：docs/astrbot-ux-interaction.md §八「直接照搬」）。
@@ -180,7 +185,7 @@ Future<bool> confirm(
   BuildContext context, {
   required String title,
   String? body,
-  String confirmLabel = '确认',
+  String? confirmLabel,
   bool danger = false,
 }) async {
   if (!context.mounted) return false;
@@ -188,6 +193,7 @@ Future<bool> confirm(
     context: context,
     builder: (dialogContext) {
       final scheme = Theme.of(dialogContext).colorScheme;
+      final s = IrmiaStrings.of(dialogContext);
       return AlertDialog(
         constraints: const BoxConstraints(minWidth: 280, maxWidth: kDialogMaxWidth),
         title: Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
@@ -201,12 +207,13 @@ Future<bool> confirm(
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop(false),
             style: TextButton.styleFrom(foregroundColor: scheme.onSurfaceVariant),
-            child: const Text('取消'),
+            // 「取消」是**跨页同一句话**：文案表里只有一处（s.cancel）
+            child: Text(s.cancel),
           ),
           FilledButton.tonal(
             onPressed: () => Navigator.of(dialogContext).pop(true),
             style: _confirmButtonStyle(scheme, danger),
-            child: Text(confirmLabel),
+            child: Text(confirmLabel ?? s.confirm),
           ),
         ],
       );
@@ -311,7 +318,8 @@ Future<bool> confirmDestructive(
             TextButton(
               onPressed: () => Navigator.of(dialogContext).pop(false),
               style: TextButton.styleFrom(foregroundColor: scheme.onSurfaceVariant),
-              child: const Text('取消'),
+              // 「取消」是**跨页同一句话**：文案表里只有一处（s.cancel）
+            child: Text(IrmiaStrings.of(dialogContext).cancel),
             ),
             FilledButton.tonal(
               onPressed: () => Navigator.of(dialogContext).pop(true),

@@ -34,6 +34,11 @@ import { join, resolve } from 'node:path';
 
 import { McpConfigError, parseMcpServers } from '../mcp/client.ts';
 import type { McpServerEntry, McpToolAttributes } from '../mcp/client.js';
+import {
+  DEFAULT_STREAM_HARD_CAP_MS, DEFAULT_STREAM_SILENCE_MS, DEFAULT_TIMEOUT_MS,
+  MAX_NONSTREAM_TIMEOUT_MS, MAX_STREAM_HARD_CAP_MS, MAX_STREAM_SILENCE_MS,
+  MIN_NONSTREAM_TIMEOUT_MS, MIN_STREAM_SILENCE_MS,
+} from '../model/ds-client.ts';
 import { resolveKey, type KeyName } from './keys.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
@@ -92,9 +97,20 @@ const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
  */
 export const DEFAULT_MEMORY_MAINTAIN_CRON = '0 4 * * *';
 /**
- * `persona/STATE.md` 的字节预算（默认 8 KB）——越过它就在**此刻层**多一行提醒，让**她**去维护。
+ * `persona/STATE.md` 的字节预算（**代码出厂默认** 8 KB；现网口径由用户在 `config.json` 里定）
+ * ——越过它就在**此刻层**多一行提醒，让**她**去维护。
  *
- * **为什么是 8 KB**（2026-10-05 用户定稿："STATE 如果超预算的话，就加个提醒……将过时内容
+ * **2026-10-17 用户把限额收到 2 KB**（原话：「**限额到 2KB**，超过限额的时候会注入框架提示吧，
+ * **未决的事及时询问，已决已办及时销项移除。不清楚的跟用户沟通移除**。否则会造成大量输入成本，
+ * 伤害用户的钱包。**保持好 STATE.md 的干净整洁**」）。落地方式是**他改 `config.json` 的
+ * `persona.stateBudgetBytes: 8192 → 2048`**，本常量**不动**（代码默认仍是 8 KB，与
+ * `buildDefaults()` 的字面量一致——两处必须同步，见下）。所以：
+ *   • **2 KB = 2048 字节**（单位是字节，不是字符，见下）；
+ *   • 判据是 **`stateBytes > budgetBytes` 严格大于**：正好 2048 字节**不**提醒，2049 才提醒；
+ *   • 提醒措辞（四件事 + 成本 + 干净整洁）见 `src/model/render.ts` 的 `stateBudgetReminder`
+ *     （**唯一一处实现**），那是随这次限额一起改写的新规。
+ *
+ * **为什么出厂是 8 KB**（2026-10-05 用户定稿："STATE 如果超预算的话，就加个提醒……将过时内容
  * 移入记忆文件或删除"）：
  *   • 8 KB ≈ 1.8k token，够放**当前任务 + 接着干 + 几条边界**这三样——也就是"下一拍真的要用"
  *     的那点状态。这三个数（1.8k token / 下面那份 16.6 KB）都是实测：目视 `data/persona/STATE.md`
@@ -105,16 +121,21 @@ export const DEFAULT_MEMORY_MAINTAIN_CRON = '0 4 * * *';
  *   • 定 8 而不是 4：她真的在干活时（当前任务 + 排队 + 边界 + 两条心情）就是 5~7 KB，
  *     压到 4 KB 会逼她为了躲提醒而删掉还在用的东西——那是**为了指标损害质量**。
  *     也不是 16：那等于"什么都不用改"，这条提醒就成了摆设。
+ *   • **2026-10-17 改判**：上述"5~7 KB"的实测口径是在她**把流水账堆进 STATE** 的那些天量的；
+ *     用户现在的判断是 2 KB 足够（他不接受"为了好看的指标损害质量"这条反论了——
+ *     他要的是**输入成本**降下来）。口径归用户，代码只负责按字节判。
  *
  * **它只提醒、不截断**（用户的原话："框架不动她的文件；她看到提醒自己去维护"）：
  * 框架一个字节都不动 `STATE.md`，也不替她搬内容——搬去哪、删什么由她判断。
  * 提醒的措辞与格式见 `src/model/render.ts` 的 `stateBudgetReminder`（唯一一处实现）。
+ * 那一行一轮只在第 1 步出现（此刻层 v66 起逐字段增量：它一轮之内不变就不重发）。
  *
  * 单位是**字节**（照 `write_persona` 里 `Buffer.byteLength` 那套既有口径），不是字符：
  * 这份文件几乎全是中文，一个汉字 3 字节，"多少字"和"多少字节"差三倍。
  *
  * ⚠️ 改这个数要**同时**改 `buildDefaults()` 里 `persona.stateBudgetBytes` 的那个字面量：
  * 出包脚本拿它与这里比对（理由写在那行旁边），只改一处出包会红。
+ * （用户改 `config.json` 的现网值不属于"改这个常量"——两者是两件事。）
  */
 export const DEFAULT_STATE_BUDGET_BYTES = 8 * 1024;
 
@@ -160,6 +181,53 @@ export interface ModelsConfig {
   light: ModelLaneConfig;
   /** 降级链备用路由；缺省不启用（不写这一段即代表不用） */
   degraded?: ModelLaneConfig | undefined;
+  /** 单次模型请求的时限（2026-10-16 加，见 {@link RequestTimeoutConfig}） */
+  requestTimeout: RequestTimeoutConfig;
+}
+
+/**
+ * 单次模型请求的三格时限（2026-10-16 加；用户的原话：「**不要硬性掐断**，因为现代的大模型
+ * **超长思考很正常**。**思考 40 分钟都有可能**」）。
+ *
+ * 为什么必须是三格、而不是一格"超时"：
+ *   · **流式**（heavy 的 turn 主循环）判的是**静默**——"多久没收到任何 SSE 数据"。
+ *     原来那条 180s 是**我们自己**硬编码的**总时限**（`main.ts` 构造 `DsClient` 时没传 `timeoutMs`），
+ *     它从"请求发出"起跑、连收流一起算 ⇒ 一次正常的长思考写到一半就被我们自己的定时器掐断
+ *     （实测被掐那一刻已累积 10 万字符推理、断在半句话上），而 `timeout` 又在可重试类别里
+ *     ⇒ 掐断 → step 失败 → 输入退回队列 → 下一轮从第一步重跑同一个请求 → 再撞同一堵墙。
+ *   · **硬顶**是"静默之外还要有一道兜底"：静默只抓得住"零输出"那种卡死，抓不住
+ *     "一直在吐字但永不结束"（对端 bug、被代理反复喂心跳）——没有它，那类连接就永远挂着。
+ *   · **非流式**（light 的一问一答）仍然用总时限：没有增量可救，超了就该退避重试。
+ *
+ * 三个键都是**启动期读一次**（`main.ts` 构造 `DsClient` 时传进去）：它们不在
+ * `HOT_RELOAD_FIELDS` 白名单里，**改完要重启进程才生效**——与 `budget.*` / `wake.*` 同一条口径
+ * （那一行注释写着为什么：要放一项进来就得先答出"改了这一格，请求前缀的哪一段字节会变"）。
+ * `DsClient.applyConfig` 已经能收这三格，将来真要热更时宿主接一根线即可，本类不必再动。
+ */
+export interface RequestTimeoutConfig {
+  /**
+   * 流式**静默**时限（毫秒，默认 **120000** = 120s，范围 1000..3600000）。
+   *
+   * 判据 = 距**上一次收到任何 SSE 数据**（响应头、正文分片、心跳注释行）多久。
+   * 取值依据：原来那条总时限是 180s 且实测帧流不慢（180s 内 10 万字符 ⇒ 平均 1.8ms 一片），
+   * 所以 **120s 一片都没有**是"这条连接真卡了"的强信号；而 180s 会误伤"服务端排队 /
+   * 长思考里正常的空档"——那正是要被放过的那些请求。
+   */
+  requestSilenceMs: number;
+  /**
+   * 流式**硬顶**（毫秒，默认 **10800000** = 3 小时，范围 [requestSilenceMs, 86400000]）。
+   *
+   * 无论收到多少数据，一次请求都不许超过它。取值刻意宽到"长思考根本撞不到"：
+   * 用户说 40 分钟都可能，按实测吞吐 8~30 tok/s 反推 40 分钟 ≈ 1.9~7.2 万 output token，
+   * 3 小时 = 4.5 个"40 分钟" ≈ 8.6~32 万 token——真到这一步已经不是"想得久"，是"停不下来"
+   * （那种请求的输出也早已越过 max_output_tokens 会被截断）。
+   */
+  requestHardCapMs: number;
+  /**
+   * 非流式（light 的 `generate()`）总时限（毫秒，默认 **180000** = 180s，范围 1000..3600000）。
+   * 沿用原来的 180s：那条路上没有"已推送的部分"可救，超时就是这个请求没成。
+   */
+  nonStreamTimeoutMs: number;
 }
 
 /**
@@ -632,12 +700,20 @@ export interface PersonaConfig {
    */
   memoryEnabled: boolean;
   /**
-   * `persona/STATE.md` 的**字节预算**（默认 [DEFAULT_STATE_BUDGET_BYTES] = 8 KB）。
+   * `persona/STATE.md` 的**字节预算**（默认 [DEFAULT_STATE_BUDGET_BYTES] = 8 KB；现网由用户定）。
    *
-   * 越过它时，框架在**此刻层**（每步都发的那一段）多一行：
-   * `[STATE.md] 16.6 KB / 预算 8 KB——预算超限，记得维护，将过时内容移入记忆文件或删除`。
+   * 越过它时，框架在**此刻层**（她正在动手的那一段）多一行：
+   * `[STATE.md] 4383 字节 / 限额 2 KB = 2048 字节——超限：未决的事及时问他；已决、已办的销项、
+   * 从 STATE.md 移除；拿不准的跟他沟通后移除。保持 STATE.md 干净整洁——否则每轮都要多背
+   * 这些字，直接烧的是他的钱`
+   * （2026-10-17 按用户的新规改写；逐字真源在 `render.ts` 的 `stateBudgetReminder`。）
+   *
+   * **单位是字节**（与 `write_persona` 同源）⇒ **2 KB = 2048 字节**。判据是
+   * **`stateBytes > budgetBytes`（严格大于）**：正好 2048 字节不提醒，2049 才提醒。
+   *
    * 放在那里是因为她**正在动手的地方**就是此刻层：她压下来之后（下一轮量到的新尺寸落回预算内）
-   * 那一行自动消失，不需要任何"已读"状态。
+   * 那一行自动消失，不需要任何"已读"状态。⚠️ v66 起此刻层逐字段增量：这一行一轮之内不变，
+   * 所以它**只在第 1 步发一次**（不是每步都发——那是 v32 当年的口径）。
    *
    * **只提醒、不截断**（2026-10-05 用户的口径）：框架不动她的文件，也不替她搬内容——
    * 哪一段过时、搬进哪个记忆文件、还是直接删，都是她的判断。这一行的全部作用是把一件
@@ -742,7 +818,7 @@ export interface ChannelsConfig {
 /**
  * 外部依赖（docs/design.md §4.18、review.md v30）。
  *
- * 三件外部依赖（pwsh 7 / ripgrep / es.exe）的探测与安装由框架管（`src/deps/`），
+ * 四件外部依赖（pwsh 7 / ripgrep / es.exe / Python）的探测与安装由框架管（`src/deps/`），
  * 这里只留**一个**人工干预的入口：路径。
  *
  * 为什么需要它：`deps.paths.<name>` 是探测三段顺序的**第一段**（用户指定 > 框架自装 > PATH）。
@@ -750,6 +826,10 @@ export interface ChannelsConfig {
  * 框架只能告诉他"未安装"——而"我明明装了"是最让人恼火的一类答复。
  * 显式指了却不可用时**不静默落到后两段**：那会变成"我配了却不生效"，
  * 比直接报错难查得多（见 src/deps/probe.ts）。
+ *
+ * Python 这一件尤其需要它：官方安装器的常见装法把解释器放在带版本号的目录里
+ * （`%LOCALAPPDATA%\Programs\Python\Python313\`），那种目录**不在 PATH 上**是常态
+ * ——"我装了 python，工具却说没有"的第一号现场就是它。
  */
 export interface DepsConfig {
   /** 各依赖的可执行文件路径（绝对路径）；不写 = 走框架自装目录与 PATH */
@@ -757,6 +837,7 @@ export interface DepsConfig {
     pwsh?: string | undefined;
     rg?: string | undefined;
     es?: string | undefined;
+    python?: string | undefined;
   };
 }
 
@@ -876,7 +957,7 @@ export interface AppConfig {
    * （界面的 `mcp-save` / `mcp-remove` 回执里也是这么说的 —— `restartRequired: true`）。
    */
   mcp: McpConfig;
-  /** 外部依赖（pwsh / rg / es）的用户指定路径；探测的第一段 */
+  /** 外部依赖（pwsh / rg / es / python）的用户指定路径；探测的第一段 */
   deps: DepsConfig;
   channels: ChannelsConfig;
   alerts: AlertsConfig;
@@ -939,6 +1020,18 @@ function buildDefaults(dir: string): AppConfig {
     models: {
       heavy: { model: DEFAULT_MODEL, baseUrl: DEFAULT_BASE_URL, apiKeyEnv: DEFAULT_API_KEY_ENV },
       light: { model: DEFAULT_MODEL, baseUrl: DEFAULT_BASE_URL, apiKeyEnv: DEFAULT_API_KEY_ENV },
+      // 三格时限的出厂值（口径与依据见 RequestTimeoutConfig 的字段注释）：
+      //   · 流式判**静默**（120s 没有任何数据）而不是总耗时 —— 长思考不再被掐；
+      //   · 另有一条很宽的硬顶（3h）兜"一直在吐字但永不结束"；
+      //   · 非流式仍用总时限（180s），它没有"已推送的部分"可救。
+      //
+      // ⚠️ 写**十进制字面量**（不写 `1.2e5`、也不写算式）：出包脚本 Read-CodeDefaults
+      // 按正则抓字段默认值，算式抓不到就当场拒绝出包（"字段改名了？"）。
+      requestTimeout: {
+        requestSilenceMs: DEFAULT_STREAM_SILENCE_MS,
+        requestHardCapMs: DEFAULT_STREAM_HARD_CAP_MS,
+        nonStreamTimeoutMs: DEFAULT_TIMEOUT_MS,
+      },
     },
     budget: {
       stepTools: 20,
@@ -1258,9 +1351,22 @@ function defaultDocument(dir: string): JsonObject {
       $comment: [
         'heavy = turn 主循环；light = 必要性判断/摘要/守卫分类；degraded = 降级链备用路由（不写即不启用）。',
         'baseUrl 是 API 根地址（不含 /responses）。',
+        'requestTimeout 是单次模型请求的三格时限（2026-10-16 加，见 src/config/config.ts 的 RequestTimeoutConfig）：',
+        '  · requestSilenceMs（默认 120000 = 120 秒）——**流式**判据是"多久没收到任何 SSE 数据"，',
+        '    不是"一共花了多久"。超长思考（用户说 40 分钟都可能）期间服务端一直在吐分片，所以它撞不到这条。',
+        '  · requestHardCapMs（默认 10800000 = 3 小时）——无论收到多少数据都不许超过它，',
+        '    兜的是"一直在吐字但永不结束"（没有它，那种连接会永远挂着）。必须 >= requestSilenceMs。',
+        '  · nonStreamTimeoutMs（默认 180000 = 180 秒）——**非流式**（light 的一问一答）仍用总时限：',
+        '    那条路上没有"已推送的部分"可救，超时就是这个请求没成。',
+        '  三格都是启动期参数：**改完要重启进程才生效**（与 budget.* / wake.* 同一条口径）。',
       ],
       heavy: { model: d.models.heavy.model, baseUrl: d.models.heavy.baseUrl, apiKeyEnv: d.models.heavy.apiKeyEnv },
       light: { model: d.models.light.model, baseUrl: d.models.light.baseUrl, apiKeyEnv: d.models.light.apiKeyEnv },
+      requestTimeout: {
+        requestSilenceMs: d.models.requestTimeout.requestSilenceMs,
+        requestHardCapMs: d.models.requestTimeout.requestHardCapMs,
+        nonStreamTimeoutMs: d.models.requestTimeout.nonStreamTimeoutMs,
+      },
     },
     budget: {
       $comment: [
@@ -1338,10 +1444,10 @@ function defaultDocument(dir: string): JsonObject {
         'memoryEnabled：**框架代管记忆**的总开关，默认 true（框架生成 MEMORIES/INDEX.md、每轮注入索引、每日 4 点整理、并维护 !pinned 与条目 TTL）。',
         '  关掉（false）＝框架不生成索引、不注入任何记忆、不跑整理；她只从装置自述知道 MEMORIES/（facts.md / episodes/ / jargon.md / style-notes.md / aliases.md）与 diary/ 存在，读写维护全归她自己。',
         '  关掉的代价写在明面上：她可能忘了整理、facts.md 会一直长下去、索引不再更新。不受影响的：MEMORIES/aliases.md 参与"会话认人/关注名单"属于通道侧，STATE.md（她当前状态）是独立的一层。',
-        'stateBudgetBytes：persona/STATE.md 的**字节预算**，默认 8192（8 KB ≈ 1.8k token）。',
-        '  越过它时框架在**此刻层**（每步都发的那一段）多一行「[STATE.md] …——预算超限，记得维护，将过时内容移入记忆文件或删除」，让她自己去把过时内容搬进记忆文件或删掉。',
-        '  为什么是 8 KB：够放「当前任务 + 接着干 + 几条边界」这三样（下一拍真的要用）的那点状态；出厂的 STATE.md 实测 17007 字节 ≈ 3.8k token/次，而且是**每轮都在重发**。',
-        '  只提醒、不截断：框架不动她的文件，也不替她搬内容。她压回预算内之后那一行自动消失（不需要"已读"）。单位是字节（与 write_persona 的字节口径同源）；改完要重启进程才接管。',
+        'stateBudgetBytes：persona/STATE.md 的**字节预算**，默认 8192（8 KB ≈ 1.8k token）。单位是**字节**，与 write_persona 的 Buffer.byteLength 同源：2 KB = 2048 字节。',
+        '  判据是**严格大于**（stateBytes > stateBudgetBytes）：正好等于预算不提醒，多一个字节才提醒。越过它时框架在**此刻层**多一行「[STATE.md] 4383 字节 / 限额 2 KB = 2048 字节——超限：未决的事及时问他；已决、已办的销项、从 STATE.md 移除；拿不准的跟他沟通后移除。保持 STATE.md 干净整洁——否则每轮都要多背这些字，直接烧的是他的钱」，让她自己去把过时内容搬进记忆文件或删掉。',
+        '  为什么出厂是 8 KB：够放「当前任务 + 接着干 + 几条边界」这三样（下一拍真的要用）的那点状态；出厂的 STATE.md 实测 17007 字节 ≈ 3.8k token/次，而且是**每轮都在重发**。现网口径由用户定（2026-10-17 他收到 2 KB = 2048 字节，改的就是这个字段）。',
+        '  只提醒、不截断：框架不动她的文件，也不替她搬内容。她压回预算内之后那一行自动消失（不需要"已读"）。改完要重启进程才接管。这一行一轮只在第 1 步出现一次（此刻层 v66 起逐字段增量：它不变就不重发）。',
         'contacts：联系人表（会话 sid → 名字）。QQ 不给昵称，也不提供查成员的接口，所以“这个 QQ 会话是用户”只能在这里声明；优先于她自己的 MEMORIES/aliases.md。',
       ],
       compactionThresholdTokens: d.persona.compactionThresholdTokens,
@@ -1462,16 +1568,19 @@ function defaultDocument(dir: string): JsonObject {
     },
     deps: {
       $comment: [
-        '外部依赖（pwsh 7 / ripgrep / es.exe）的用户指定路径——探测顺序的第一段（用户指定 > 框架自装目录 <dataDir>/tools/<name> > PATH）。',
+        '外部依赖（pwsh 7 / ripgrep / es.exe / Python）的用户指定路径——探测顺序的第一段（用户指定 > 框架自装目录 <dataDir>/tools/<name> > PATH）。',
         '不写就走后两段；写了一个不可用的路径**不会**静默退回 PATH，而是如实报"你指的那个用不了"——"我配了却不生效"是最难查的一类故障。',
         'pwsh 要求主版本 >= 7（powershell.exe 5.1 不算满足，它只是工具的回退项）。rg 与 es 是 rg_search / es_search 的引擎，没装就不注册这两件工具。',
-        'rg 与 es 可以在 GUI 设置页「外部依赖」一键安装（下载官方包解压到 <dataDir>/tools/<name>/）；pwsh 7 需要人工安装（winget install Microsoft.PowerShell）。',
+        'Python 要求 3.8+（2.x 算"版本不符"，不算满足）：它是 pwsh 工具 lang:"python" 那一档用的解释器，将来的 Office 工具包与 computer use 插件也挂在它上面。',
+        'rg 与 es 与 Python 可以在 GUI 设置页「外部依赖」一键安装（下载官方包解压到 <dataDir>/tools/<name>/，装完就地复检、不必重启）；pwsh 7 需要人工安装（winget install Microsoft.PowerShell）。',
+        'Python 的在线下载失败时（代理/防火墙），把官方 embeddable zip 放到 <dataDir>/tools/.cache/python.zip 再点一次「安装」，那时不再联网。',
       ],
       // 只写出显式指定过的路径：`undefined` 在 JSON 里会被丢掉，写进去反而让模板文件出现空值
       paths: {
         ...(d.deps.paths.pwsh === undefined ? {} : { pwsh: d.deps.paths.pwsh }),
         ...(d.deps.paths.rg === undefined ? {} : { rg: d.deps.paths.rg }),
         ...(d.deps.paths.es === undefined ? {} : { es: d.deps.paths.es }),
+        ...(d.deps.paths.python === undefined ? {} : { python: d.deps.paths.python }),
       },
     },
     channels: {
@@ -1685,8 +1794,46 @@ function parseLane(raw: JsonValue | undefined, where: string, base: ModelLaneCon
   };
 }
 
-function pickBoolean(raw: JsonValue | undefined, where: string, fallback: boolean): boolean {
-  if (raw === undefined || raw === null) return fallback;
+/**
+ * `models.requestTimeout` 三格时限的解析与**交叉校验**（2026-10-16 加）。
+ *
+ * 范围常量取自 `model/ds-client.ts`（**唯一一份**）：那三个默认值就是客户端构造时的缺省值，
+ * 在这里再抄一遍数字，迟早出现"配置说 120s、客户端跑 180s"这种看不出来的漂移。
+ *
+ * 三条校验各自的理由：
+ *   · 静默必须 ≥ 1s（0 会让每一片数据之间都判超时——请求必然失败，而现象是"模型完全不回话"）；
+ *   · 硬顶必须 **≥ 静默**：反过来的话静默永远没机会开火，用户以为自己在调静默、其实在调硬顶；
+ *   · 非流式的总时限不许大过 1h：它是"一问一答"，超过一小时的那种等待该由重试/降级链管。
+ */
+function parseRequestTimeout(raw: JsonValue | undefined, base: RequestTimeoutConfig): RequestTimeoutConfig {
+  if (raw === undefined || raw === null) return { ...base };
+  if (!isPlainObject(raw)) {
+    throw new ConfigError(`models.requestTimeout 必须是对象，收到 ${describeValue(raw)}`, 'models.requestTimeout');
+  }
+  const where = 'models.requestTimeout';
+  const requestSilenceMs = pickInt(
+    raw['requestSilenceMs'], `${where}.requestSilenceMs`, base.requestSilenceMs,
+    MIN_STREAM_SILENCE_MS, MAX_STREAM_SILENCE_MS,
+  );
+  const requestHardCapMs = pickInt(
+    raw['requestHardCapMs'], `${where}.requestHardCapMs`, base.requestHardCapMs,
+    MIN_STREAM_SILENCE_MS, MAX_STREAM_HARD_CAP_MS,
+  );
+  if (requestHardCapMs < requestSilenceMs) {
+    throw new ConfigError(
+      `${where}.requestHardCapMs（${requestHardCapMs}）不得小于 ${where}.requestSilenceMs（${requestSilenceMs}）：`
+      + '硬顶是"静默之外的另一道闸"，比静默还短就等于静默永远不会开火',
+      `${where}.requestHardCapMs`,
+    );
+  }
+  const nonStreamTimeoutMs = pickInt(
+    raw['nonStreamTimeoutMs'], `${where}.nonStreamTimeoutMs`, base.nonStreamTimeoutMs,
+    MIN_NONSTREAM_TIMEOUT_MS, MAX_NONSTREAM_TIMEOUT_MS,
+  );
+  return { requestSilenceMs, requestHardCapMs, nonStreamTimeoutMs };
+}
+
+function pickBoolean(raw: JsonValue | undefined, where: string, fallback: boolean): boolean {  if (raw === undefined || raw === null) return fallback;
   if (typeof raw !== 'boolean') {
     throw new ConfigError(`${where} 只能是 true / false，收到 ${describeValue(raw)}`, where);
   }
@@ -1892,6 +2039,8 @@ function parseAppConfig(doc: JsonObject, dir: string): AppConfig {
   const models: ModelsConfig = {
     heavy: parseLane(modelsRaw['heavy'], 'models.heavy', base.models.heavy),
     light: parseLane(modelsRaw['light'], 'models.light', base.models.light),
+    // 三格时限：缺字段即出厂值，非法即报错（见 parseRequestTimeout）
+    requestTimeout: parseRequestTimeout(modelsRaw['requestTimeout'], base.models.requestTimeout),
   };
   const degradedRaw = modelsRaw['degraded'];
   if (degradedRaw !== undefined && degradedRaw !== null) {
@@ -2036,8 +2185,8 @@ function parseAppConfig(doc: JsonObject, dir: string): AppConfig {
   const depsRaw = objectOr(doc['deps'], 'deps');
   const depsPathsRaw = objectOr(depsRaw['paths'], 'deps.paths');
   const deps: DepsConfig = { paths: {} };
-  // 三个键各自独立：只写了 rg 的人不该因为没写 pwsh 而报错（缺字段 = 不干预）
-  for (const name of ['pwsh', 'rg', 'es'] as const) {
+  // 四个键各自独立：只写了 rg 的人不该因为没写 pwsh 而报错（缺字段 = 不干预）
+  for (const name of ['pwsh', 'rg', 'es', 'python'] as const) {
     const raw = depsPathsRaw[name];
     if (raw === undefined || raw === null) continue;
     if (typeof raw !== 'string') {

@@ -48,8 +48,8 @@ const TZ = 'Asia/Shanghai';
 const NOW_MS = Date.parse('2026-10-08T02:00:00.000Z');
 
 /** 用户在**两条通道**上的 id（配置里就是这么写的：一个 openid、一个数字 QQ 号） */
-const OWNER_OPENID = 'E7FEC35E951B5CCF8BA66793BF6B1314';
-const OWNER_QQ = '1269541505';
+const OWNER_OPENID = '00000000000000000000000000000001';
+const OWNER_QQ = '1234567890';
 /** 谁是用户：`runtime/trust.ts` 按这个名字判 owner */
 const OWNER_LABEL = '用户（OWNER）';
 /** 联系人表（口径与 config.json 的 `persona.contacts` 同形，键是 sid） */

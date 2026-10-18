@@ -9,7 +9,7 @@
  *
  * 现场（`D:\IrmiaAgent\_ops-readchannel\REPORT.md` §2）：她一次 speak 的三条气泡，从**平台另一扇门**
  * （同一实体群的 `qq-official` 那一路）被当作"别人发来的消息"推回来，`person` 填的是**她自己的
- * openid**（`86F07678…`）。整条入站链路上**没有任何一处**判"这条是不是我自己发的"，于是这条回声
+ * openid**（`00000003…`）。整条入站链路上**没有任何一处**判"这条是不是我自己发的"，于是这条回声
  * 被完整地当成某个群成员说的话：落 `channel/message` → 算未读 → 进群成员档案
  * （`data/group-members.json` 里多出一条 `群友C（群昵称：伊尔弥亚2号）`，与真人网友并列）。
  *
@@ -238,7 +238,7 @@ export function noticeViewOf(data: ChannelNoticeData, seq: number, ts: string): 
 
 /**
  * 把一个人显示成名字。**查不到不许编**——名字真源查不出来时退成短标识锚
- * （`…9F56`，与 `tools/admin.ts` 的 `makePersonAliaser` 同一档写法：那是全仓"认不出人时怎么称呼"
+ * （`…0006`，与 `tools/admin.ts` 的 `makePersonAliaser` 同一档写法：那是全仓"认不出人时怎么称呼"
  * 的唯一口径，这里刻意与它同形，免得同一批里同一个 openid 有两个写法）。
  */
 export type NoticeNamer = (id: string, nickname?: string) => string;
@@ -249,7 +249,7 @@ export type NoticeNamer = (id: string, nickname?: string) => string;
  * notice **不带昵称**（只有 `user_id` / `openid`），名字只能走既有真源现查——查不到时
  * **绝不编一个名字**：
  *   · 代号取 `unknown`（`某人` / `某个群成员` / `对方`）：那是"我不知道是谁"的如实说法，不是名字；
- *   · 后面追一句 `（…9F56）` —— 与 `makePersonAliaser` 认不出长 openid 时**同一种锚写法**
+ *   · 后面追一句 `（…0006）` —— 与 `makePersonAliaser` 认不出长 openid 时**同一种锚写法**
  *     （同一个 id 在这一屏里因此只有一种写法）。
  *
  * `id` 是空串 = 平台没给这一格：返回空串，由调用点决定整句怎么写（这一层不替它编）。
@@ -269,7 +269,7 @@ function whoLabel(
 }
 
 /**
- * 认不出人时那个锚：**恒为末尾四位**（`…9F56` / `…0999`），与 `tools/admin.ts` 的
+ * 认不出人时那个锚：**恒为末尾四位**（`…0006` / `…0999`），与 `tools/admin.ts` 的
  * `makePersonAliaser` 同一种写法。
  *
  * 为什么短标识也补零到四位：同一个群里"…999"与"…0999"看起来像两个不同的锚，
@@ -329,7 +329,7 @@ export function noticeLineText(
       if (notice.subType === 'lift_ban') {
         return whole ? `[${actor === '' ? '某人' : actor} 解除了全员禁言]` : `[${member(notice.targetId)} 被解除禁言]`;
       }
-      // 全员禁言那一条的当事人是群本身，摆出来只会是"某个群成员（…3642）"这种噪音 ⇒ 不摆人
+      // 全员禁言那一条的当事人是群本身，摆出来只会是"某个群成员（…6782）"这种噪音 ⇒ 不摆人
       if (whole) return `[${actor === '' ? '某人' : actor} 开启了全员禁言]`;
       // 单个人被禁言：**谁被禁**是 `user_id`，"谁禁的"在 `operator_id` 里（平台可能不给）
       return actor === '' ? `[${member(notice.targetId)} 被禁言${duration}]` : `[${actor} 把 ${member(notice.targetId)} 禁言${duration}]`;

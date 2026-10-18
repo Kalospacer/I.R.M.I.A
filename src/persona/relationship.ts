@@ -33,7 +33,7 @@ const PERSON_WAKE_TYPES: ReadonlySet<string> = new Set([
  * 用**她已经维护的那份 sid→名字 表**（`MEMORIES/aliases.md`）把一个渠道身份解析成人名。
  *
  * 为什么需要这一步（2026-10-05 实测的真 bug）：档案文件名是**人名**（`RELATIONSHIPS/OWNER.md`），
- * 而 QQ 单聊那条唤醒里的 `person` 是 **openid**（`E7FEC35E…`）——直接拿 openid 找文件必然找不到，
+ * 而 QQ 单聊那条唤醒里的 `person` 是 **openid**（`00000001…`）——直接拿 openid 找文件必然找不到，
  * 于是**他在 QQ 单聊里说话时不注入档案，在 GUI 里说话却注入**。同一件事两个样子，是这轮要修的。
  *
  * 判据只做一处：sid 的新旧写法兼容与查找顺序**复用** `channel/sessions.ts` 的

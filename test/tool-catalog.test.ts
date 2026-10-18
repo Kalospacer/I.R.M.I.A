@@ -40,7 +40,7 @@
  *   · **③ 合成账**（工具段 5502 ＋ `instructions` 里那几笔常驻）= **5569**。**不是门**：
  *     没有任何断言拿它当界，它只是"常驻前缀这几笔加起来多少"的提醒（下一笔开销先复测再决定）。
  *   · v61 这一批（**记忆那一批**）：`memory_read` 扩三个入口（`index`/`query`/`n`，**+64**）
- *     ＋ 腾挪 **−34**（`es_search` 六格 ＋ `safe_edit` 四格）＋ `ask_human` **断装配**
+ *     ＋ 腾挪 **−34**（`find` 六格 ＋ `safe_edit` 四格）＋ `ask_human` **断装配**
  *     （**不省 token**：它从 v52 起就不在数组里；这一笔是"同批"，不是递增理由）。
  *   · 历史：v52 5358 / v55 5280 / v57 5313 / v59 5362 / **v61 5392**。
  *   · 权威值的出处：`docs/design.md §4.18`「口径与复测」那一段与 `src/model/render.ts` 的
@@ -240,8 +240,8 @@ test('工具清单：常驻总量不许悄悄涨（防"文档与实测各说各�
   // v52（2026-10-12）的本条视角真值：**23 件 / 5358**（= 运行期 24 件 / 5468 − `mcp` 110）。
   // v55（2026-10-13，timer `payload` 三格约定那一批）的本条视角真值：**23 件 / 5280**
   // （= 运行期 24 件 / 5390 − `mcp` 110）。净变化 = **−78**：`+7`（`timer.payload` 点明三格）
-  // 抵掉 **−85**（四件大工具的参数说明压缩：`es_search` −43（描述 −22 / 参数面 −21）/
-  // `safe_edit` −24 / `safe_read` −18 / `rg_search` 未动；逐条 diff 表见提交说明与
+  // 抵掉 **−85**（四件大工具的参数说明压缩：`find` −43（描述 −22 / 参数面 −21）/
+  // `safe_edit` −24 / `safe_read` −18 / `grep` 未动；逐条 diff 表见提交说明与
   // `_research/_tmp-v55-params-account.mts`）。
   // ⚠ 这一批真正要装的是 `instructions` 那段（`PAYLOAD_SHAPE_TEXT` **+67**）：①②同批之后
   // 运行期 = 5390 + 67 = **5457 / 5500（余 43）**，`<5500` 与"余量 ≥30"两条都还绿。
@@ -276,7 +276,7 @@ test('工具清单：v52 的五件一批在上界之内（余量别被下一件�
   // v59（2026-10-12）：**5313 → 5362**（timer 的 `payload` 再约一格 `scope`，+49）⇒ 余量 138。
   // v61（2026-10-15，**记忆那一批**）：**5362 → 5392（+30）** ⇒ 余量 **108**；运行期 **5502**。
   //   净 +30 = `memory_read` 扩三个入口（`index`/`query`/`n`）**+64**（整件 169 → 233）
-  //   ＋ 腾挪 **−34**（`es_search` 六格 354 → 330 ＋ `safe_edit` 四格 327 → 317：
+  //   ＋ 腾挪 **−34**（`find` 六格 354 → 330 ＋ `safe_edit` 四格 327 → 317：
   //   只删"同一件事写两遍"）。
   //   ⚠ 运行期那一档越过 5500 那条**提醒线**（+2），但**它不是门**（本文件头写死了：
   //   唯一那道门是下面这个 `catalogTokens`）——**别读成"破线"**，门的余量是 108。
@@ -285,7 +285,7 @@ test('工具清单：v52 的五件一批在上界之内（余量别被下一件�
   assert.deepEqual(problems, [], `有工具被跳过：${problems.join('；')}`);
   const total = registry.catalogTokens({ includeDestructive: true });
   const names = registry.listForModel({ includeDestructive: true }).map((tool) => tool.name);
-  assert.equal(names.length, 23, `代码口径的件数变了（v52：23 件，= 运行期 24 件 − mcp）：${names.length}`);
+  assert.equal(names.length, 22, `代码口径的件数变了（v64：22 件 = 运行期 23 件 − mcp；砍 read_blob 后 23 → 22）：${names.length}`);
   // 两件"这一批动过的"必须在场：`web_search` 是新加的、`pwsh` 是改造过的
   assert.ok(names.includes('web_search'), 'web_search 必须常驻（它固化的是她一直在手搓的那条路）');
   assert.ok(names.includes('pwsh'), 'pwsh 必须常驻');
@@ -297,7 +297,7 @@ test('工具清单：v52 的五件一批在上界之内（余量别被下一件�
     `上界 5500 只剩 ${5500 - total} token（v61 之后的余量是 108；判据 ≥ ${MIN_HEADROOM}）：`
     + '再加一件工具（整件 ≥100 token）或让某件的说明长回去，都会把余量吃到线下。'
     + '要加就先按 docs/design.md §4.18 复测、再决定从哪里腾地方（v52 腾的是 ask_human 那 134、'
-    + 'v55 腾的是四件大工具参数说明里重复与废话那 85、v61 腾的是 es_search/safe_edit 那 37）',
+    + 'v55 腾的是四件大工具参数说明里重复与废话那 85、v61 腾的是 find/safe_edit 那 37）',
   );
 });
 

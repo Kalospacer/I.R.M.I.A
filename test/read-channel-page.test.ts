@@ -7,7 +7,9 @@
  * 「**未读也是只读提及和之前十条**」「**不视作已处理。提示她还有没看到的，往上翻页**」。
  *
  * 两条路径、两套判据，这一份把两条都钉住：
- *   ① **默认（不给游标）= 只读未读里"点了她的那些" + 每条之前十条**；已读的旧消息不再倒一遍。
+ *   ① **默认（不给游标）= 只给"上次查看之后"的新的那几条**（⚠ **口径已换**：v67/`fceeffe` 之前
+ *      是"未读里点了她的那些 + 每条之前十条"，那版已废——见下面 `默认：只给"上次查看之后的"那一窗`
+ *      那一条与 `read-channel-incremental.test.ts`）；已读的旧消息不再倒一遍。
  *      已读**只推进到"确实给她看过的那几条"**（没给她的保持未读，下次仍然会被告诉"还有没看到"）。
  *   ② **翻页（给 `before` 游标）= 读全部历史，每页 50 条、一个字都不动已读**。
  *
@@ -61,6 +63,23 @@ interface Rig {
   log: EventLog;
   /** 落一条通道消息，返回它的事件 seq（**翻页游标就是它**）。正文里带上自己那一句的编号 */
   write: (no: number, patch?: { at?: boolean; text?: string }) => number;
+  /**
+   * 落一条**她自己说出去的话**（`speak/sent`，v67 的用例要用它撑出"未读多过一屏"的形状）。
+   *
+   * 为什么要它：`readChannelSpoken` 是**无界**的（她在那个会话里说过的全部），所以"她自己的行"
+   * 是把未读撑到 `limit` 以上、从而触发"没摆下的新消息"那一支的唯一自然来源
+   *（消息那一侧宿主只回最近 `limit` 条，永远撑不满）。
+   */
+  speak: (text: string, callId: string) => number;
+  /**
+   * 把夹具的**时钟**往前拨 `seconds` 秒（v67 加）。
+   *
+   * 为什么需要它：`write` 与 `speak` 默认落在**同一毫秒**上（这个文件的既有取舍：先后只由事件 seq
+   * 决定）。而"她自己说过的话"那一类的同毫秒次序键是**投递时刻的毫秒**（`atMs`），它天然压过
+   * 消息的平台序号——于是同一毫秒里的发言会排到消息**之后**。要构造"她的旧发言 + 更新的消息"
+   * 这种真实形状，就得让两者的时刻真的分开。
+   */
+  at: (seconds: number) => void;
   read: (args: Record<string, unknown>) => Promise<ToolHandlerResult>;
   readEvents: () => Array<{ sid: string; upToSeq: number }>;
   /**
@@ -83,7 +102,9 @@ async function makeRig(t: TestContext): Promise<Rig> {
   const dir = mkdtempSync(join(tmpdir(), 'irmia-channel-page-'));
   const log = await EventLog.open(join(dir, 'events'));
   const projection = fold([]);
-  const now = (): Date => new Date('2026-10-08T07:00:00.000Z');
+  /** 夹具时钟：默认停在 `2026-10-08T07:00:00Z`，`at()` 拨动它（见 `Rig.at` 的说明） */
+  let clockMs = Date.parse('2026-10-08T07:00:00.000Z');
+  const now = (): Date => new Date(clockMs);
   t.after(() => {
     log.close();
     rmSync(dir, { recursive: true, force: true });
@@ -115,9 +136,26 @@ async function makeRig(t: TestContext): Promise<Rig> {
     seqs.set(no, seq);
     return seq;
   };
+  /**
+   * 她自己说出去的一句（真形状：`channel: 'reply-url'` + 非空 `text` + `sid` 就是
+   * `deliveredToSid` 认的那一条凭据，见 `src/tools/admin.ts`）。
+   */
+  const speak: Rig['speak'] = (text, callId) => {
+    const seq = log.nextSeq();
+    const event = {
+      seq,
+      ts: now().toISOString(),
+      type: 'speak/sent',
+      data: { channel: 'reply-url', chars: text.length, sid: SID, text, spokenParts: 1, callId, turn: 7 },
+      visibility: defaultVisibility('speak/sent'),
+      origin: 'test/channel-page',
+    } as unknown as AppEvent;
+    log.append(event, { sync: true });
+    applyOne(projection, event);
+    return seq;
+  };
 
-  const real = new RealLoop({
-    log,
+  const real = new RealLoop({    log,
     dataDir: dir,
     projection,
     now,
@@ -147,6 +185,8 @@ async function makeRig(t: TestContext): Promise<Rig> {
   return {
     log,
     write,
+    speak,
+    at: (seconds) => { clockMs = Date.parse('2026-10-08T07:00:00.000Z') + seconds * 1000; },
     read: async (args) => await tk.byName('read_channel').handler(args, ctx),
     readEvents: () => [...reads],
     // **从日志读回**那一条的真实 seq（别用落库时那次 `nextSeq()` 的返回值：
@@ -296,11 +336,11 @@ test('往新翻（不带游标）：只给比已读更新的那批，旧的一�
   assert.match(wide.content, /没有新消息/u, '同一批再读一次照旧去重');
 });
 
-// ──────────────────────────────── ④ 默认只给"提及 + 前十条" ────────────────────────────────
+// ──────────────────────────────── ④ 默认那一屏 = 上次查看之后的那些（v67） ────────────────────────────────
 
-test('默认：未读装不下时只给提及 + 它之前十条，前面那段旧闲话不给她', async (t) => {
+test('默认：只给"上次查看之后的"那一窗，不为提及单独开前后文（旧口径已废）', async (t) => {
   const rig = await makeRig(t);
-  // 先读一次把已读位立起来（第一次读的那一屏是"最近一屏"，见实现里的 ①）
+  // 先读一次把水位立起来（第一次读的那一屏是"最近一屏"，见实现里的 `firstSight`）
   rig.write(3);
   await rig.read({ sid: SID, limit: 5 });
   // 之后攒一大批（远超一屏）：第 195 句点她，其余都是闲话
@@ -312,27 +352,35 @@ test('默认：未读装不下时只给提及 + 它之前十条，前面那段�
   const out = await rig.read({ sid: SID, limit: 50 });
   assert.equal(out.isError, undefined, out.content);
   const rows = rowNos(out.content);
-  assert.deepEqual(rows, Array.from({ length: 11 }, (_, i) => i + 185),
-    '恰好是"提及 + 它之前十条"（别的闲话不摆出来）');
-  assert.equal(out.content.includes('第 184 句'), false, '窗口之外的一条都不给');
-  assert.equal(out.content.includes('第 196 句'), false, '提及之后的没点她的也不给');
+  // **2026-10-17 用户的第一条口径**：「默认只展示上次查看以来的新消息」。
+  // 取数窗口就是"最近 50 条"，而它们**全都是**上次查看之后的新消息 ⇒ 一条不少地摆出来。
+  // （旧口径在这里给的是"提及 + 它之前十条"＝第 185..195 句，其余新话一个字都看不到。）
+  assert.deepEqual(rows, Array.from({ length: 50 }, (_, i) => i + 151),
+    `新消息都要看得见（不是只给提及那一窗）：${out.content}`);
+  assert.equal(out.content.includes('第 150 句'), false, '取数窗口之外的一条都不给');
+  assert.equal(out.content.includes('第 3 句'), false, '上次查看之前的不再倒一遍');
+  // 提及仍然一眼可辨：行首 `▶ ` + 行尾那一格相对年龄
+  const marked = out.content.split('\n').filter((line) => line.startsWith('▶ '));
+  assert.equal(marked.length, 1, `点了她的那条要带标记：\n${out.content}`);
+  assert.ok(marked[0]!.includes('第 195 句'));
+  assert.match(marked[0]!, /【这条提及是.+的】/u, `提及行要带相对年龄：${marked[0]}`);
+  assert.equal(marked[0]!.includes('不是新消息'), false,
+    '它是**新的**提及（在水位之后），不许被说成旧提及');
 });
 
-test('默认：多提要挨得近时各带各的前十条、重叠段不重复给', async (t) => {
+test('默认：多提要各带一个标记、同一段不重复给', async (t) => {
   const rig = await makeRig(t);
   rig.write(1);
   await rig.read({ sid: SID, limit: 5 });
-  // 第 12 句与第 20 句各点她一次；取数窗口是"最近 30 条"（第 9..38 句）⇒ 两条提及都在窗口里，
-  // 而第二条提及的"前十条"（第 10..19 句）**盖住了第一条提及**（第 12 句）
+  // 第 12 句与第 20 句各点她一次
   for (let no = 2; no <= 38; no += 1) rig.write(no, no === 12 || no === 20 ? { at: true } : {});
 
   const out = await rig.read({ sid: SID, limit: 30 });
   const rows = rowNos(out.content);
-  assert.equal(new Set(rows).size, rows.length, `窗口重叠时不许把同一段给两遍：${rows.join(',')}`);
-  // 取数窗口是"最近 30 条"（第 9..38 句）：两条提及的窗口各被窗口下界截到从第 9 句起
-  //（9..12 与 10..20）⇒ 并起来就是第 9..20 句，重叠段（10..12）只出现一次
-  assert.deepEqual(rows, Array.from({ length: 12 }, (_, i) => i + 9),
-    '两次提及的窗口并起来就是第 9..20 句（重叠段只给一次）');
+  assert.equal(new Set(rows).size, rows.length, `同一段不许给两遍：${rows.join(',')}`);
+  // 取数窗口是"最近 30 条"（第 9..38 句），全都是新消息 ⇒ 全给她（不再按提及切窗）
+  assert.deepEqual(rows, Array.from({ length: 30 }, (_, i) => i + 9),
+    '上次查看之后的 30 条都在（新口径：不按提及切窗）');
   // 两条提及各带一个标记（她看得出两句都是冲她来的）
   const marked = out.content.split('\n').filter((line) => line.startsWith('▶ '));
   assert.equal(marked.length, 2, `两条提及各带一个标记：\n${out.content}`);
@@ -341,125 +389,126 @@ test('默认：多提要挨得近时各带各的前十条、重叠段不重复�
 
 // ──────────────────────────────── ⑤ 已读推进：只推到"给她看过的那几条" ────────────────────────────────
 
-test('已读只推进到**展示过的那一条**（不是本页末尾）；没展示的未读仍在"没看到"里', async (t) => {
+test('已读只推进到**展示过的那一条**（不是取数窗口的末尾）；没摆下的仍在"没摆下"里', async (t) => {
   const rig = await makeRig(t);
-  // 先立已读位（读到第 3 句），再攒一批：第 30 句点她，前十条 = 20..29，之后 31..49 是没点她的新话
+  // 先立水位（读到第 3 句）
   rig.write(3);
   await rig.read({ sid: SID, limit: 5 });
-  for (let no = 4; no <= 49; no += 1) rig.write(no, no === 30 ? { at: true } : {});
+  // 她先说了一串（**比后面的消息旧**），再攒一批消息——她自己的行是**无界**的（`readChannelSpoken`
+  // 给的是她在那个会话里说过的全部），所以它是"未读多过一屏"的唯一自然来源。
+  rig.at(10);
+  for (let i = 0; i < 6; i += 1) rig.speak(`我说第 ${i} 段`, `call_${i}`);
+  rig.at(60);
+  for (let no = 4; no <= 30; no += 1) rig.write(no);
 
-  // limit 44 < 未读（47 条）⇒ 只给"提及 + 前十条"；取数窗口（最近 44 条＝第 6..49 句）刚好含它
-  const first = await rig.read({ sid: SID, limit: 44 });
+  // limit 8：候选 = 6 条她自己的 + 消息窗口（最近 8 条＝第 23..30 句）= 14 条 ⇒ 装不下
+  const first = await rig.read({ sid: SID, limit: 8 });
   assert.equal(first.isError, undefined, first.content);
   const shown = rowNos(first.content);
-  assert.deepEqual(shown, Array.from({ length: 11 }, (_, i) => i + 20), '显示的是提及 + 它之前十条');
+  // 她那一串（挨着的 6 行）算**例外**照摆（见 `incrementalWindow` ③）：它们是"她刚发出去、还没读到"
+  // 的凭据，看不见就会以为没发出去（`SENT_CREDENTIAL_NOTE`）。例外**占名额** ⇒ 剩下 2 行给最新的消息。
+  assert.ok(first.content.includes('我说第 0 段') && first.content.includes('我说第 5 段'),
+    `她连着说的那一段要一起摆：\n${first.content}`);
+  assert.deepEqual(shown, [29, 30], '例外占掉 6 个名额，消息只摆得下最新的 2 条');
 
-  // ① 已读**只**推到展示过的那一条（第 30 句）——不是推到本页末尾（第 49 句）
+  // ① 已读**只**推到展示过的那一条（第 30 句）——不是"这一批里所有的"
   const reads = rig.readEvents();
   assert.equal(reads.length, 2, '两次读各记一笔已读');
   assert.equal(reads[1]!.upToSeq, 30, '已读只推进到"确实给她看过的那几条"里的最后一条');
-  // ② 没给她的那些**仍然没看到**：回执必须说出来，并指路翻页
-  assert.match(first.content, /另有 \d+ 条你还没看/u, `没给她的那些要如实说：\n${first.content}`);
+  // ② 没摆下的那些**仍然没看到**：回执必须说出来，并指一条真能捞回它们的路
+  assert.match(first.content, /另有 \d+ 条新的这一屏没摆下/u, `没摆下的要如实说：\n${first.content}`);
   assert.match(first.content, /往上翻页|before=\d+/u, '那句话必须带翻页指路');
+  // 照着那个游标翻过去，没摆下的那几条（第 23..28 句）真的在，而已摆过的不再重复
+  const back = await rig.read({ sid: SID, before: cursorOf(first.content), limit: 20 });
+  const backRows = rowNos(back.content);
+  assert.ok(backRows.includes(23) && backRows.includes(28),
+    `那个游标要能捞回没摆下的：\n${back.content}`);
+  assert.equal(back.content.includes('第 30 句'), false, '翻页是从游标往回，不许把上一屏再摆一遍');
+  assert.equal(back.content.includes('没有新消息'), false, '翻页那一支就是照给内容');
 });
 
-test('「另有 N 条你还没看」：有没展示的未读时必现，一条都没漏下时不许出现', async (t) => {
+test('「另有 N 条新的没摆下」：有没摆下的才出现，一条都没漏下时不许出现', async (t) => {
   const rig = await makeRig(t);
   rig.write(3);
   await rig.read({ sid: SID, limit: 5 });
-  for (let no = 4; no <= 49; no += 1) rig.write(no, no === 30 ? { at: true } : {});
-  const withGap = await rig.read({ sid: SID, limit: 44 });
-  assert.match(withGap.content, /另有 \d+ 条你还没看/u, `没展示的那些要如实说：\n${withGap.content}`);
+  rig.at(10);
+  for (let i = 0; i < 6; i += 1) rig.speak(`我说第 ${i} 段`, `call_${i}`);
+  rig.at(60);
+  for (let no = 4; no <= 30; no += 1) rig.write(no);
+  const withGap = await rig.read({ sid: SID, limit: 8 });
+  assert.match(withGap.content, /另有 \d+ 条新的这一屏没摆下/u, `没摆下的要如实说：\n${withGap.content}`);
 
-  // 一条没漏下时那句话不许出现：未读装得下一屏（少于一屏）就全给她，没有"另有"
+  // 一条没漏下时那句话不许出现：新消息装得下一屏 ⇒ 全给她，没有"另有"
   const clean = await makeRig(t);
   clean.write(1);
   await clean.read({ sid: SID, limit: 5 });
   clean.write(2);
   clean.write(3);
   const all = await clean.read({ sid: SID, limit: 50 });
-  assert.equal(all.content.includes('另有'), false, `没漏下任何未读就不许说"另有 N 条"：\n${all.content}`);
+  assert.equal(all.content.includes('另有'), false, `没漏下任何新消息就不许说"另有"：\n${all.content}`);
 });
 
-test('同一批未读第二次读：没展示的那些仍在"没看到"里（提及已被看过就不再倒一遍）', async (t) => {
+test('同一批第二次读：已经给过的那些不再倒一遍', async (t) => {
   const rig = await makeRig(t);
   rig.write(3);
   await rig.read({ sid: SID, limit: 5 });
-  for (let no = 4; no <= 49; no += 1) rig.write(no, no === 30 ? { at: true } : {});
+  for (let no = 4; no <= 30; no += 1) rig.write(no, no === 20 ? { at: true } : {});
 
-  const first = await rig.read({ sid: SID, limit: 44 });
-  assert.match(first.content, /另有 \d+ 条你还没看/u, `没展示的那些要如实说：\n${first.content}`);
-  assert.deepEqual(rowNos(first.content), Array.from({ length: 11 }, (_, i) => i + 20));
+  const first = await rig.read({ sid: SID, limit: 8 });
+  assert.deepEqual(rowNos(first.content), [23, 24, 25, 26, 27, 28, 29, 30]);
 
-  // 第二次读：上一屏那条提及**已经在里面给过她了**（已读推到它），于是默认那一屏落回
-  // **未读里仅存的那条提及**（第 30 句在未读里没了，但更早那条提及如果还在窗口里就照给）；
-  // 这一批里已经没有别的提及 ⇒ 如实说"没有新消息"或照给窗口，都不许再倒已给过的那一段。
-  const second = await rig.read({ sid: SID, limit: 44 });
+  // 第二次读：那一屏已经**给过她了**（水位推到第 30 句）⇒ 不许把同一段再摆一遍
+  const second = await rig.read({ sid: SID, limit: 8 });
   assert.equal(second.isError, undefined, second.content);
+  assert.match(second.content, /^没有新消息/u, `同一批再读一次要明说没有新的：\n${second.content}`);
   assert.equal(second.content.includes('第 30 句'), false,
-    `已给过她的那条提及不许再倒一遍：\n${second.content}`);
+    `已给过她的那条不许再倒一遍：\n${second.content}`);
 });
 
-// ──────────────────────────────── ⑥ 一条提及都没有 ────────────────────────────────
+// ──────────────────────────────── ⑥ 没有提及也照给（默认那一屏不是"提及屏"） ────────────────────────────────
 
-test('一条提及都没有（有未读但都跟她无关）：第一句"没有新消息"，带"另有 N 条你没看"', async (t) => {
+test('一条提及都没有：新消息照给（默认那一屏读的是"新"，不是"点名"）', async (t) => {
   const rig = await makeRig(t);
-  // 先来 30 句闲话、只给她最近 3 句（其余"还没给过她"）——那 27 句正是要靠翻页才看得到的
   for (let no = 1; no <= 30; no += 1) rig.write(no);
   const boot = await rig.read({ sid: SID, limit: 3 });
   assert.equal(boot.isError, undefined, boot.content);
   assert.deepEqual(rowNos(boot.content), [28, 29, 30], '第一屏取最近 3 句（"宁可多给一次"那条既有取舍）');
   assert.equal(rig.readEvents().length, 1, '第一屏照给 ⇒ 照记一笔已读');
 
-  // 之后来的新话**一条都没点她** ⇒ 按口径如实说 + 指路，且一条都不标已读
+  // 之后来的新话**一条都没点她** —— 但它们**是新消息**，按 2026-10-17 的口径照给
+  //（旧口径在这里回的是"没有新消息：这些新话一条都没点你"，即"没点她就等于没有"）
   for (let no = 31; no <= 34; no += 1) rig.write(no);
   const out = await rig.read({ sid: SID, limit: 3 });
   assert.equal(out.isError, undefined, out.content);
-  // ① 回执的**第一句**就是那四个字（2026-10-08 用户的口径：「read_channel，如果没有消息
-  //    就直接回执没有新消息」）——她要的是一眼可判的结论，不是"没有点名你的新消息"这种绕着说的话
-  assert.match(out.content, /^没有新消息/u, `第一句必须是「没有新消息」：\n${out.content}`);
-  // ② 而这里**确实有没给她看的未读**（只是没点她）⇒ 按用户的口径可以附一句，但必须带 N
-  assert.match(out.content, /另有 \d+ 条你没看/u, `有未读就得如实说数量：\n${out.content}`);
-  assert.match(out.content, /翻页/u, '要给一条出路（想看就翻页）');
-  assert.match(out.content, /before=\d+/u, '出路要具体到"填哪个游标"');
-  assert.equal(rig.readEvents().length, 1, '一条都没给她看 ⇒ 一条都不许标成已读');
-  // 再读一次：**照旧**说同一件事（那批未读一条都没被她看到过，这不算"重复投递"）
-  const again = await rig.read({ sid: SID, limit: 3 });
-  assert.match(again.content, /^没有新消息/u);
-  assert.match(again.content, /另有 \d+ 条你没看/u);
-  assert.equal(rig.readEvents().length, 1, '还是没给她看 ⇒ 仍然不许标已读');
+  assert.equal(out.content.includes('没有新消息'), false,
+    `有新消息就不许说"没有新消息"——哪怕一条都没点她：\n${out.content}`);
+  assert.deepEqual(rowNos(out.content), [32, 33, 34], '一屏就是 limit 行，取最新那几条');
+  assert.equal(rig.readEvents().length, 2, '给她看过 ⇒ 照记已读');
 
-  // 而"她想看就能看到"这件事必须成立：页脚那个游标翻过去，那些"没点她、也不是最近一屏"的话都在
+  // 而"她想看就能看到"这件事必须成立：页脚那个游标翻过去，更早的那些都在
   const cursor = cursorOf(out.content);
   const paged = await rig.read({ sid: SID, before: cursor, limit: 17 });
   const pagedRows = rowNos(paged.content);
   assert.equal(pagedRows.length, 17, `一页就是 limit 行：\n${paged.content}`);
-  // 这一页正是"她还没看过、又不是最近那一屏"的那一段（第 15..31 句；第 31 句刚好压在前一屏的取数窗口外）
   assert.deepEqual(pagedRows, Array.from({ length: 17 }, (_, i) => i + 15),
     `翻页要接着往前给，一条不漏一条不重：\n${paged.content}`);
   assert.equal(paged.content.includes('没有新消息'), false, '翻页那一支就是照给内容，不是再说一遍"没有"');
 });
 
-test('两种"没有新消息"措辞可分：确实什么都没有 ⇒ 不带 N；有未读但没点她 ⇒ 带 N', async (t) => {
-  // 判据只有一个：**有没有没给她看的未读**。两句话因此一眼分得开——
-  // 前者是"这里真的没有新东西了"，后者是"有新话，只是没点你"。混淆的代价是她反复翻同一个信箱。
+test('确实没有新的：一句话说完（不摆旧内容，也不提数量）', async (t) => {
+  // 判据只有一个：**上次查看之后有没有新的**。没有就一句话，且那句话必须短——
+  // 它出现的场合是"她隔一会儿看一眼"，长一句就是每次读都白付一笔。
   const quiet = await makeRig(t);
   quiet.write(1);
   await quiet.read({ sid: SID, limit: 5 });
   const nothing = await quiet.read({ sid: SID, limit: 5 });
   assert.match(nothing.content, /^没有新消息/u, `第一句照旧是那四个字：\n${nothing.content}`);
-  assert.equal(/另有 \d+ 条你没看/u.test(nothing.content), false,
-    `确实什么都没有时**不许**提数量（那会让她以为漏了什么）：\n${nothing.content}`);
-
-  const busy = await makeRig(t);
-  busy.write(1);
-  await busy.read({ sid: SID, limit: 3 });
-  // 未读装不下一屏（limit 3）且一条都没点她 ⇒ 落到"有未读但都跟她无关"那一支
-  for (let no = 2; no <= 8; no += 1) busy.write(no);
-  const unrelated = await busy.read({ sid: SID, limit: 3 });
-  assert.match(unrelated.content, /^没有新消息/u, `第一句照旧是那四个字：\n${unrelated.content}`);
-  assert.match(unrelated.content, /另有 \d+ 条你没看/u,
-    `有未读但没点她时必须带 N（否则她以为这里真的空了）：\n${unrelated.content}`);
+  assert.equal(/另有 \d+ 条/u.test(nothing.content), false,
+    `确实没有新的时**不许**提数量（那会让她以为漏了什么）：\n${nothing.content}`);
+  assert.equal(nothing.content.includes('[external_event'), false,
+    `一条新的都没有时**不许**返回一大段旧内容：\n${nothing.content}`);
+  assert.ok(nothing.content.length < 300, `那句话要短（实测旧口径这类回执中位 759 字）：${nothing.content.length} 字`);
+  assert.equal(quiet.readEvents().length, 1, '一条都没给她看 ⇒ 一条都不许再标已读');
 });
 
 // ──────────────────────────────── ⑦ 上限：夹住并如实说 ────────────────────────────────

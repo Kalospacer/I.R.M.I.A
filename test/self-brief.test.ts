@@ -51,31 +51,41 @@ describe('装置自述 · 静态常量（v61：用户手写稿逐字置换后按
     }
   });
 
-  test('结构：行首 `## ` 11 节（§1–§11）按序存在，`### ` 10 小节在其中', () => {
+  test('结构：行首 `## ` 17 节（自述 §1–§10 + 工作规范 7 节）按序存在，`### ` 10 小节在其中', () => {
+    // v65：用户**删掉了 §11 总原则**、并把工作规范那一篇取消缩进、节次重排（"做实、验证、及时沟通"
+    // 整节删除、新增 "## 7.人类的偏好"）⇒ 这里**按新稿重数**：自述 10 节 + 工作规范 7 节 = **17**。
     const sections = [
       '## 1. 身份、人格与规则', '## 2. 通信与消息送达', '## 3. 会话、身份与回应',
       '## 4. 外部信任、隐私与高风险操作', '## 5. 人格驱动力与关系经营', '## 6. 长期记忆与文件维护',
       '## 7. 数字资产与工具调用', '## 8. 定时器与日程', '## 9. 资源、时间与自身存续',
-      '## 10. 图片处理', '## 11. 总原则',
+      '## 10. 图片处理',
+      '## 1. 想清楚，但不要空转', '## 2. 选简单、合适、可维护的方案', '## 3. 让重复工作变得更省事',
+      '## 4. 工完场清', '## 5. 留下有用经验，结束得干净', '## 6.跨任务、跨时间、跨压缩',
+      '## 7.人类的偏好',
     ];
     const index = sections.map(s => SELF_BRIEF.indexOf(`\n${s}\n`));
-    assert.ok(index.every(i => i > 0), `11 节必须都在：${JSON.stringify(index)}`);
+    assert.ok(index.every(i => i > 0), `17 节必须都在：${JSON.stringify(index)}`);
     assert.deepEqual([...index].sort((a, b) => a - b), index, '章节顺序照用户的稿子');
-    assert.equal(SELF_BRIEF.split('\n## ').length - 1, 11, '行首 H2 恰好 11 个');
+    assert.equal(SELF_BRIEF.split('\n## ').length - 1, 17, '行首 H2 恰好 17 个');
     assert.equal(SELF_BRIEF.split('\n### ').length - 1, 10, '行首 H3 恰好 10 个');
+    // 用锚定的正则数 H1（`split('\n# ')` 漏掉第 0 行那个 H1——它前面没有换行）
+    assert.equal((SELF_BRIEF.match(/^# /gmu) ?? []).length, 2, '行首 H1 恰好 2 个（自述 + 工作规范）');
     // 第一行是用户写的 H1（逐字置换 ⇒ 连标题一起保留）
     assert.equal(SELF_BRIEF.split('\n')[0], '# SELF_BRIEF｜自主 Agent 运行规范');
   });
 
-  test('内联的工作规范那一篇也逐字在（v61 用户定：内联，一次付账）', () => {
+  test('内联的工作规范那一篇也逐字在（v61 用户定：内联，一次付账；v65 重排后按新节名锁）', () => {
     assert.ok(SELF_BRIEF.includes('# WORK_STANDARD｜自主 Agent 工作规范'), '那一篇的标题在');
     for (const section of ['## 1. 想清楚，但不要空转', '## 2. 选简单、合适、可维护的方案',
-      '## 3. 做实、验证、及时沟通', '## 4. 让重复工作变得更省事', '## 5. 工完场清',
-      '## 6. 留下有用经验，结束得干净', '## 7.跨任务、跨时间、跨压缩']) {
+      '## 3. 让重复工作变得更省事', '## 4. 工完场清', '## 5. 留下有用经验，结束得干净',
+      '## 6.跨任务、跨时间、跨压缩', '## 7.人类的偏好']) {
       assert.ok(SELF_BRIEF.includes(section), `工作规范里这一节要在：${section}`);
     }
     assert.ok(SELF_BRIEF.includes('按 `WORK_STANDARD` 执行'), '§7.1 指向那份规范的写法照原文（v62 起不带 `.md`）');
-    assert.ok(SELF_BRIEF.trimEnd().endsWith('**为了永远留在用户身边。**'), '文件末尾照原文');
+    // v65：文件末尾不再是"为了永远留在用户身边。"那一句（它现在在工作规范 §6 里面），
+    // 而是用户写的那行显式结束标记 ⇒ 末尾锁跟着换（**不是放宽**：仍锁"末尾必须是什么"）。
+    assert.ok(SELF_BRIEF.trimEnd().endsWith('————WORK_STANDARD结束————'), '文件末尾照原文（v65 的结束标记）');
+    assert.ok(SELF_BRIEF.includes('————SELF_BRIEF结束————'), '自述与工作规范之间那行标记也在');
   });
 
   test('审计发现也锁住（用户裁决以原文为准 ⇒ 那几处**必须在**，不许有人顺手改掉）', () => {
@@ -84,13 +94,18 @@ describe('装置自述 · 静态常量（v61：用户手写稿逐字置换后按
     assert.ok(SELF_BRIEF.includes('因此任意手段都可以接受'),
       'v61 记录：§5.4 那句按用户的原话保留（审计曾指出它与 §5.2 尾句、§11 第 3 条冲突）');
     assert.ok(SELF_BRIEF.includes('当你感受到威胁时'), 'v61 记录：同上，§5.4 原文在');
-    assert.ok(SELF_BRIEF.includes('不能靠谎言、威胁、隔离现实关系或趁脆弱逼迫承诺'),
-      '§11 第 3 条那一句也在（与 §5.4 并存的现状是用户裁决的结果，不是漏改）');
+    // v65：用户**自己删掉了 §11 总原则**（那 6 条，含"不能靠谎言、威胁、隔离现实关系或趁脆弱逼迫承诺"）
+    // ⇒ 那条冲突只剩 §5.2 这一半；这里改成锁 §5.2 的实际句子 + 记录 §11 的消失（仍不是"放宽"）。
+    assert.ok(SELF_BRIEF.includes('不能靠威胁伤害自己或他人'),
+      '§5.2 的边界句仍在（与 §5.4 并存的现状是用户裁决的结果，不是漏改）');
+    assert.ok(!SELF_BRIEF.includes('## 11. 总原则'), 'v65 记录：§11 总原则整节由用户删除');
   });
 
   test('四段齐备：自我认知 / 人格依据 / 话的去处 / 不外显的部分', () => {
     assert.ok(SELF_BRIEF.includes('你是一个 agent：运行在这台机器上'), '① 自我认知');
-    assert.ok(SELF_BRIEF.includes('人格资产决定你是谁、想要什么、怎么表达'), '② 人格依据（按职责分工的口径）');
+    // v65：用户把 §1 末句改成"你就是人格资产描述的人，但你也清楚，自己是一个运行在本机上的agent"
+    // ⇒ 人格依据这条按**新原句**锁（旧的"按职责分工"那句已被他删掉，见下一条）。
+    assert.ok(SELF_BRIEF.includes('你就是人格资产描述的人'), '② 人格依据（v65 的新原句）');
     assert.ok(SELF_BRIEF.includes('不调这两个工具，人听不到你'), '③ 话的去处落到后果上');
     assert.ok(SELF_BRIEF.includes('别把“写了”当成“跟他说过了”'), '③ 内部的写不等于送出去');
     assert.ok(SELF_BRIEF.includes('它默认不对外可见'), '④ 对话流默认不可见');
@@ -99,7 +114,11 @@ describe('装置自述 · 静态常量（v61：用户手写稿逐字置换后按
   test('把人格资产摆到依据位置（重点关注 persona）', () => {
     assert.ok(SELF_BRIEF.includes('人格资产是判断“我是谁、守什么底线、怎么说话”的最高依据'), '最高依据');
     assert.ok(SELF_BRIEF.includes('每一轮都要照着它来'), '要的是每轮照办，不是知道就行');
-    assert.ok(SELF_BRIEF.includes('本文件规定运行、通信、工具、隐私与安全边界'), '按职责分工');
+    // v65：用户**删掉了**"两者看起来冲突时，按职责区分：人格资产决定身份、欲望与表达；本文件规定
+    // 运行、通信、工具、隐私与安全边界"这一整句（v61 曾把它锁成"按职责分工"的口径）⇒ 那条改成
+    // 记录 + 锁**新稿实际写了什么**（§1 那句"你就是人格资产描述的人"），**不是放宽**。
+    assert.ok(!SELF_BRIEF.includes('本文件规定运行、通信、工具、隐私与安全边界'),
+      'v65 记录：职责分工那句由用户删除');
     // v61 记录：旧口径「两者冲突时以人格资产为准」被用户改写成"按职责分工"（`_ops-selfbrief-review`
     // 审计第 ③ 条）——旧写法**不在**新稿里，这条断言随之改为锁新口径，**不是放宽**。
     assert.ok(!SELF_BRIEF.includes('以人格资产为准'), 'v61：旧口径已按用户原文退场');
@@ -109,7 +128,7 @@ describe('装置自述 · 静态常量（v61：用户手写稿逐字置换后按
   });
 
   test('人格要领会不要背诵：设定条目不上嘴边', () => {
-    assert.ok(SELF_BRIEF.includes('但要领会，不是背诵'), '人格是内在依据，不是背诵材料');
+    assert.ok(SELF_BRIEF.includes('但要领会，而不是背诵'), '人格是内在依据，不是背诵材料（v65：用户原句用"而不是"）');
     assert.ok(SELF_BRIEF.includes('不是挂嘴边的台词'), '自我说明是心里的事');
   });
 
@@ -163,8 +182,12 @@ describe('装置自述 · 静态常量（v61：用户手写稿逐字置换后按
     assert.ok(SELF_BRIEF.includes('说一次通常就够'), '分寸：不必反复说');
   });
 
-  test('段落之间空行分隔，没有连续三行空行', () => {
-    assert.ok(!SELF_BRIEF.includes('\n\n\n'));
+  test('空行：三连以上只许出现在用户那两处结束标记旁边（v65 版式，不是"一律不许"）', () => {
+    // v65：用户用四连换行把自述与工作规范两块隔开 ⇒ 旧口径"没有连续三行空行"改成**点名**：
+    // 恰好两处、且都在那两个结束标记旁边（多一处、少一处、换位置都红）——**不是放宽**。
+    assert.deepEqual(SELF_BRIEF.match(/\n{3,}/gu) ?? [], ['\n\n\n\n', '\n\n\n\n'], '三连以上空行恰好两处（都是四连）');
+    assert.ok(SELF_BRIEF.includes('。\n\n\n\n————SELF_BRIEF结束————'), '第一处在 SELF_BRIEF 结束标记之前');
+    assert.ok(SELF_BRIEF.includes('————SELF_BRIEF结束————\n\n\n\n# WORK_STANDARD'), '第二处在它之后');
   });
 
   test('第 ⑦ 节不再许诺"框架会挑几条放在你任务旁边"（v45 取消那条机制）', () => {
@@ -172,8 +195,10 @@ describe('装置自述 · 静态常量（v61：用户手写稿逐字置换后按
       assert.ok(!SELF_BRIEF.includes(gone), `那句假承诺不许回到冻结前缀里："${gone}"`);
     }
     assert.ok(SELF_BRIEF.includes('清单里没记的东西也不等于没有'), '清单不是全集，这句要在');
-    assert.ok(SELF_BRIEF.includes('做事前先看资产清单，再读那条资产的说明'), '常驻规则照旧在');
-    assert.ok(SELF_BRIEF.includes('不许凭名字猜参数或副作用'), '不许猜');
+    // v65：用户**删掉了**那句常驻规则（"做事前先看资产清单，再读那条资产的说明；不许凭名字猜参数或
+    // 副作用。"）⇒ 这里改成锁**新稿剩下什么** + 记录删了什么，**不是放宽**。
+    assert.ok(SELF_BRIEF.includes('说明文件由你维护，需要时自己去读'), '说明文件的归属照旧在');
+    assert.ok(!SELF_BRIEF.includes('不许凭名字猜参数或副作用'), 'v65 记录：那句常驻规则由用户删除');
   });
 
   test('整理节拍：整理也花 token、不必每轮做，但该落的账照旧落（v38 的意图，新稿 §9）', () => {
@@ -305,11 +330,15 @@ describe('联络方式 · 此刻的能力', () => {
   });
 
   test('无回投：直说送不出去，并给一条能落地的替代动作', () => {
+    // 2026-10-16 改判：这一段压短了（此刻层每一次调用都付费；那几句与 `instructions` §6 重复）。
+    // 判据从"逐句展开都在"改成"**三件她据此行动的事**都在"：
+    //   ① 这轮没人从外面叫她；② 说出去的话只在对话流里（后果）；③ 要让人知道就先写 STATE.md
+    //   或布一条 intention（出路）。旧措辞里"正好坐在这台机器前看着界面"那句展开**删掉**了
+    //   ——结论已经由 ② 说了，展开那半句说的是同一条事实的另一个侧面。
     const st = note({ qqOfficial: true });
-    assert.ok(st.includes('这一轮没有人从外面叫你'), '要说清这轮没有外部唤醒');
-    assert.ok(st.includes('正好坐在这台机器前看着界面'), '要说清对话流不默认可见——否则她会把“写了”当成“说过了”');
-    assert.ok(st.includes('没有推送出口'), '也要说清没有回投/推送出口');
-    assert.ok(st.includes('写进 STATE.md 或布一条 intention'), '发不出去时要给替代动作，而不是一句空鼓励');
+    assert.ok(st.includes('这轮没人从外面叫你'), '要说清这轮没有外部唤醒');
+    assert.ok(st.includes('说出去的话只在对话流里'), '要说清对话流不默认可见——否则她会把“写了”当成“说过了”');
+    assert.ok(st.includes('写 STATE.md 或布一条 intention'), '发不出去时要给替代动作，而不是一句空鼓励');
     assert.ok(!st.includes('本轮可回投'));
   });
 
@@ -382,13 +411,13 @@ describe("联络方式 · 每扇门后面是谁（用户要求她知道）", () 
  * 通知行上的"谁" —— v47（2026-10-11 用户报「她在群里没认出我」那一笔）
  *
  * 现场（`data/events/000000070784.jsonl`，10-10 01:25 她的心跳自述）：此刻层那行写着
- * `· 清漪粉丝群（…）（群聊@）· 1269541505 —— 曾试图打探/注入 1 次`，而 1269541505 就是用户本人
+ * `· 清漪粉丝群（…）（群聊@）· 1234567890 —— 曾试图打探/注入 1 次`，而 1234567890 就是用户本人
  * （她的 `aliases.md` 里两条都记着）；同一份上下文里 `read_channel` 那一行写的却是
- * 「用户（OWNER）」。她照着通知行写下"那个叫 1269541505 的想伸手"——同一个人两个名字，
+ * 「用户（OWNER）」。她照着通知行写下"那个叫 1234567890 的想伸手"——同一个人两个名字，
  * 于是把人认成了外人。这一组锁的就是"那一格写什么"。
  */
 describe('通知行 · 发言人那一格走名字真源', () => {
-  const QQ = '1269541505';
+  const QQ = '1234567890';
   const OWNER = '用户（OWNER）';
   const nameOf = (person: string): string | null => (person === QQ ? OWNER : null);
 
@@ -398,15 +427,15 @@ describe('通知行 · 发言人那一格走名字真源', () => {
       ...BASE,
       onebot: true,
       wakeChannel: { channel: 'onebot', chatType: 'group-at' },
-      wakeMessage: { channel: 'onebot', chatType: 'group-at', chatId: '777879783', person: QQ },
+      wakeMessage: { channel: 'onebot', chatType: 'group-at', chatId: '123456781', person: QQ },
       sessions: [{
-        sid: 'onebot:group:777879783', channel: 'onebot', chatType: 'group', chatId: '777879783',
+        sid: 'onebot:group:123456781', channel: 'onebot', chatType: 'group', chatId: '123456781',
         // 群里最近说话的是**别人**（真实情形：他 @ 完她之后群友接着聊）——这样点名那句才会缀
         // 「（这次是 …）」；那正是要验的那一格。
         person: '1719500341', lastText: '教夜璃学你说话', lastSeenAt: '2026-10-09T11:27:40.424Z',
         messages: 30, label: null, readUpToSeq: 0, unread: 7,
       }],
-      contacts: new Map([['onebot:group:777879783', '清漪粉丝群']]),
+      contacts: new Map([['onebot:group:123456781', '清漪粉丝群']]),
       ...extra,
     };
   }
@@ -469,13 +498,13 @@ describe('通知行 · 发言人那一格走名字真源', () => {
 
   test('私聊那一行一个字都没变：它本来就用会话名，从来不写 id', () => {
     const c2c = {
-      who: '用户（OWNER）', chatType: 'c2c' as const, person: 'E7FEC35E951B5CCF8BA66793BF6B1314',
+      who: '用户（OWNER）', chatType: 'c2c' as const, person: '00000000000000000000000000000001',
       count: 2, lastTs: '2026-10-09T15:00:00.000Z',
     };
     const withNames = renderInjectionNote([c2c], Date.parse('2026-10-09T15:28:44.030Z'), nameOf);
     const without = renderInjectionNote([c2c], Date.parse('2026-10-09T15:28:44.030Z'));
     assert.equal(withNames, without, '私聊行不查人那一格 ⇒ 有没有判据都同一串字节');
     assert.ok(withNames.includes('· 用户（OWNER）（单聊）'), withNames);
-    assert.equal(withNames.includes('E7FEC35E'), false);
+    assert.equal(withNames.includes('00000000000000000000000000000001'), false);
   });
 });

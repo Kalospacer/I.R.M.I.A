@@ -4,6 +4,8 @@ import 'package:window_manager/window_manager.dart';
 import 'app.dart';
 // 「我要走了」的标记：后端保活靠它把"他主动关的"与"崩了"分开，见 docs/gui-guard.md §3
 import 'gui_quit.dart';
+import 'i18n/strings_override.dart';
+import 'i18n/strings_scope.dart';
 import 'shell/tray.dart';
 // 「关窗时收进托盘」这个界面偏好（`%APPDATA%/Irmia/ui-state.json`，键 close-to-tray）
 import 'ui_state.dart';
@@ -58,8 +60,22 @@ Future<void> main() async {
   await windowManager.setPreventClose(closeToTrayEnabled);
   windowManager.addListener(_CloseToTray());
 
+  // 语言：**只在这一处读系统 locale**（理由见 i18n/strings_scope.dart 顶部）。
+  // 盘上存的是"用户选了什么"（跟随系统 / 中文 / English），这里把它解析成具体语言
+  // 再交给界面——树里拿到的永远是 zh 或 en，widget 测试因此不会跟着机器的系统语言变。
+  // 读盘失败一律当「跟随系统」（失败静默在 ui_state 里）。
+  final language = await restoreLanguage(
+    systemLocale: WidgetsBinding.instance.platformDispatcher.locale,
+  );
+
+  // 文案覆盖层（i18n 的第三层，见 lib/i18n/strings_override.dart）：启动读一次
+  // `%APPDATA%\Irmia\strings-override.json`。**文件不在 / 读不动 / JSON 坏都只是回默认
+  // 文案**，一个都不拦启动；拼错的键在这儿打到控制台（"我改了怎么没变"的唯一线索）。
+  // 放在 runApp 之前：首帧就该是用户改过的那份字，不能先闪一下默认文案。
+  await loadStringsOverride(language: language);
+
   // 托盘在 app.dart 里装（那里拿得到命令通道；这里只管窗口）
-  runApp(const IrmiaApp());
+  runApp(IrmiaApp(initialLanguage: language));
 }
 
 /// 关窗 → 按偏好处置：默认**退出界面**（她照常跑），开了开关才收进托盘。

@@ -36,16 +36,40 @@ dependencies:
   flutter:
     sdk: flutter
 
+  # 中文（以及英文）的 **Material 自带文案**：文本框的剪切/复制/粘贴菜单、
+  # 滚动条与对话框的无障碍标签、日期/数字的本地化格式。这些字符串我们自己造不出来，
+  # 而界面里现有 12 个 `SelectableText` + 2 个 `SelectionArea` + 36 个 `TextField`——
+  # 不引这个包，那排菜单在中文界面上永远是英文的 "Copy / Select all"（2026-10-17 盘点）。
+  #
+  # **它不提供我们自己的界面文案**：那 1760 条在 `lib/i18n/app_strings.dart` 里自建。
+  # 也就是说这个依赖只解决"Material 自己那层皮"，不解决"我们说的话"——
+  # 两者的分工写在 `app.dart` 的 `localizationsDelegates` 与 `i18n/app_strings.dart` 顶部。
+  flutter_localizations:
+    sdk: flutter
+
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   # 托盘化（2026-10-04 用户要的）：托盘图标与菜单 + 窗口显示/隐藏
   tray_manager: ^0.5.0
   window_manager: ^0.5.0
+  # 可控时钟（`clock.now()`）。**必须在 dependencies 而不是 dev_dependencies**：
+  # `lib/pages/chat_page.dart` 的 `ThinkingProgress.elapsed` 就 import 了它。
+  # 为什么那一处要改用它（2026-10-16「用时每秒走」）：两者在真机上**完全等价**
+  # （`clock` 默认转发到 `DateTime.now()`），差别只在用例里——`flutter_test` 会把
+  # `clock.now()` 接管成**随 `tester.pump(时长)` 前进的假时钟**，而 `DateTime.now()`
+  # 读的是真实墙钟、`pump` 推不动它 ⇒ 没有这一改，"那一行每秒自己走"就只能靠肉眼看真窗口。
+  # 这也是 flutter_test 自己用来驱动帧时间的那只钟（`binding.clock`）。
+  clock: ^1.1.1
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
+
+  # 假时钟。flutter_test 里本来就带着它（传递依赖），但 app 侧有一条"事件一到就重读"的
+  # 节奏要断言（见 test/brand_status_test.dart），直接 import 传递依赖会被
+  # `depend_on_referenced_packages` 判为"用了没声明的依赖"——所以在这里显式声明。
+  fake_async: ^1.3.1
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is

@@ -108,8 +108,8 @@ describe('信任级 · 通道消息按会话认人', () => {
   /**
    * **同一个人在不同通道上有不同的 id**（2026-10-07 对齐 OneBot 时修的那条）。
    *
-   * 官方那条路给的是 32 位 openid（`qq:c2c:E7FE…`），OneBot 那条路给的是**数字 QQ 号**
-   * （`onebot:c2c:2175258788`）——两个值永不相等。`real-loop.ownerIds()` 原先从联系人表里
+   * 官方那条路给的是 32 位 openid（`qq:c2c:0000…`），OneBot 那条路给的是**数字 QQ 号**
+   * （`onebot:c2c:1234567891`）——两个值永不相等。`real-loop.ownerIds()` 原先从联系人表里
    * 只挑 `qq:c2c:` 那一种，于是**用户在 OneBot 群里被判成 external（客人）**：
    * `tools.groupSceneHardRefusal` 打开时她会拒掉本机类工具、或者要他"报一下身份"。
    *
@@ -118,7 +118,7 @@ describe('信任级 · 通道消息按会话认人', () => {
    * 用户在哪条通道上要被认出来，就往那张表里填那一条通道的 id：身份永远由人声明。
    */
   describe('用户在多条通道上：id 不同，声明过就都算', () => {
-    const ONEBOT_OWNER_QQ = '2175258788';
+    const ONEBOT_OWNER_QQ = '1234567891';
     const ONEBOT_GROUP = sidOf('onebot', 'group-at', '987654321');
     /** `ownerIds()` 的产物：两个通道上的用户 id 同时在集合里（这正是修好之后的样子） */
     const OWNER_IDS = new Set<string>(['OWNER_OPENID', ONEBOT_OWNER_QQ]);
@@ -178,11 +178,11 @@ describe('信任级 · 工具可见性（安全默认压过用户配置）', () 
     const v = modelVisibilityFor('external', true);
     assert.deepEqual(v, { allowOnly: EXTERNAL_TOOL_ALLOWLIST });
     assert.ok(v.allowOnly?.includes('speak'));
-    // safe_read / rg_search 都不是 destructive，但它们能读到 MEMORIES/
+    // safe_read / grep 都不是 destructive，但它们能读到 MEMORIES/
     // 里关于用户的事——对一个从群里来的陌生人同样不该给。它们不在白名单里，这就是那条界线。
     // （v42 起列目录并进 safe_read：`list_dir` 这个名字没了，但"能不能列目录"这件事
     //  跟着 safe_read 一起被挡在白名单之外——方向是收紧。）
-    for (const name of ['safe_read', 'rg_search', 'pwsh', 'safe_write', 'write_persona']) {
+    for (const name of ['safe_read', 'grep', 'pwsh', 'safe_write', 'write_persona']) {
       assert.ok(!v.allowOnly?.includes(name), `${name} 不该给外部来源`);
     }
   });

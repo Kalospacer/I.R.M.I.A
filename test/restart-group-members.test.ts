@@ -215,7 +215,7 @@ function officialAtMe(data: { person: string; nickname?: string; messageId: stri
 test('重启前到达的群 @，重启后靠**已落盘的事件**回填进成员档案（两条通道都算）', async (t) => {
   const rig = await makeRig(t);
   // **重启之前**落库的三条：两个 OneBot 群里 @ 她的人、一个官方群里 @ 她的人
-  rig.write('wake/channel', atMe({ person: '2175258788', nickname: '阿岚', messageId: 'g-1', msgSeq: 1 }));
+  rig.write('wake/channel', atMe({ person: '1234567891', nickname: '阿岚', messageId: 'g-1', msgSeq: 1 }));
   rig.write('wake/channel', atMe({ person: '10001', nickname: '群里的老王', messageId: 'g-2', msgSeq: 2 }));
   rig.write('wake/channel', officialAtMe({ person: 'E7FE0A1B', nickname: 'OWNER', messageId: 'o-1', msgSeq: 1 }));
   assert.equal(existsSync(join(rig.dir, GROUP_MEMBERS_FILE)), false, '重启前还没有人折过这些事件：档案不存在');
@@ -224,7 +224,7 @@ test('重启前到达的群 @，重启后靠**已落盘的事件**回填进成�
   // 游标已被 warmUp 推到当刻水位而**什么都不做**——所以下面这几条断言只可能来自回填。
   await rig.loop().tickOnce();
 
-  const lan = memberEntry(rig.dir, '2175258788');
+  const lan = memberEntry(rig.dir, '1234567891');
   assert.ok(lan !== null, '重启前 @ 过她的人必须进档案（这道空档就是本次要补的）');
   assert.equal(lan.nickname, '阿岚', '平台给的昵称要如实记下（那是回填唯一该落的事实）');
   assert.equal(lan.groupSid, SID, '在哪个群见的也要记（界面按群分组显示）');
@@ -245,12 +245,12 @@ test('重启前到达的群 @，重启后靠**已落盘的事件**回填进成�
 
 test('回填**幂等**：再重启一次，档案字节与再次重启前逐字节相同', async (t) => {
   const rig = await makeRig(t);
-  rig.write('wake/channel', atMe({ person: '2175258788', nickname: '阿岚', messageId: 'g-1', msgSeq: 1 }));
+  rig.write('wake/channel', atMe({ person: '1234567891', nickname: '阿岚', messageId: 'g-1', msgSeq: 1 }));
   rig.write('wake/channel', officialAtMe({ person: 'E7FE0A1B', nickname: 'OWNER', messageId: 'o-1', msgSeq: 1 }));
 
   await rig.loop().tickOnce();
   const afterFirst = membersBytes(rig.dir);
-  assert.ok(afterFirst.includes('2175258788'), '第一遍回填该落下东西（否则下面的"没变"没有意义）');
+  assert.ok(afterFirst.includes('1234567891'), '第一遍回填该落下东西（否则下面的"没变"没有意义）');
   const sessionsBefore = sessionFingerprint(rig.loop());
 
   // 第二遍：**新实例**（游标归零）再读同一份日志。同一批事件折两遍，结果必须一样。
@@ -284,7 +284,7 @@ test('回填**不碰**会话簿：条数、未读、已读位与"不回填时"�
     });
   }
   rig.write('channel/read', { sid: SID, upToSeq: 3 });
-  rig.write('wake/channel', atMe({ person: '2175258788', nickname: '阿岚', messageId: 'g-4', msgSeq: 4 }));
+  rig.write('wake/channel', atMe({ person: '1234567891', nickname: '阿岚', messageId: 'g-4', msgSeq: 4 }));
   rig.write('wake/channel', atMe({ person: '10001', nickname: '群里的老王', messageId: 'g-5', msgSeq: 5 }));
   for (let seq = 6; seq <= 7; seq += 1) {
     rig.write('channel/message', {
@@ -300,7 +300,7 @@ test('回填**不碰**会话簿：条数、未读、已读位与"不回填时"�
   rig.restart();
   await rig.loop().tickOnce();
   assert.equal(sessionFingerprint(rig.loop()), before, '回填一个字都不许改会话条数/未读/已读位');
-  assert.ok(memberEntry(rig.dir, '2175258788') !== null, '这一趟确实回填了（否则上面的"没变"可能是没跑）');
+  assert.ok(memberEntry(rig.dir, '1234567891') !== null, '这一趟确实回填了（否则上面的"没变"可能是没跑）');
 
   // 正面把数字说出来（不只是"两边相等"）：一个会话、7 条消息、未读 2 条（第 4、5 条在已读位 3 之后）
   const entry = rig.loop().sessions().find((s) => s.sid === SID);
@@ -353,12 +353,12 @@ test('回填只认"叫过她"：群里的普通闲聊不登记', async (t) => {
     channel: 'onebot', chatType: 'group', person: '10087', nickname: '路人乙',
     chatId: GROUP, text: '另一个闲人', messageId: 'g-2', msgSeq: 2,
   });
-  rig.write('wake/channel', atMe({ person: '2175258788', nickname: '阿岚', messageId: 'g-3', msgSeq: 3 }));
+  rig.write('wake/channel', atMe({ person: '1234567891', nickname: '阿岚', messageId: 'g-3', msgSeq: 3 }));
 
   await rig.loop().tickOnce();
   assert.equal(memberEntry(rig.dir, '10086'), null, '没叫她的人不进档案（免得把冒过泡的人都灌进去）');
   assert.equal(memberEntry(rig.dir, '10087'), null, '信箱那条路的人也不进（登记只认"叫她"的那条路）');
-  assert.ok(memberEntry(rig.dir, '2175258788') !== null, '同一批里真叫过她的人照样进来');
+  assert.ok(memberEntry(rig.dir, '1234567891') !== null, '同一批里真叫过她的人照样进来');
 });
 
 // ─────────────────── ⑥ 已经有名字的人不进档案（与运行期同一条判据） ───────────────────
@@ -367,13 +367,13 @@ test('回填跳过**人已经声明过名字**的人：用户不许变成"群友
   const rig = await makeRig(t, (config) => {
     // 用户：名字由人写进 `persona.contacts`（键是**单聊** sid，与 real-loop 的判据同源）
     config.persona.owner = '用户';
-    config.persona.contacts['onebot:c2c:2175258788'] = '用户';
+    config.persona.contacts['onebot:c2c:1234567891'] = '用户';
   });
-  rig.write('wake/channel', atMe({ person: '2175258788', nickname: '阿岚', messageId: 'g-1', msgSeq: 1 }));
+  rig.write('wake/channel', atMe({ person: '1234567891', nickname: '阿岚', messageId: 'g-1', msgSeq: 1 }));
   rig.write('wake/channel', atMe({ person: '10001', nickname: '群里的老王', messageId: 'g-2', msgSeq: 2 }));
 
   await rig.loop().tickOnce();
-  assert.equal(memberEntry(rig.dir, '2175258788'), null, '用户不进"群成员"档案（实测踩过：他被注册成过群友）');
+  assert.equal(memberEntry(rig.dir, '1234567891'), null, '用户不进"群成员"档案（实测踩过：他被注册成过群友）');
   assert.ok(memberEntry(rig.dir, '10001') !== null, '同一批里没有名字的人照常回填');
 });
 

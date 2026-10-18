@@ -57,7 +57,7 @@ export const MACHINE_TOOLS: readonly string[] = [
 /** 社交类：明确放行的那些（说话、看、发媒体）；其余按本机类处理 */
 export const SOCIAL_TOOLS: readonly string[] = [
   'speak', 'report', 'read_channel', 'send_media', 'vision_read', 'vision_query',
-  'http_get', 'todo', 'rg_search', 'es_search', 'read_blob',
+  'http_get', 'todo', 'grep', 'find',
   'ask_human',
 ];
 // v42：`list_dir` 从这张名单里**移出**（工具本身也删了，列目录并进 `safe_read`）。

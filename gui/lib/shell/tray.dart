@@ -1,35 +1,56 @@
+// TODO(i18n): 本文件还有 1 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/shell/tray.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
 import 'package:tray_manager/tray_manager.dart';
-import 'package:window_manager/window_manager.dart';
 
-import '../gui_quit.dart';
 import '../her_name.dart';
+import '../i18n/app_strings.dart';
 
 /// Irmia GUI 的**托盘**（2026-10-04 用户要的托盘化）。
 ///
 /// 她是常驻的，界面不该"关掉就没了"。所以：
 ///   • 关窗默认**退出界面**（她照常跑），只有人在设置页显式打开「关窗时收进托盘」才隐藏
 ///     ——见 main.dart 的 `_CloseToTray` 与 ui_state.dart 的 [kCloseToTrayFlag]；
-///   • 托盘菜单三件：显示/隐藏界面、重启前后端、退出——注意菜单里那项**永远可用**，
-///     它是**显式动作**（人自己点的"收进托盘"），与关窗那个偏好是两件事；
-///   • **重启复用后端那个动作**（`/api/commands/restart`），并把界面自己的可执行路径带过去——
-///     与运行情况页那颗按钮同一条路，免得两处各写一份重启逻辑；
+///   • **菜单五项**（2026-10-17 改）：显示界面 / 收进托盘 / 重启前后端 /
+///     **退出界面** / **退出全部（界面 + 后端）**。"收进托盘"作为**显式动作**永远可用，
+///     与关窗那个偏好是两件事；
+///   • **重启只有一条路**：`lib/restart_action.dart` 的 [performRestart] —— 与首页那颗
+///     「重启前后端」**同一个函数、同一套三态判据**（改之前两条路一套严一套松，现场见那个文件）；
+///   • **退出为什么分成两项**（用户 2026-10-17 ②）：
+///     原来的「退出」只 `windowManager.destroy()`，后端照旧在跑——而菜单上那句话是"退出"，
+///     人读成"整个应用都退了"。可是"关掉界面、她继续值守"恰恰是这个框架的**常态**
+///     （见 main.dart 的说明：她是独立进程），一刀切把它变成"连后端一起退"会把最常用的
+///     那个动作变危险。两项各有各的语义、各有各的代价，所以分开摆：
+///       · 「退出界面（她继续在后台运行）」= 老行为，**零风险**（后端与协议端都不动）；
+///       · 「退出全部（界面 + 后端）」= 真把后端（连同它拉起的协议端）停掉，代价写在确认框里
+///         （硬杀：`session/end` 与协议端收尸都会丢，协议端可能要重登一次）。
+///     判据：一个"退出"若两件事都做，就没有任何入口能做那件安全的事；反过来若只做安全那件，
+///     人就被迫去任务管理器做另一件（正是用户报的毛病）。**两项**是唯一都对得上的形状。
 ///   • 悬停提示写的是**她的名字**（`persona/IDENTITY.md` 的「名字：」那一行），
 ///     不再是写死的一个名字：名字读不到时显示产品名（见 [setDisplayName] 与 her_name.dart）。
+///
+/// 本文件**只认菜单与插件**：窗口怎么显示/隐藏、退出要不要写标记、怎么停后端，
+/// 全在宿主（app.dart）注入的 [TrayActions] 里。这样"菜单项 → 哪一个动作"可以用例钉住
+/// （[dispatchTrayMenu] 是纯函数），而插件那一层不需要在测试里跑。
 class IrmiaTray with TrayListener {
   IrmiaTray._();
 
   static final IrmiaTray instance = IrmiaTray._();
 
-  /// 宿主注入的"发命令"能力（复用界面已有的 api 客户端；不注入就只能显示/隐藏）。
-  /// 返回的是服务端回执（`Map`），重启那条路要用它来说清楚结局。
-  Future<Object?> Function(String command, Map<String, dynamic> payload)? _post;
-  VoidCallback? _onQuitRequested;
-  /// 服务端对「重启前后端」的回执（见 [install] 的 `onRestartResult`）
-  void Function(Object? result)? _onRestartResult;
+  /// 宿主注入的四个动作（都来自 app.dart，本文件不碰窗口、不碰后端）
+  TrayActions _actions = const TrayActions(
+    show: _noop,
+    hide: _noop,
+    restart: _noopAsync,
+    quitUi: _noop,
+    quitAll: _noop,
+  );
+
   bool _installed = false;
 
   /// **托盘提示里的名字**（悬停时那行字）。
@@ -45,35 +66,35 @@ class IrmiaTray with TrayListener {
   /// 绝不能把关窗改成"隐藏"——那会让人点一下 X 就再也叫不回界面，只能任务管理器。
   bool get installed => _installed;
 
-  /// 装托盘。`post` 给的是 `/api/commands/<name>` 的发送函数（带确认短语）；
-  /// `displayName` 是当前已知的她的名字（拿不到就传 [IrmiaTray] 的默认回退值）。
+  /// 装托盘。`actions` 是四个动作的落点（见 [TrayActions]）；
+  /// `strings` 只用来画菜单文字（`refreshMenu` 换了语言再画一遍）。
   Future<void> install({
-    Future<Object?> Function(String command, Map<String, dynamic> payload)? post,
-    VoidCallback? onQuitRequested,
+    required TrayActions actions,
+    required AppStrings strings,
     String? displayName,
-    /// 「重启前后端」的服务端回执（那句话是**唯一一处**判据：成功带真实新 pid 与端口、
-    /// 失败带原因、未确认就说未确认）。托盘自己不显示它，交给宿主按同一口径处理——
-    /// 但绝不能丢：丢了就退回"点了没反应"那种最糟的反馈。
-    void Function(Object? result)? onRestartResult,
   }) async {
-    _post = post;
-    _onQuitRequested = onQuitRequested;
-    _onRestartResult = onRestartResult;
+    _actions = actions;
     if (displayName != null && displayName.trim().isNotEmpty) _displayName = displayName.trim();
     if (_installed) return;
 
     trayManager.addListener(this);
     await trayManager.setIcon(_iconPath);
     await trayManager.setToolTip(_displayName);
-    await trayManager.setContextMenu(Menu(items: [
-      MenuItem(key: 'show', label: '显示界面'),
-      MenuItem(key: 'hide', label: '收进托盘'),
-      MenuItem.separator(),
-      MenuItem(key: 'restart', label: '重启前后端'),
-      MenuItem.separator(),
-      MenuItem(key: 'quit', label: '退出'),
-    ]));
+    await trayManager.setContextMenu(Menu(items: trayMenuItems(strings)));
     _installed = true;
+  }
+
+  /// 语言换了之后把菜单文字重画一遍（`effectiveLanguage` 一变就调）。
+  ///
+  /// 为什么值得单独一个方法：菜单是**插件那边的原生对象**，不跟着 Flutter 重建；
+  /// 不重画的话"切到 English 了、托盘还是中文"，而这种不一致没人会想到去查。
+  Future<void> refreshMenu(AppStrings strings) async {
+    if (!_installed) return;
+    try {
+      await trayManager.setContextMenu(Menu(items: trayMenuItems(strings)));
+    } catch (_) {
+      // 重画失败不影响托盘还活着：下次 `install`（下一次启动）会画对
+    }
   }
 
   /// 她的名字读到（或改了）之后更新托盘提示。
@@ -93,6 +114,18 @@ class IrmiaTray with TrayListener {
     }
   }
 
+  /// 拆掉托盘（退出流程用；托盘是常驻资源，退出前要收干净）
+  Future<void> remove() async {
+    if (!_installed) return;
+    _installed = false;
+    try {
+      trayManager.removeListener(this);
+      await trayManager.destroy();
+    } catch (_) {
+      // 拆不掉也不该拦住退出
+    }
+  }
+
   /// 托盘图标：直接用 runner 里那份应用图标（省得再放一份、两份还会不一致）
   String get _iconPath {
     if (Platform.isWindows) {
@@ -106,8 +139,7 @@ class IrmiaTray with TrayListener {
   @override
   void onTrayIconMouseDown() {
     // 左键点图标：显示并聚焦（Windows 上的习惯）
-    unawaited(windowManager.show());
-    unawaited(windowManager.focus());
+    _actions.show();
   }
 
   @override
@@ -122,39 +154,86 @@ class IrmiaTray with TrayListener {
 
   @override
   void onTrayMenuItemClick(MenuItem menuItem) {
-    switch (menuItem.key) {
-      case 'show':
-        unawaited(windowManager.show());
-        unawaited(windowManager.focus());
-        break;
-      case 'hide':
-        unawaited(windowManager.hide());
-        break;
-      case 'restart':
-        final post = _post;
-        if (post == null) break;
-        // 与运行情况页那颗按钮**同一条路**：界面把自己的可执行路径带过去，脚本连界面一起重启。
-        //
-        // 这里不弹 toast（托盘点击时窗口可能收着，弹在哪儿都没有意义），但**那句结论不能丢**：
-        // 服务端回来的 `note` 是唯一一处判据（成功带真实新 pid 与端口、失败带原因、
-        // 未确认就说未确认），所以转交给 `_onRestartResult` 由宿主按同一口径显示
-        // （见 main.dart：窗口在就显示，收在托盘里就只写进日志——不假装"点了没反应"，
-        // 也不在看不见的地方撒谎）。
-        unawaited(post('restart', {'guiExe': Platform.resolvedExecutable})
-            .then((Object? result) => _onRestartResult?.call(result)));
-        break;
-      case 'quit':
-        // **先写标记、再退**（协议见 docs/gui-guard.md §3）：后端保活按"有没有这个标记"
-        // 分"他主动退的"与"崩了/被杀了"，不写就会被当成崩溃拉回来（最多 6 次）。
-        // ⚠ 上面 'hide'（收进托盘）那一支**不许**写：界面还在跑，写了会压住真的那次崩溃。
-        unawaited(markGuiQuit('tray-quit'));
-        _onQuitRequested?.call();
-        unawaited(trayManager.destroy());
-        unawaited(windowManager.destroy());
-        break;
-    }
+    dispatchTrayMenu(menuItem.key ?? '', _actions);
   }
 }
+
+/// 托盘菜单项的**点击分发**（纯逻辑：不碰插件、不碰窗口，用例可以直接调它钉住"哪一项做哪件事"）。
+///
+/// 认不出的 key 什么都不做：菜单将来加了项而这里忘了接，症状是"点了没反应"，
+/// 比"点了一个不知道是什么的动作"好些。
+void dispatchTrayMenu(String key, TrayActions actions) {
+  switch (key) {
+    case kTrayKeyShow:
+      actions.show();
+      break;
+    case kTrayKeyHide:
+      actions.hide();
+      break;
+    case kTrayKeyRestart:
+      // 与首页那颗按钮**同一个函数**（见 lib/restart_action.dart）：
+      // 请求、三态判据、说的话、等回来的窗口，全部只有一份。
+      unawaited(actions.restart());
+      break;
+    case kTrayKeyQuitUi:
+      actions.quitUi();
+      break;
+    case kTrayKeyQuitAll:
+      actions.quitAll();
+      break;
+  }
+}
+
+/// 菜单项 key（字符串：`MenuItem.key` 是 String?，插件那边也是这个值回来）
+const String kTrayKeyShow = 'show';
+const String kTrayKeyHide = 'hide';
+const String kTrayKeyRestart = 'restart';
+const String kTrayKeyQuitUi = 'quit-ui';
+const String kTrayKeyQuitAll = 'quit-all';
+
+/// 四个动作的落点（宿主注入；测试里可以给空实现）。
+class TrayActions {
+  const TrayActions({
+    required this.show,
+    required this.hide,
+    required this.restart,
+    required this.quitUi,
+    required this.quitAll,
+  });
+
+  /// 显示并聚焦窗口
+  final VoidCallback show;
+
+  /// 收进托盘（界面还在跑）
+  final VoidCallback hide;
+
+  /// 重启前后端（与首页那颗按钮同一个函数）
+  final Future<void> Function() restart;
+
+  /// 只退出界面（后端继续在后台跑）
+  final VoidCallback quitUi;
+
+  /// 退出全部（界面 + 后端）
+  final VoidCallback quitAll;
+}
+
+/// 菜单的**内容与措辞**（顺序就是屏幕上从上到下）。纯函数 + 文案表：
+/// 中英各一份由 [AppStrings] 给，菜单文字不在这里写死。
+List<MenuItem> trayMenuItems(AppStrings strings) => <MenuItem>[
+      MenuItem(key: kTrayKeyShow, label: strings.trayShow),
+      MenuItem(key: kTrayKeyHide, label: strings.trayHide),
+      MenuItem.separator(),
+      MenuItem(key: kTrayKeyRestart, label: strings.trayRestart),
+      MenuItem.separator(),
+      // **两项退出**：一个只关界面（安全、常用），一个连后端一起（重、有代价）。
+      // 措辞里就把区别写清楚——菜单只有一行字的地方，正是最该说准的地方。
+      MenuItem(key: kTrayKeyQuitUi, label: strings.trayQuitUi),
+      MenuItem(key: kTrayKeyQuitAll, label: strings.trayQuitAll),
+    ];
+
+void _noop() {}
+
+Future<void> _noopAsync() async {}
 
 void unawaited(Future<void> future) {
   future.ignore();

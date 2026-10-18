@@ -313,6 +313,9 @@ test('⑤ claimCount 达 3：输入进死信队列，不再回到 pending', asyn
     assert.equal(dead.length, 1);
     assert.equal(dead[0]!.data.inputSeq, 1);
     assert.equal(dead[0]!.data.claimCount, MAX_CLAIM_COUNT);
+    // **为什么进死信**要说得出是哪一类（2026-10-16 加）：界面读字段、读不了自由文本，
+    // 而"认领到上限"与"用户按下 /stop"的下一步动作完全不同（前者要查它为什么必然失败，后者随时能重投）
+    assert.equal(dead[0]!.data.reason, 'claim-limit');
     // 死信路径不得再退回队列
     assert.equal(events.filter(e => e.type === 'input/requeued').length, 2, '只有历史那两条 requeued');
 
@@ -322,6 +325,93 @@ test('⑤ claimCount 达 3：输入进死信队列，不再回到 pending', asyn
       result.repairs.some(r => r.includes('死信')),
       `repairs 应记录死信，实际：${JSON.stringify(result.repairs)}`,
     );
+  });
+});
+
+test('⑤c 认领次数**跨重启**累计：判据全部从日志读回，不靠进程内存', async (t) => {
+  /**
+   * 这一条钉的是用户报的那件事（「我重启了又 tm 重投了」）**为什么本来就成立**：
+   * `claimCount` 的每一次累加都落在**日志**里（`input/claimed.claimCounts` +
+   * `input/requeued.claimCounts`），恢复流程用 `claimedCountsOf` **回读日志**
+   * （`recover.ts` 的注释写明"为什么必须回日志：投影的 claimedByTurn 只留 wakeSeq，
+   * 认领次数在 `input/claimed` 折叠时被丢掉"）——所以"重启三次 = 认领三次"跨进程成立，
+   * 唯一会把它清零的是**人**（`web/server.ts` 的 `requeue` 显式写 `claimCounts: [0]`）。
+   *
+   * ⚠ 这里刻意**不做**"认领了但没关 turn 就重启"那一步：那样会把同一个 wakeSeq 在 pending 里
+   * 复制一条（`fold.ts` 的 `input/requeued` 是 push，不是 upsert），而那种形状**生产里到不了**
+   * ——每次 `input/claimed` 都紧跟着同一个 turn 的 `turn/end`（turn 一定会闭合，
+   * 崩了也由恢复流程补 `turn/end{interrupted}`）。所以这条用例按生产的形状造数据，
+   * 判据仍然全部落在日志上，只是**前一次认领的累计结果从上一轮恢复里读出来**
+   * （而不是像 ⑤ 那样把三轮都写在同一份夹具里、由一次恢复读完）。
+   */
+  const fixture = makeFixture(t, [
+    wakeManual(1, '总在重启时被撞见的输入'),
+    // 第 1 轮：起 turn、认领、崩溃（没有 turn/end）⇒ 恢复必须退回队列，累计 1
+    event(2, 'turn/start', { turn: 1 }, 2),
+    event(3, 'input/claimed', { turn: 1, wakeSeqs: [1], claimCounts: [0] }, 3),
+  ]);
+
+  /** 一次完整的"启动 → 断言 → 关机"（每次都必须放锁） */
+  const bootOnce = async (check: (result: RecoverResult) => void): Promise<void> => {
+    // 每次启动前删掉投影缓存：这一条验的是"**判据从日志读回来**"，
+    // 命中缓存会把它变成"读上一份内存快照"（缓存合法性由 ①b 钉着）
+    rmSync(fixture.cachePath, { force: true });
+    const result = await recover({ dataDir: fixture.dir, log: () => {} });
+    try {
+      check(result);
+    } finally {
+      result.lock.release();
+      result.log.close();
+    }
+  };
+
+  // ── 第 1 次重启：退回，累计 1 ──
+  await bootOnce((result) => {
+    const requeued = fixture.readEvents().filter(e => e.type === 'input/requeued').at(-1);
+    assert.equal(requeued?.data.claimCounts[0], 1, '第 1 次重启：退回时累计到 1');
+    assert.equal(result.projection.pending[0]?.claimCount, 1, '投影里读到的也是它');
+  });
+
+  // ── 运行期（第 2 轮）：**认领次数从日志读回**（这次是上一轮恢复写下的那一笔） ──
+  const claimSeq = fixture.readEvents().length + 1;
+  fixture.appendRaw(
+    `${JSON.stringify(event(claimSeq, 'turn/start', { turn: 2 }, claimSeq))}\n`
+    + `${JSON.stringify(event(claimSeq + 1, 'input/claimed', { turn: 2, wakeSeqs: [1], claimCounts: [1] }, claimSeq + 1))}\n`,
+  );
+
+  // ── 第 2 次重启：再退一次，累计 **2**（不是从 0 重来） ──
+  await bootOnce((result) => {
+    const requeued = fixture.readEvents().filter(e => e.type === 'input/requeued').at(-1);
+    assert.equal(requeued?.data.claimCounts[0], 2, '★ 重启不重置：累计接着 1 数到 2');
+    /**
+     * ⚠ 读 pending 时按 wakeSeq 取**最大**的认领次数，而不是 `pending[0]`：
+     * 这一轮恢复把"已经在队列里、又没被任何 turn 认领"的那条**又 push 了一次**
+     * （`fold.ts` 的 `input/requeued` 是 push、不是 upsert），于是队列里同时有累计 1 与累计 2 两份。
+     * 那是**本用例造的形状**（真实运行期认领一定先于退回：`input/claimed` 摘走它、
+     * `turn/end` 收尾），不是判据的落点——判据是"退回时读到的是日志里的累计值"，
+     * 就是上面那条断言。死信那一步会把同名项一并摘掉（`fold.ts` 的 filter），
+     * 所以这份重复不会带到"进死信"之后。
+     */
+    const maxClaim = Math.max(...result.projection.pending.filter(p => p.wakeSeq === 1).map(p => p.claimCount));
+    assert.equal(maxClaim, 2);
+  });
+
+  // ── 运行期（第 3 轮）：再认领一次 ──
+  const claimSeq2 = fixture.readEvents().length + 1;
+  fixture.appendRaw(
+    `${JSON.stringify(event(claimSeq2, 'turn/start', { turn: 3 }, claimSeq2))}\n`
+    + `${JSON.stringify(event(claimSeq2 + 1, 'input/claimed', { turn: 3, wakeSeqs: [1], claimCounts: [2] }, claimSeq2 + 1))}\n`,
+  );
+
+  // ── 第 3 次重启：**到上限 ⇒ 进死信**，不再退回 ──
+  await bootOnce((result) => {
+    const dead = fixture.readEvents().filter(e => e.type === 'input/dead-letter');
+    assert.equal(dead.length, 1, '跨重启累计到上限 ⇒ 进死信，不再自动重投');
+    assert.equal(dead[0]!.data.inputSeq, 1);
+    assert.equal(dead[0]!.data.claimCount, MAX_CLAIM_COUNT);
+    assert.equal(dead[0]!.data.reason, 'claim-limit');
+    assert.deepEqual(result.projection.pending, [], '它不再回到队列里 ⇒ 重启也不会再被认领一次');
+    assert.deepEqual(result.projection.deadLetters.map(d => d.inputSeq), [1]);
   });
 });
 

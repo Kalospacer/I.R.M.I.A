@@ -29,6 +29,7 @@ import {
   probeCandidate,
   PWSH_DOWNLOAD_PAGE,
   PWSH_WINGET_HINT,
+  PYTHON_DOWNLOAD_PAGE,
   TOOLS_DIR_NAME,
   type DepAction,
   type DependencyProbeOutcome,
@@ -42,11 +43,14 @@ import {
   ES_CLI_ZIP_URL,
   installZipDependency,
   managedDirFor,
+  PYTHON_EMBED_URL,
+  resolvePythonEmbedUrl,
   resolveRipgrepAsset,
   type DepInstallOutcome,
   type Downloader,
   type ZipPackage,
 } from './install.ts';
+import { bootstrapPip, probePipOf, type PipBootstrapOutcome } from './pip.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
@@ -59,6 +63,14 @@ const EXTRA_SEARCH_DIRS: Readonly<Record<DepName, readonly string[]>> = {
     'C:\\Program Files (x86)\\Everything',
     'C:\\Program Files\\Everything 1.5a',
   ],
+  // Python **刻意是空的**：它的常见装法把解释器放在带版本号的目录里
+  // （`%LOCALAPPDATA%\Programs\Python\Python313\`、`C:\Program Files\Python313\`），
+  // 而版本号会随年份变——写进这张表就是给未来埋一个必然过期的常量（用户报告里会出现
+  // "已试：…\Python313\python.exe"这种他已经不再拥有的路径）。三段顺序的第三段走 PATH，
+  // 官方安装器默认会把自己挂上去；微软商店版则由 Windows 的 App Execution Alias 提供
+  // （`python3.exe` / `python.exe` 在 `%LOCALAPPDATA%\Microsoft\WindowsApps`，它在 PATH 上）。
+  // 真遇到"装了却不认"的机器，第一段（`deps.paths.python`）就是为它准备的。
+  python: [],
 };
 
 /** 用户 config 里的路径字段名（`deps.paths.<name>`）；与依赖名同名，不另起一套 */
@@ -66,6 +78,7 @@ export interface DepPathOverrides {
   pwsh?: string | undefined;
   rg?: string | undefined;
   es?: string | undefined;
+  python?: string | undefined;
 }
 
 // ──────────────────────────────── 报告形状（GET /api/deps 与 GUI 卡片共用） ────────────────────────────────
@@ -79,6 +92,13 @@ export interface DepReportEntry {
   /** 探测到的可执行文件（就绪时非空） */
   path: string;
   version: string;
+  /**
+   * 命中来源（config / managed / path）。
+   *
+   * **界面靠它把"已就绪"分成两句话**（用户 2026-10-17）：`path` / `config` = "系统 PATH 上
+   * 那份"（机器上本来就有，**不是**框架要求装的），`managed` = "框架托管那份"（兜底）。
+   * 归类口径只有一处：`probe.ts` 的 `sourceKindOf`。
+   */
   source: DependencyProbeOutcome['source'];
   /** 探测顺序里试过的位置（"下一步该动哪里"要看它） */
   attempts: string[];
@@ -98,6 +118,15 @@ export interface DepReportEntry {
   minVersion: string;
   /** 框架自装目录（`<dataDir>/tools/<name>`） */
   managedDir: string;
+  /**
+   * 只有 python 有这一格：**`python -m pip --version` 探到的 pip 版本**（`26.2.1`）。
+   * 空串 = 这个解释器上没有可用的 pip（`pipReason` 里是为什么）。
+   * 别的依赖是 `null`（它们没有"自带的包管理器"这回事）——界面靠这个区分"没有这一格"
+   * 与"这一格是空的"。
+   */
+  pipVersion: string | null;
+  /** pip 不可用时的一句人话；pip 可用或这一件不是 python 时为空串 */
+  pipReason: string;
 }
 
 export interface DepsReport {
@@ -131,6 +160,17 @@ export interface DepsManagerOptions {
   exists?: ((path: string) => boolean) | undefined;
   /** 自装目录枚举覆盖点（测试用） */
   listDir?: ((dir: string) => string[]) | undefined;
+  /**
+   * **pip 探测**（只有 python 用得上）：`python -m pip --version` ⇒ 版本。
+   * 不给时走真实现；测试注入假命令，绝不起真进程。
+   */
+  probePip?: ((exe: string) => Promise<{ ok: boolean; version: string; reason: string }>) | undefined;
+  /**
+   * **pip 引导**（只有 python 的安装用得上）：解压之后把 pip 铺进 `Lib\site-packages`。
+   * 不给时走真实现（`bootstrapPip`）；测试注入假实现——测试里落地的是一段假字节，
+   * 真引导必然失败（那正好也是"引导失败"用例要的形状）。
+   */
+  bootstrapPip?: ((input: { dir: string; exePath: string; cacheDir: string; download: Downloader }) => Promise<PipBootstrapOutcome>) | undefined;
   /** 下载器覆盖点（测试用假源，绝不联网） */
   download?: Downloader | undefined;
   /** 文本型 URL 抓取覆盖点（GitHub release 查询那条路；测试注入假 JSON） */
@@ -177,7 +217,7 @@ export class DepsManager {
 
   /**
    * 取结论（缓存优先）。**第一次调用时才探测**——启动路径上只付一次代价的关键：
-   * 三件依赖各探一次，而不是每件工具各探一次。
+   * 四件依赖各探一次，而不是每件工具各探一次。
    */
   get(name: DepName): Promise<DependencyProbeOutcome> {
     const cached = this.#cache.get(name);
@@ -221,7 +261,7 @@ export class DepsManager {
   }
 
   /**
-   * 一键安装。可一键装的只有 zip 型（rg / es）；pwsh 是 manual——见 `packageFor`。
+   * 一键安装。可一键装的只有 zip 型（rg / es / python）；pwsh 是 manual——见 `packageFor`。
    */
   async install(name: DepName): Promise<DepInstallOutcome> {
     const pkg = packageFor(name, this.#options.fetchText ?? fetchTextWithNode);
@@ -242,11 +282,16 @@ export class DepsManager {
       };
     }
 
+    const download = this.#options.download ?? downloadWithNode;
+    const withHook: ZipPackage = name === 'python'
+      ? { ...pkg, postExtract: (input) => this.#bootstrapPipFor(input, download) }
+      : pkg;
+
     const outcome = await installZipDependency({
       name,
-      pkg,
+      pkg: withHook,
       dataDir: this.dataDir,
-      download: this.#options.download ?? downloadWithNode,
+      download,
       verify: async (exePath) => {
         const verified = await this.verifyExecutable(name, exePath);
         return verified.ok ? { version: verified.version } : null;
@@ -257,14 +302,42 @@ export class DepsManager {
     if (outcome.ok) {
       // 复检通过才刷新缓存：失败时刷新会白付一次探测代价，也掩盖不了"还是找不到"
       this.refresh();
-      this.#note(`[依赖] ${DEP_SPECS[name].label} 已安装到 ${outcome.dir}（版本 ${outcome.version}）`);
+      const aux = outcome.auxiliaryVersion === undefined ? '' : `，pip ${outcome.auxiliaryVersion}`;
+      const auxFail = outcome.auxiliaryOk === false ? '（pip 未引导成功，见报告）' : '';
+      this.#note(
+        `[依赖] ${DEP_SPECS[name].label} 已安装到 ${outcome.dir}（版本 ${outcome.version}${aux}）${auxFail}`,
+      );
     } else {
       this.#note(`[依赖] ${DEP_SPECS[name].label} 安装未完成（${outcome.step}）：${outcome.error}`);
     }
     return outcome;
   }
 
-  /** 完整报告（GET /api/deps）：三件依赖的探测结果 + 建议动作 + 自装目录路径 */
+  /**
+   * python 独有的收尾：**引导 pip**（用户 2026-10-16：「pip 必须要，方便后续 agent
+   * 自行拓展能力」）。挂在通用编排的 `postExtract` 钩子上，于是 `install.ts` 那一层
+   * 一个字都不用知道 pip 是什么（细节与"为什么 ensurepip 走不通"的实测记录在 src/deps/pip.ts）。
+   *
+   * 失败**不推翻安装**（没有 pip 的 python 还是 python），但结论一定出现在 details 上
+   * ——静默的失败等于撒谎。
+   */
+  async #bootstrapPipFor(
+    input: { dir: string; exePath: string; cacheDir: string },
+    download: Downloader,
+  ): Promise<{ ok: boolean; version: string; reason: string; details: string[] }> {
+    const outcome = await (this.#options.bootstrapPip === undefined
+      ? bootstrapPipReal({
+        dir: input.dir,
+        exePath: input.exePath,
+        cacheDir: input.cacheDir,
+        download,
+        ...(this.#options.fetchText === undefined ? {} : { fetchText: this.#options.fetchText }),
+      })
+      : this.#options.bootstrapPip({ ...input, download }));
+    return { ok: outcome.ok, version: outcome.version, reason: outcome.reason, details: outcome.details };
+  }
+
+  /** 完整报告（GET /api/deps）：四件依赖的探测结果 + 建议动作 + 自装目录路径 */
   async report(now: () => Date = () => new Date()): Promise<DepsReport> {
     const all = await this.getAll();
     const entries = DEP_NAMES.map((name) => this.#entry(name, all[name]));
@@ -304,6 +377,9 @@ export class DepsManager {
       downloadPage: spec.downloadPage,
       minVersion: spec.minVersion,
       managedDir: this.managedDir(name),
+      // 只有 python 会带这两格（`pipVersion` 是 undefined 时是"没有这一格"⇒ 界面显示 null）
+      pipVersion: outcome.pipVersion ?? null,
+      pipReason: outcome.pipReason ?? '',
     };
   }
 
@@ -319,6 +395,13 @@ export class DepsManager {
         ...(this.#options.listDir === undefined ? {} : { listDir: this.#options.listDir }),
         extraSearchDirs: EXTRA_SEARCH_DIRS[name],
         ...(this.#options.probeTimeoutMs === undefined ? {} : { timeoutMs: this.#options.probeTimeoutMs }),
+        // python 专属：解释器找到之后顺手问一次 pip（别的依赖这一格用不上）。
+        // 默认实现直接拿**探测到的那个可执行文件**去问（`python.exe -m pip --version`）：
+        // 它可能是完整路径、也可能是 PATH 上的裸名 `python`，两种都由 spawn 自己解析，
+        // 所以这里不需要先判断"托管与否"。
+        ...(name === 'python'
+          ? { probePip: this.#options.probePip ?? probePipFor }
+          : {}),
       }));
     return outcome;
   }
@@ -350,6 +433,9 @@ export class DepsManager {
  * 因为写死的那一刻就开始过期，而这个依赖是"要求安装"的（过期意味着新用户装不上）。
  * `es`：voidtools 的 CLI 包是固定链接（历史上 1.1.0.27 → 1.1.0.38 地址不变），
  * 但 URL 里嵌着版本号，升版时会 404——那时报"下载失败：HTTP 404"并给下载页，不静默失败。
+ * `python`：与 `rg` 同一条思路（官方发布 API 查最新稳定版），但**兜底地址是钉住的 3.13.16**
+ * ——python.org 的 ftp 路径是 `/ftp/python/<版本>/python-<版本>-embed-amd64.zip`，
+ * 形状在历史上没变过（3.5 至今），所以那条兜底比 rg 的资产名兜底稳得多。
  * `pwsh`：**刻意不提供**（见 install() 里的理由）。
  *
  * `fetchText` 从这里透传下去（而不是包内部自己抓），测试注入的假 JSON 才能生效。
@@ -372,18 +458,34 @@ export function packageFor(
   if (name === 'es') {
     return { name: 'es', url: ES_CLI_ZIP_URL, exeNames: ['es.exe'] };
   }
+  if (name === 'python') {
+    return {
+      name: 'python',
+      // 兜底：用户 2026-10-16 批的那一版（3.13.16，实测 HEAD 200 / 11,439,094 字节）。
+      // 它只在 API 那条路失败时用——两条路都指向**官方同一个 ftp 目录**。
+      url: PYTHON_EMBED_URL,
+      resolveUrl: () => resolvePythonEmbedUrl(fetchText),
+      // embeddable 包**没有顶层目录**（`python.exe` 就在根），所以这条通常一步命中；
+      // 留 `python3.exe` 是因为微软商店版的名字与它同形，手工放包的人可能用那个名字。
+      exeNames: ['python.exe', 'python3.exe'],
+    };
+  }
   return null;
 }
 
 /**
- * GitHub API 的文本抓取：与下载走同一条 `node:https` 通道（不引包，也不落盘——
- * 这个响应是几 KB 的 JSON，读完就丢）。
+ * 文本型 URL 的抓取：与下载走同一条 `node:https` 通道（不引包，也不落盘——
+ * 这些响应都是几 KB 的 JSON，读完就丢）。
+ *
+ * `accept` 刻意把两种都收下：GitHub 的 release API 喜欢 `application/vnd.github+json`，
+ * 而 python.org 的发布 API 是普通 `application/json`。把它写成只认前者会让 python 那条路
+ * 被对端按内容协商挑一个别的形态回来——**同一个抓取器服务两个源**，就别在这里偏心。
  */
 export function fetchTextWithNode(url: string, timeoutMs = 30_000): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const request = httpsGet(
       url,
-      { headers: { 'user-agent': 'irmia-agent-deps/1.0', accept: 'application/vnd.github+json' } },
+      { headers: { 'user-agent': 'irmia-agent-deps/1.0', accept: 'application/json, application/vnd.github+json' } },
       (response) => {
         const status = response.statusCode ?? 0;
         if (status !== 200) {
@@ -407,6 +509,40 @@ export function fetchTextWithNode(url: string, timeoutMs = 30_000): Promise<stri
   });
 }
 
+// ──────────────────────────────── pip 的出厂实现 ────────────────────────────────
+
+/**
+ * 出厂的 pip 探测：直接拿探测到的那个可执行文件跑 `-m pip --version`。
+ *
+ * 为什么接收**可执行文件**而不是目录：探测到的可能是完整路径（自装目录 / 用户指定），
+ * 也可能是 PATH 上的裸名（`python`）。让 spawn 自己去解析 PATH，两处都不用特判。
+ */
+export async function probePipFor(exe: string): Promise<{ ok: boolean; version: string; reason: string }> {
+  const version = await probePipOf(exe);  return version === null
+    ? {
+      ok: false,
+      version: '',
+      reason: '这个解释器上没有可用的 pip（`python -m pip --version` 没给出 pip 版本）',
+    }
+    : { ok: true, version, reason: '' };
+}
+
+/** 出厂的 pip 引导：把 `bootstrapPip` 需要的三样（下载器 / 文本抓取 / 真命令）凑齐 */
+function bootstrapPipReal(input: {
+  dir: string;
+  exePath: string;
+  cacheDir: string;
+  download: Downloader;
+  fetchText?: ((url: string) => Promise<string>) | undefined;
+}): Promise<PipBootstrapOutcome> {
+  return bootstrapPip({
+    dir: input.dir,
+    cacheDir: input.cacheDir,
+    download: input.download,
+    ...(input.fetchText === undefined ? {} : { fetchText: input.fetchText }),
+  });
+}
+
 /** 平台分隔符：自装目录路径给人看，用系统自己的形状 */
 function sep(): string {
   return process.platform === 'win32' ? '\\' : '/';
@@ -425,7 +561,14 @@ export function createDepsManager(options: DepsManagerOptions): DepsManager {
 /** 供测试与宿主共用的存在性/枚举默认实现（定义在 probe.ts：安装与探测共用同一套） */
 export { defaultDepFs } from './probe.ts';
 
-/** 报告里"未就绪"的那几件，拼一句启动日志（宿主用） */
+/**
+ * 报告里"未就绪"的那几件，拼一句启动日志（宿主用）。
+ *
+ * **口径（用户 2026-10-17）**：这里只出现**真的该让用户动手**的那几件——
+ * PATH 上有一个可用 python 的机器上，python **不会**出现在这份清单里（它是"已就绪"）。
+ * 反过来"PATH 上那份 python 没有 pip"也**不会**让它出现在这里：python 可用就是可用，
+ * pip 是它自己那一行的事（见 `DepReportEntry.pipReason`）。
+ */
 export function summarizeNotReady(report: DepsReport): string[] {
   return report.entries
     .filter((entry) => !entry.ok)
@@ -434,11 +577,15 @@ export function summarizeNotReady(report: DepsReport): string[] {
         ? `版本不符（需要 ${entry.minVersion}）`
         : '未安装';
       const hint = entry.installable
-        ? '可在设置页「外部依赖」一键安装'
+        ? (entry.status === 'version-mismatch'
+          // 版本不符时"一键装"不只是选项，而是最省事的那条路：框架装的是它自己挑的版本，
+          // 不会撞上"系统里那个太旧又升不动"（python 尤其：这份 embeddable 包与系统那份并存）
+          ? '可升级系统里那个，或直接由框架一键装一份自己的（设置页「外部依赖」）'
+          : '可在设置页「外部依赖」一键安装')
         : `装法：${entry.manualHint ?? entry.downloadPage ?? '见官方文档'}`;
       return `[依赖] ${entry.label} ${state}——${entry.impact}；${hint}`;
     });
 }
 
-export { DEP_NAMES, DEP_SPECS, PWSH_DOWNLOAD_PAGE, PWSH_WINGET_HINT, ES_DOWNLOAD_PAGE };
+export { DEP_NAMES, DEP_SPECS, PWSH_DOWNLOAD_PAGE, PWSH_WINGET_HINT, ES_DOWNLOAD_PAGE, PYTHON_DOWNLOAD_PAGE };
 export type { DependencyProbeOutcome, DepName, DepProbeOptions };

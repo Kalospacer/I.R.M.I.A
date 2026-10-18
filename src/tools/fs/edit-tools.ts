@@ -11,7 +11,7 @@
  */
 
 import { createBackup, listBackups, readBackup } from './backup.ts';
-import { PATH_BOUNDARY_HINT } from '../boundary.ts';
+import { PATH_HINT } from '../boundary.ts';
 import type { FsEnv } from './env.ts';
 import { resolveGuarded } from './env.ts';
 import {
@@ -79,7 +79,7 @@ export function createSafeEditTool(env: FsEnv): ToolDefinition {
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: `文件路径。${PATH_BOUNDARY_HINT}` },
+        path: { type: 'string', description: `文件路径（相对或绝对）。${PATH_HINT}` },
         // mode 这一格的描述是**两个行模式的语义本身**（见下面三段注释）。为什么不写进工具描述：
         // `safe_edit` 是 `test/tool-catalog.test.ts` 里被压到 <60 token 的那六件之一，而
         // "把两个方向各写一句 + 点明拼不出替换"至少要 20 个 token——工具描述只塞得下那句
@@ -150,7 +150,7 @@ export function createSafeEditTool(env: FsEnv): ToolDefinition {
       const parsed = parseEditRequest(args);
       if ('error' in parsed) return invalidArgs('safe_edit', parsed.error);
 
-      const guarded = await resolveGuarded(env, ctx, pathInput, { purpose: 'safe_edit' });
+      const guarded = await resolveGuarded(env, ctx, pathInput, { purpose: 'safe_edit', access: 'write' });
       if (!guarded.ok) {
         return fail(
           guarded.code,
@@ -198,6 +198,12 @@ export function createSafeEditTool(env: FsEnv): ToolDefinition {
       const lines = [
         `${guarded.relPath} 已更新：${plan.summary}`,
         `行数 ${beforeLines} → ${afterLines}${plan.fuzzy ? '（缩进容错命中）' : ''}`,
+        // 编码那一格（2026-10-18）：**原文件不是 UTF-8 时必须说出来**——因为写回是
+        // "按原编码编回去"，而 GB18030/GBK 在零依赖运行时**没有编码器**，实际会改存 UTF-8。
+        // 不说的话，下一次用别的工具（编辑器 / git / 老脚本）读同一个文件就会对不上。
+        decoded.encoding === 'utf8'
+          ? ''
+          : `编码 ${decoded.encoding}：${encodeText(plan.text, decoded.encoding).notes.join('；')}`,
         verdict === undefined ? '' : describeVerdict(verdict.verdict),
         backup === undefined ? '' : backupLine(backup.record.name, backup.created),
         snapshotLine(result.snapshotWarnings),
@@ -220,7 +226,7 @@ export function createSafeWriteTool(env: FsEnv): ToolDefinition {
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: `文件路径。${PATH_BOUNDARY_HINT}` },
+        path: { type: 'string', description: `文件路径（相对或绝对）。${PATH_HINT}` },
         content: { type: 'string', description: '完整文件内容' },
         overwrite: {
           type: 'boolean',
@@ -261,6 +267,7 @@ export function createSafeWriteTool(env: FsEnv): ToolDefinition {
 
       const guarded = await resolveGuarded(env, ctx, pathInput, {
         purpose: 'safe_write',
+        access: 'write',
         allowMissing: true,
       });
       if (!guarded.ok) return fail(guarded.code, guarded.reason);
@@ -375,7 +382,7 @@ export function createSafeRollbackTool(env: FsEnv): ToolDefinition {
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: `文件路径。${PATH_BOUNDARY_HINT}` },
+        path: { type: 'string', description: `文件路径（相对或绝对）。${PATH_HINT}` },
         backup: { type: 'string', description: '指定备份文件名（见 list:true 的输出）；省略则取最近一次' },
         list: { type: 'boolean', description: '只列出备份，不执行回滚' },
       },
@@ -395,6 +402,7 @@ export function createSafeRollbackTool(env: FsEnv): ToolDefinition {
 
       const guarded = await resolveGuarded(env, ctx, pathInput, {
         purpose: 'safe_rollback',
+        access: 'write',
         allowMissing: true,
       });
       if (!guarded.ok) return fail(guarded.code, guarded.reason);
@@ -560,7 +568,7 @@ export function createMultiEditTool(env: FsEnv): ToolDefinition {
 
         let entry = files.get(fileInput);
         if (entry === undefined) {
-          const guarded = await resolveGuarded(env, ctx, fileInput, { purpose: 'multi_edit' });
+          const guarded = await resolveGuarded(env, ctx, fileInput, { purpose: 'multi_edit', access: 'write' });
           if (!guarded.ok) {
             const hint = guarded.code === FS_ERROR_CODES.NOT_FOUND
               ? '；multi_edit 只改已存在的文件，新建文件请用 safe_write。'

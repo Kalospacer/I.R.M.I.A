@@ -33,8 +33,53 @@ import type { ModelLane } from '../log/types.js';
 export const DEFAULT_BASE_URL = 'https://api.deepseek.com';
 export const DEFAULT_HEAVY_MODEL = 'deepseek-v4-pro';
 export const DEFAULT_LIGHT_MODEL = 'deepseek-flash';
-/** 单请求总超时上限（含思维链生成时间；§4.14「总超时上限」） */
+/**
+ * 非流式（`generate()`）的单请求**总时限**（含思维链生成时间；§4.14「总超时上限」）。
+ *
+ * **流式那条路不再用它**（2026-10-16 改，见 {@link DEFAULT_STREAM_SILENCE_MS}）：
+ * 总时限对一条正在活跃输出的 SSE 是错的判据——它会在一段正常的长思考写到一半时把连接掐掉。
+ * light 的 `generate()` 是"一问一答、没有增量可救"，总时限在那里仍然是对的。
+ */
 export const DEFAULT_TIMEOUT_MS = 180_000;
+
+/**
+ * 流式的**静默时限**（毫秒）：多久**没收到任何 SSE 数据**（分片/心跳/注释行）才判它卡死。
+ *
+ * 判据是"沉默"而不是"总耗时"——这是 2026-10-16 那批 180s 事故的正解：
+ * 实测被掐那一刻服务端**正在活跃输出**（已累积 10 万字符推理、断在半句话上），
+ * 而旧判据（总时限）只看得见"从发出到现在多久"，看不见"它一直在吐字"。
+ *
+ * 取值 **120 s** 的依据：现有的那条总时限是 180s，而实测帧流不慢（180s 内产出 10 万字符
+ * ⇒ 平均每 1.8ms 一段）；反过来，**120s 一片都没有**是"这条连接真卡了"的强信号，
+ * 而 180s 会把"服务端排队/长思考里正常的空档"一起误伤（那正是用户报的「思考 40 分钟」会被掐）。
+ */
+export const DEFAULT_STREAM_SILENCE_MS = 120_000;
+
+/**
+ * 流式的**硬顶**（毫秒）：无论收到多少数据，一次请求都不许超过这个总时长。
+ *
+ * 为什么静默判据之外还要它：静默只抓得住"零输出"那一种卡死；一个**永远不结束但一直在吐字**
+ * 的服务端（对端 bug、被代理反复喂心跳、模型真的停不下来）能让静默窗口永远被喂饱
+ * ⇒ 连接永远挂着。硬顶就是那一种的兜底。
+ *
+ * 取值 **3 小时**的依据（刻意宽到"长思考根本撞不到"）：
+ *   · 用户明说「思考 40 分钟都有可能」；按实测吞吐 8~30 tok/s 反推，
+ *     40 分钟 ≈ 1.9~7.2 万 output token；
+ *   · 3 小时 = 4.5 个"40 分钟"，对应约 8.6~32 万 token —— 已经越过 max_output_tokens
+ *     会把输出截断的量级，所以**真到这一步就不是"想得久"，是"停不下来"**；
+ *   · 它与本文件里那条"总时限"是两件事：总时限（180s/可配）判"多久没结束"，
+ *     硬顶判"永远不结束"。它不是给正常请求用的，是给挂死的连接用的。
+ */
+export const DEFAULT_STREAM_HARD_CAP_MS = 10_800_000;
+
+/** 静默时限的合法范围（配置校验用）：1s ~ 1h。再短会把正常空档误判，再长就失去"卡死"的意义 */
+export const MIN_STREAM_SILENCE_MS = 1_000;
+export const MAX_STREAM_SILENCE_MS = 3_600_000;
+/** 硬顶的合法范围：不得短于静默时限，上限 24h（超过它就不再是"兜底"而是"没有兜底"） */
+export const MAX_STREAM_HARD_CAP_MS = 86_400_000;
+/** 非流式总时限的合法范围：1s ~ 1h */
+export const MIN_NONSTREAM_TIMEOUT_MS = 1_000;
+export const MAX_NONSTREAM_TIMEOUT_MS = 3_600_000;
 /** 连续失败上限，与 §4.6 失败刹车的默认阈值 5 同源 */
 export const DEFAULT_MAX_ATTEMPTS = 5;
 export const DEFAULT_BASE_DELAY_MS = 500;
@@ -197,6 +242,11 @@ export interface DsStreamCallbacks {
 }
 
 export interface DsStreamResult {
+  /**
+   * **上游终态**：`response.completed` / `response.incomplete` / `response.failed` 里服务端自己
+   * 报的 status。没收到终态事件时恒为 `'incomplete'` —— **不许**把断流/超时/调用方中断写成
+   * `'failed'`：`'failed'` 只表示"上游明确宣告失败"。失败与否只看 `failure` 那一格。
+   */
   status: DsStatus;
   /** 已推送的可见文本全文（中断时即"已收部分"，对齐 schema §3 的 interrupted 语义） */
   text: string;
@@ -208,9 +258,26 @@ export interface DsStreamResult {
   model: string | null;
   responseId: string | null;
   durationMs: number;
-  /** 未收到终态事件即为 true：网络断、超时、调用方中断都算 */
+  /** 未收到终态事件即为 true：网络断、超时、调用方中断都算（只说"没收到终态"，不说成没成功） */
   interrupted: boolean;
-  /** interrupted 或 failed 时的原因；正常完成恒为 null */
+  /**
+   * **失败判据（唯一）**：非 null ⇔ 这次调用**没有正常收尾**。
+   *
+   * 两类都落在这里：
+   *   · 上游终态事件宣告失败（`response.failed`）——非流式的同一状态在 `parseResponseBody`
+   *     里直接抛 `DsClientError{kind:'server'}`，两条路的语义一致；
+   *   · 或者压根没等到终态事件（断流 / 静默或硬顶超时 / 调用方中断）。
+   *
+   * 正常收尾（`response.completed` / `response.incomplete`）恒为 `null`。
+   *
+   * **循环层只读这一格**判"这一步是不是失败"（`runtime/agent-loop.ts` 的 `runStep`），
+   * 不再自己组合 `status` / `interrupted` 判第二遍——那正是 2026-10-17 修掉的 P0 的形状：
+   * 客户端用 status/failure 表达终态失败，循环层只认 `interrupted`，于是 `response.failed`
+   * 走成"成功收尾"（半截工具调用被拿去执行、turn 记 completed、输入不退回）。
+   *
+   * 这条不变量由 `build()` **一处**兜底：上游没带 `error` 对象、或流在终态前结束，都会补一条
+   * **有码有文**的原因 —— "失败不可能没有依据"，循环层也就不需要任何 fallback 判据。
+   */
   failure: { code: string; message: string } | null;
 }
 
@@ -295,6 +362,28 @@ export function isDsClientError(value: unknown): value is DsClientError {
 }
 
 /**
+ * 两个中止原因的**哨兵**（`AbortController.abort(reason)` 的原样载荷）。
+ *
+ * 为什么用 `instanceof` 认而不是靠错误消息里的字：消息是给人读的文案，会被改；
+ * 而"是被我们自己哪一只闸掐掉的"必须是**判据**——`classifyTransportError` 要用它把
+ * 两种情况分开（静默 vs 硬顶），归因错了，事后读日志的人会去查错的墙。
+ * 取 `name` 也带上（`Error` 子类的常规做法），但判据只用 `instanceof`。
+ */
+export class DsSilenceTimeout extends Error {
+  constructor() {
+    super('DsClient 流式静默超时：这么久没有收到任何数据');
+    this.name = 'DsSilenceTimeout';
+  }
+}
+
+export class DsHardCapTimeout extends Error {
+  constructor() {
+    super('DsClient 流式硬顶超时：一次请求的总时长超过硬上限');
+    this.name = 'DsHardCapTimeout';
+  }
+}
+
+/**
  * `Retry-After` 解析：整数秒或 HTTP-date 两种形态，非法值返回 null。
  * 过去时间与 0 都归 0——服务端说"立即可重试"时不该被我们的指数退避覆盖。
  */
@@ -340,18 +429,63 @@ export function classifyHttpStatus(
 }
 
 /**
+ * **400 的一种可判别指纹：思考模式要求回传思维链，而我们没回**（2026-10-17 实测）。
+ *
+ * 服务端原话（逐字，`data/events/000000136342.jsonl` seq 137943 = turn 2151 / seq 138764 = turn 2174）：
+ *   {"error":{"message":"The `reasoning_text` in the thinking mode must be passed back to the API.
+ *    (request_id: …)","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}
+ *
+ * **为什么要一个专门判据，而不是"看见 400 就算"**：4xx 除 429 外一律归 `invalid`、一律不重试，
+ * 而 `invalid` 是个大筐。实测同一份日志里 57 条 `http_400` 分两类，处置完全不同：
+ *   · 23 条是这条（要改的是"回不回传思维链"，已另案等用户拍板）；
+ *   · 32 条是 `input[35]: You have uploaded an unsupported image…`（要改的是那一条消息本身）。
+ * 事后只看得见一个 `http_400`，等于两条线索一起丢了。
+ *
+ * 判据：正文里同时出现 `reasoning_text` 与 `passed back`，
+ *   · **大小写不敏感**（服务端换个 casing 也认）；
+ *   · **两者之间允许任意字符**（实测原话中间还夹着 "in the thinking mode must be "，
+ *     而进日志的是一整段被 JSON 转义过的正文，引号/反斜杠/换行都可能出现）；
+ *   · 但**不许隔太远**（`{0,200}`）：一份正文里可能有两段互不相干的字段，隔了半篇就不算同一条消息，
+ *     宁可漏标也不误标（误标的代价是把人引去改错的墙）。
+ *
+ * 它只做**识别**，不做任何处置：分类仍是 `invalid`、仍然不重试、结局仍是 `error`——
+ * 这一格不改变任何行为，只让"是哪一类 400"从此能用 grep 判出来。
+ */
+export function isReasoningEchoRejection(detail: string | null | undefined): boolean {
+  if (typeof detail !== 'string' || detail === '') return false;
+  return /reasoning_text[\s\S]{0,200}?passed[\s_-]*back/iu.test(detail);
+}
+
+/**
  * 传输层失败 → 类别。判据顺序即优先级：先看是谁中止的（调用方 / 我们的超时），
  * 再看 socket 级错误码——连接被重置归 server，DNS 与连接失败归 network（§4.14 表）。
  */
 export function classifyTransportError(
   error: unknown,
-  flags: { timedOut: boolean; externalAborted: boolean },
+  flags: { timedOut: boolean; externalAborted: boolean; hardCap?: boolean; silenceMs?: number; hardCapMs?: number },
 ): DsClientError {
   if (flags.externalAborted) {
     return new DsClientError({ kind: 'aborted', code: 'aborted', message: '调用方中断了请求', cause: error });
   }
+  if (flags.timedOut && flags.hardCap === true) {
+    // 硬顶与静默必须**分开报**：两者的下一步动作不同（静默 ⇒ 值得重连；硬顶 ⇒ 这条请求本身
+    // 就停不下来，重发只会再来三小时），事后读日志的人也要一眼看出是哪一只闸掐的。
+    const cap = flags.hardCapMs === undefined ? '' : `（${flags.hardCapMs}ms）`;
+    return new DsClientError({
+      kind: 'timeout',
+      code: 'timeout_hard_cap',
+      message: `流式请求撞到硬顶${cap}仍未结束，已中止`,
+      cause: error,
+    });
+  }
   if (flags.timedOut) {
-    return new DsClientError({ kind: 'timeout', code: 'timeout', message: '请求超时，未收到完整响应', cause: error });
+    const silence = flags.silenceMs === undefined ? '' : `（${flags.silenceMs}ms 没有收到任何数据）`;
+    return new DsClientError({
+      kind: 'timeout',
+      code: 'timeout_silent',
+      message: `流式请求静默超时${silence}，已中止`,
+      cause: error,
+    });
   }
   const code = transportCodeOf(error);
   if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'UND_ERR_SOCKET') {
@@ -912,6 +1046,20 @@ function createStreamAccumulator(
       else if (item.type === 'reasoning') reasoning += item.text;
       else toolCalls.push({ callId: item.callId, name: item.name, arguments: item.arguments });
     }
+    /**
+     * **失败判据的单一出口**（契约见 `DsStreamResult.failure` 的注释）：正常收尾才允许是 null。
+     *
+     * 两个补洞点都只在这里、且只有这一处：
+     *   · 上游 `response.failed` 但没带 `error` 对象（真实 SSE 里见过只有 status 的包）；
+     *   · 流在终态事件之前就结束了（干净 EOF 也算——循环层对它的处置与断流同一条）。
+     * 补出来的一定有码有文，所以循环层不需要任何 fallback 判据。
+     */
+    const normallyEnded = !interrupted && status !== 'failed';
+    const failureOut = failure ?? (normallyEnded
+      ? null
+      : status === 'failed'
+        ? { code: 'response_failed', message: '上游响应状态 failed（终态事件里没带错误详情）' }
+        : { code: 'stream_interrupted', message: '流在收到终态事件之前结束（未拿到完整响应）' });
     return {
       status,
       text,
@@ -924,7 +1072,7 @@ function createStreamAccumulator(
       responseId,
       durationMs: now() - startedAt,
       interrupted,
-      failure,
+      failure: failureOut,
     };
   }
 
@@ -933,7 +1081,10 @@ function createStreamAccumulator(
     finish: () => build(!terminal),
     settleTransportFailure: (error: DsClientError): DsStreamResult => {
       if (hasUsableOutput(collectOutputItems())) {
-        status = error.kind === 'aborted' ? 'incomplete' : 'failed';
+        // 断流/超时/调用方中断都**没有上游终态可报** ⇒ status 保持 `'incomplete'`。
+        // 刻意不写 `'failed'`：那个值专指上游终态失败（见 `DsStreamResult.status` 的注释），
+        // 混用会让"超时"和"上游宣告失败"在观测面上不可分。失败原因只走 `failure`。
+        status = 'incomplete';
         failure = { code: error.code, message: error.message };
         return build(true);
       }
@@ -949,7 +1100,12 @@ export interface DsClientOptions {
   apiKey: string;
   heavyModel?: string;
   lightModel?: string;
+  /** 非流式（`generate()`）的总时限；缺省 {@link DEFAULT_TIMEOUT_MS}（配置键 `models.nonStreamTimeoutMs`） */
   timeoutMs?: number;
+  /** 流式的**静默**时限；缺省 {@link DEFAULT_STREAM_SILENCE_MS}（配置键 `models.requestSilenceMs`） */
+  silenceMs?: number;
+  /** 流式的**硬顶**；缺省 {@link DEFAULT_STREAM_HARD_CAP_MS}（配置键 `models.requestHardCapMs`） */
+  hardCapMs?: number;
   /** 部署标识，固定写进请求 `user`：KVCache 调度亲和（§4.13 观测闭环） */
   user?: string;
   maxAttempts?: number;
@@ -972,21 +1128,39 @@ export interface DsConfigPatch {
   apiKey?: string;
   heavyModel?: string;
   lightModel?: string;
+  timeoutMs?: number;
+  silenceMs?: number;
+  hardCapMs?: number;
 }
 
 interface RequestHandle {
   signal: AbortSignal;
   timedOut(): boolean;
+  /** 是"硬顶"而不是"静默"掐的吗（决定错误码，见 classifyTransportError） */
+  hardCapped(): boolean;
   externalAborted(): boolean;
+  /** 收到任何数据（含响应头）时调一次：静默计时器就此重置 */
+  noteData(): void;
   dispose(): void;
 }
 
 export class DsClient {
-  /** 以下四项是配置热更点（models.* 在白名单内）：非 readonly，走 applyConfig */
+  /** 以下各字段是配置热更点（models.*）：非 readonly，走 applyConfig */
   baseUrl: string;
   heavyModel: string;
   lightModel: string;
-  readonly timeoutMs: number;
+  /**
+   * 非流式总时限 / 流式静默时限 / 流式硬顶（毫秒）。
+   *
+   * **热更语义**（与 `applyConfig` 的其余字段一致）：`applyConfig` 收下它们之后，
+   * 改完对**下一拍请求**生效、在途那条仍按出发时那份参数走。
+   * ⚠️ **当前生产还没接线**：`models.requestTimeout` 不在 `HOT_RELOAD_FIELDS` 白名单里
+   * （`config/watcher.ts` 的口径是"全部字段都要重启才生效"，只有 `mcp.servers` 例外），
+   * 所以今天改这三格**要重启进程**。留这三个可选入参是为了让宿主将来热更时不必再动本类。
+   */
+  timeoutMs: number;
+  silenceMs: number;
+  hardCapMs: number;
   readonly user: string;
 
   private apiKey: string;
@@ -996,7 +1170,17 @@ export class DsClient {
   private readonly fetchImpl: typeof fetch;
   private readonly sleep: SleepFn;
   private readonly now: () => number;
-  private readonly onRetry: ((info: RetryInfo) => void) | null;
+  /**
+   * 重试订阅者（`onRetry` 的**多播**形态）。
+   *
+   * 为什么从"构造时注入一个回调"改成订阅：消费方是**每轮新建**的（`runTurn` 每轮一个
+   * `TurnRunner`），而 `DsClient` 是**进程级单例**——构造时注入就等于把第一轮的那个
+   * 闭包永久钉在上面，后面每一轮的重试都记到第一轮头上去。订阅让"谁在听"跟着轮次走。
+   *
+   * 这一格的存在就是为了 `budget/consumed.retryCount`：原先只有**抛错**那条路上带得到
+   * `attempts`，成功路径恒写 0（`agent-loop.ts` 里那条 TODO）。
+   */
+  private readonly retryListeners = new Set<(info: RetryInfo) => void>();
   /** 连续失败计数：成功即清零；随错误外抛供 §4.6 失败刹车使用 */
   private streak = 0;
 
@@ -1006,6 +1190,8 @@ export class DsClient {
     this.heavyModel = options.heavyModel ?? DEFAULT_HEAVY_MODEL;
     this.lightModel = options.lightModel ?? DEFAULT_LIGHT_MODEL;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.silenceMs = options.silenceMs ?? DEFAULT_STREAM_SILENCE_MS;
+    this.hardCapMs = options.hardCapMs ?? DEFAULT_STREAM_HARD_CAP_MS;
     this.user = options.user ?? DEFAULT_DEPLOYMENT_USER;
     this.maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
     this.baseDelayMs = options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
@@ -1013,7 +1199,29 @@ export class DsClient {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.sleep = options.sleep ?? defaultSleep;
     this.now = options.now ?? (() => Date.now());
-    this.onRetry = options.onRetry ?? null;
+    if (options.onRetry !== undefined) this.retryListeners.add(options.onRetry);
+  }
+
+  /**
+   * 订阅"发生了一次重试"（返回退订函数）。
+   *
+   * 与构造选项 `onRetry` 等价，只是可以**多播**、且可以在运行期挂/摘——
+   * 见 `retryListeners` 那段注释（轮次级观测需要它）。退订是幂等的。
+   */
+  subscribeRetry(listener: (info: RetryInfo) => void): () => void {
+    this.retryListeners.add(listener);
+    return () => { this.retryListeners.delete(listener); };
+  }
+
+  /** 通知所有订阅者；**任何订阅者抛错都不影响这次调用**（观测不该有能力打断请求） */
+  private notifyRetry(info: RetryInfo): void {
+    for (const listener of this.retryListeners) {
+      try {
+        listener(info);
+      } catch {
+        /* 观测回调抛错只丢这一次观测 */
+      }
+    }
   }
 
   /**
@@ -1026,6 +1234,11 @@ export class DsClient {
     if (patch.apiKey !== undefined && patch.apiKey.trim() !== '') this.apiKey = patch.apiKey;
     if (patch.heavyModel !== undefined && patch.heavyModel.trim() !== '') this.heavyModel = patch.heavyModel;
     if (patch.lightModel !== undefined && patch.lightModel.trim() !== '') this.lightModel = patch.lightModel;
+    // 三格时限照收（校验在 config.ts 那一处；这里只认正数，免得热更进来一个 NaN 把闸门关掉——
+    // 一个 `setTimeout(NaN)` 等价于"没有计时器"，而那正是"真卡死的连接永远挂着"的形状）
+    if (patch.timeoutMs !== undefined && patch.timeoutMs > 0) this.timeoutMs = patch.timeoutMs;
+    if (patch.silenceMs !== undefined && patch.silenceMs > 0) this.silenceMs = patch.silenceMs;
+    if (patch.hardCapMs !== undefined && patch.hardCapMs > 0) this.hardCapMs = patch.hardCapMs;
   }
 
   /** lane → 端点模型；降级链用 `DsRequest.model` 覆盖 */
@@ -1054,10 +1267,13 @@ export class DsClient {
 
     try {
       const core = await withRetry(async () => {
-        const handle = this.createHandle(request.signal);
+        const handle = this.createHandle('total', request.signal);
         try {
           const res = await this.send(url, buildRequestBody(request, model, this.user, false), false, handle);
           if (!res.ok) throw await httpErrorOf(res);
+          // 非流式拿到响应头就已经是"有数据"了（body 还没读完，但连接是活的）：
+          // 重置一次静默计时器，让"响应头快、正文慢"这类请求走总时限那条判据而不是静默那条
+          handle.noteData();
           const text = await this.readBody(res, handle);
           return parseResponseBody(text, model);
         } finally {
@@ -1075,17 +1291,24 @@ export class DsClient {
    * SSE 流式。已推送的内容不可重放，因此这里不做整条流的重试（重试决策属于调用方）：
    * 收到过内容后发生中断/超时/网络断，返回已收部分（`interrupted: true`）；
    * 一个字都没收到就失败，则当作可重试错误抛出，与 generate 的错误语义一致。
+   *
+   * **超时语义是"静默"不是"总耗时"**（2026-10-16 改，理由见 {@link DEFAULT_STREAM_SILENCE_MS}）：
+   * 每收到一片数据就重置静默计时器，另有一条很宽的硬顶兜"一直在吐字但永不结束"。
    */
   async stream(request: DsRequest, callbacks: DsStreamCallbacks = {}): Promise<DsStreamResult> {
     const lane = request.lane;
     const model = request.model ?? this.modelFor(lane);
     const url = `${this.baseUrl}/responses`;
     const startedAt = this.now();
-    const handle = this.createHandle(request.signal);
+    const handle = this.createHandle('silent', request.signal);
     const accumulator = createStreamAccumulator(model, callbacks, startedAt, this.now);
 
     try {
       const res = await this.send(url, buildRequestBody(request, model, this.user, true), true, handle);
+      // **响应头到达 = 收到数据**：它是"连接活着、服务端已接手"的第一个证据。
+      // 少这一下，一个"记得住响应头、之后才慢慢想"的服务端会被静默闸在 120s 处掐掉——
+      // 而那恰恰是用户说的"超长思考"最典型的形状。
+      handle.noteData();
       if (!res.ok) throw await httpErrorOf(res);
       if (res.body === null) {
         throw new DsClientError({ kind: 'server', code: 'no_body', message: '流式响应缺少 body' });
@@ -1113,6 +1336,10 @@ export class DsClient {
         const { done, value } = await reader.read();
         if (done) break;
         if (value !== undefined) {
+          // **收到一片就重置静默计时器**（这是本函数存在的全部要点）：静默判据问的是
+          // "多久没有数据"，不是"一共花了多久"——长思考期间服务端一直在吐 reasoning 分片，
+          // 所以它永远不该撞上这只闸。
+          handle.noteData();
           for (const frame of sse.push(decoder.decode(value, { stream: true }))) accumulator.apply(frame);
         }
       }
@@ -1123,6 +1350,9 @@ export class DsClient {
       const classified = classifyTransportError(error, {
         timedOut: handle.timedOut(),
         externalAborted: handle.externalAborted(),
+        hardCap: handle.hardCapped(),
+        silenceMs: this.silenceMs,
+        hardCapMs: this.hardCapMs,
       });
       return accumulator.settleTransportFailure(classified);
     }
@@ -1138,18 +1368,49 @@ export class DsClient {
       shouldRetry: (error: unknown, attempt: number) => shouldRetryAttempt(error, attempt),
     };
     if (signal !== undefined) options.signal = signal;
-    if (this.onRetry !== null) options.onRetry = this.onRetry;
+    // 无条件挂上多播口：没有订阅者时它是一次空转，比"记得在有订阅者时才接线"可靠
+    options.onRetry = (info) => { this.notifyRetry(info); };
     return options;
   }
 
-  /** 超时与调用方中断共用一条 AbortController，但保留来源标志以便分类 */
-  private createHandle(external?: AbortSignal): RequestHandle {
+  /**
+   * 请求句柄：超时与调用方中断共用一条 `AbortController`，但保留**来源标志**以便分类。
+   *
+   * 两种模式（2026-10-16 拆开，这是长思考事故的机制层修复）：
+   *   · `'total'` —— **总时限**：从建表到 `dispose` 只有这一只闸。用于非流式 `generate()`
+   *     （一问一答、没有增量可救，超了就该退避重试）。
+   *   · `'silent'` —— **静默时限 + 硬顶**：只要 `noteData()` 被叫到（每收到一片数据/响应头），
+   *     静默计时器就重新起跳；硬顶不重置。用于流式 `stream()`。
+   *
+   * 为什么两种模式必须分开而不是"把 180s 调大"：调大只是把墙往后推，
+   * 一条活跃输出了 40 分钟的流照样会在第 N 分钟被同一只闸掐掉，而它本来能正常收尾。
+   */
+  private createHandle(mode: 'total' | 'silent', external?: AbortSignal): RequestHandle {
     const controller = new AbortController();
     let timedOut = false;
-    const timer = setTimeout(() => {
+    let hardCap = false;
+    let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+    let capTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const abortSilent = (): void => {
       timedOut = true;
-      controller.abort(new Error('DsClient 请求超时'));
-    }, this.timeoutMs);
+      controller.abort(new DsSilenceTimeout());
+    };
+    const abortHardCap = (): void => {
+      timedOut = true;
+      hardCap = true;
+      controller.abort(new DsHardCapTimeout());
+    };
+
+    if (mode === 'total') {
+      // 非流式：老口径不变（一个总时限），只是现在可配、也可热更
+      silenceTimer = setTimeout(abortSilent, this.timeoutMs);
+    } else {
+      // 流式：静默闸先起跳（等响应头也在它的覆盖下）+ 硬顶
+      silenceTimer = setTimeout(abortSilent, this.silenceMs);
+      capTimer = setTimeout(abortHardCap, this.hardCapMs);
+    }
+
     const onExternalAbort = (): void => controller.abort(new Error('调用方中断'));
     if (external !== undefined) {
       if (external.aborted) onExternalAbort();
@@ -1158,9 +1419,19 @@ export class DsClient {
     return {
       signal: controller.signal,
       timedOut: () => timedOut,
+      hardCapped: () => hardCap,
       externalAborted: () => external?.aborted === true,
+      noteData: () => {
+        if (mode !== 'silent' || timedOut) return;
+        // 重置（不是"停止"）：静默判据是滑动窗口——只要还在吐字，它就一直被推到下一次数据之后
+        if (silenceTimer !== null) clearTimeout(silenceTimer);
+        silenceTimer = setTimeout(abortSilent, this.silenceMs);
+      },
       dispose: () => {
-        clearTimeout(timer);
+        if (silenceTimer !== null) clearTimeout(silenceTimer);
+        if (capTimer !== null) clearTimeout(capTimer);
+        silenceTimer = null;
+        capTimer = null;
         external?.removeEventListener('abort', onExternalAbort);
       },
     };
@@ -1188,6 +1459,9 @@ export class DsClient {
       throw classifyTransportError(error, {
         timedOut: handle.timedOut(),
         externalAborted: handle.externalAborted(),
+        hardCap: handle.hardCapped(),
+        silenceMs: this.silenceMs,
+        hardCapMs: this.hardCapMs,
       });
     }
   }
@@ -1199,6 +1473,9 @@ export class DsClient {
       throw classifyTransportError(error, {
         timedOut: handle.timedOut(),
         externalAborted: handle.externalAborted(),
+        hardCap: handle.hardCapped(),
+        silenceMs: this.silenceMs,
+        hardCapMs: this.hardCapMs,
       });
     }
   }
@@ -1218,11 +1495,28 @@ function stripTrailingSlash(url: string): string {
   return url.replace(/\/+$/u, '');
 }
 
-/** empty 走有限重试（3 次），invalid/aborted 一次都不重试，其余按 §4.14 表退避 */
+/** 超时型失败内层最多重试一次（理由见 {@link shouldRetryAttempt}） */
+export const TIMEOUT_MAX_ATTEMPTS = 2;
+
+/**
+ * 内层重试判据（只作用于 `generate()`——`stream()` 不做内层重试，见它的注释）。
+ *
+ *   · `empty`   —— 有限重试 3 次后外抛（§4.14 表，原口径不变）；
+ *   · `timeout` —— **最多一次带退避的重试**（2026-10-16 加，这是"又 error 又重投"的一半机制）：
+ *       内层原来对 timeout 一视同仁地重试满 `maxAttempts`（默认 5），而每一次都要
+ *       把同一个总时限**再等一遍** ⇒ 单次调用最坏 5×180s=15 分钟，然后外层再走 turn 级重投。
+ *       现在语义是"给你一次机会、退避之后再问一次；还是超时就是这条请求真过不去"，
+ *       第二次失败外抛的原因里带着是哪只闸（`timeout_silent` / `timeout_hard_cap`）。
+ *   · 其余可重试类别照旧按 §4.14 表退避。
+ *
+ * ⚠ 它**不能**收紧到"一次都不重试"：偶发网络抖动造成的 `timeout_silent` 是**该**重试的
+ * （那条连接确实断了，重发一条通常会好），一次都不重试会把偶发故障变成硬失败。
+ */
 function shouldRetryAttempt(error: unknown, attempt: number): boolean {
   if (!(error instanceof DsClientError)) return false;
   if (!error.retryable) return false;
   if (error.kind === 'empty') return attempt < EMPTY_MAX_ATTEMPTS;
+  if (error.kind === 'timeout') return attempt < TIMEOUT_MAX_ATTEMPTS;
   return true;
 }
 

@@ -1,5 +1,5 @@
 /**
- * Irmia Agent — 文件系工具包：只读两件（safe_read / read_blob）
+ * Irmia Agent — 文件系工具包：只读两件（safe_read 注册；read_blob 自 v64 起保留实现但**不注册**）
  *
  * 两件工具都是 sideEffect none + parallel（design.md §4.18 工具清单）。
  * 只读不等于随便读，三条纪律：
@@ -32,7 +32,7 @@ import { join } from 'node:path';
 
 // blob 目录名与 blobId 形状的唯一定义点在 state/blob-store.ts（写入端同源），这里只做转发
 import { BLOB_DIR_NAME, BLOB_ID_PATTERN } from '../../state/blob-store.ts';
-import { PATH_BOUNDARY_HINT } from '../boundary.ts';
+import { PATH_HINT } from '../boundary.ts';
 import type { FsEnv } from './env.ts';
 import { resolveGuarded } from './env.ts';
 import { resolveInsideRoot } from './path-guard.ts';
@@ -90,25 +90,41 @@ type EncodingConfidence = 'certain' | 'probe' | 'fallback';
 function decodeWithEncoding(
   buf: Buffer,
   requested: string | undefined,
-): { text: string; encoding: DetectedEncoding; confidence: EncodingConfidence; notes: string[] } {
+): { text: string; encoding: DetectedEncoding; confidence: EncodingConfidence; notes: string[]; replaced: number; lossy: boolean } {
   if (requested === undefined || requested === 'auto') {
     const decoded = decodeText(buf);
-    return { text: decoded.text, encoding: decoded.encoding, confidence: decoded.confidence, notes: decoded.notes };
+    return {
+      text: decoded.text,
+      encoding: decoded.encoding,
+      confidence: decoded.confidence,
+      notes: decoded.notes,
+      replaced: decoded.replaced,
+      lossy: decoded.lossy,
+    };
   }
   const label = requested.toLowerCase();
   if (label === 'utf16be') {
     const body = buf.subarray(0, buf.length - (buf.length % 2));
     const swapped = Buffer.from(body);
     swapped.swap16();
-    return { text: swapped.toString('utf16le'), encoding: 'utf16be', confidence: 'certain', notes: [] };
+    return {
+      text: swapped.toString('utf16le'),
+      encoding: 'utf16be',
+      confidence: 'certain',
+      notes: [],
+      replaced: 0,
+      lossy: false,
+    };
   }
+  // `gbk` 与 `gb18030` 是同一张 ICU 表（WHATWG 里 gbk 就是 gb18030 解码器的别名），
+  // 两个入参都落到 `gb18030` 这个更全的名字上——回执里报的是**实际用的解码器**。
   const map: Record<string, string> = {
     utf8: 'utf8',
     'utf-8': 'utf8',
     utf16le: 'utf16le',
     'utf-16le': 'utf16le',
-    gbk: 'gbk',
-    gb18030: 'gbk',
+    gbk: 'gb18030',
+    gb18030: 'gb18030',
     latin1: 'latin1',
     binary: 'latin1',
   };
@@ -120,22 +136,31 @@ function decodeWithEncoding(
       encoding: decoded.encoding,
       confidence: decoded.confidence,
       notes: [`不认识的 encoding「${requested}」，已按自动检测处理`],
+      replaced: decoded.replaced,
+      lossy: decoded.lossy,
     };
   }
   try {
     const text = new TextDecoder(decoderLabel).decode(buf);
     return {
       text,
-      encoding: (label === 'utf-8' ? 'utf8' : label) as DetectedEncoding,
+      encoding: (label === 'utf-8' ? 'utf8' : decoderLabel) as DetectedEncoding,
       confidence: 'certain',
       notes: [],
+      replaced: 0,
+      lossy: false,
     };
   } catch (err) {
+    // 指定编码解不出来时**不能退回 `buf.toString('utf8')`**：那正是"静默产出替换字符"的老路。
+    // 走共享判定链，并如实说清"你指定的编码没用上、实际是按什么解的"。
+    const decoded = decodeText(buf);
     return {
-      text: buf.toString('utf8'),
-      encoding: 'utf8',
+      text: decoded.text,
+      encoding: decoded.encoding,
       confidence: 'fallback',
-      notes: [`按 ${requested} 解码失败（${toErrorMessage(err)}），已退回 UTF-8`],
+      notes: [`按 ${requested} 解码失败（${toErrorMessage(err)}），已改用自动检测`],
+      replaced: decoded.replaced,
+      lossy: decoded.lossy,
     };
   }
 }
@@ -166,10 +191,12 @@ function cutToByteBudget(line: string, budget: number): string {
 export function createSafeReadTool(env: FsEnv): ToolDefinition {
   return {
     name: 'safe_read',
+    // 描述口径（v64，用户 2026-10-13）：**一句祈使句 = 动作 + 对象**，再加一句边界/默认，
+    // 细节全下沉到参数说明（offset/limit/head/tail/depth 的用法都在各自那一格里）。
+    // 路径基准与具名根**不在这里重复**——它们由共享常量 `PATH_HINT` 说一次（六个工具共用一份措辞）。
     description:
-      '读取文本文件，**每行都带真实行号前缀**（`  12│ 内容`，safe_edit 的三种模式都认这个行号）。' +
-      `offset/limit 取区间、head/tail 取两端。传目录则列目录。`
-      + `自动检测编码（BOM/UTF-8/GBK）。只读。${PATH_BOUNDARY_HINT}。`,
+      '读文本文件，带真实行号（可直接给 safe_edit 用）。传目录则列目录；'
+      + `自动检测编码（BOM/UTF-8/GBK）；offset 超出末行就从最后一行起。只读。${PATH_HINT}。`,
     parameters: {
       type: 'object',
       properties: {
@@ -180,10 +207,9 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
         //   `head`/`tail` 的互斥、`encoding` 的六个取值全部原样保留）。
         path: {
           type: 'string',
-          description: '文件或目录路径：相对工作根或绝对路径；MEMORIES/ 与 diary/ 会自动落到记忆目录。'
-            + '目录则列出条目（类型/大小/修改时间）',
+          description: `文件或目录路径（相对或绝对）。${PATH_HINT}。目录则列出条目（类型/大小/修改时间）`,
         },
-        offset: { type: 'integer', description: '起始行号，1-based，默认 1（0 与 1 等价）' },
+        offset: { type: 'integer', description: '起始行号，1-based，默认 1（0=1；超出末行就从最后一行起）' },
         limit: { type: 'integer', description: '最多几行，默认全部；path 是目录时＝最多列几条，默认 200' },
         // 各档都保留：`offset` 的 1-based 口径由它自己那一格承担，`head`/`tail`/`depth` 只留互斥与边界
         head: { type: 'integer', description: '只读前 N 行，与 offset/limit/tail 互斥（目录不适用）' },
@@ -261,6 +287,7 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
       // 而 list_dir 已经删掉——列目录这件事现在归这里，所以再把它挡回去就是"指路到不存在的工具"。
       const guarded = await resolveGuarded(env, ctx, pathInput, {
         purpose: 'safe_read',
+        access: 'read',
         allowDirectory: true,
       });
       if (!guarded.ok) return fail(guarded.code, guarded.reason);
@@ -318,7 +345,7 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
         return fail(
           FS_ERROR_CODES.BINARY_FILE,
           `${guarded.relPath} 看起来是二进制文件（含 NUL 字节），safe_read 只处理文本。` +
-            '若确实要看字节，请用 read_blob 并指定 encoding:"base64"。',
+            '若确实要看字节，用 pwsh 先把它转成 base64 再看。',
         );
       }
 
@@ -433,7 +460,7 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
             + `**上面那个行数只是前 ${formatBytes(readLen)} 内的行数，不是全文件的行数**。`
             + `因此**本次回显的行号只在前 ${formatBytes(readLen)} 内有效**——`
             + '不要拿它去 insert_at_line / delete_lines（编辑器按**整文件**行号结算，靠后的行号会对不上，'
-            + '而且不会报错）。要动这么大的文件：先用 rg_search 定位，再按定位到的**区间**读；'
+            + '而且不会报错）。要动这么大的文件：先用 grep 定位，再按定位到的**区间**读；'
             + '确实要整篇处理时由人在外部编辑器里做。',
         );
       }
@@ -448,17 +475,26 @@ export function createSafeReadTool(env: FsEnv): ToolDefinition {
         hints.push(
           `本次返回内容已达单次字节上限 ${formatBytes(byteLimit)}（返回 ${formatBytes(bodyBytes)}），` +
             `**这不是文件全文**——只发到第 ${shownEnd} 行就停了（该行可能也被切短）。` +
-            `继续读请用 offset=${shownEnd + 1}&limit=${lineLimit}，或用 rg_search 定位后只取那一小段。`,
+            `继续读请用 offset=${shownEnd + 1}&limit=${lineLimit}，或用 grep 定位后只取那一小段。`,
         );
       }
       if (!beyondByteLimit && size > env.maxReadBytes) {
-        hints.push(`提示：文件较大（${formatBytes(size)}），若这是外置的工具结果，用 read_blob 分页取更省上下文。`);
+        hints.push(`提示：文件较大（${formatBytes(size)}），按 offset/limit 分页读更省上下文。`);
       }
       if (totalLines > 0 && shownEnd < totalLines) {
         hints.push(`文件还有 ${totalLines - shownEnd} 行未显示。`);
       }
       if (decoded.confidence === 'fallback') {
         hints.push('编码探针未能确定编码，内容可能显示为乱码；可传 encoding 参数强制指定。');
+      }
+      // **有损就明说**（2026-10-18）：这条不依赖 confidence 口径——即便是"严格 GB18030 失败后
+      // 退到 latin1"这种确定判断，也不许她看到一堆看着像字、其实不确定的字符却不被告知。
+      if (decoded.lossy) {
+        hints.push(
+          `本次内容有 ${decoded.replaced} 处无法映射原字符（原字节既不是合法 UTF-8，也不是合法 GB18030），`
+            + `已按 latin1 单字节映射解出：字节没丢，但非 ASCII 字符的含义无从确定。`
+            + '要保真请改用 pwsh 取原始字节（例如 base64），或用 encoding 参数试别的编码。',
+        );
       }
 
       const content = truncated
@@ -576,10 +612,10 @@ export async function renderDirectoryListing(
     `${relPath === '' ? '.' : relPath}/ · 目录 ${dirCount} 个 / 文件 ${fileCount} 个 · depth=${depth}`;
   const body = lines.length === 0 ? '(空目录)' : lines.join('\n');
   // 截断说明要**可执行**：说清被截了多少、以及三条真的能缩小范围的路（这是"把上限说出口"
-  // 与"指路"的同一句话，不是客套）。旧 list_dir 只说了"缩小范围或用 rg_search/es_search"。
+  // 与"指路"的同一句话，不是客套）。旧 list_dir 只说了"缩小范围或用 grep/find"。
   const tailNote = truncated
     ? `\n[已截断：上限 ${maxEntries} 条（同层按名称排序）。缩小 path、调小 depth，`
-      + '或用 rg_search（按内容）/es_search（按文件名）精确定位；'
+      + '或用 grep（按内容）/find（按文件名）精确定位；'
       + '要按修改时间或大小排序、要看隐藏项（.env 这类），用 pwsh 的 Get-ChildItem。]'
     : '';
   return { content: `${header}\n${body}${tailNote}`, truncated, aborted };
@@ -635,7 +671,7 @@ export function createReadBlobTool(env: FsEnv): ToolDefinition {
         }
         target = join(root, blobId);
       } else {
-        const guarded = await resolveInsideRoot(root, relPath as string, { purpose: 'read_blob' });
+        const guarded = await resolveInsideRoot(root, relPath as string, { purpose: 'read_blob', access: 'read' });
         if (!guarded.ok) {
           return fail(
             guarded.code,

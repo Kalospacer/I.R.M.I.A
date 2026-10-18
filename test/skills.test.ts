@@ -535,7 +535,7 @@ describe('技能目录只读区', () => {
   async function tools(root: string): Promise<Map<string, ToolDefinition>> {
     const table = new Map<string, ToolDefinition>();
     const built = await buildFsTools(
-      // es_search 是条件注册的（要探测 es.exe）：显式关掉，让这条用例在任何机器上都同形
+      // find 是条件注册的（要探测 es.exe）：显式关掉，让这条用例在任何机器上都同形
       { backupDir: join(root, '.backups'), everythingPath: null },
       { now: () => new Date('2026-03-01T00:00:00.000Z') },
     );

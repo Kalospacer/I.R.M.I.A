@@ -13,6 +13,8 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { existsSync, readdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -43,8 +45,10 @@ import {
   decodeClixmlErrors,
   detectPowerShell,
   normalizeNewlines,
+  resetInterpreterProbeCache,
   resetPowerShellProbeCache,
   screenCommand,
+  scriptEnv,
   stripClixml,
   truncateOutput,
   type PwshToolDefinition,
@@ -57,6 +61,10 @@ import {
 } from '../src/channel/qq-official.ts';
 import type { ToolContext } from '../src/tools/types.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
+// 宿主接线那一组（PATH 优先 · 托管兜底的两槽候选）走的是**真装配**：
+// 只把依赖探测注入成假结论，中间那一跳（catalog → pwsh）一个字都不打桩
+import { DepsManager } from '../src/deps/manager.ts';
+import { buildCatalogRegistry } from '../src/tools/catalog.ts';
 
 // ──────────────────────────────── 测试脚手架 ────────────────────────────────
 
@@ -390,7 +398,7 @@ describe('write_persona：persona 唯一写通道与只读保护', () => {
     assert.equal(await readFile(join(personaRoot, 'STYLE.md'), 'utf8'), '说话方式\n');
   });
 
-  test('按需层超过 4KB 只警告不拒绝；硬上限则拒绝', async () => {
+  test('按需层超过软上限（2 KB = 2048 字节）只警告不拒绝；硬上限则拒绝', async () => {
     const ws = await workspace('persona-size');
     const personaRoot = join(ws, 'persona');
     const toolkit = createAdminTools({
@@ -418,6 +426,66 @@ describe('write_persona：persona 唯一写通道与只读保护', () => {
     const tooBig = await tool.handler({ file: 'STATE.md', content: 'x'.repeat(70 * 1024) }, ctx);
     assert.equal(tooBig.isError, true);
     assert.equal(tooBig.error?.code, 'E_TOO_LARGE');
+  });
+
+  test('软上限的判据是严格大于：正好 2048 字节不警告，2049 才警告（与 STATE 预算同一条线）', async () => {
+    // 2026-10-17 用户批的那一笔：阈值 4096 → 2048，与 `persona.stateBudgetBytes` 同一根线。
+    // 判据钉**严不严格**：`bytes > onDemandWarnBytes`，不是 `>=`——与 `stateBudgetReminder`
+    // 的 `stateBytes > budgetBytes` 一模一样（正好 2048 那边两种提醒都不该出现）。
+    assert.equal(ONDEMAND_WARN_BYTES, 2048, '软上限就是 2 KB = 2048 字节');
+    const ws = await workspace('persona-warn-line');
+    const personaRoot = join(ws, 'persona');
+    const toolkit = createAdminTools({
+      timers: new TimerStore(null),
+      emit: makeRecorder().emit,
+      personaRoot,
+    });
+    const ctx = makeCtx(ws);
+    const tool = toolkit.byName('write_persona');
+
+    // 正好 2048 字节：不警告（内容照样写入；'x' 是 1 字节，规范化不动它）
+    const exactly = await tool.handler(
+      { file: 'STATE.md', content: 'x'.repeat(ONDEMAND_WARN_BYTES) },
+      ctx,
+    );
+    assert.equal(exactly.isError, undefined, exactly.content);
+    assert.equal(exactly.content.includes(`已写入 STATE.md：${ONDEMAND_WARN_BYTES} 字节`), true);
+    assert.doesNotMatch(exactly.content, /\[警告\]/, '正好等于上限：不警告');
+    assert.equal((exactly.additionalContext ?? []).length, 0, '正好等于上限：一条警告都没有');
+
+    // 多一个字节：警告，但内容照样写入（只提醒、不拒绝）
+    const over = await tool.handler(
+      { file: 'STATE.md', content: 'x'.repeat(ONDEMAND_WARN_BYTES + 1) },
+      ctx,
+    );
+    assert.equal(over.isError, undefined, over.content);
+    assert.match(over.content, /\[警告\]/);
+    assert.ok(
+      (over.additionalContext ?? []).some((line) => line.includes('按需层')),
+      '警告进 additionalContext（她看得到）',
+    );
+    // 回执里的数字由常量生成：改阈值不会让回执说谎（说 2048 就真的是 2048）
+    assert.ok(
+      over.content.includes(`超过按需层建议上限 ${ONDEMAND_WARN_BYTES} 字节`),
+      `回执要给出真实阈值：${over.content}`,
+    );
+    assert.equal(await readFile(join(personaRoot, 'STATE.md'), 'utf8'), 'x'.repeat(ONDEMAND_WARN_BYTES + 1));
+  });
+
+  test('工具描述里的门槛也跟着写 2KB（tools 段字节变了 ⇒ 同批递 RENDER_VERSION 69）', () => {
+    // 阈值与描述不能分岔：一个说 2KB、一个写 4KB，读的人会按 4KB 估自己的文件。
+    // 这一句进的是 `tools` 段（`ToolDefinition.description` → 请求体 tools），所以本批
+    // 改它必须**同批**递 RENDER_VERSION（68 → 69，见 render.ts 文件头 v69 那一篇）。
+    const toolkit = createAdminTools({ timers: new TimerStore(null), emit: makeRecorder().emit });
+    const tool = toolkit.byName('write_persona');
+    assert.ok(tool.description.includes('按需层超 2KB 警告'), `描述要说 2KB：${tool.description}`);
+    assert.equal(tool.description.includes('4KB'), false, '不许再说 4KB（与阈值分岔）');
+    // 等长替换（4KB → 2KB）：`catalogTokens` 的硬门（< 5500、余量 ≥ 30）不受这一笔影响
+    assert.equal(
+      Buffer.byteLength(tool.description, 'utf8'),
+      Buffer.byteLength(tool.description.replace('按需层超 2KB 警告', '按需层超 4KB 警告'), 'utf8'),
+      '只换了一个字符，字节数不变',
+    );
   });
 
   test('路径逃逸与非 .md 后缀一律拒绝', async () => {
@@ -1258,7 +1326,9 @@ describe('speak：告警出口与三路投递', () => {
     assert.match(rejected.content, new RegExp(`${SPEAK_TEXT_MAX} 字`, 'u'), '要说清门是多少字');
     assert.match(rejected.content, new RegExp(`这段 ${SPEAK_TEXT_MAX + 1} 字`, 'u'), '要如实报出收到了多少字');
     // 三条出路一条都不许少（用户原话：重新组织语言 / 多次调用 / report）
-    assert.match(rejected.content, /重新组织/u, '出路①：重新组织成更短的一句');
+    // 2026-10-16 改判：出路① 的**措辞**从"重新组织成更短的一句"压成"压缩成更短的一句"
+    // （回执每次调用都进上下文；压的是形容词，三条出路一条没少）——判据跟着新字面量走。
+    assert.match(rejected.content, /压缩成更短的一句/u, '出路①：压成更短的一句');
     assert.match(rejected.content, /拆成几次调用/u, '出路②：拆成几次调用');
     assert.match(rejected.content, /report/u, '出路③：内容本来就长 → report');
     // "一个字都没发出去"必须是**事实**，不是一句话：任何一路都不许多出一条
@@ -1331,7 +1401,7 @@ describe('speak：告警出口与三路投递', () => {
     ].join('\n'), 'utf8');
   }
 
-  const MEMBER1_OPENID = 'B01F025D72D3B2075F49EFB08297D105';
+  const MEMBER1_OPENID = '00000000000000000000000000000004';
 
   /** 真 QQ 通道 + 夹具网络出口：记下每一个真正发出去的请求体 */
   function qqRigWith(http: (input: { url: string; jsonBody: unknown }) => HttpJsonResponse): {
@@ -1439,7 +1509,7 @@ describe('speak：告警出口与三路投递', () => {
     // 更**不拒发**。它到了群里是普通文字，那是她的写法问题，轮不到框架替她拦。
     const ws = await workspace('speak-mention-bracket');
     await writeMemberAliases(ws, [
-      '9C39B782C8B6F3124178E33561C4B4D7 = 甲',
+      '00000000000000000000000000000005 = 甲',
       `${MEMBER1_OPENID} = **1 号**（群昵称「伊尔弥亚」，昵称不作数）`,
     ]);
     const recorder = makeRecorder();
@@ -2447,5 +2517,377 @@ describe('pwsh：整段脚本与 lang（v52）', () => {
     assert.equal(screenCommand('Get-ChildItem .'), null);
     assert.notEqual(screenCommand('Remove-Item -Recurse -Force D:\\'), null);
     assert.ok(FORBIDDEN_PATTERNS.length >= 17, '两组语言规则都登记在案');
+  });
+});
+
+// ──────────────────────────────── PATH 优先的 Python 与 pip（2026-10-17 口径翻正） ────────────────────────────────
+
+/**
+ * 用户 2026-10-17 的口径（**覆盖上一版的"托管优先、PATH 兜底"**）：
+ *
+ * > 「**Python 和 pip 不应该是默认要求装的，而是有就用 PATH 里的。没有的话就要求装。**」
+ *
+ * 这一组锁四件事，每件都对应一个**会骗到人**的失败形状：
+ *   ① **PATH 上有一个可用的 ⇒ 就用它**（哪怕框架也装了一份），且回执里说清"是系统那份"；
+ *   ② **PATH 上没有时才用托管那份**（"没有的话就要求装"那条路），回执里说清"是托管那份"；
+ *   ③ **两处都没有时的回执必须诚实**：说清试过哪些名字、**脚本一次都没跑**、并给出"框架能替你装"；
+ *   ④ **`PIP_CONFIG_FILE` 只给 python 档**，而且只在**真的用托管那份**时才带上
+ *      （系统那份旁边没有我们的 pip.ini，硬塞过去就是改掉她自己的 pip 配置）。
+ */
+describe('pwsh：Python 解释器解析（PATH 优先 · 托管兜底，2026-10-17）', () => {
+  let ws = '';
+  before(async () => { ws = await workspace('pwsh-pip'); });
+
+  /** 本机 PATH 上那个能跑起来的 python（找不到时返回 null：用例据此如实跳过，而不是假绿） */
+  async function pathPython(): Promise<string | null> {
+    for (const name of ['python3', 'python']) {
+      const found = await new Promise<boolean>((resolve) => {
+        const child = spawn(name, ['--version'], { stdio: 'ignore', windowsHide: true });
+        child.on('error', () => resolve(false));
+        child.on('close', () => resolve(true));
+      });
+      if (found) return name;
+    }
+    return null;
+  }
+
+  test('PATH 有 python ⇒ 用它（断言回执里的路径 == PATH 上那个），托管那份一次都不被碰', async () => {
+    const onPath = await pathPython();
+    if (onPath === null) return; // 这台机器上没有 python ⇒ 走下面"两处都没有"那条用例的分支
+    let asked = 0;
+    const tool = createPwshTool({
+      destructiveEnabled: true,
+      onWarning: () => undefined,
+      langProbe: async () => {
+        asked += 1;
+        // 宿主给**两槽候选**（PATH 一槽、托管一槽），谁先用由工具定。
+        // 托管槽故意指一个**不存在**的路径：真按 PATH 优先就不该碰到它。
+        return {
+          pathSlot: onPath,
+          managedSlot: 'C:\\data\\tools\\python\\python.exe',
+          pipConfigFile: 'C:\\data\\tools\\python\\pip.ini',
+        };
+      },
+    });
+    try {
+      const result = await tool.handler({ command: 'print("path-first-ok")', lang: 'python' }, makeCtx(ws));
+      assert.equal(asked, 1, '要先问宿主那两槽候选');
+      assert.match(result.content, /path-first-ok/u, 'PATH 优先那条路要真能跑起来');
+      // 回执那一行要如实说清**用的是哪一个**（用户 2026-10-16 要路径、10-17 要"哪一份"）
+      assert.match(result.content, new RegExp(`\\[lang\\] python · ${onPath}\\b`, 'u'),
+        `回执要写明用 PATH 上那个解释器：${result.content.split('\n').slice(-3).join(' | ')}`);
+      assert.match(result.content, /系统 PATH 上那份/u, `回执要说清"哪一份"：${result.content.split('\n').slice(-3).join(' | ')}`);
+      assert.doesNotMatch(result.content, /框架托管那份/u, '用的是 PATH 那份，回执不许说成托管的');
+      assert.doesNotMatch(result.content, /tools\\\\?python/u, '托管那份一次都不该出现在这一次的回执里');
+    } finally {
+      await tool.shutdown();
+    }
+  });
+
+  test('两槽候选都起不来时不静默降级：如实报错（"不能假装跑了"）', async () => {
+    // 两槽都给**不存在**的路径。⚠ 还必须把 PATH 清空：名字链最后会回落到 `python3` / `python`，
+    // 而本机 PATH 上真的有一个（3.11.5）——不清空的话这条用例命中的是它，验的就不是"找不到"了。
+    const empty = await mkdtemp(join(tmpdir(), 'irmia-broken-slots-'));
+    const originalPath = process.env['PATH'];
+    const originalPathext = process.env['PATHEXT'];
+    process.env['PATH'] = empty;
+    process.env['PATHEXT'] = '';
+    resetInterpreterProbeCache();
+    for (const name of ['python3', 'python']) {
+      const found = await new Promise<boolean>((resolve) => {
+        const child = spawn(name, ['--version'], { stdio: 'ignore', windowsHide: true });
+        child.on('error', () => resolve(false));
+        child.on('close', () => resolve(true));
+      });
+      assert.equal(found, false, `前置条件：清空 PATH 之后 ${name} 不该还能起来`);
+    }
+    const tool = createPwshTool({
+      destructiveEnabled: true,
+      onWarning: () => undefined,
+      langProbe: async () => ({
+        pathSlot: 'C:\\never\\there\\python.exe',
+        managedSlot: 'C:\\never\\there\\managed\\python.exe',
+        pipConfigFile: 'C:\\never\\there\\managed\\pip.ini',
+      }),
+    });
+    try {
+      const result = await tool.handler({ command: 'print(1)', lang: 'python' }, makeCtx(ws));
+      assert.equal(result.isError, true, `两个候选都起不来时必须失败：${result.content.slice(0, 200)}`);
+      assert.match(result.content, /找不到可用的 Python 解释器/u);
+    } finally {
+      await tool.shutdown();
+      resetInterpreterProbeCache();
+      if (originalPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = originalPath;
+      if (originalPathext === undefined) delete process.env['PATHEXT'];
+      else process.env['PATHEXT'] = originalPathext;
+    }
+  });
+
+  test('PATH 一个都没有、托管有 ⇒ 用托管的（"没有的话就要求装"那条路）', async () => {
+    // 用"PATH 清空 + 托管槽给真解释器"造现场：托管槽只有在 PATH 全空时才会被考虑。
+    // 本机有 python（3.11.5）时它是**最有说服力**的那条用例：清空 PATH 之前那个必须轮不到。
+    const onPath = await pathPython();
+    if (onPath === null) return; // 没有真解释器可借 ⇒ 这一条在本机不成立，如实跳过
+    const empty = await mkdtemp(join(tmpdir(), 'irmia-pathonly-'));
+    const originalPath = process.env['PATH'];
+    const originalPathext = process.env['PATHEXT'];
+    process.env['PATH'] = empty;
+    process.env['PATHEXT'] = '';
+    resetInterpreterProbeCache();
+    // 前置条件自检：清完 PATH 之后，名字链必须真的起不来（否则这条用例是假锁）
+    for (const name of ['python3', 'python']) {
+      const found = await new Promise<boolean>((resolve) => {
+        const child = spawn(name, ['--version'], { stdio: 'ignore', windowsHide: true });
+        child.on('error', () => resolve(false));
+        child.on('close', () => resolve(true));
+      });
+      assert.equal(found, false, `前置条件：清空 PATH 之后 ${name} 不该还能起来`);
+    }
+    // 托管槽给**真解释器**的完整路径（`where python` 的答案），于是"PATH 空 ⇒ 用托管"能真跑起来。
+    // ⚠ 还原 PATH 之前不许 spawn 那个完整路径——它自己的依赖（DLL）不在 PATH 上会起不来，
+    //   所以这一条**只验解析结论**（回执那一行），不验脚本输出。
+    const real = await new Promise<string | null>((resolve) => {
+      const child = spawn('where', [onPath], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      let out = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => { out += chunk; });
+      child.on('error', () => resolve(null));
+      child.on('close', () => resolve(out.trim().split(/\r?\n/u)[0]?.trim() || null));
+    });
+    if (real === null) return;
+    const tool = createPwshTool({
+      destructiveEnabled: true,
+      onWarning: () => undefined,
+      langProbe: async () => ({
+        pathSlot: onPath,           // 名字链在 PATH 上空了 ⇒ 这一槽不会被解析成功
+        managedSlot: real,          // 兜底那一份：完整路径，起得来
+        pipConfigFile: join(ws, 'pip.ini'),
+      }),
+    });
+    try {
+      const result = await tool.handler({ command: 'print("managed-fallback")', lang: 'python' }, makeCtx(ws));
+      assert.equal(result.isError, undefined, `托管兜底要真能跑：${result.content.slice(0, 300)}`);
+      assert.match(result.content, /managed-fallback/u);
+      assert.match(result.content, /框架托管那份/u, `回执要说清用的是托管那份：${result.content.split('\n').slice(-3).join(' | ')}`);
+    } finally {
+      await tool.shutdown();
+      resetInterpreterProbeCache();
+      if (originalPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = originalPath;
+      if (originalPathext === undefined) delete process.env['PATHEXT'];
+      else process.env['PATHEXT'] = originalPathext;
+    }
+  });
+
+  test('两处都没有时的诚实回执：说清试过什么、脚本没跑、并给出两条出路', async () => {
+    // **造一个"这台机器上什么解释器都没有"的现场**：把 PATH 清空到一个空目录。
+    // 不这么做的话本机有 python（3.11.5）⇒ 这条用例永远是"跳过"，那就成了假锁
+    // （绿得没有信息）；而探测结果在模块级缓存里，所以先清缓存再改 PATH，最后两个都还原。
+    const empty = await mkdtemp(join(tmpdir(), 'irmia-nopython-'));
+    const originalPath = process.env['PATH'];
+    const originalPathext = process.env['PATHEXT'];
+    process.env['PATH'] = empty;
+    process.env['PATHEXT'] = '';
+    resetInterpreterProbeCache();
+    // 前置条件自检：**清完 PATH 之后那两个名字必须真的起不来**。没有这一条的话，
+    // 一旦将来有人改了"解释器从哪儿找"，这条用例会静默变成一条永远跳过的假锁
+    // （绿得没有信息——本仓点过名的那种）。所以这里自己 spawn 一次把它钉住。
+    for (const name of ['python3', 'python']) {
+      const found = await new Promise<boolean>((resolve) => {
+        const child = spawn(name, ['--version'], { stdio: 'ignore', windowsHide: true });
+        child.on('error', () => resolve(false));
+        child.on('close', () => resolve(true));
+      });
+      assert.equal(found, false, `前置条件：清空 PATH 之后 ${name} 不该还能起来`);
+    }
+    const tool = createPwshTool({
+      destructiveEnabled: true,
+      onWarning: () => undefined,
+      // 两槽都是空：这正是"这台机器一个 python 都没有、框架也没替它装过"的形状
+      langProbe: async () => ({ pathSlot: null, managedSlot: null, pipConfigFile: null }),
+    });
+    try {
+      const ctx = makeCtx(ws);
+      const result = await tool.handler({ command: 'print("永远不该被执行")', lang: 'python' }, ctx);
+      assert.equal(result.isError, true, `清空 PATH 之后必须找不到解释器：${result.content.slice(0, 200)}`);
+      const text = result.content;
+      assert.match(text, /找不到可用的 Python 解释器/u);
+      assert.match(text, /试过：python3 \/ python/u, '要把试过的名字摆出来（不然她只能瞎试）');
+      assert.match(text, /这一段脚本没有执行/u, '**要说清脚本一次都没跑**（不是"跑了但没结果"）');
+      assert.match(text, /「外部依赖」/u, '要指出框架能替你装（这不是环境定局）');
+      assert.match(text, /pip install/u, '要说出装好之后能干什么（她要 pip 的理由）');
+      assert.match(text, /一键装上/u, '要说清那是"一键"（不必她自己折腾）');
+      // 说清没跑 ⇒ 工作目录里不该留下任何临时脚本（.irmia-tmp 目录本身可以为空/不存在）
+      const tmpDir = join(ws, '.irmia-tmp');
+      if (existsSync(tmpDir)) {
+        assert.deepEqual(readdirSync(tmpDir).filter((n) => n.endsWith('.py')), [], '没跑就不该留下 .py 临时文件');
+      }
+    } finally {
+      await tool.shutdown();
+      resetInterpreterProbeCache();
+      if (originalPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = originalPath;
+      if (originalPathext === undefined) delete process.env['PATHEXT'];
+      else process.env['PATHEXT'] = originalPathext;
+    }
+  });
+});
+
+describe('pwsh：`PIP_CONFIG_FILE` 只给 python 档（用户 2026-10-16 加分项）', () => {
+  test('scriptEnv：python 档带 PIP_CONFIG_FILE，pwsh / node 两档一个字节都不加', () => {
+    const ini = 'D:\\data\\tools\\python\\pip.ini';
+    const py = scriptEnv('python', ini);
+    assert.equal(py['PIP_CONFIG_FILE'], ini, 'python 档要指到托管那份 pip.ini');
+    // UTF-8 那两句三档都有（v52 的既定行为，不许被这次改动碰掉）
+    for (const lang of ['pwsh', 'python', 'node'] as const) {
+      assert.equal(scriptEnv(lang, ini)['PYTHONIOENCODING'], 'utf-8');
+      assert.equal(scriptEnv(lang, ini)['PYTHONUTF8'], '1');
+    }
+    // **另两档不许有这个变量**：设上就是污染别人的环境（子进程里读得到）
+    assert.equal(scriptEnv('pwsh', ini)['PIP_CONFIG_FILE'], undefined, 'pwsh 档不许被污染');
+    assert.equal(scriptEnv('node', ini)['PIP_CONFIG_FILE'], undefined, 'node 档不许被污染');
+    // 没有配置时（没装托管 Python / 文件不在盘上）：python 档也不设，而不是设成一个空串
+    assert.equal(scriptEnv('python', null)['PIP_CONFIG_FILE'], undefined);
+  });
+
+  test('真跑一遍：python 档看得到托管 pip.ini，pwsh / node 两档看不到（端到端）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'irmia-pipenv-'));
+    const ini = join(dir, 'pip.ini');
+    await writeFile(ini, '[global]\ntimeout = 30\n', 'utf8');
+    const tool = createPwshTool({
+      destructiveEnabled: true,
+      onWarning: () => undefined,
+      pythonPipConfigFile: ini,
+    });
+    try {
+      const probe = await tool.handler({ command: 'print(1)', lang: 'python' }, makeCtx(dir));
+      if (probe.error?.code === 'E_NO_RUNTIME') return; // 本机没有 python ⇒ 如实跳过
+      // ① python 档：环境里能看到 PIP_CONFIG_FILE，且指向那个文件
+      const py = await tool.handler({
+        command: 'import os\nprint("PIPCFG=" + str(os.environ.get("PIP_CONFIG_FILE")))',
+        lang: 'python',
+      }, makeCtx(dir));
+      assert.match(py.content, /PIPCFG=.*pip\.ini/u, `python 档要带上 PIP_CONFIG_FILE：${py.content}`);
+      // ② pwsh 档：**看不到**（同一台机器、同一个工具实例，唯一差别是 lang）
+      const ps = await tool.handler({ command: 'Write-Output "PIPCFG=$env:PIP_CONFIG_FILE"', lang: 'pwsh', persistent: false }, makeCtx(dir));
+      assert.match(ps.content, /PIPCFG=\s*$/mu, `pwsh 档不许被 PIP_CONFIG_FILE 污染：${ps.content}`);
+      // ③ node 档：同样看不到
+      const js = await tool.handler({
+        command: 'console.log("PIPCFG=" + String(process.env.PIP_CONFIG_FILE))',
+        lang: 'node',
+      }, makeCtx(dir));
+      assert.match(js.content, /PIPCFG=undefined/u, `node 档不许被 PIP_CONFIG_FILE 污染：${js.content}`);
+    } finally {
+      await tool.shutdown();
+    }
+  });
+
+  test('文件不在盘上时不设这个变量（不指向一个不存在的配置）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'irmia-pipenv-missing-'));
+    const tool = createPwshTool({
+      destructiveEnabled: true,
+      onWarning: () => undefined,
+      pythonPipConfigFile: join(dir, '从来没有过的-pip.ini'),
+    });
+    try {
+      const probe = await tool.handler({ command: 'print(1)', lang: 'python' }, makeCtx(dir));
+      if (probe.error?.code === 'E_NO_RUNTIME') return;
+      const py = await tool.handler({
+        command: 'import os\nprint("PIPCFG=" + str(os.environ.get("PIP_CONFIG_FILE")))',
+        lang: 'python',
+      }, makeCtx(dir));
+      assert.match(py.content, /PIPCFG=None/u, `文件不存在时不许设：${py.content}`);
+    } finally {
+      await tool.shutdown();
+    }
+  });
+});
+
+// ──────────────────────────────── 宿主接线：两槽候选真的送到工具那一侧 ────────────────────────────────
+
+/**
+ * 上面那一组用的是**注入的 `langProbe`**（验工具怎么用这两槽）。这一组补的是**中间那一跳**：
+ * `tools/catalog.ts` 的 `buildShellTools` 是不是真的按"PATH 一槽 + 托管一槽"给出去。
+ *
+ * 为什么这一跳值得单独锁：它是上一版把口径接反的地方（宿主直接给"赢家"、工具照办）。
+ * 只锁两头的话，接线退回旧样子时两头都还是绿的——**绿得没有信息**。
+ */
+describe('宿主接线：`buildShellTools` 给的两槽候选（PATH 优先 · 托管兜底）', () => {
+  test('PATH 上有一个可用的 python ⇒ 托管槽也给了，但工具用 PATH 那个、并如实说"系统那份"', async () => {
+    const onPath = await new Promise<string | null>((resolve) => {
+      const child = spawn('where', ['python'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      let out = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => { out += chunk; });
+      child.on('error', () => resolve(null));
+      child.on('close', () => resolve(out.trim().split(/\r?\n/u)[0]?.trim() || null));
+    });
+    if (onPath === null) return; // 这台机器上没有 python ⇒ 与上面"两处都没有"那条同一处置：如实跳过
+
+    const dir = await mkdtemp(join(tmpdir(), 'irmia-wiring-slots-'));
+    const managedDir = join(dir, 'tools', 'python');
+    await mkdir(managedDir, { recursive: true });
+    // 托管槽靠**盘上真有那个文件**命中（判据与探测第二段逐字相同），所以这里落一个空文件；
+    // 它不在 PATH 上、也不在名字链里 ⇒ 只有"托管那一槽"会给出来
+    const managedExe = join(managedDir, 'python.exe');
+    await writeFile(managedExe, 'not-a-real-python', 'utf8');
+    const ini = join(managedDir, 'pip.ini');
+    await writeFile(ini, '[global]\ntimeout = 30\n', 'utf8');
+
+    const deps = new DepsManager({
+      dataDir: dir,
+      // python 那一件按**真实形状**注入：PATH 上有一个可用的（这一台机器上真有的那个）
+      probe: async (name) => {
+        if (name === 'python') {
+          return {
+            name, status: 'ready', path: onPath, version: '3.11.5', anyVersion: '3.11.5',
+            source: 'path', dir: null, reason: '', attempts: [],
+            pipVersion: '26.2.1', pipReason: '',
+          };
+        }
+        if (name === 'pwsh') {
+          // 用**正在跑测试的这个 node** 顶替 pwsh：本工具只认"跑得起来 + 版本主号 ≥ 7"，
+          // 而 `node --version` 给的是 `v22.x`（主号 ≥ 7）⇒ pwsh 档可用，python 档才测得到
+          return {
+            name, status: 'ready', path: process.execPath, version: '22.0.0', anyVersion: '22.0.0',
+            source: 'path', dir: null, reason: '', attempts: [],
+          };
+        }
+        return {
+          name, status: 'missing', path: '', version: '', anyVersion: '',
+          source: null, dir: null, reason: `${name} 未安装`, attempts: [],
+        };
+      },
+    });
+
+    const { registry } = await buildCatalogRegistry({
+      dataDir: dir,
+      timers: new TimerStore({ dir, fire: () => undefined }),
+      emit: () => undefined,
+      destructiveEnabled: true,
+      deps,
+    });
+    const tool = registry.get('pwsh');
+    assert.ok(tool !== null, 'pwsh 工具要在注册表里');
+    try {
+      const result = await tool.handler(
+        { command: 'print("wiring-ok")', lang: 'python' },
+        makeCtx(dir),
+      );
+      assert.match(result.content, /wiring-ok/u, `接线之后 PATH 那份要真能跑：${result.content.slice(0, 300)}`);
+      assert.match(result.content, /系统 PATH 上那份/u,
+        `宿主给了两槽、工具要用 PATH 那一槽：${result.content.split('\n').slice(-3).join(' | ')}`);
+      // 托管那份的 pip.ini **不该**被塞进系统那份 python 的环境里（那是污染她自己的 pip 配置）
+      const env = await tool.handler({
+        command: 'import os\nprint("PIPCFG=" + str(os.environ.get("PIP_CONFIG_FILE")))',
+        lang: 'python',
+      }, makeCtx(dir));
+      assert.match(env.content, /PIPCFG=None/u,
+        `用系统那份时不许带上托管那份 pip.ini：${env.content.slice(0, 300)}`);
+    } finally {
+      await tool.shutdown();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

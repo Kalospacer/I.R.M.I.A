@@ -1,26 +1,42 @@
 /**
  * Irmia Agent — 文件系工具包：编码检测与文本处理
  *
- * safe_read 承诺「编码检测」，这里给出确定性规则（不做统计猜测，只做可验证判定）：
- *   1. BOM 命中即定案（UTF-8 / UTF-16LE / UTF-16BE）；
- *   2. 无 BOM 时用严格 UTF-8 解码探针——能过就是 UTF-8；
- *   3. 再试 GBK（中文 Windows 文本文件的高频来源），仍走严格模式；
- *   4. 最后退到 latin1，它永不失败，保证任何字节串都能得到确定性文本。
+ * **判定链本身已收口到 `src/util/bytes-text.ts`（全仓唯一解码器）**：这个文件只负责
+ * 文件系工具需要的那层包装（`confidence` 口径、`looksBinary`、行处理与 glob）。
+ * 判定顺序（BOM → 严格 UTF-8 → 严格 GB18030 → latin1 兜底）写在那边，不在这里重复实现
+ * ——两处各写一套的结果就是"读写两侧对同一个文件给出不同编码"。
  *
  * 二进制判定独立于编码：含 NUL 字节且没有 UTF-16/32 BOM 的，一律不当作文本。
  */
 
 import { createHash } from 'node:crypto';
 
-export type DetectedEncoding = 'utf8' | 'utf8-bom' | 'utf16le' | 'utf16be' | 'gbk' | 'latin1';
+import {
+  decodeText as decodeBytes,
+  describeDecoding,
+  type TextEncoding,
+} from '../../util/bytes-text.ts';
+
+/**
+ * 检测结果里的编码名。
+ *
+ * `gb18030` 是**检测输出**（WHATWG 里 `gbk` 就是 `gb18030` 解码器的别名，报更全的那个名字）；
+ * `gbk` 保留为**输入别名**——`safe_read` 的 `encoding` 参数枚举里就是它（改那个枚举会动
+ * 工具描述，属于另一件事），写入时两者等价。
+ */
+export type DetectedEncoding = TextEncoding | 'gbk';
 
 export interface DecodedText {
   text: string;
-  encoding: DetectedEncoding;
+  encoding: TextEncoding;
   /** BOM 命中的是确定事实；后两条是探针推断 */
   confidence: 'certain' | 'probe' | 'fallback';
   /** 探针失败链，用于给模型解释为什么可能显示成乱码 */
   notes: string[];
+  /** 无法映射的字符数（0 = 字节到字符一一对应）；见 `util/bytes-text.ts` 的 DecodedText */
+  replaced: number;
+  /** `replaced > 0`：这份文本不是原字节的忠实还原，回执里必须说出来 */
+  lossy: boolean;
 }
 
 export interface EncodeResult {
@@ -47,42 +63,30 @@ function tryStrictDecode(buf: Buffer, label: string): string | null {
   }
 }
 
+/**
+ * 字节 → 文本（**委托** `src/util/bytes-text.ts`：全仓唯一解码链）。
+ *
+ * 这里只补两件文件系工具专有的事：
+ *   · `confidence` —— BOM 是 `certain`、探针成功是 `probe`、latin1 兜底是 `fallback`；
+ *   · `notes` 换成文件视角的人话（`describeDecoding`）。
+ * `replaced` / `lossy` 原样透出：**回执必须能说出"按 X 解、N 处无法映射"**。
+ */
 export function decodeText(buf: Buffer): DecodedText {
-  if (hasPrefix(buf, UTF8_BOM)) {
-    return { text: buf.subarray(3).toString('utf8'), encoding: 'utf8-bom', confidence: 'certain', notes: [] };
-  }
-  if (hasPrefix(buf, UTF16LE_BOM)) {
-    return {
-      text: buf.subarray(2).toString('utf16le'),
-      encoding: 'utf16le',
-      confidence: 'certain',
-      notes: [],
-    };
-  }
-  if (hasPrefix(buf, UTF16BE_BOM)) {
-    // Node 没有 bswap，手工交换字节对后按 utf16le 解；奇数长度丢弃末字节
-    const body = buf.subarray(2, buf.length - ((buf.length - 2) % 2));
-    const swapped = Buffer.from(body);
-    swapped.swap16();
-    return { text: swapped.toString('utf16le'), encoding: 'utf16be', confidence: 'certain', notes: [] };
-  }
-
-  const utf8 = tryStrictDecode(buf, 'utf-8');
-  if (utf8 !== null) {
-    return { text: utf8, encoding: 'utf8', confidence: 'probe', notes: [] };
-  }
-
-  const notes: string[] = ['严格 UTF-8 解码失败'];
-  const gbk = tryStrictDecode(buf, 'gbk');
-  if (gbk !== null) {
-    return { text: gbk, encoding: 'gbk', confidence: 'probe', notes: [...notes, '按 GBK 解码成功'] };
-  }
-  notes.push('GBK 解码也失败');
+  const decoded = decodeBytes(buf);
+  const confidence: DecodedText['confidence'] =
+    decoded.encoding === 'utf8-bom' || decoded.encoding === 'utf16le' || decoded.encoding === 'utf16be'
+      ? 'certain'
+      : decoded.encoding === 'latin1'
+        ? 'fallback'
+        : 'probe';
+  const note = describeDecoding(decoded);
   return {
-    text: buf.toString('latin1'),
-    encoding: 'latin1',
-    confidence: 'fallback',
-    notes: [...notes, '已退到 latin1 单字节映射，非 ASCII 字符可能显示为乱码'],
+    text: decoded.text,
+    encoding: decoded.encoding,
+    confidence,
+    notes: note === null ? decoded.notes : [...decoded.notes, note],
+    replaced: decoded.replaced,
+    lossy: decoded.lossy,
   };
 }
 
@@ -112,13 +116,14 @@ export function encodeText(text: string, encoding: DetectedEncoding): EncodeResu
       body.swap16();
       return { buffer: Buffer.concat([UTF16BE_BOM, body]), encoding, notes: [] };
     }
-    case 'gbk': {
+    case 'gbk':
+    case 'gb18030': {
       // Node 的 Buffer/TextEncoder 都不支持 GBK 编码方向（只有解码方向由 ICU 提供）。
       // 与其写出一串坏字节，不如改存 UTF-8 并如实告知——这个文件之后按 UTF-8 读是一致的。
       return {
         buffer: Buffer.from(text, 'utf8'),
         encoding: 'utf8',
-        notes: ['原文件是 GBK；零依赖运行时没有 GBK 编码器，新内容改存为 UTF-8（内容无损）'],
+        notes: ['原文件是 GB18030/GBK；零依赖运行时没有 GB 系编码器，新内容改存为 UTF-8（内容无损）'],
       };
     }
     case 'latin1': {

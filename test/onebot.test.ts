@@ -1119,7 +1119,7 @@ describe('onebot：端点重读（协议端配置晚于本进程物化）', () =
   /** 照现场那份 `data/services/snowluma/config/onebot_<uin>.json` 的形状写一份按账号快照 */
   function writeOnebotSnapshot(dir: string, server: { port: number; accessToken: string }): void {
     mkdirSync(join(dir, 'config'), { recursive: true });
-    writeFileSync(join(dir, 'config', 'onebot_2175258788.json'), JSON.stringify({
+    writeFileSync(join(dir, 'config', 'onebot_1234567891.json'), JSON.stringify({
       mode: 'snapshot',
       networks: {
         wsServers: [{
@@ -1198,8 +1198,10 @@ describe('onebot：端点重读（协议端配置晚于本进程物化）', () =
   });
 
   test('配置后出现 ⇒ 下一拍重连就带上 token 并连上（形式与 SnowLuma 认的一致）', async (t) => {
-    // token 的形状取自现场那份配置（48 位 base64url）
-    const token = 'nIdI43XlvUSQGe_ybLBSYLQbYQIXu_LQ5l5eM1zoa6A';
+    // `test-ws-token-0000` 是**夹具，不是真凭据**——曾经这里抄的是现场那份配置里的真 token，
+    // 而 test/ 会随公开副本发出去。形状（长度/字符集）对这条用例没有意义：
+    // 它验的是"重连时要读配置、把 token 带上、且状态里必须打码"这三件事。
+    const token = 'test-ws-token-0000';
     const cat = await startFakeNapCat(t, { accessToken: token });
     const dir = tempDir(); // 空目录：协议端还没登录 QQ，配置还没物化
     let reads = 0;

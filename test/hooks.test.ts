@@ -703,7 +703,7 @@ test('防篡改：agent 写 data/hooks.json 被写入口拒绝，且文件不被
   const tools = await buildFsTools({
     dataDir,
     protectedPaths: protectedHookPaths(dataDir),
-    // 条件注册的 es_search 要探测 es.exe：显式关掉，这条用例只关心写入口的白名单
+    // 条件注册的 find 要探测 es.exe：显式关掉，这条用例只关心写入口的白名单
     everythingPath: null,
   });
   const safeWrite = tools.find((tool) => tool.name === 'safe_write');

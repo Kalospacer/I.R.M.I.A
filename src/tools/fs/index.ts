@@ -2,7 +2,7 @@
  * Irmia Agent — 文件系工具包入口
  *
  * 对外只有一个注册函数：`fsTools(registry)`。**七件常驻 + 两件条件注册**：
- * `rg_search` 与 `es_search` 各自探测到引擎才被造出来（v30：rg 也改成条件注册了，
+ * `grep` 与 `find` 各自探测到引擎才被造出来（v30：rg 也改成条件注册了，
  * 它原先的"TS 逐行扫描降级"已经删掉，理由见 search-tools.ts 的文件头）。
  * v42 删掉了 `list_dir`（常驻八件 → 七件），列目录并进 `safe_read`（传目录即列目录）。
  *
@@ -24,14 +24,16 @@ import {
   createSafeRollbackTool,
   createSafeWriteTool,
 } from './edit-tools.ts';
+// `createReadBlobTool` **仍然 import**：它的实现是"保留但不注册"（与 `ask_human` 同口径），
+// 而下面的 re-export 是别人 import 它的入口（`web/server.ts` 的工具清单曾点名它）。
 import { createReadBlobTool, createSafeReadTool } from './read-tools.ts';
-import { createEsSearchTool, createRgSearchTool, searchGateOf, type SearchEngineGate } from './search-tools.ts';
+import { createFindTool, createGrepTool, searchGateOf, type SearchEngineGate } from './search-tools.ts';
 import { estimateTokens, MAX_DESCRIPTION_TOKENS } from '../registry.ts';
 import type { DepsManager, DepName } from '../../deps/manager.ts';
 import type { FsToolDeps, FsToolOptions, ToolDefinition, ToolRegistryLike } from './types.ts';
 
 export * from './types.ts';
-export { createEnv, resolveGuarded, runProcessDefault, DEFAULT_READ_ONLY_PREFIXES, type FsEnv } from './env.ts';
+export { createEnv, pathAliasesFor, resolveGuarded, runProcessDefault, DEFAULT_READ_ONLY_PREFIXES, type FsEnv } from './env.ts';
 export {
   BLOB_DIR_NAME,
   BLOB_ID_PATTERN,
@@ -46,7 +48,7 @@ export {
   type DirListing,
   type DirListingOptions,
 } from './read-tools.ts';
-export { ENGINE_LINE_PREFIX, createEsSearchTool, createRgSearchTool, searchGateOf, type SearchEngineGate } from './search-tools.ts';
+export { ENGINE_LINE_PREFIX, createFindTool, createGrepTool, searchGateOf, type SearchEngineGate } from './search-tools.ts';
 export {
   atomicWrite,
   fuzzyMatch,
@@ -129,8 +131,8 @@ type FsBuildInput = FsToolOptions & BuildFsToolsOptions;
  * 装配文件系工具。
  *
  * 两件搜索工具的注册都取决于**框架的依赖探测结论**（`src/deps/`，一次探测、结论缓存）：
- *   · rg_search：没装 ripgrep 就不注册（v30 删掉了它的 TS 降级链）；
- *   · es_search：没装 es.exe 就不注册（v27 起就这么做）。
+ *   · grep：没装 ripgrep 就不注册（v30 删掉了它的 TS 降级链）；
+ *   · find：没装 es.exe 就不注册（v27 起就这么做）。
  * 两者的 handler 拿的是同一份结论里认定的可执行文件，所以"注册了但一调就失败"
  * 这种自相矛盾不会发生。
  *
@@ -167,19 +169,23 @@ export async function buildFsTools(
 
   const tools: ToolDefinition[] = [createSafeReadTool(env)];
   if (rgGate.available) {
-    tools.push(createRgSearchTool(env, rgGate));
-    note(`[工具] rg_search 已注册（引擎 ${rgGate.command}，${rgGate.label}）`);
+    tools.push(createGrepTool(env, rgGate));
+    note(`[工具] grep 已注册（引擎 ${rgGate.command}，${rgGate.label}）`);
   } else {
-    note(`[工具] rg_search 未注册：${rgProbe.reason}`);
+    note(`[工具] grep 未注册：${rgProbe.reason}`);
   }
   if (esGate.available) {
-    tools.push(createEsSearchTool(env, esGate));
-    note(`[工具] es_search 已注册（引擎 ${esGate.command}，${esGate.label}）`);
+    tools.push(createFindTool(env, esGate));
+    note(`[工具] find 已注册（引擎 ${esGate.command}，${esGate.label}）`);
   } else {
-    note(`[工具] es_search 未注册：${esProbe.reason}`);
+    note(`[工具] find 未注册：${esProbe.reason}`);
   }
+  // ⚠ `read_blob` **不注册**（v64，用户 2026-10-13「砍掉 read_blob」）：外置区
+  // `<dataDir>/blobs/<sha256>` 就在**仓库根之内**、又不在只读区 ⇒ `safe_read` 直接读得回来
+  // ⇒ 它是冗余件（全量日志里只被调过 2 次，且都在她自己的工具自测里）。
+  // **实现保留、不注册**——与 `ask_human` 同一口径（`createReadBlobTool` 仍导出于 read-tools.ts，
+  // 哪天要它回来只需在这里加回一行）；指针文案已改成指向 `safe_read`。
   tools.push(
-    createReadBlobTool(env),
     createSafeEditTool(env),
     createSafeWriteTool(env),
     createSafeRollbackTool(env),

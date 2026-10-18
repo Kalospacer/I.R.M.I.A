@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
@@ -33,6 +33,7 @@ import {
   resolveInsideRoot,
   isInside,
   BLOB_ID_PATTERN,
+  createReadBlobTool,
   fsTools,
   type DetectedEncoding,
   type ToolContext,
@@ -49,7 +50,7 @@ interface Harness {
   backupDir: string;
   ctx: ToolContext;
   tool(name: string): ToolDefinition;
-  /** 工具是否注册（rg_search / es_search 都是条件注册的，断言"没注册"要用它） */
+  /** 工具是否注册（grep / find 都是条件注册的，断言"没注册"要用它） */
   has(name: string): boolean;
   /** 本次装配用到的探测次数（锁"一次探测"这条不变量） */
   probes(): number;
@@ -247,11 +248,19 @@ describe('text-codec', () => {
     const gbk = Buffer.from([0xd6, 0xd0, 0xce, 0xc4]);
     const decoded = decodeText(gbk);
     assert.equal(decoded.text, '中文');
-    assert.equal(decoded.encoding, 'gbk');
+    // 2026-10-18：报 `gb18030` 而不是 `gbk`。判据是 WHATWG Encoding —— `gbk` 就是
+    // `gb18030` 解码器的**别名**（实测 `TextDecoder('gbk')` 与 `TextDecoder('gb18030')`
+    // 对同一份字节输出逐字相同），而判定链已收口到 `util/bytes-text.ts`，那里报更全的名字。
+    // 入参方向仍然两个都收（`safe_read` 的 encoding 枚举里是 `gbk`，改枚举会动工具描述）。
+    assert.equal(decoded.encoding, 'gb18030');
+    assert.equal(decoded.replaced, 0, '严格解码成功时替换数必须为 0');
+    assert.equal(decoded.lossy, false);
 
     const encoded = encodeText('中文', 'gbk');
     assert.equal(encoded.encoding, 'utf8');
     assert.equal(encoded.notes.length, 1);
+    // 写侧的判据：改存出来的字节必须是 UTF-8 无 BOM
+    assert.equal(encoded.buffer.toString('hex'), Buffer.from('中文', 'utf8').toString('hex'));
   });
 
   it('globToRegExp 支持 ** 与 {a,b}', () => {
@@ -302,8 +311,8 @@ describe('text-codec', () => {
 
 // ──────────────────────────────── 白名单 ────────────────────────────────
 
-describe('路径白名单（M4-1 / M4-2）', () => {
-  it('工作区内文件可读，越界路径被拒绝', async () => {
+describe('路径白名单（M4-1 / M4-2）—— v64 起**只挡写**', () => {
+  it('工作区内文件可读；越界**写**被拒（读类照走）', async () => {
     await withHarness(async (h) => {
       await writeFile(join(h.root, 'inside.txt'), 'hello', 'utf8');
       await writeFile(join(h.outside, 'secret.txt'), 'TOPSECRET', 'utf8');
@@ -312,21 +321,29 @@ describe('路径白名单（M4-1 / M4-2）', () => {
       assert.equal(good.isError, undefined);
       assert.match(good.content, /hello/u);
 
-      for (const bad of ['../secret.txt', '../../secret.txt', join(h.outside, 'secret.txt')]) {
-        const res = await h.tool('safe_read').handler({ path: bad }, h.ctx);
+      // 读：越界照走（全盘就是全盘——用户 2026-10-13 的裁决）
+      for (const okPath of [relative(h.root, join(h.outside, 'secret.txt')), join(h.outside, 'secret.txt')]) {
+        const res = await h.tool('safe_read').handler({ path: okPath }, h.ctx);
+        assert.equal(res.isError, undefined, `读类不该被白名单挡住：${okPath}（${res.content}）`);
+        assert.match(res.content, /TOPSECRET/u);
+      }
+
+      // 写：同样那几条路径全被拒（这才是白名单今天管的事）
+      for (const bad of ['../secret.txt', '../../secret.txt', join(h.outside, 'written.txt')]) {
+        const res = await h.tool('safe_write').handler({ path: bad, content: 'x' }, h.ctx);
         assert.equal(res.isError, true, `应拒绝：${bad}`);
         assert.equal(res.error?.code, FS_ERROR_CODES.PATH_DENIED);
       }
     });
   });
 
-  it('同前缀目录不算工作区内', async () => {
+  it('同前缀目录不算边界内（写类）：`<root>-evil` 写不进去', async () => {
     await withHarness(async (h) => {
       const sibling = `${h.root}-evil`;
       await mkdir(sibling, { recursive: true });
       await writeFile(join(sibling, 'x.txt'), 'nope', 'utf8');
       try {
-        const res = await h.tool('safe_read').handler({ path: join(sibling, 'x.txt') }, h.ctx);
+        const res = await h.tool('safe_write').handler({ path: join(sibling, 'x.txt'), content: 'x' }, h.ctx);
         assert.equal(res.isError, true);
         assert.equal(res.error?.code, FS_ERROR_CODES.PATH_DENIED);
       } finally {
@@ -335,17 +352,18 @@ describe('路径白名单（M4-1 / M4-2）', () => {
     });
   });
 
-  it('指向工作区外的符号链接目录：读与写都被拒绝', async () => {
+  it('指向边界外的符号链接目录：**写**被拒绝（读类照走）', async () => {
     await withHarness(async (h) => {
       await writeFile(join(h.outside, 'secret.txt'), 'TOPSECRET', 'utf8');
       await symlink(h.outside, join(h.root, 'link'), 'junction');
       await mkdir(join(h.outside, 'sub'), { recursive: true });
 
+      // 读：走链接读得到（v64：读不受边界约束）
       const read = await h.tool('safe_read').handler({ path: 'link/secret.txt' }, h.ctx);
-      assert.equal(read.isError, true);
-      assert.equal(read.error?.code, FS_ERROR_CODES.PATH_DENIED);
+      assert.equal(read.isError, undefined, `读类不该被挡：${read.content}`);
+      assert.match(read.content, /TOPSECRET/u);
 
-      // 目标还不存在，但路径经过符号链接——必须靠 realpath 祖先解析挡住（M4-2 的关键点）
+      // 目标还不存在，但路径经过符号链接——必须靠 realpath 祖先解析挡住（M4-2 的关键点，写类）
       const write = await h.tool('safe_write').handler({ path: 'link/pwn.txt', content: 'x' }, h.ctx);
       assert.equal(write.isError, true);
       assert.equal(write.error?.code, FS_ERROR_CODES.PATH_DENIED);
@@ -353,7 +371,7 @@ describe('路径白名单（M4-1 / M4-2）', () => {
     });
   });
 
-  it('指向工作区外的符号链接文件同样被拒绝', async () => {
+  it('指向边界外的符号链接文件：写被拒、读照走（v64：只挡写）', async () => {
     await withHarness(async (h) => {
       await writeFile(join(h.outside, 'secret.txt'), 'TOPSECRET', 'utf8');
       try {
@@ -363,9 +381,14 @@ describe('路径白名单（M4-1 / M4-2）', () => {
         if (process.platform === 'win32' && (err as NodeJS.ErrnoException).code === 'EPERM') return;
         throw err;
       }
-      const res = await h.tool('safe_read').handler({ path: 'file-link.txt' }, h.ctx);
-      assert.equal(res.isError, true);
-      assert.equal(res.error?.code, FS_ERROR_CODES.PATH_DENIED);
+      // 读：走链接读得到（读类不受边界约束）
+      const read = await h.tool('safe_read').handler({ path: 'file-link.txt' }, h.ctx);
+      assert.equal(read.isError, undefined, `读类不该被挡：${read.content}`);
+      assert.match(read.content, /TOPSECRET/u);
+      // 写：同样那条链接路径被拒（realpath 展开后才比边界）
+      const write = await h.tool('safe_write').handler({ path: 'file-link.txt', content: 'x' }, h.ctx);
+      assert.equal(write.isError, true);
+      assert.equal(write.error?.code, FS_ERROR_CODES.PATH_DENIED);
     });
   });
 
@@ -391,9 +414,10 @@ describe('路径白名单（M4-1 / M4-2）', () => {
 
   it('resolveInsideRoot 对空路径与 NUL 字节给出明确理由', async () => {
     await withHarness(async (h) => {
-      const empty = await resolveInsideRoot(h.root, '   ');
+      // v64：`access` 必填 ⇒ 这里显式声明读类（与调用点同一条判据，不许省）
+      const empty = await resolveInsideRoot(h.root, '   ', { access: 'read' });
       assert.equal(empty.ok, false);
-      const nul = await resolveInsideRoot(h.root, 'a\0b');
+      const nul = await resolveInsideRoot(h.root, 'a\0b', { access: 'read' });
       assert.equal(nul.ok, false);
       if (!nul.ok) assert.equal(nul.code, FS_ERROR_CODES.PATH_DENIED);
     });
@@ -540,13 +564,13 @@ describe('safe_read', () => {
     });
   });
 
-  it('二进制文件被拒绝并指向 read_blob', async () => {
+  it('二进制文件被拒绝，出路指向 pwsh（v64：read_blob 的 base64 那条路已消失）', async () => {
     await withHarness(async (h) => {
       await writeFile(join(h.root, 'bin.dat'), Buffer.from([0x00, 0x01, 0x02, 0x00, 0xff]));
       const res = await h.tool('safe_read').handler({ path: 'bin.dat' }, h.ctx);
       assert.equal(res.isError, true);
       assert.equal(res.error?.code, FS_ERROR_CODES.BINARY_FILE);
-      assert.match(res.content, /read_blob/u);
+      assert.match(res.content, /pwsh/u, '出路必须是真还在的那条（base64 用 pwsh 转）');
     });
   });
 
@@ -660,8 +684,8 @@ describe('safe_read 的目录形态（v42：list_dir 并入这里）', () => {
       assert.equal(res.isError, undefined, res.content);
       assert.match(res.content, /已截断：上限 3 条/u);
       // 指路要可执行：缩小 path / 调小 depth / 两件搜索工具 / pwsh 的 Get-ChildItem
-      assert.match(res.content, /rg_search/u);
-      assert.match(res.content, /es_search/u);
+      assert.match(res.content, /grep/u);
+      assert.match(res.content, /find/u);
       assert.match(res.content, /Get-ChildItem/u);
       const rows = res.content.split('\n').filter((line) => /^\[(D|F|L|\?)\] /u.test(line));
       assert.equal(rows.length, 3, 'limit 就是这一次列目录的条数上限');
@@ -689,14 +713,14 @@ describe('safe_read 的目录形态（v42：list_dir 并入这里）', () => {
   });
 });
 
-// ──────────────────────────────── rg_search / es_search ────────────────────────────────
+// ──────────────────────────────── grep / find ────────────────────────────────
 
-describe('rg_search（条件注册）', () => {
+describe('grep（条件注册）', () => {
   it('探测不到 ripgrep 时**根本不注册**（v30 删掉了 TS 降级链）', async () => {
     await withHarness(async (h) => {
-      assert.equal(h.has('rg_search'), false, '没有 ripgrep 就不该有这件工具');
+      assert.equal(h.has('grep'), false, '没有 ripgrep 就不该有这件工具');
       // 同一台机器上其余工具一件都不能少：条件注册只针对引擎那两件
-      for (const name of ['safe_read', 'read_blob', 'safe_edit', 'safe_write']) {
+      for (const name of ['safe_read', 'safe_edit', 'safe_write']) {
         assert.equal(h.has(name), true, `${name} 不该被连坐`);
       }
     }, { ripgrepPath: null });
@@ -707,7 +731,7 @@ describe('rg_search（条件注册）', () => {
     if (fakeEnginePath === null) return; // Windows：没有可执行的假引擎，跳过（本机真装 rg 时由下面的用例覆盖）
     await withHarness(async (h) => {
       await writeFile(join(h.root, 'a.ts'), 'const a = 1;\n// TODO fix\nconst b = 2;\n', 'utf8');
-      const res = await h.tool('rg_search').handler({ pattern: 'TODO', context: 1 }, h.ctx);
+      const res = await h.tool('grep').handler({ pattern: 'TODO', context: 1 }, h.ctx);
       assert.match(res.content, /^engine: ripgrep/u);
       assert.match(res.content, /a\.ts:2:4/u);
       // 上下文行与匹配行同形：前一行带行号管道符，命中行带冒号
@@ -723,7 +747,7 @@ describe('rg_search（条件注册）', () => {
     if (!await detectRipgrep()) return;
     await withHarness(async (h) => {
       await writeFile(join(h.root, 'a.ts'), 'const a = 1;\n// TODO fix\nconst b = 2;\n', 'utf8');
-      const res = await h.tool('rg_search').handler({ pattern: 'TODO', context: 1 }, h.ctx);
+      const res = await h.tool('grep').handler({ pattern: 'TODO', context: 1 }, h.ctx);
       assert.match(res.content, /^engine: ripgrep/u);
       assert.match(res.content, /a\.ts:2:4/u);
       assert.match(res.content, /2: \/\/ TODO fix/u);
@@ -734,8 +758,8 @@ describe('rg_search（条件注册）', () => {
     await withHarness(async (h) => {
       await writeFile(join(h.root, 'a.txt'), 'hit\n', 'utf8');
       // rg 显式禁用（不探），es 自动探测且本机没有（一次探测）
-      assert.equal(h.has('rg_search'), false);
-      assert.equal(h.has('es_search'), false);
+      assert.equal(h.has('grep'), false);
+      assert.equal(h.has('find'), false);
       assert.equal(h.probes(), 1, '两件工具只该付一次探测（禁用的那件连探都不探）');
     }, { ripgrepPath: null });
   });
@@ -744,7 +768,7 @@ describe('rg_search（条件注册）', () => {
     await ensureFakeEngineScript();
     if (fakeEnginePath === null) return;
     await withHarness(async (h) => {
-      const res = await h.tool('rg_search').handler({ pattern: '([' }, h.ctx);
+      const res = await h.tool('grep').handler({ pattern: '([' }, h.ctx);
       assert.equal(res.isError, true);
       assert.equal(res.error?.code, FS_ERROR_CODES.INVALID_ARGS);
     });
@@ -755,7 +779,7 @@ describe('rg_search（条件注册）', () => {
     if (fakeEnginePath === null) return;
     await withHarness(async (h) => {
       await writeFile(join(h.root, 'a.txt'), Array.from({ length: 20 }, () => 'hit').join('\n'), 'utf8');
-      const res = await h.tool('rg_search').handler({ pattern: 'hit', max_results: 3 }, h.ctx);
+      const res = await h.tool('grep').handler({ pattern: 'hit', max_results: 3 }, h.ctx);
       assert.match(res.content, /\[已达上限 3/u);
     });
   });
@@ -764,18 +788,18 @@ describe('rg_search（条件注册）', () => {
     await ensureFakeEngineScript();
     if (fakeEnginePath === null) return;
     await withHarness(async (h) => {
-      const res = await h.tool('rg_search').handler({ pattern: 'x', path: '../' }, h.ctx);
+      const res = await h.tool('grep').handler({ pattern: 'x', path: '../' }, h.ctx);
       assert.equal(res.isError, true);
       assert.equal(res.error?.code, FS_ERROR_CODES.PATH_DENIED);
     });
   });
 
   /**
-   * P3：实测她 11 次把**文件路径**喂给 rg_search，全部被"不是目录"挡回去
+   * P3：实测她 11 次把**文件路径**喂给 grep，全部被"不是目录"挡回去
    * （占这件工具 16 次失败里的 11 次，docs/tools-audit.md §2.2）——而 `rg` 本来就吃文件操作数。
    *
    * 用假引擎而不是本机真 rg：这条锁的是"文件操作数被原样交出去、结果能解析"，
-   * 装没装 rg 都该跑。`runProcess` 注入同时管探测与搜索（与 es_search 那两条同一套路）。
+   * 装没装 rg 都该跑。`runProcess` 注入同时管探测与搜索（与 find 那两条同一套路）。
    */
   it('path 给单个文件也吃得下：传文件只搜它，传目录照旧递归（P3）', async () => {
     /** 每次 runProcess 的实参（探测 + 搜索都记，最后一条就是这次搜索） */
@@ -803,7 +827,7 @@ describe('rg_search（条件注册）', () => {
       // ① 传文件：不再被拒，且交给 rg 的最后一个实参就是那个文件本身（不是它的父目录）。
       //    比较用**大小写无关**：path-guard 交出去的是 realpath 规范化后的路径，
       //    而 TEMP 在 Windows 上大小写与 mkdtemp 拿到的写法未必一致。
-      const file = await h.tool('rg_search').handler({ pattern: 'hit', path: 'a.ts' }, h.ctx);
+      const file = await h.tool('grep').handler({ pattern: 'hit', path: 'a.ts' }, h.ctx);
       assert.equal(file.isError, undefined, file.content);
       assert.match(file.content, /a\.ts:2:1: hit here/u);
       assert.equal(
@@ -813,7 +837,7 @@ describe('rg_search（条件注册）', () => {
       );
 
       // ② 传目录：行为一个字不改，照旧递归（原来是目录、现在还是目录）
-      const dir = await h.tool('rg_search').handler({ pattern: 'hit', path: 'sub' }, h.ctx);
+      const dir = await h.tool('grep').handler({ pattern: 'hit', path: 'sub' }, h.ctx);
       assert.equal(dir.isError, undefined, dir.content);
       assert.match(dir.content, /sub\/b\.ts:2:1: hit here/u);
       assert.equal(calls.at(-1)?.at(-1)?.toLowerCase(), join(h.root, 'sub').toLowerCase(), '目录照旧原样交给 rg');
@@ -821,12 +845,12 @@ describe('rg_search（条件注册）', () => {
   });
 });
 
-describe('es_search（条件注册）', () => {
+describe('find（条件注册）', () => {
   it('探测不到 es.exe 时**根本不注册**（旧实现里它永远在，且每次都 fallback）', async () => {
     await withHarness(async (h) => {
-      assert.equal(h.has('es_search'), false, '没有 es.exe 就不该有这件工具');
+      assert.equal(h.has('find'), false, '没有 es.exe 就不该有这件工具');
       // 同一台机器上其余工具一件都不能少：条件注册只针对这一件
-      for (const name of ['safe_read', 'read_blob', 'safe_edit']) {
+      for (const name of ['safe_read', 'safe_edit']) {
         assert.equal(h.has(name), true, `${name} 不该被连坐`);
       }
     }, { everythingPath: null });
@@ -853,16 +877,16 @@ describe('es_search（条件注册）', () => {
     };
     await withHarness(async (h) => {
       ws.root = h.root;
-      assert.equal(h.has('es_search'), true, '探到 es.exe 就该注册');
+      assert.equal(h.has('find'), true, '探到 es.exe 就该注册');
       // 描述预算是硬门（design §4.18 / registry.ts 的 MAX_DESCRIPTION_TOKENS）：这一件是
       // **条件注册**的，没装 es.exe 的机器上 `tool-catalog` 那条 `problems` 断言根本看不到它，
       // 所以这里在"它确实注册了"的这条用例里直接锁一次——参数加到 10 个，描述仍要压得住。
-      const descTokens = estimateTokens(h.tool('es_search').description);
+      const descTokens = estimateTokens(h.tool('find').description);
       assert.ok(
         descTokens < MAX_DESCRIPTION_TOKENS,
-        `es_search 的描述 ${descTokens} token，超过硬门 ${MAX_DESCRIPTION_TOKENS}（超了会静默少一件工具）`,
+        `find 的描述 ${descTokens} token，超过硬门 ${MAX_DESCRIPTION_TOKENS}（超了会静默少一件工具）`,
       );
-      const result = await h.tool('es_search').handler({ pattern: '*.test.ts' }, h.ctx);
+      const result = await h.tool('find').handler({ pattern: '*.test.ts' }, h.ctx);
       assert.equal(result.isError, undefined, result.content);
       assert.match(result.content, /^engine: everything \(es (fake|15\.1\.0)\)/u);
       assert.ok(!result.content.includes('fallback'), '探到引擎就不该再走 fallback');
@@ -874,7 +898,7 @@ describe('es_search（条件注册）', () => {
       // 三次调用 = rg 探测 + es 探测 + 这一次搜索。**探测各一次**就是这条用例要锁的不变量：
       // 旧实现里 es 的 5 个候选会各来一次，而这个假实现会看到 5 次 `-version`
       assert.equal(calls.length, 3, `调用序列不符：${JSON.stringify(calls)}`);
-      // `-n 100`：es_search 的 max_results 默认值**保持 100**（与源同值，`tools/es_search.py:206`）。
+      // `-n 100`：find 的 max_results 默认值**保持 100**（与源同值，`tools/es_search.py:206`）。
       // 本次只把它的**下界**从 1 放宽到 0（`max_results:0` = 只统计），默认值一个字没动
       assert.match(calls[2]?.join(' ') ?? '', /-n 100 -path /u, '第三次必须是那次搜索本身');
     }, { everythingPath: 'C:\\fake\\es.exe' }, { runProcess: fakeEs });
@@ -884,11 +908,11 @@ describe('es_search（条件注册）', () => {
     // 与退出码 8 那条同一条口径：工具是因为探测到引擎才注册的，
     // 超时之后换一条自己的扫描路，只会让"结果看起来是成功的"却不说明它换了引擎。
     await withHarness(async (h) => {
-      const res = await h.tool('es_search').handler({ pattern: 'a.txt', detail: 'full', regex: true }, h.ctx);
+      const res = await h.tool('find').handler({ pattern: 'a.txt', detail: 'full', regex: true }, h.ctx);
       assert.equal(res.isError, true);
       assert.equal(res.error?.code, FS_ERROR_CODES.SEARCH_FAILED);
       assert.match(res.content, /调用超时/u);
-      assert.match(res.content, /rg_search/u, '拒绝时要给出替代路径');
+      assert.match(res.content, /grep/u, '拒绝时要给出替代路径');
     }, { everythingPath: 'C:\\fake\\es.exe' }, {
       runProcess: async (_command: string, args: string[]) => (args.includes('-version')
         ? { code: 0, stdout: '1.1.0.38', stderr: '', failed: false, timedOut: false }
@@ -898,10 +922,10 @@ describe('es_search（条件注册）', () => {
 
   it('引擎在、客户端没跑（退出码 8）时如实报错，不静默降级成扫描', async () => {
     await withHarness(async (h) => {
-      const res = await h.tool('es_search').handler({ pattern: 'a.txt' }, h.ctx);
+      const res = await h.tool('find').handler({ pattern: 'a.txt' }, h.ctx);
       assert.equal(res.isError, true);
       assert.match(res.content, /Everything 客户端没有在运行/u);
-      assert.match(res.content, /rg_search/u, '拒绝时要给出替代路径');
+      assert.match(res.content, /grep/u, '拒绝时要给出替代路径');
     }, { everythingPath: 'C:\\fake\\es.exe' }, {
       runProcess: async (_command: string, args: string[]) => (args.includes('-version')
         ? { code: 0, stdout: '1.1.0.27', stderr: '', failed: false, timedOut: false }
@@ -910,9 +934,9 @@ describe('es_search（条件注册）', () => {
   });
 });
 
-// ──────────────────── es_search 的引擎实参映射（对齐 devkit 的参数面） ────────────────────
+// ──────────────────── find 的引擎实参映射（对齐 devkit 的参数面） ────────────────────
 //
-// 这一组锁的是**参数 → es.exe 实参**那一层：devkit 的 `es_search`（`tools/es_search.py`）
+// 这一组锁的是**参数 → es.exe 实参**那一层：devkit 的 `find`（`tools/es_search.py`）
 // 有 9 个参数，我们的封装曾经只有 5 个 —— 用户原话是「es.exe 是个强大的工具，
 // 我不希望被我们的封装毁了」，「至少要达到原 irmia_devkit_open 的水平」。
 // 所以每一条映射都逐条断言**完整实参数组**（而不是"包含某个开关"）：
@@ -956,7 +980,7 @@ function esArgvOf(calls: string[][], root: string): string[] {
   return search.slice(1).map((arg) => (arg.toLowerCase() === root.toLowerCase() ? '<ROOT>' : arg));
 }
 
-describe('es_search 的引擎实参映射（逐条对齐 devkit）', () => {
+describe('find 的引擎实参映射（逐条对齐 devkit）', () => {
   /** 每条用例：参数 → 期望的完整实参数组（`<ROOT>` 会被换成本次工作根） */
   const cases: Array<[string, Record<string, unknown>, string[]]> = [
     ['默认（只列路径）', { pattern: '*.ts' }, ['-n', '100', '-path', '<ROOT>', '--', '*.ts']],
@@ -992,7 +1016,7 @@ describe('es_search 的引擎实参映射（逐条对齐 devkit）', () => {
       const calls: string[][] = [];
       await withHarness(
         async (h) => {
-          const res = await h.tool('es_search').handler(args, h.ctx);
+          const res = await h.tool('find').handler(args, h.ctx);
           assert.equal(res.isError, undefined, `${label} 不该失败：${res.content}`);
           assert.deepEqual(esArgvOf(calls, h.root), expected, `${label} 的实参形状不符`);
         },
@@ -1019,7 +1043,7 @@ describe('es_search 的引擎实参映射（逐条对齐 devkit）', () => {
       const calls: string[][] = [];
       await withHarness(
         async (h) => {
-          const res = await h.tool('es_search').handler({ pattern: '*.ts', sort_by: key }, h.ctx);
+          const res = await h.tool('find').handler({ pattern: '*.ts', sort_by: key }, h.ctx);
           assert.equal(res.isError, undefined, `sort_by=${key} 不该失败：${res.content}`);
           const argv = esArgvOf(calls, h.root);
           const at = argv.indexOf('-sort');
@@ -1042,7 +1066,7 @@ describe('es_search 的引擎实参映射（逐条对齐 devkit）', () => {
           [{ pattern: 'x', detail: 'files' }, /detail 只能是 paths \/ full/u],
         ];
         for (const [args, pattern] of bad) {
-          const res = await h.tool('es_search').handler(args, h.ctx);
+          const res = await h.tool('find').handler(args, h.ctx);
           assert.equal(res.isError, true, `${JSON.stringify(args)} 该被拒`);
           assert.equal(res.error?.code, FS_ERROR_CODES.INVALID_ARGS);
           assert.match(res.content, pattern, `错误消息要说清合法取值：${res.content}`);
@@ -1057,7 +1081,7 @@ describe('es_search 的引擎实参映射（逐条对齐 devkit）', () => {
   });
 });
 
-describe("es_search 的 detail:'full'（devkit 能拿到的一条都不少）", () => {
+describe("find 的 detail:'full'（devkit 能拿到的一条都不少）", () => {
   /**
    * 真 CSV 夹具：**逐字照本机 es.exe 1.1.0.38 的 `-csv` 输出形状**（尺寸/时间都来自真机冒烟）——
    * 表头 `Name,Path,Size,Date Modified`、名字与路径带引号而数字与时间不带、
@@ -1080,7 +1104,7 @@ describe("es_search 的 detail:'full'（devkit 能拿到的一条都不少）", 
     await withHarness(
       async (h) => {
         ws.root = h.root;
-        const res = await h.tool('es_search').handler({ pattern: '*.ts', detail: 'full' }, h.ctx);
+        const res = await h.tool('find').handler({ pattern: '*.ts', detail: 'full' }, h.ctx);
         assert.equal(res.isError, undefined, res.content);
         assert.match(res.content, /^engine: everything \(es /u, '首行仍是 engine');
         assert.match(res.content, /模式 `\*\.ts` · 命中 4 个/u, `头部要有命中数：\n${res.content}`);
@@ -1110,7 +1134,7 @@ describe("es_search 的 detail:'full'（devkit 能拿到的一条都不少）", 
     const calls: string[][] = [];
     await withHarness(
       async (h) => {
-        const res = await h.tool('es_search').handler({ pattern: 'zzz', detail: 'full' }, h.ctx);
+        const res = await h.tool('find').handler({ pattern: 'zzz', detail: 'full' }, h.ctx);
         assert.equal(res.isError, undefined, res.content);
         assert.match(res.content, /命中 0 个/u);
         assert.match(res.content, /\(无命中\)/u);
@@ -1128,7 +1152,7 @@ describe("es_search 的 detail:'full'（devkit 能拿到的一条都不少）", 
     await withHarness(
       async (h) => {
         ws.root = h.root;
-        const res = await h.tool('es_search').handler({ pattern: '*.ts' }, h.ctx);
+        const res = await h.tool('find').handler({ pattern: '*.ts' }, h.ctx);
         assert.equal(res.isError, undefined, res.content);
         assert.match(res.content, /src\/alpha\.ts/u);
         assert.match(res.content, /src\/beta\.ts/u);
@@ -1148,51 +1172,53 @@ describe("es_search 的 detail:'full'（devkit 能拿到的一条都不少）", 
   });
 });
 
-// ──────────────────────────────── read_blob ────────────────────────────────
+// ──────────────────────────────── read_blob（v64 起**不注册**）────────────────────────────────
+//
+// 用户 2026-10-13「砍掉 read_blob」：外置区 `data/blobs/<sha256>` 就在**仓库根之内**、又不在只读区
+// ⇒ `safe_read` 直接读得回来 ⇒ 冗余件（全量日志里只被调过 2 次，且都在她自己的工具自测里）。
+// **判据不是"放宽"，而是"注册表里也没有它"**：这里钉三件——
+//   ① `read_blob` 不在 `fsTools` 的产出里（实现保留、不注册，与 `ask_human` 同口径）；
+//   ② 外置之后**信息仍然拿得回来**：按指针给的路径用 `safe_read` 读得到原文（否则等于把"截断"
+//      伪装成"可读"）；
+//   ③ 二进制那份能力如实交代（`safe_read` 拒二进制，出路是 `pwsh` 转 base64——描述与文案都改了）。
 
-describe('read_blob', () => {
-  it('按 offset/limit 分页，且给出续读指引', async () => {
+describe('read_blob（v64 起不注册）', () => {
+  it('实现仍在（导出于 read-tools.ts），但 `fsTools` 不注册它', async () => {
+    const table = new Map<string, ToolDefinition>();
+    const list = await fsTools(
+      { register: (tool) => table.set(tool.name, tool) },
+      { deps: stubDeps({ rg: true, es: true }) },
+    );
+    assert.ok(!list.some((tool) => tool.name === 'read_blob'), '它不该出现在注册清单里');
+    assert.equal(table.get('read_blob'), undefined);
+    // 实现保留：工厂还能造出来（哪天要它回来只需在 fs/index.ts 加回一行）
+    const tool = createReadBlobTool(createEnv({}));
+    assert.equal(tool.name, 'read_blob');
+    assert.equal(tool.timeoutMs, 10_000);
+  });
+
+  it('外置之后信息拿得回来：按指针里的路径用 safe_read 读得到原文（这是砍它的前提）', async () => {
     await withHarness(async (h) => {
       const blobId = 'a'.repeat(64);
       const blobs = join(h.root, 'data', 'blobs');
       await mkdir(blobs, { recursive: true });
       await writeFile(join(blobs, blobId), 'ABCDEFGHIJ', 'utf8');
 
-      const page1 = await h.tool('read_blob').handler({ blobId, offset: 0, limit: 4 }, h.ctx);
-      assert.equal(page1.isError, undefined);
-      assert.match(page1.content, /ABCD/u);
-      assert.match(page1.content, /续读：offset=4&limit=4/u);
-
-      const page2 = await h.tool('read_blob').handler({ blobId, offset: 4, limit: 6 }, h.ctx);
-      assert.match(page2.content, /EFGHIJ/u);
-      assert.match(page2.content, /已到末尾/u);
-      assert.ok(!page2.content.includes('续读'));
+      // 指针文案给的路径形态（`blobPointerText` 逐字：data/blobs/<sha256>）
+      const res = await h.tool('safe_read').handler({ path: `data/blobs/${blobId}` }, h.ctx);
+      assert.equal(res.isError, undefined, res.content);
+      assert.match(res.content, /ABCDEFGHIJ/u, '全文按那一条路径读得回来');
     });
   });
 
-  it('blobId 格式非法 / blob 不存在 / offset 越界都有明确错误码', async () => {
+  it('二进制那条路如实交代：safe_read 会拒，并指向 pwsh（read_blob 的 base64 已随之消失）', async () => {
     await withHarness(async (h) => {
-      const bad = await h.tool('read_blob').handler({ blobId: 'zz' }, h.ctx);
-      assert.equal(bad.error?.code, FS_ERROR_CODES.INVALID_ARGS);
-      assert.ok(BLOB_ID_PATTERN.test('a'.repeat(64)));
-
-      const missing = await h.tool('read_blob').handler({ blobId: 'b'.repeat(64) }, h.ctx);
-      assert.equal(missing.error?.code, FS_ERROR_CODES.NOT_FOUND);
-
-      const blobs = join(h.root, 'data', 'blobs');
-      await mkdir(blobs, { recursive: true });
-      await writeFile(join(blobs, 'c'.repeat(64)), 'short', 'utf8');
-      const past = await h.tool('read_blob').handler({ blobId: 'c'.repeat(64), offset: 99 }, h.ctx);
-      assert.equal(past.error?.code, FS_ERROR_CODES.INVALID_ARGS);
-    });
-  });
-
-  it('path 不能逃出 blob 根', async () => {
-    await withHarness(async (h) => {
-      await writeFile(join(h.root, 'outside-blob.txt'), 'x', 'utf8');
-      const res = await h.tool('read_blob').handler({ path: '../../outside-blob.txt' }, h.ctx);
+      await writeFile(join(h.root, 'bin.dat'), Buffer.from([0x00, 0x01, 0x02, 0x00, 0xff]), 'binary');
+      const res = await h.tool('safe_read').handler({ path: 'bin.dat' }, h.ctx);
       assert.equal(res.isError, true);
-      assert.equal(res.error?.code, FS_ERROR_CODES.PATH_DENIED);
+      assert.equal(res.error?.code, FS_ERROR_CODES.BINARY_FILE);
+      assert.match(res.content, /pwsh/u, '出路要指向真的还有效的那条（base64 用 pwsh 转）');
+      assert.ok(!res.content.includes('read_blob'), '别再指向一个不存在的工具');
     });
   });
 });
@@ -1854,22 +1880,22 @@ function stubDeps(available: { rg: boolean; es: boolean }): DepsManager {
 }
 
 describe('fsTools 注册', () => {
-  it('两个引擎都没有时注册六件（rg_search 与 es_search 都不在），且三属性符合 design.md §4.18', async () => {
+  it('两个引擎都没有时注册五件（grep 与 find 都不在，read_blob 已砍），且三属性符合 design.md §4.18', async () => {
     const table = new Map<string, ToolDefinition>();
     // 显式注入"两个引擎都没有"的结论：这条用例要在**任意一台机器上**给出同一份清单
     const list = await fsTools(
       { register: (tool) => table.set(tool.name, tool) },
       { deps: stubDeps({ rg: false, es: false }) },
     );
-    // v42：`list_dir` 删掉之后常驻八件 → 七件（这里没装引擎，所以是六件）
+    // v42：`list_dir` 删掉之后常驻八件 → 七件；v64 再砍 `read_blob` ⇒ 六件（这里没装引擎，所以是五件）
+    // （件数是**缓存前缀**的一部分：名单与顺序都被这条钉着，改动必须是有意的）
     assert.deepEqual(
       list.map((tool) => tool.name),
-      ['safe_read', 'read_blob', 'safe_edit', 'safe_write', 'safe_rollback', 'multi_edit'],
+      ['safe_read', 'safe_edit', 'safe_write', 'safe_rollback', 'multi_edit'],
     );
 
     const expected: Record<string, [string, string, number]> = {
       safe_read: ['parallel', 'none', 10_000],
-      read_blob: ['parallel', 'none', 10_000],
       safe_edit: ['exclusive', 'destructive', 30_000],
       safe_write: ['exclusive', 'destructive', 30_000],
       safe_rollback: ['exclusive', 'destructive', 30_000],
@@ -1887,7 +1913,7 @@ describe('fsTools 注册', () => {
     }
   });
 
-  it('装齐两个引擎时是八件，且两件搜索工具各自插在原位置（顺序即缓存前缀）', async () => {
+  it('装齐两个引擎时是七件，且两件搜索工具各自插在原位置（顺序即缓存前缀）', async () => {
     const table = new Map<string, ToolDefinition>();
     const list = await fsTools(
       { register: (tool) => table.set(tool.name, tool) },
@@ -1895,9 +1921,9 @@ describe('fsTools 注册', () => {
     );
     assert.deepEqual(
       list.map((tool) => tool.name),
-      ['safe_read', 'rg_search', 'es_search', 'read_blob', 'safe_edit', 'safe_write', 'safe_rollback', 'multi_edit'],
+      ['safe_read', 'grep', 'find', 'safe_edit', 'safe_write', 'safe_rollback', 'multi_edit'],
     );
-    for (const name of ['rg_search', 'es_search']) {
+    for (const name of ['grep', 'find']) {
       const tool = table.get(name);
       assert.equal(tool?.executionMode, 'parallel', `${name} executionMode`);
       assert.equal(tool?.timeoutMs, 15_000, `${name} timeoutMs`);
@@ -1905,7 +1931,7 @@ describe('fsTools 注册', () => {
     }
   });
 
-  it('只有 rg 时是七件：条件注册是逐件的，不互相连坐', async () => {
+  it('只有 rg 时是六件：条件注册是逐件的，不互相连坐', async () => {
     const table = new Map<string, ToolDefinition>();
     const list = await fsTools(
       { register: (tool) => table.set(tool.name, tool) },
@@ -1913,7 +1939,7 @@ describe('fsTools 注册', () => {
     );
     assert.deepEqual(
       list.map((tool) => tool.name),
-      ['safe_read', 'rg_search', 'read_blob', 'safe_edit', 'safe_write', 'safe_rollback', 'multi_edit'],
+      ['safe_read', 'grep', 'safe_edit', 'safe_write', 'safe_rollback', 'multi_edit'],
     );
   });
 
@@ -1928,8 +1954,8 @@ describe('fsTools 注册', () => {
     // 所以按内容筛，而不是按条数（条数会随装配期多说一句实话而变化）
     const missing = notes.filter((line) => /未注册/u.test(line));
     assert.equal(missing.length, 2, `应当两条告知（rg 与 es 各一条），实际 ${JSON.stringify(notes)}`);
-    assert.match(missing[0] ?? '', /rg_search 未注册/u);
-    assert.match(missing[1] ?? '', /es_search 未注册/u);
+    assert.match(missing[0] ?? '', /grep 未注册/u);
+    assert.match(missing[1] ?? '', /find 未注册/u);
   });
 
   it('enableDestructive=false 时只注册只读工具（M4-4 的注册层前提）', async () => {
@@ -1940,7 +1966,8 @@ describe('fsTools 注册', () => {
       {},
       { enableDestructive: false },
     );
-    assert.equal(list.length, 4);
+    // v64：非破坏性的常驻件 = safe_read + grep + find（read_blob 已砍）
+    assert.equal(list.length, 3);
     assert.ok(list.every((tool) => tool.sideEffect !== 'destructive'));
   });
 
@@ -2085,12 +2112,13 @@ describe('fsTools 注册', () => {
     });
   });
 
-  it('别名不是绕过口：从别名根往上爬出主根仍然被拒', async () => {
+  it('别名不是绕过口：从别名根往上爬出主根，**写**仍然被拒（v64：白名单只挡写）', async () => {
     await withHarness(async (h) => {
       await mkdir(join(h.root, 'data', 'workspace', 'MEMORIES'), { recursive: true });
-      // 别名改写之后仍要过白名单：爬出主根的路径一律拒绝（与直写 `..` 同一条判据）
+      // 别名改写之后仍要过白名单：爬出主根的路径一律拒绝（与直写 `..` 同一条判据）——
+      // v64 起这条判据只作用于**写**，所以这里用 safe_write 验（读类不受边界约束）
       const escape = `MEMORIES/${'../'.repeat(20)}definitely-outside.txt`;
-      const result = await h.tool('safe_read').handler({ path: escape }, h.ctx);
+      const result = await h.tool('safe_write').handler({ path: escape, content: 'x' }, h.ctx);
       assert.equal(result.isError, true, '爬出主根必须被拒');
       assert.match(result.content, /落在工作目录/u);
     });
@@ -2106,7 +2134,7 @@ describe('fsTools 注册', () => {
       const env = createEnv({ dataDir: join(h.root, 'data') }, { now: () => new Date(0) });
       const rewritten = expandAliases('MEMORIES', env.pathAliases(h.ctx), h.root);
       assert.equal(rewritten, memoryDir);
-      const guarded = await resolveInsideRoot(h.root, rewritten, { purpose: 'rg_search', requireDirectory: true });
+      const guarded = await resolveInsideRoot(h.root, rewritten, { purpose: 'grep', requireDirectory: true });
       assert.equal(guarded.ok, true, `别名改写后的路径应当过守卫：${JSON.stringify(guarded)}`);
     });
   });
@@ -2393,12 +2421,12 @@ describe('参数契约与默认值（照 devkit 对齐）', () => {
   });
 
   /**
-   * rg_search 的两个默认值（都照源）：
+   * grep 的两个默认值（都照源）：
    * - `context` 默认 **0**（源 `tools/rg_search.py:278` 的 `context_lines` 默认 0）；
    * - 大小写默认 **不区分**（源 `case_sensitive` 默认 false，`_registry.py:583-605`）。
    *   本条同时锁**参数名**：本地旧名 `ignore_case` 默认 false = 区分大小写，方向正好相反。
    */
-  it('rg_search 默认不区分大小写、context 默认 0；case_sensitive:true 才区分', async () => {
+  it('grep 默认不区分大小写、context 默认 0；case_sensitive:true 才区分', async () => {
     const calls: string[][] = [];
     const fakeRg = async (command: string, args: string[]): Promise<{
       code: number | null; stdout: string; stderr: string; failed: boolean; timedOut: boolean;
@@ -2413,17 +2441,17 @@ describe('参数契约与默认值（照 devkit 对齐）', () => {
     await withHarness(async (h) => {
       await writeFile(join(h.root, 'a.ts'), 'const Foo = 1;\n', 'utf8');
 
-      const def = await h.tool('rg_search').handler({ pattern: 'Foo' }, h.ctx);
+      const def = await h.tool('grep').handler({ pattern: 'Foo' }, h.ctx);
       assert.equal(def.isError, undefined, def.content);
       const defArgs = calls.at(-1) ?? [];
       assert.ok(defArgs.includes('--ignore-case'), `默认必须不区分大小写：${defArgs.join(' ')}`);
       assert.equal(defArgs[defArgs.indexOf('--context') + 1], '0', 'context 默认必须是 0');
       assert.match(def.content, /忽略大小写/u, '首行标注要如实说这次是不敏感还是敏感');
-      const schema = h.tool('rg_search').parameters['properties'] as Record<string, unknown>;
+      const schema = h.tool('grep').parameters['properties'] as Record<string, unknown>;
       assert.equal('ignore_case' in schema, false, '旧名 ignore_case 要收掉（两套读法正是歧义来源）');
       assert.equal('case_sensitive' in schema, true);
 
-      const sensitive = await h.tool('rg_search').handler({ pattern: 'Foo', case_sensitive: true }, h.ctx);
+      const sensitive = await h.tool('grep').handler({ pattern: 'Foo', case_sensitive: true }, h.ctx);
       assert.equal(sensitive.isError, undefined, sensitive.content);
       const sensArgs = calls.at(-1) ?? [];
       assert.ok(!sensArgs.includes('--ignore-case'), `case_sensitive:true 时不能加 --ignore-case：${sensArgs.join(' ')}`);
@@ -2431,7 +2459,7 @@ describe('参数契约与默认值（照 devkit 对齐）', () => {
     }, { ripgrepPath: 'C:\\fake\\rg.exe' }, { runProcess: fakeRg });
   });
 
-  it('rg_search 的 max_results 默认 40（源口径），截断提示随之', async () => {
+  it('grep 的 max_results 默认 40（源口径），截断提示随之', async () => {
     // 假引擎要回**真实存在**的文件：解析那一步会对每个路径做 relative(workspaceRoot, …)，
     // 编一个不存在的名字会得到工作区外的路径，命中数就恒为 0（那样测的就不是上限了）
     const ws = { root: '' };
@@ -2448,7 +2476,7 @@ describe('参数契约与默认值（照 devkit 对齐）', () => {
     await withHarness(async (h) => {
       ws.root = h.root;
       await writeFile(join(h.root, 'a.ts'), 'hit\n', 'utf8');
-      const res = await h.tool('rg_search').handler({ pattern: 'hit' }, h.ctx);
+      const res = await h.tool('grep').handler({ pattern: 'hit' }, h.ctx);
       assert.equal(res.isError, undefined, res.content);
       // 60 条命中、默认上限 40 → 20 条被截掉，并且**要说出来**
       assert.match(res.content, /\[已达上限 40/u, `默认上限必须是 40：\n${res.content.slice(0, 400)}`);
@@ -2458,7 +2486,7 @@ describe('参数契约与默认值（照 devkit 对齐）', () => {
     }, { ripgrepPath: 'C:\\fake\\rg.exe' }, { runProcess: fakeRg });
   });
 
-  it('es_search 的 max_results:0 = 只报数量不列条目（源语义），且不加 -n', async () => {
+  it('find 的 max_results:0 = 只报数量不列条目（源语义），且不加 -n', async () => {
     const calls: string[][] = [];
     const ws = { root: '' };
     const fakeEs = async (command: string, args: string[]): Promise<Record<string, unknown>> => {
@@ -2480,7 +2508,7 @@ describe('参数契约与默认值（照 devkit 对齐）', () => {
       await writeFile(join(h.root, 'src', 'alpha.ts'), 'x', 'utf8');
       await writeFile(join(h.root, 'src', 'beta.ts'), 'x', 'utf8');
 
-      const counted = await h.tool('es_search').handler({ pattern: '*.ts', max_results: 0 }, h.ctx);
+      const counted = await h.tool('find').handler({ pattern: '*.ts', max_results: 0 }, h.ctx);
       assert.equal(counted.isError, undefined, counted.content);
       assert.match(counted.content, /命中 2 个/u, '要报数量');
       assert.ok(!counted.content.includes('alpha.ts'), `只统计就不该列条目：\n${counted.content}`);
@@ -2490,12 +2518,12 @@ describe('参数契约与默认值（照 devkit 对齐）', () => {
       // 0 = 只要数量：`detail:'full'` 那组 CSV 开关也不该付（一条都不列，CSV 解析纯属白干）
       assert.ok(!countArgs.includes('-csv'), `max_results:0 时不该付 CSV 那组：${countArgs.join(' ')}`);
       assert.equal(
-        (await h.tool('es_search').handler({ pattern: '*.ts', max_results: 0, detail: 'full' }, h.ctx)).content,
+        (await h.tool('find').handler({ pattern: '*.ts', max_results: 0, detail: 'full' }, h.ctx)).content,
         counted.content,
         'max_results:0 时 detail 不改变输出（只统计这一档没有"详细"可言）',
       );
 
-      const listed = await h.tool('es_search').handler({ pattern: '*.ts' }, h.ctx);
+      const listed = await h.tool('find').handler({ pattern: '*.ts' }, h.ctx);
       assert.match(listed.content, /src\/alpha\.ts/u, '默认（不传 max_results）照旧列条目');
       const listArgs = calls.at(-1) ?? [];
       assert.equal(listArgs[listArgs.indexOf('-n') + 1], '100', '默认值保持 100（与源同值）');

@@ -16,7 +16,7 @@ import {
   aliasNoteOf, applyAliases, parseAliases, resolveNameForSid, resolveSessionName, splitAliasNote,
 } from '../src/channel/sessions.ts';
 
-const SID = 'qq:group:0AE5BFDC4E3C03A66B6356CB86A71B21';
+const SID = 'qq:group:00000000000000000000000000000002';
 
 /**
  * 她盘上那份别名表的**真实形状**（2026-10-05 从 `data/workspace/MEMORIES/aliases.md` 抄的骨架）：
@@ -26,11 +26,11 @@ const SID = 'qq:group:0AE5BFDC4E3C03A66B6356CB86A71B21';
 const TABLE = [
   '# 身份别名',
   '',
-  'qq:c2c:E7FEC35E951B5CCF8BA66793BF6B1314 = OWNER（用户）',
+  'qq:c2c:00000000000000000000000000000001 = OWNER（用户）',
   `${SID} = IRMIA框架测试群（口径：看情况淡着）`,
   '# 群成员（openid，不是 sid；只在认人时用）',
-  '9C39B782C8B6F3124178E33561C4B4D7 = 甲（群里发过"guodie"那位；**别当用户**）',
-  'B01F025D72D3B2075F49EFB08297D105 = **1 号**（群昵称「伊尔弥亚」，昵称不作数、认 id）',
+  '00000000000000000000000000000005 = 甲（群里发过"guodie"那位；**别当用户**）',
+  '00000000000000000000000000000004 = **1 号**（群昵称「伊尔弥亚」，昵称不作数、认 id）',
   '（openid 尾号 …BA6F） = 朝夕（完整 openid 待补）',
   '多莉丝 = **另一个 agent，在别的机器上**（没有 openid，联络不到）',
   '写了名字，下次他来就用这个名字显示——**QQ 不提供昵称**，认人只能靠你自己记。',
@@ -140,7 +140,7 @@ describe('别名 · 名字与备注流向哪儿', () => {
  * 群成员那一段（裸 openid 键）——**框架不消费它，但也绝不许它混进会话别名表**。
  *
  * 2026-10-05 实测过：`parseAliases` 只认含 `:` 的键，所以她写的
- * `9C39B782C8B6F3124178E33561C4B4D7 = 甲（…）` 那一整段本来就不会被解析。
+ * `00000000000000000000000000000005 = 甲（…）` 那一整段本来就不会被解析。
  * 同一天用户还决定移除"名字 → openid → 官方 @ 串"那一跳（原话「我觉得没必要存在」），
  * 于是这一段**只剩一个用途**：她自己照它写官方 @ 形态（docs/design.md §4.20.1）。
  * 这里留下的就是那条边界——`parseAliases` 的契约一个字没变。
@@ -150,9 +150,9 @@ describe('别名 · 群成员段（裸 openid 键不进会话表）', () => {
     // 六处消费者问的都是"**这个会话**叫什么"，裸 openid 混进去对它们是纯噪音
     const aliases = parseAliases(TABLE);
     assert.equal(aliases.size, 2, '只有那两条 sid 成了条目');
-    assert.equal(aliases.has('9C39B782C8B6F3124178E33561C4B4D7'), false);
-    assert.equal(aliases.has('B01F025D72D3B2075F49EFB08297D105'), false);
+    assert.equal(aliases.has('00000000000000000000000000000005'), false);
+    assert.equal(aliases.has('00000000000000000000000000000004'), false);
     assert.equal(aliases.get(SID)?.name, 'IRMIA框架测试群');
-    assert.equal(aliases.get('qq:c2c:E7FEC35E951B5CCF8BA66793BF6B1314')?.name, 'OWNER');
+    assert.equal(aliases.get('qq:c2c:00000000000000000000000000000001')?.name, 'OWNER');
   });
 });

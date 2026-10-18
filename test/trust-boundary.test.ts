@@ -222,7 +222,7 @@ describe('完全信任 · 工作根之外的文件真的能碰', () => {
 
 // ──────────────────────────────── 只限工作目录（workspace） ────────────────────────────────
 
-describe('只限工作目录 · 同样的路径被拒绝，且理由说清边界在哪', () => {
+describe('只限工作目录（v64：**只挡写**）· 写越界被拒且理由说清；读与检索不受限', () => {
   it('safe_write 越界被拒，且一个字节都没落盘', async () => {
     const h = await makeHarness();
     const target = join(outside, 'workspace-new.txt');
@@ -236,20 +236,23 @@ describe('只限工作目录 · 同样的路径被拒绝，且理由说清边界
     assert.equal(await exists(target), false, '被拒绝的写入不得留下文件');
   });
 
-  it('safe_read 越界被拒', async () => {
+  it('safe_read 越界**照走**（v64：全盘就是全盘，读不受 trust.mode 约束）', async () => {
     const h = await makeHarness();
     const target = join(outside, 'workspace-read.txt');
     await writeFile(target, '外面', 'utf8');
 
     const result = await run(h.tool('safe_read'), h.ctx({ boundaryRoot: boundary }), { path: target });
 
-    assertBoundaryDenial(result, boundary);
+    assert.notEqual(result.isError, true, `读类不该被边界挡住：${result.content}`);
+    assert.match(result.content, /外面/u);
   });
 
-  it('safe_read 传目录越界同样被拒（列目录不是绕过边界的第二条路）', async () => {
+  it('safe_read 传目录越界也照走（列目录同样属读）', async () => {
     const h = await makeHarness();
+    await writeFile(join(outside, 'listed.txt'), 'x', 'utf8');
     const result = await run(h.tool('safe_read'), h.ctx({ boundaryRoot: boundary }), { path: outside });
-    assertBoundaryDenial(result, boundary);
+    assert.notEqual(result.isError, true, `列目录是读：${result.content}`);
+    assert.match(result.content, /listed\.txt/u);
   });
 
   it('边界内照旧可用（拒绝的是越界，不是把这个模式弄坏）', async () => {
@@ -266,24 +269,26 @@ describe('只限工作目录 · 同样的路径被拒绝，且理由说清边界
     assert.match(read.content, /边界内/u);
   });
 
-  it('符号链接指向边界外：workspace 模式下照旧被拒（realpath 之后才比边界）', async () => {
+  it('符号链接指向边界外：**写**照旧被拒（realpath 之后才比边界；读类不看边界）', async () => {
     const h = await makeHarness();
-    await writeFile(join(outside, 'linked-secret.txt'), 'LINKED', 'utf8');
     const link = join(boundary, 'link-out');
     await symlink(outside, link, 'junction');
 
-    const result = await run(h.tool('safe_read'), h.ctx({ boundaryRoot: boundary }), {
-      path: join(link, 'linked-secret.txt'),
+    const write = await run(h.tool('safe_write'), h.ctx({ boundaryRoot: boundary }), {
+      path: join(link, 'through-link.txt'),
+      content: '不该被写出来',
     });
 
-    assertBoundaryDenial(result, boundary);
+    assertBoundaryDenial(write, boundary);
+    assert.equal(await exists(join(outside, 'through-link.txt')), false, '链接那头也不许留下文件');
   });
 
-  it('边界根本身不可用时报清楚它不可用（不是含混的"路径被拒"）', async () => {
+  it('边界根本身不可用时报清楚它不可用（写类会用到它 ⇒ 用写来测）', async () => {
     const h = await makeHarness();
     const missing = join(outside, 'no-such-boundary-dir');
-    const result = await run(h.tool('safe_read'), h.ctx({ boundaryRoot: missing }), {
+    const result = await run(h.tool('safe_write'), h.ctx({ boundaryRoot: missing }), {
       path: join(boundary, 'inside.txt'),
+      content: 'x',
     });
     assert.equal(result.isError, true);
     assert.match(result.content, /信任边界根不可用/u);
@@ -303,7 +308,7 @@ describe('只限工作目录 · 同样的路径被拒绝，且理由说清边界
 // **`workspace` = 今天的行为**、**`full` = 新放开的那一档**。
 // 这组用例按**默认口径**摆盘：工作根 = 临时目录，dataDir = `<工作根>/data`（与出厂一致）。
 
-describe('workspace 档 · 默认边界（= 工作根）下，她自己的资产读得到、外面进不去', () => {
+describe('workspace 档 · 默认边界（= 工作根）下，她自己的资产读写都在、外面写不进去', () => {
   /** 与真实出厂布局同形：记忆在 `<工作根>/data/workspace/MEMORIES/`，人格在 `<工作根>/data/persona/` */
   async function assetHarness(): Promise<{ h: Harness; memoryFile: string; personaFile: string }> {
     const h = await makeHarness();
@@ -337,39 +342,49 @@ describe('workspace 档 · 默认边界（= 工作根）下，她自己的资产
     assert.notEqual(absolute.isError, true, absolute.content);
   });
 
-  it('同一个档下，工作根之外照旧被拒（"读得到自己的资产"不等于放开了边界）', async () => {
+  it('同一个档下，工作根之外**读得到、写不进去**（v64：边界只挡写）', async () => {
     const { h } = await assetHarness();
     const ctx = h.ctx({ boundaryRoot: root });
 
+    // 读：不受限（全盘就是全盘）——连"资产读得到"这句话都不再靠边界施舍
+    await writeFile(join(outside, 'secret.txt'), '外面', 'utf8');
     const read = await run(h.tool('safe_read'), ctx, { path: join(outside, 'secret.txt') });
     const list = await run(h.tool('safe_read'), ctx, { path: outside });
-
     for (const result of [read, list]) {
-      assertBoundaryDenial(result, root);
+      assert.notEqual(result.isError, true, `读类不该被挡：${result.content}`);
     }
+
+    // 写：被拒（这才是 workspace 档要治的那一件事）
+    const write = await run(h.tool('safe_write'), ctx, {
+      path: join(outside, 'outside-new.txt'),
+      content: 'x',
+    });
+    assertBoundaryDenial(write, root);
+    assert.equal(await exists(join(outside, 'outside-new.txt')), false);
   });
 });
 
 // ──────────────────────────────── 默认仍是受限（回归钉子） ────────────────────────────────
 
-describe('回归钉：不传 boundaryRoot 的调用点一条都不许被打开', () => {
-  it('safe_read / safe_write 在工作根之外全被拒绝（历史口径原样）', async () => {
+describe('回归钉（v64 版）：**写**类调用点一条都不许被打开；读类一律不受边界约束', () => {
+  it('safe_write 在工作根之外被拒（历史口径原样）；safe_read 照走（v64 起的口径）', async () => {
     const h = await makeHarness();
     const plain = h.ctx(); // 刻意不带 boundaryRoot
     assert.equal('boundaryRoot' in plain, false, '这条用例的前提就是不传它');
 
+    await writeFile(join(outside, 'whatever.txt'), '外面', 'utf8');
     const read = await run(h.tool('safe_read'), plain, { path: join(outside, 'whatever.txt') });
     const write = await run(h.tool('safe_write'), plain, { path: join(outside, 'pwn.txt'), content: 'x' });
-    // 目录形态走的是同一条 resolveGuarded（`allowDirectory` 只改"收不收目录"，
-    // **边界那一条一个字没松**）——所以它必须同样被拒，措辞也是同一句
+    // 目录形态走的是同一条 resolveGuarded（`allowDirectory` 只改"收不收目录"）——
+    // v64 起它属**读**，所以不再被边界拦（这条曾是"边界一个字没松"的证据，现在反过来钉新口径）
     const list = await run(h.tool('safe_read'), plain, { path: outside });
 
-    for (const [name, result] of [['safe_read', read], ['safe_write', write], ['safe_read（目录）', list]] as const) {
-      assert.equal(result.isError, true, `${name} 本该被拒：${result.content}`);
-      assert.equal(result.error?.code, FS_ERROR_CODES.PATH_DENIED, name);
-      // 历史措辞原样保留（既有 fs 测试按它断言）
-      assert.match(result.content, /落在工作目录/u, name);
-    }
+    assert.notEqual(read.isError, true, `读类不该被挡：${read.content}`);
+    assert.notEqual(list.isError, true, `列目录是读：${list.content}`);
+    assert.equal(write.isError, true, `写类本该被拒：${write.content}`);
+    assert.equal(write.error?.code, FS_ERROR_CODES.PATH_DENIED);
+    // 历史措辞原样保留（既有 fs 测试按它断言）
+    assert.match(write.content, /落在工作目录/u);
     assert.equal(await exists(join(outside, 'pwn.txt')), false);
   });
 

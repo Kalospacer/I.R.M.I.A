@@ -49,9 +49,19 @@ export const EPISODE_TTL_DAYS = 7;
 export const MEMORY_MAINTAIN_PAYLOAD_KIND = 'memory-maintain';
 /** 事件 origin */
 export const MEMORY_ORIGIN = 'persona/memory-maintain';
-/** 单次合并注入模型的正文上限（字符；零依赖估算，与 design §4.12 同口径） */
+/**
+ * 单次合并调用喂给模型的正文上限（字符；零依赖估算，与 design §4.12 同口径）。
+ *
+ * **P1-13（2026-10-17 修）**：这是**一次调用的块大小**，不是原文上限。长流水账先按
+ * {@link EPISODE_MAX_CHARS} 切段，再按本上限打包成**多次调用**——原文的每一段都喂得进去，
+ * 不再"一份大日子只取头 4,000 字"。旧写法在这里裁掉的是**尾巴**（日期升序拼接，越晚的
+ * episode 越先被裁），于是近期大日子 80%+ 的正文永不提炼、原件却照样移出索引。
+ */
 const MERGE_INPUT_MAX_CHARS = 16_000;
-/** 单个 episode 注入上限（字符） */
+/**
+ * 单个 episode **单段**喂入上限（字符；P1-13 起它只管切段粒度，不再是"注入上限"）。
+ * 切段处会在标题里写明「第 i/n 段 / 全文 N 字 / 这是节选」，见 {@link sliceHeader}。
+ */
 const EPISODE_MAX_CHARS = 4_000;
 /** facts 摘要注入上限（字符）：给模型看现有条目以便 UPDATE / INVALIDATE 定位 */
 const FACTS_HINT_MAX_CHARS = 4_000;
@@ -141,6 +151,22 @@ export interface MaintainMemoryResult {
   expiredEntries: number;
   /** 日记文件绝对路径（模型与回退路径都会产出）；写失败为 null */
   diaryFile: string | null;
+  /**
+   * 本次合并**实际喂进模型**的 episode 正文字符数（P1-13 读数：喂进去的字数，不含段标题）。
+   * 与 {@link mergeTotalChars} 一起构成"喂进去的字数 / 原文总字数"这对读数。
+   */
+  mergeFedChars: number;
+  /** 到期 episode 的**原文总字符数**（P1-13 读数的分母；含被裁掉的部分，旧写法它永远大于分子） */
+  mergeTotalChars: number;
+  /** 合并调用次数（>1 = 原文被分块喂了；0 = 本次没调模型） */
+  mergeCalls: number;
+  /**
+   * 回了「ops 为空」的合并调用次数（P1-14：只回 summary、没提出任何可写项）。
+   * 这类调用**不算成功**：不归档原件（见 {@link keptForRetry}）。
+   */
+  emptyOpsCalls: number;
+  /** 因「ops 为空」判失败而**保留在 episodes/ 等下次重试**的原件（P1-14：不许归档） */
+  keptForRetry: string[];
   /** 本任务的 light lane 消耗（input+output 合计） */
   lightTokens: number;
   lightCalls: number;
@@ -422,6 +448,7 @@ const MERGE_INSTRUCTIONS = [
   '4. 只是换个说法、信息量没有增加时用 NOOP——不要为了凑数而改写。',
   '5. 需要精简或纠正已有条目时用 UPDATE（target 定位旧条目，entry 给新正文）。',
   '6. 值得永不衰减的重要事实（过敏、姓名、底线）在 entry 开头写 [!pinned]。',
+  '7. 输入可能是长流水账的**分段**（标题里写着「第 i/n 段」「全文 N 字」「这是节选」）：照样提炼这一段里有价值的决定与结论，别因为"这一段没头没尾"就跳过；同一份流水账的其余段会在同一次或下一次合并里给你。',
 ].join('\n');
 
 const DIARY_INSTRUCTIONS = [
@@ -632,6 +659,155 @@ function listDueEpisodes(memDir: string, today: string, maxAgeDays: number): Epi
   return due;
 }
 
+// ──────────────────────────────── 分块喂（P1-13） ────────────────────────────────
+
+/**
+ * episode 的一段：长流水账按 {@link EPISODE_MAX_CHARS} 切成若干段，每段都是**原文的连续区间**。
+ * 短流水账就只有一段（index = count = 1）。分段只改"怎么喂"，不改原文——原件在归档前一个字不动。
+ */
+interface EpisodeSlice {
+  /** episodes/ 下的文件名（不含路径） */
+  name: string;
+  date: string;
+  /** 第几段 / 共几段（1 起） */
+  index: number;
+  count: number;
+  /** 本段在原文里的字符区间（1 起、闭区间；给人读的读数） */
+  from: number;
+  to: number;
+  /** 原文总字符数 */
+  total: number;
+  text: string;
+}
+
+/** 是不是一个 UTF-16 高代理（切在它后面会把 emoji 劈成两个坏字符） */
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+/**
+ * 把一份 episode 切成 ≤ {@link EPISODE_MAX_CHARS} 的段。
+ *
+ * 三条纪律（P1-13）：
+ *   • **不丢任何字节**：段首尾相接覆盖全文（`to` 就是下一段的 `from - 1`），不是"取头截尾"。
+ *   • 优先在换行处切（流水账是逐行写的），切不动才硬切；硬切时不切坏代理对。
+ *   • 纯函数：只读传入的文本，不读时钟、不读环境——重放/测试逐字节可复现。
+ */
+function sliceEpisode(episode: EpisodeFile): EpisodeSlice[] {
+  const text = episode.text;
+  if (text === '') return [];
+  const spans: Array<{ from: number; to: number }> = [];
+  let from = 0;
+  while (from < text.length) {
+    let to = Math.min(text.length, from + EPISODE_MAX_CHARS);
+    if (to < text.length) {
+      const nl = text.lastIndexOf('\n', to - 1);
+      // 只在"切在换行处还能留下大半段"时才用换行边界（否则每段都被一个早换行拖成碎段）
+      if (nl >= from + Math.floor(EPISODE_MAX_CHARS / 2)) to = nl + 1;
+      if (to > from + 1 && isHighSurrogate(text.charCodeAt(to - 1))) to -= 1;
+    }
+    if (to <= from) to = Math.min(text.length, from + 1);
+    spans.push({ from, to });
+    from = to;
+  }
+  const count = spans.length;
+  return spans.map((span, index) => ({
+    name: episode.name,
+    date: episode.date,
+    index: index + 1,
+    count,
+    from: span.from + 1,
+    to: span.to,
+    total: text.length,
+    text: text.slice(span.from, span.to),
+  }));
+}
+
+/**
+ * 段的标题行：**把"这是节选、全文多少字"写在给模型看的那一行里**（P1-13 的要求）。
+ * 单段（整份都在）如实说"全文 N 字"；多段说清第几段、本段区间、全文多少字。
+ */
+function sliceHeader(slice: EpisodeSlice): string {
+  if (slice.count === 1) return `=== episodes/${slice.name}（全文 ${slice.total} 字）===`;
+  return `=== episodes/${slice.name} 第 ${slice.index}/${slice.count} 段`
+    + `（第 ${slice.from}–${slice.to} 字，全文 ${slice.total} 字；这是节选，不是全文）===`;
+}
+
+/** 一次合并调用的正文（段标题 + 段正文，段间空行） */
+function mergeBodyOf(slices: readonly EpisodeSlice[]): string {
+  return slices.map(slice => `${sliceHeader(slice)}\n${slice.text}`).join('\n\n');
+}
+
+/**
+ * 把段按**单次调用正文上限**打包（贪心，保序）。一份短流水账仍然只产生一次调用；
+ * 大日子分成几次，每一次都带着"第几次合并"的上下文（见 maintainMemory 的 prompt）。
+ */
+function packSlices(slices: readonly EpisodeSlice[], maxChars: number): EpisodeSlice[][] {
+  const groups: EpisodeSlice[][] = [];
+  let current: EpisodeSlice[] = [];
+  let used = 0;
+  for (const slice of slices) {
+    const cost = sliceHeader(slice).length + 1 + slice.text.length + 2;
+    if (current.length > 0 && used + cost > maxChars) {
+      groups.push(current);
+      current = [];
+      used = 0;
+    }
+    current.push(slice);
+    used += cost;
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+/** 一次合并调用的判定结果（P1-14：空 ops 与"读不出操作"都不是成功） */
+type MergeVerdict =
+  | { kind: 'ops'; ops: PlannedOp[]; summary: string }
+  | { kind: 'empty'; summary: string }
+  | { kind: 'malformed'; summary: string };
+
+/**
+ * 判定一次合并回包。三档的分界就是 P1-14 的判据：
+ *   • `ops`：模型**提出了操作**（含 NOOP —— 那是显式判断"这段不值得记"，算成功）。
+ *   • `empty`：只回了 summary（或什么都没有）、operations 是空数组 —— **不算成功**：
+ *     原件**不许归档**（否则就是"整理成功、记忆消失"），本次也**不写兜底**（原文还在
+ *     episodes/ 里，每天重复追加同一条反而会污染 facts.md；留着原件等下一次重试）。
+ *   • `malformed`：不是 JSON / operations 里有东西但一条合法操作都读不出 —— 按**模型失败**
+ *     处理（走确定性兜底，正文进观察区；这条路的原件可以归档，因为内容已经原样落进 facts）。
+ */
+function mergeVerdictOf(payload: unknown): MergeVerdict {
+  if (typeof payload !== 'object' || payload === null) return { kind: 'malformed', summary: '' };
+  const record = payload as Record<string, unknown>;
+  const rawSummary = record['summary'];
+  const summary = typeof rawSummary === 'string' ? rawSummary.trim() : '';
+  const rawOps = record['operations'];
+  if (!Array.isArray(rawOps) || rawOps.length === 0) return { kind: 'empty', summary };
+  const ops = readOps(record);
+  if (ops.length === 0) return { kind: 'malformed', summary };
+  return { kind: 'ops', ops, summary };
+}
+
+/** 确定性兜底条目的来源标注（单段保持旧口径，多段要能看出是哪一段） */
+function fallbackSourceOf(slice: EpisodeSlice): string {
+  return slice.count === 1
+    ? `episode ${slice.date}`
+    : `episode ${slice.date} 第 ${slice.index}/${slice.count} 段`;
+}
+
+/**
+ * 给日记素材的**节选**（P1-13 同一条纪律：不许只取头）。
+ * 长流水账取"头 + 尾"并写明这是节选、全文多少字——日记要的是这一天的样子，
+ * 而大日子最重要的事往往写在最后。读数是给模型看的（不是计数），所以直接用字符数。
+ */
+function excerptOf(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const headLen = Math.floor(maxChars / 2);
+  const tailLen = maxChars - headLen;
+  return `${text.slice(0, headLen)}\n`
+    + `…（节选：全文 ${text.length} 字，这里只给了头 ${headLen} 字与尾 ${tailLen} 字）…\n`
+    + text.slice(text.length - tailLen);
+}
+
 function emptyOps(): MemoryOps {
   return { add: 0, update: 0, invalidate: 0, noop: 0 };
 }
@@ -752,7 +928,12 @@ async function callLight(
 /**
  * 每日整理任务的核心逻辑。返回四操作计数与本次实际发生的事情（供调用方写事件/日志/测试断言）。
  * 任何一步失败都不抛给调用方（整理是后台自维护动作，不能因为模型抽风把循环拖崩）：
- * 模型不可用时退化为**确定性合并**（把流水账正文按日期附进观察区），记忆不丢、原件照样归档。
+ * 模型不可用时退化为**确定性合并**（把流水账正文按段附进观察区），记忆不丢、原件照样归档。
+ *
+ * P1-13（2026-10-17）：流水账**分块喂**——先切段（{@link sliceEpisode}）再按单次上限打包
+ * （{@link packSlices}），并把"喂入字数 / 原文总字数"记进返回值。旧写法只喂头 4,000 字。
+ * P1-14（同日）：回包 ops 为空**不算成功**——不写兜底、**不归档原件**，原件留在 episodes/
+ * 等下一次重试，并在 reason 里明说"这次没提出可写项"。
  */
 export async function maintainMemory(dataDir: string, opts: MaintainMemoryOptions): Promise<MaintainMemoryResult> {
   const now = opts.now ?? (() => new Date());
@@ -778,6 +959,11 @@ export async function maintainMemory(dataDir: string, opts: MaintainMemoryOption
     archived: [],
     expiredEntries: 0,
     diaryFile: null,
+    mergeFedChars: 0,
+    mergeTotalChars: 0,
+    mergeCalls: 0,
+    emptyOpsCalls: 0,
+    keptForRetry: [],
     lightTokens: 0,
     lightCalls: 0,
     modelFailures: 0,
@@ -788,57 +974,87 @@ export async function maintainMemory(dataDir: string, opts: MaintainMemoryOption
   const before = renderFacts(doc);
 
   let summary = '';
+  /** 回了「ops 为空」的 episode：**不归档**（P1-14：那是"整理成功、记忆消失"） */
+  const keptForRetry = new Set<string>();
+
   if (episodes.length > 0 || opts.force === true) {
     result.ran = true;
     result.merged = episodes.map(e => e.name);
-    const hint = clip(renderFacts(doc), FACTS_HINT_MAX_CHARS);
-    const body = clip(
-      episodes
-        .map(e => `=== episodes/${e.name} ===\n${clip(e.text, EPISODE_MAX_CHARS)}`)
-        .join('\n\n'),
-      MERGE_INPUT_MAX_CHARS,
-    );
-    const prompt = `${MERGE_INSTRUCTIONS}\n\n已有记忆（现状，供定位与去重）：\n${hint === '' ? '（空）' : hint}`
-      + `\n\n待整理的流水账：\n${body === '' ? '（空）' : body}`;
-    const text: DsTextFormat = { type: 'json_schema', name: 'memory_operations', schema: MERGE_SCHEMA };
-    let parsedOps: PlannedOp[] = [];
-    let modelUsed = false;
-    try {
-      const response = await callLight(opts, account, {
-        lane: 'light',
-        input: prompt,
-        text,
-        // 思考强度：**用户的口径（2026-10-06）—— light 一律 `low`，不提供更改**
-        // （另一档 heavy 一律 `high`，唯一落点是 `runtime/agent-loop.ts` 的 `toDsRequest`）。
-        // **别给这里加配置项**：config.json 里没有、也不许长出能改它的字段——
-        // 判据钉在 `test/thinking-effort-invariant.test.ts`（想加旋钮，那条测试要先红）。
-        reasoning: { effort: 'low' },
-      }, counters);
-      const payload = extractJson(textFromOutputs(response as DsResponse));
-      parsedOps = readOps(payload);
-      const rawSummary = (payload as Record<string, unknown> | null)?.['summary'];
-      summary = typeof rawSummary === 'string' ? rawSummary.trim() : '';
-      modelUsed = parsedOps.length > 0 || summary !== '';
-    } catch (err) {
-      write(`[记忆整理] light 合并失败，改用确定性合并：${err instanceof Error ? err.message : String(err)}`);
-    }
 
-    if (modelUsed) {
-      const source = episodes.length === 0 ? `maintain ${today}` : `episode ${episodes.map(e => e.date).join(',')}`;
-      const applied = applyOps(doc, parsedOps, { today, source });
-      sumOps(result.ops, applied.ops);
-    } else {
-      // 回退：不丢内容。原件正文按日期成条落进观察区，等下一次整理再让模型提纯。
-      for (const episode of episodes) {
-        const bodyText = clip(episode.text.trim(), EPISODE_MAX_CHARS);
-        if (bodyText === '') continue;
-        doc.sections.observation.push(formatEntry({
-          pinned: false, invalid: false, start: episode.date, end: null,
-          body: `(source: episode ${episode.date}) ${bodyText.replace(/\n+/g, ' ⏎ ')}`,
-        }, today));
-        result.ops.add += 1;
+    // ① 分块（P1-13）：切段 → 按单次上限打包。原文一个字都不裁，只决定"怎么喂"。
+    const slices = episodes.flatMap(episode => sliceEpisode(episode));
+    result.mergeTotalChars = slices.reduce((chars, slice) => chars + slice.text.length, 0);
+    // 没有到期流水账但被 force（手动 /dream）：仍走一次空素材调用——她要的是这一次的结论与日记
+    const groups = slices.length === 0 ? [[]] : packSlices(slices, MERGE_INPUT_MAX_CHARS);
+    const failedSlices: EpisodeSlice[] = [];
+
+    for (const [index, group] of groups.entries()) {
+      const hint = clip(renderFacts(doc), FACTS_HINT_MAX_CHARS);
+      const body = group.length === 0 ? '' : mergeBodyOf(group);
+      const callLabel = groups.length === 1 ? '' : `（第 ${index + 1}/${groups.length} 次合并）`;
+      const prompt = `${MERGE_INSTRUCTIONS}\n\n已有记忆（现状，供定位与去重）：\n${hint === '' ? '（空）' : hint}`
+        + `\n\n待整理的流水账${callLabel}：\n${body === '' ? '（空）' : body}`;
+      const text: DsTextFormat = { type: 'json_schema', name: 'memory_operations', schema: MERGE_SCHEMA };
+      result.mergeCalls += 1;
+      try {
+        const response = await callLight(opts, account, {
+          lane: 'light',
+          input: prompt,
+          text,
+          // 思考强度：**用户的口径（2026-10-06）—— light 一律 `low`，不提供更改**
+          // （另一档 heavy 一律 `high`，唯一落点是 `runtime/agent-loop.ts` 的 `toDsRequest`）。
+          // **别给这里加配置项**：config.json 里没有、也不许长出能改它的字段——
+          // 判据钉在 `test/thinking-effort-invariant.test.ts`（想加旋钮，那条测试要先红）。
+          reasoning: { effort: 'low' },
+        }, counters);
+        // 读数（P1-13）：这一块**真的发出去了**（只计段正文，不含段标题）；回包不理想也照实计
+        result.mergeFedChars += group.reduce((chars, slice) => chars + slice.text.length, 0);
+        const verdict = mergeVerdictOf(extractJson(textFromOutputs(response as DsResponse)));
+        if (verdict.summary !== '') summary = verdict.summary;
+
+        if (verdict.kind === 'empty') {
+          // **P1-14**：只回 summary、ops 为空 ⇒ 判失败。不写兜底（那会每天重复追加同一条原文），
+          // 也不归档（原件留在 episodes/，下一次整理会重新读到它）。
+          result.emptyOpsCalls += 1;
+          for (const slice of group) keptForRetry.add(slice.name);
+          write(`[记忆整理] ${callLabel === '' ? '' : `${callLabel} `}只回了摘要、没提出任何可写项（ops 为空）`
+            + ' —— 判失败：涉及的原件不归档，留在 episodes/ 等下次重试');
+          continue;
+        }
+        if (verdict.kind === 'malformed') {
+          // 回了内容但读不出操作：按**模型失败**处理（走确定性兜底，正文原样进观察区）
+          failedSlices.push(...group);
+          write(`[记忆整理] ${callLabel === '' ? '' : `${callLabel} `}合并回包读不出操作，改用确定性合并`);
+          continue;
+        }
+
+        // 来源只写这一次调用实际喂进去的那些日期（分批时不要把所有日期都记到每一批头上）
+        const dates = [...new Set(group.map(slice => slice.date))];
+        const source = dates.length === 0 ? `maintain ${today}` : `episode ${dates.join(',')}`;
+        const applied = applyOps(doc, verdict.ops, { today, source });
+        sumOps(result.ops, applied.ops);
+      } catch (err) {
+        failedSlices.push(...group);
+        write(`[记忆整理] light 合并失败${callLabel === '' ? '' : ` ${callLabel}`}，改用确定性合并：`
+          + `${err instanceof Error ? err.message : String(err)}`);
       }
     }
+
+    // 确定性兜底（只在**模型这条路失败了**时才走）：每一段正文原样落进观察区。
+    // 段粒度 ≤ EPISODE_MAX_CHARS ⇒ 兜底也是**全文**，不再出现"兜底只留头 4,000 字"。
+    for (const slice of failedSlices) {
+      const bodyText = slice.text.trim();
+      if (bodyText === '') continue;
+      doc.sections.observation.push(formatEntry({
+        pinned: false, invalid: false, start: slice.date, end: null,
+        body: `(source: ${fallbackSourceOf(slice)}) ${bodyText.replace(/\n+/g, ' ⏎ ')}`,
+      }, today));
+      result.ops.add += 1;
+    }
+
+    // 读数进日志（P1-13）：喂进去的字数 / 原文总字数 + 调用次数
+    write(`[记忆整理] 合并喂入 ${result.mergeFedChars}/${result.mergeTotalChars} 字`
+      + `（${result.mergeCalls} 次调用${result.emptyOpsCalls > 0 ? `，其中 ${result.emptyOpsCalls} 次 ops 为空` : ''}）`);
   } else {
     result.reason = '没有超过 TTL 的 episode，本次无需合并';
   }
@@ -856,6 +1072,12 @@ export async function maintainMemory(dataDir: string, opts: MaintainMemoryOption
 
   // ④ 原件归档
   for (const episode of episodes) {
+    // **P1-14**：回包 ops 为空 ⇒ 本次整理判失败，原件**不许归档**。
+    // 归档 = "整理成功、记忆消失"（兜底被跳过、原件还被移出索引），所以留下它等下次重试。
+    if (keptForRetry.has(episode.name)) {
+      result.keptForRetry.push(episode.name);
+      continue;
+    }
     try {
       result.archived.push(archiveEpisode(memDir, episode.name));
     } catch (err) {
@@ -876,8 +1098,21 @@ export async function maintainMemory(dataDir: string, opts: MaintainMemoryOption
   result.lightTokens = counters.tokens;
   result.modelFailures = counters.failures;
   if (result.reason === '') {
-    result.reason = `合并 ${result.merged.length} 份流水账、归档 ${expired.length} 条过期记忆、`
-      + `操作 ADD${result.ops.add}/UPDATE${result.ops.update}/INVALIDATE${result.ops.invalidate}/NOOP${result.ops.noop}`;
+    const fed = `喂入 ${result.mergeFedChars}/${result.mergeTotalChars} 字`;
+    if (result.keptForRetry.length > 0) {
+      // P1-14：如实说"这次没提出可写项"，并点名哪些原件被留下（不许悄悄归档）
+      result.reason = `合并 ${result.merged.length} 份流水账（${fed}），但模型**没提出任何可写项（ops 为空）**`
+        + `⇒ 本次判失败、原件不归档：${result.keptForRetry.join('、')} 留在 episodes/ 等下次重试；`
+        + `归档 ${expired.length} 条过期记忆、操作 ADD${result.ops.add}/UPDATE${result.ops.update}`
+        + `/INVALIDATE${result.ops.invalidate}/NOOP${result.ops.noop}`;
+    } else {
+      const empty = result.emptyOpsCalls > 0
+        ? `（其中 ${result.emptyOpsCalls} 次只回了摘要、没提出可写项）`
+        : '';
+      result.reason = `合并 ${result.merged.length} 份流水账（${fed}，${result.mergeCalls} 次调用）${empty}、`
+        + `归档 ${expired.length} 条过期记忆、操作 ADD${result.ops.add}/UPDATE${result.ops.update}`
+        + `/INVALIDATE${result.ops.invalidate}/NOOP${result.ops.noop}`;
+    }
   }
 
   // ⑥ 留痕（internal：整理过程不进上下文）
@@ -930,7 +1165,14 @@ async function writeDiary(
   const materialParts: string[] = [];
   if (ctx.summary !== '') materialParts.push(`整理的结论：${ctx.summary}`);
   if (ctx.episodes.length > 0) {
-    materialParts.push(...ctx.episodes.map(e => `=== episodes/${e.name} ===\n${clip(e.text, EPISODE_MAX_CHARS)}`));
+    // P1-13 同一条纪律：长流水账取"头 + 尾"并写明这是节选，**不许只取头**
+    //（大日子最重要的事往往写在最后；旧写法只给前 4,000 字）。
+    // 每份的节选预算按份数摊：份数多时宁可每份少给一点，也不让 material 的总上限把最后几份整个裁掉。
+    const perEpisode = Math.max(
+      1_000,
+      Math.min(EPISODE_MAX_CHARS, Math.floor(MERGE_INPUT_MAX_CHARS / ctx.episodes.length)),
+    );
+    materialParts.push(...ctx.episodes.map(e => `=== episodes/${e.name} ===\n${excerptOf(e.text, perEpisode)}`));
   }
   if (materialParts.length === 0) materialParts.push(`今天的记忆现状：\n${clip(ctx.facts, FACTS_HINT_MAX_CHARS)}`);
   const material = clip(materialParts.join('\n\n'), MERGE_INPUT_MAX_CHARS);

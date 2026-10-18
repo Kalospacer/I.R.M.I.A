@@ -1,5 +1,5 @@
 /**
- * Irmia Agent —— 人在消息里打的那两个指令（B1）：`/compact` 与 `/handoff`。
+ * Irmia Agent —— 人在消息里打的那几个指令：`/compact`、`/handoff`，以及 `/stop`。
  *
  * ## 为什么要有"手动触发"这条路
  *
@@ -8,6 +8,12 @@
  *   • "这一轮接下来要干一件很长的事，现在先把上下文收紧"；
  *   • "我要关机器了 / 要换一班人接手，现在就把交接写下来"。
  * 等阈值自己撞上来，往往已经晚了——所以给两个能**当场**触发的指令。
+ *
+ * 第三条 `/stop`（2026-10-16 加）是**另一种东西**：它不是"让她做点什么"，而是**用户自己动手**。
+ * 用户的原话：「加一个 **`/stop` 指令**，让我能**打断今天这种无限循环**。**我重启了又 tm 重投了**」
+ * ——它要掐的正是"超时 → 退回队列 → 重投 → 再超时"那个循环，所以它必须
+ * （a）**掐得断正在跑的那条流**、（b）**清得空待处理队列**、（c）**认得出发的人是不是用户**。
+ * 三件事都不在这个文件里做（这里只解析与文案）：动作在 `real-loop.ts` 的 `handleStopCommand`。
  *
  * ## 为什么不让她自己调
  *
@@ -20,6 +26,7 @@
  * 只认**整条消息以指令词开头**这一种形态：
  *   `/compact`               → 压缩（可跟一句理由：`/compact 上下文太长了`）
  *   `/handoff`               → 写交接笔记
+ *   `/stop`                  → 急停（掐掉在跑的模型流 + 清空待处理队列）
  *   `/compact` 之外的斜杠词   → `unknown`（上层据此回一句"没有这个指令"，
  *                              **不要**当成普通消息发给她——那会让她去猜"用户是不是在说别的"）
  * 一句话中间出现的 `/compact`（例如"我说的是 /compact 那个功能"）**不认**：
@@ -30,7 +37,9 @@
  * ## 与接线的关系（当前边界）
  *
  * 这个文件只做**纯解析**与文案：把一个字符串变成"要做什么 + 理由"。真的去压缩 / 真的去写
- * 交接笔记在 `real-loop.ts`（`handleSlashCommands`）。
+ * 交接笔记在 `real-loop.ts`（`handleSlashCommands`）；`/stop` 那条走**更早的一个入口**
+ * （`real-loop.isStopCommand` / `handleStopCommand`）——它必须在 `pending` 排队之前、
+ * 在 `busy` 判据之外就被处理掉，否则"现在停"会变成"下一拍停"。
  *
  * **两条指令共用同一条落库路径**（2026-10-04 接完线才知道的事，值得写在最前面）：
  * 效果都是"写一份交接笔记作为 `compaction/summary`"。因为那是**唯一**一条"下一个 turn
@@ -41,7 +50,7 @@
  */
 
 /** 识别出来的指令种类 */
-export type SlashCommandKind = 'compact' | 'handoff' | 'unknown';
+export type SlashCommandKind = 'compact' | 'handoff' | 'stop' | 'unknown';
 
 export interface SlashCommand {
   kind: SlashCommandKind;
@@ -51,8 +60,15 @@ export interface SlashCommand {
   argument: string;
 }
 
-/** 两个指令词（小写比对；这里同时是"哪些词算指令"的唯一名单） */
-const COMMANDS: readonly string[] = ['compact', 'handoff'];
+/**
+ * 指令词名单（小写比对；这里同时是"哪些词算指令"的唯一名单）。
+ *
+ * `stop`（2026-10-16 加）来自用户的原话：「加一个 **`/stop` 指令**，让我能**打断今天这种无限循环**。
+ * **我重启了又 tm 重投了**」——它是这三条里唯一一条**框架动作**（掐流、清队列），
+ * 也是唯一一条**在队列里也要能打断正在跑的活**的指令（见 `real-loop.ts` 的
+ * `isStopCommand` 与 `handleStopCommand`）。
+ */
+const COMMANDS: readonly string[] = ['compact', 'handoff', 'stop'];
 
 /**
  * "像一个指令词"的形状：字母开头，只含字母/数字/下划线/连字符。
@@ -93,12 +109,13 @@ export function parseSlashCommand(text: string): SlashCommand | null {
 }
 
 /**
- * 两个指令各一句话（回话与文档共用一处文案：措辞只有一份，改的时候不会漏掉一处）。
+ * 三条指令各一句话（回话与文档共用一处文案：措辞只有一份，改的时候不会漏掉一处）。
  * 顺序与 {@link COMMANDS} 一致。
  */
 const COMMAND_HELP: readonly string[] = [
   '/compact —— 立刻压缩一次上下文（截至此刻的往来换成摘要，原文仍在事件日志里）',
   '/handoff —— 立刻写下交接笔记（它会成为下一个 turn 的「早期历史摘要」）',
+  '/stop —— 急停：掐断正在跑的那次模型输出、把待处理队列清掉（输入进死信，标注 stopped-by-owner）',
 ];
 
 /**
@@ -126,6 +143,37 @@ export function isSlashCommandEvent(event: { type: string; data: unknown }): boo
 }
 
 /**
+ * **框架指令**进不进她的上下文：`isSlashCommandEvent` 之外，还认用户单聊里的 `/stop`。
+ *
+ * 为什么要多这一条（而 `isSlashCommandEvent` 本身不能改）：那个函数的判据是
+ * 「整条就是一条指令的 `wake/manual`」——它被 `replay` 与 `agent-loop` 的 `eventFilter`
+ * 共用，**改宽它就会改掉"旧日志重建出来的请求"**（同一份日志重建同一份请求，这条承诺不能断）。
+ *
+ * `/stop` 是唯一一条**会在通道里被用户打出来**的框架指令（`/compact` / `/handoff`
+ * 刻意只认本机对话流，见 `real-loop.runSlashCommand` 的注释——让外部文字决定"她该忘掉什么"
+ * 是把改她上下文的权力交给外人）。正常路径上它根本不会被落库（入口就拦下了，见
+ * `real-loop.isStopCommand`），所以这一条是**防线第二道**：万一有一条 `/stop` 进了日志
+ * （手工补写、旧版本回放、将来放宽了入口），它也不该以一条 user 消息的样子出现在她眼前——
+ * 那只会让她去猜"用户是不是想让我停什么"，而那正是文件头写明不许发生的事。
+ *
+ * 代价（照实写）：这**确实**是对旧日志生效的一条行为变化——但影响面可以精确框住：
+ * 只有"用户单聊里、正文恰好以 `/stop` 开头"的通道消息会从"进上下文"变成"不进"，
+ * 而这类消息在此之前的代码里**从来没有人打过**（`/stop` 是这一版才有的指令）。
+ *
+ * 为什么"是不是用户"不在这里判：判据要联系人表 + 用户名字 + 已声明的用户 id（`runtime/trust.ts`
+ * 那一套），而本函数是渲染/重建路径上的纯函数（不读配置）。入口那一处（`isStopCommand`）
+ * 是**权限的判据点**——这里是"别让她看见按钮"的兜底，不是权限。
+ */
+export function isFrameworkCommandEvent(event: { type: string; data: unknown }): boolean {
+  if (isSlashCommandEvent(event)) return true;
+  if (event.type !== 'wake/channel') return false;
+  const data = (event.data ?? {}) as { chatType?: unknown; text?: unknown };
+  if (data.chatType !== 'c2c') return false;
+  if (typeof data.text !== 'string') return false;
+  return parseSlashCommand(data.text)?.kind === 'stop';
+}
+
+/**
  * 认不出来的斜杠词的回话。
  * 为什么必须**点名**那个词、并且**列出**可用的两个：打了 `/clear` 的人下一步要么改成正确的词，
  * 要么去提需求；只说"不认识的指令"他得自己猜有什么。（**不**把这条消息当成普通消息发给她——
@@ -134,6 +182,51 @@ export function isSlashCommandEvent(event: { type: string; data: unknown }): boo
 export function unknownCommandReply(name: string): string {
   return `没有这个指令 ${name}。可用的有：${COMMAND_HELP.join('；')}。`;
 }
+
+// ──────────────────────────────── `/stop`（急停） ────────────────────────────────
+
+/**
+ * 这条唤醒是不是用户按下的 `/stop`（**跨通道**：GUI 的 `wake/manual` 与通道的 `wake/channel`）。
+ *
+ * 与另外两条指令的差别（每一处都是刻意的）：
+ *   · 它**认通道**（用户可能在 QQ 单聊里按，也可能在 GUI 里按）——"停下来"这件事
+ *     与他从哪个窗口说无关，而 `/compact` / `/handoff` 只认本机对话流（改她上下文的能力不外放）；
+ *   · 它**不进队列**（入口就拦下，见 `real-loop.ts` 的 `isStopCommand`）：让它排进 pending
+ *     等下一拍就晚了——用户要的是"现在就停"；
+ *   · **权限不在这个函数里判**：这里只回答"这是不是一条 `/stop`"，
+ *     "发的人是不是用户"由入口那一处判（判据要联系人表与用户名字，纯函数拿不到）。
+ *
+ * 全角斜杠（`／`）由 `parseSlashCommand` 归一，所以 `／stop` 也认。
+ */
+export function isStopCommandText(type: string, text: string | undefined): boolean {
+  if (type !== 'wake/manual' && type !== 'wake/channel') return false;
+  if (typeof text !== 'string' || text.trim() === '') return false;
+  return parseSlashCommand(text)?.kind === 'stop';
+}
+
+/**
+ * 急停的回执（**按真实结局分两种**，不许用一句话糊过去两种情形）。
+ *
+ * 措辞对着三件真事写：
+ *   ① **已经停了什么**——正在跑的那次模型输出被掐断（已收到的部分照既有 `interrupted` 语义留档），
+ *      队列里的输入进了死信并标了 `stopped-by-owner`；
+ *   ② **它们没有消失**——死信可以在界面上重投（`requeue`）或丢弃（`discard`），原文都在日志里；
+ *   ③ **不会再自动重投**——这正是用户今天最痛的那件事（「我重启了又 tm 重投了」）：
+ *      停在死信里就是停在死信里，除非人点头。
+ */
+export const STOP_RECEIPT =
+  '已经急停：正在跑的那次模型输出被掐断（已收到的部分照旧留在日志里），'
+  + '待处理队列里的输入全部移进死信并标注 stopped-by-owner——它们不会自己重投。'
+  + '要接着做：在界面的死信队列里挑一条重投（认领次数会归零），或者丢掉。';
+
+/**
+ * 没有在跑的活、队列也空时的回执（幂等的落点）。
+ *
+ * 为什么这也必须回一句：用户按了按钮却什么都不显示，他分不清"停了"和"按了没反应"
+ * （`/dream` 那次"按了没反应"的教训写在 `runSlashCommand` 里）。这一句同时是**事实**：
+ * 确实没有在跑的活、队列也确实空。
+ */
+export const STOP_IDLE_RECEIPT = '没有在跑的活：此刻没有正在进行的模型输出，待处理队列也是空的。';
 
 /**
  * 压缩的收据（接线时随动作一起回给用户）。

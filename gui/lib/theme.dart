@@ -1,37 +1,48 @@
+// TODO(i18n): 本文件还有 8 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/theme.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import 'theme/design_tokens.dart';
+
 /// Irmia GUI 主题 —— 与 Web 端同一颗种子（#2563EB）派生，两处不打架。
 /// 规格来源：docs/gui-design.md §4。
+///
+/// **数值一律来自 `theme/design_tokens.dart`**（间距、字号、色值、圆角、动效的唯一真值）。
+/// 这里只做装配：把令牌拼成 ThemeData，不发明新数。下面每个常量都是"给老调用点留的名字"，
+/// 值本身在 tokens 里——谁要改色/改圆角，改 tokens，不要改这里。
 class IrmiaTheme {
   IrmiaTheme._();
 
-  static const seed = Color(0xFF2563EB);
+  static const seed = Palette.seed;
 
   /// 状态四色在明暗两模下不变（语义不随主题漂移）
-  static const ok = Color(0xFF2F9E44);
-  static const warn = Color(0xFFF08C00);
-  static const danger = Color(0xFFE03131);
-  static const sleep = Color(0xFFADB5BD);
+  static const ok = Palette.okFixed;
+  static const warn = Palette.warnFixed;
+  static const danger = Palette.dangerFixed;
+  static const sleep = Palette.sleepFixed;
 
-  /// 发丝影：不是泛光，是纸的厚度
-  static const hairline = <BoxShadow>[
-    BoxShadow(color: Color(0x0D101828), blurRadius: 2, offset: Offset(0, 1)),
-  ];
+  /// 发丝影：不是泛光，是纸的厚度（唯一一套阴影，见 [Shape.shadows]）
+  static const hairline = Shape.shadows;
 
-  static const radiusCard = 12.0;
-  static const radiusCtl = 8.0;
-  static const radiusAvatar = 16.0;
+  static const radiusCard = Shape.radiusCard;
+  static const radiusCtl = Shape.radiusControl;
+  static const radiusAvatar = Shape.radiusAvatar;
 
   /// 暗主题那两处白描边的宽度（用户原话："改成白色描边"，要**细**）。
   /// **只有这一处定义宽度**；谁用、什么时候用见 [IrmiaDarkPair]。
-  static const hairlineWidth = 1.0;
+  static const hairlineWidth = Shape.hairline;
 
-  /// 动效节奏（MaidKit 实证值）
-  static const durPage = Duration(milliseconds: 180);
-  static const durCard = Duration(milliseconds: 240);
+  /// 动效节奏：页面 180ms / 卡片 240ms / SSE 淡入 150ms。
+  ///
+  /// 三个数现在是 [Motion] 的别名：`durPage` = [Motion.base]、`durCard` = [Motion.slow]，
+  /// `durSse` 是"一条事件淡入"的专用值（150，介于 fast 与 base 之间，事件流专用）。
+  static const durPage = Motion.base;
+  static const durCard = Motion.slow;
   static const durSse = Duration(milliseconds: 150);
 
   /// 界面字体栈。**只在这里写一次**：`ThemeData.fontFamily` 与那几个"直接交给 Material、
@@ -43,16 +54,17 @@ class IrmiaTheme {
   static ThemeData dark() => _build(Brightness.dark);
 
   static ThemeData _build(Brightness brightness) {
+    final palette = Palette.ofBrightness(brightness);
     final scheme = ColorScheme.fromSeed(seedColor: seed, brightness: brightness);
-    final isDark = brightness == Brightness.dark;
 
-    // 与 Web token 表对齐的少量覆写：外壳用 surfaceContainer 系
-    final surface = isDark ? const Color(0xFF14161A) : const Color(0xFFFFFFFF);
-    final surfaceContainer = isDark ? const Color(0xFF1A1D22) : const Color(0xFFF5F7FA);
-    final surfaceHighest = isDark ? const Color(0xFF232A3A) : const Color(0xFFE8EEF9);
-    final outline = isDark ? const Color(0xFF2C3138) : const Color(0xFFE8ECF0);
-    final onSurface = isDark ? const Color(0xFFE9ECEF) : const Color(0xFF1F2329);
-    final onVariant = isDark ? const Color(0xFF98A0AA) : const Color(0xFF8F959E);
+    // 与 Web token 表对齐的少量覆写：外壳用 surfaceContainer 系。
+    // 取值全部来自 [Palette]（见 design_tokens.dart 的映射表）。
+    final surface = palette.bg;
+    final surfaceContainer = palette.sunken;
+    final surfaceHighest = palette.raised;
+    final outline = palette.border;
+    final onSurface = palette.ink;
+    final onVariant = palette.inkFaint;
 
     final base = ThemeData(
       useMaterial3: true,
@@ -64,13 +76,15 @@ class IrmiaTheme {
         surfaceContainerHighest: surfaceHighest,
         outlineVariant: outline,
         onSurfaceVariant: onVariant,
-        primary: isDark ? const Color(0xFF3B82F6) : seed,
+        primary: palette.primary,
       ),
       scaffoldBackgroundColor: surface,
       // 系统字体栈：中文原生感（Flutter 默认即平台字体，这里显式声明意图）
       fontFamily: Platform.isWindows ? windowsUiFont : null,
       visualDensity: VisualDensity.standard,
       splashFactory: InkSparkle.splashFactory,
+      // 文字三档挂上去：页面取 `IrmiaInk.of(context)` 就有主/次/弱三个语义名
+      extensions: <ThemeExtension<dynamic>>[IrmiaInk.fromPalette(palette)],
     );
 
     // 按钮文字：**只在这里定义一次**。
@@ -83,11 +97,38 @@ class IrmiaTheme {
     //
     // 从主题的 labelLarge 派生，字体栈就跟着 ThemeData 的 fontFamily 走；
     // 各页面也**不要**再传 textStyle，字号要统一就在这里改。
+    //
+    // 字号 13：**这是全套界面里唯一的 13**，而且只服务按钮。它比 [Type.body]（14）小一档，
+    // 是因为按钮永远是"一句话那么宽"，14 在 92 宽的窄按钮里会挤；它比 [Type.caption]（12）
+    // 大一档，是因为它是可点的东西、要比旁注显眼。有测试钉着（button_typography_test.dart）。
     final buttonText = (base.textTheme.labelLarge ?? const TextStyle())
         .copyWith(fontSize: 13, fontWeight: FontWeight.w500);
 
+    // 三档字的落地：不带 style 的 Text() 从此就是这三档（见 design_tokens.dart 的 [Type]）。
+    // 只改这四格，其余仍走 M3 默认——改多了整棵树的几何都会动，那不是"提升观感"。
+    final landedText = base.textTheme.copyWith(
+      titleLarge: Type.title.style(
+        color: base.textTheme.titleLarge?.color,
+        weight: FontWeight.w600,
+      ),
+      bodyMedium: Type.body.style(color: base.textTheme.bodyMedium?.color),
+      bodySmall: Type.caption.style(color: base.textTheme.bodySmall?.color),
+      labelSmall: Type.caption.style(color: base.textTheme.labelSmall?.color),
+    );
+
     return base.copyWith(
-      dividerTheme: DividerThemeData(color: outline, thickness: 1, space: 1),
+      textTheme: landedText,
+      dividerTheme: DividerThemeData(
+        color: outline,
+        thickness: Shape.hairline,
+        space: Shape.hairline,
+      ),
+      // 弹窗圆角统一到卡片的 12：M3 默认是 28，与同一屏里的卡片/输入框不是一个形
+      // （用户 ⑧ 的统一令在这一处过去被漏掉了）。
+      dialogTheme: DialogThemeData(
+        backgroundColor: surface,
+        shape: RoundedRectangleBorder(borderRadius: Shape.card),
+      ),
       cardTheme: CardThemeData(
         color: surface,
         elevation: 0,
@@ -101,7 +142,11 @@ class IrmiaTheme {
         filled: true,
         fillColor: surface,
         isDense: true,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        // 内边距归一：14/12 → 12/12（4/8 栅格里只有 12 这一档贴近 14）
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: Space.x3,
+          vertical: Space.x3,
+        ),
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(radiusCtl),
           borderSide: BorderSide(color: outline),
@@ -112,12 +157,13 @@ class IrmiaTheme {
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(radiusCtl),
-          borderSide: BorderSide(color: base.colorScheme.primary, width: 1.4),
+          borderSide: BorderSide(color: base.colorScheme.primary, width: Shape.focusWidth),
         ),
       ),
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+          // 20/14 → 16/12：与卡片的 16 对齐，按钮不再是"比卡片还胖"的那一个
+          padding: const EdgeInsets.symmetric(horizontal: Space.x4, vertical: Space.x3),
           // 控件圆角一律走 radiusCtl（用户 ⑧："多处圆角不一致？统一为这种吧"——
           // 他指的是同一张卡里输入框那种 8）。这里原来是写死的 22：按钮是胶囊、
           // 挨着它的输入框是 8，一张卡里两种圆角。
@@ -159,13 +205,14 @@ class IrmiaTheme {
         // `width` 与 `margin` 互斥（SnackBar 自己断言了），margin 一撤底部间距就没了、
         // 条子贴到窗口下沿。主题里的 insetPadding 是 margin 的兜底来源（snack_bar.dart:718-721），
         // 定宽时横向不生效、纵向照样把它托起来 ✓。
-        insetPadding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+        // 16/12/16/24 → 全是栅格值（[Space]）
+        insetPadding: const EdgeInsets.fromLTRB(Space.x4, Space.x3, Space.x4, Space.x6),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(radiusCtl)),
       ),
       tooltipTheme: TooltipThemeData(
         decoration: BoxDecoration(
           color: onSurface,
-          borderRadius: BorderRadius.circular(6),
+          borderRadius: BorderRadius.circular(Shape.radiusControl),
         ),
         textStyle: TextStyle(color: surface, fontSize: 12),
       ),
@@ -174,8 +221,9 @@ class IrmiaTheme {
 
   /// 氛围光：内容区顶部一片淡蓝晕开（与 Web 同一片光）
   static BoxDecoration dawn(Brightness brightness) {
-    final primary = brightness == Brightness.dark ? const Color(0xFF3B82F6) : seed;
-    final base = brightness == Brightness.dark ? const Color(0xFF14161A) : Colors.white;
+    final palette = Palette.ofBrightness(brightness);
+    final primary = palette.primary;
+    final base = palette.bg;
     return BoxDecoration(
       gradient: LinearGradient(
         begin: Alignment.topCenter,

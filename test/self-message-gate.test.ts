@@ -152,7 +152,7 @@ async function startFakeProtocolSide(
       try { call = JSON.parse(text) as Record<string, unknown>; } catch { return; }
       actions.push(call);
       if (call['action'] === 'get_login_info') {
-        const userId = options.loginInfoUserId === undefined ? '2175258788' : options.loginInfoUserId;
+        const userId = options.loginInfoUserId === undefined ? '1234567891' : options.loginInfoUserId;
         sendJson({
           status: 'ok', retcode: 0, echo: call['echo'],
           data: userId === null ? {} : { user_id: userId, nickname: '伊尔弥亚2号' },
@@ -184,21 +184,21 @@ async function startFakeProtocolSide(
 test('判据只认"此刻知道"的那些：学到之前放行、学到之后拦住（这就是那处"改了等于没改"）', () => {
   const learned = new Set<string>();
   const self = new SelfIdentity([() => [...learned]]);
-  const echo = { channel: 'qq-official', person: '86F07678EEB2533A51B1ADA03670C730' };
+  const echo = { channel: 'qq-official', person: '00000000000000000000000000000003' };
 
   // 学到之前：**放行**（认不出自己时宁可让一次回声漏进来，也绝不丢掉别人的话）
   assert.equal(isSelfMessage(echo, self), false, '还不知道自己是谁时不许误拦');
 
   // "运行期学到了"——走的是与 main.ts 完全相同的两条腿：现读口（provider）+ 推送口（add）
-  learned.add('86F07678EEB2533A51B1ADA03670C730');
+  learned.add('00000000000000000000000000000003');
   assert.equal(isSelfMessage(echo, self), true, '现读口必须让"刚学到的"当场算数（不能是启动快照）');
-  assert.deepEqual(self.values(), ['86F07678EEB2533A51B1ADA03670C730']);
+  assert.deepEqual(self.values(), ['00000000000000000000000000000003']);
 
   // 推送口那条腿：不经过 provider 也认
   const pushed = new SelfIdentity();
-  assert.equal(isSelfMessage({ person: '2175258788' }, pushed), false);
-  pushed.add('2175258788');
-  assert.equal(isSelfMessage({ person: '2175258788' }, pushed), true);
+  assert.equal(isSelfMessage({ person: '1234567891' }, pushed), false);
+  pushed.add('1234567891');
+  assert.equal(isSelfMessage({ person: '1234567891' }, pushed), true);
 
   // 空 person / 空白：不认（畸形事件不该被"当成自己"静默吞掉）
   assert.equal(isSelfMessage({ person: '' }, pushed), false);
@@ -225,12 +225,12 @@ test('官 Bot：回声的 openid 是**运行期学到**的，学到之后它不�
   const self = new SelfIdentity([() => learned]);
 
   // 平台推来一条"群里有人 @ 了她"的事件 ⇒ 适配器从 `mentions[bot]` 里学到**自己的 openid**
-  const GROUP_OPENID = '0AE5BFDC4E3C03A66B6356CB86A71B21';
-  const SELF_OPENID = '86F07678EEB2533A51B1ADA03670C730';
+  const GROUP_OPENID = '00000000000000000000000000000002';
+  const SELF_OPENID = '00000000000000000000000000000003';
   const groupEvent = {
     id: 'ROBOT1.0_inbound',
     group_openid: GROUP_OPENID,
-    author: { member_openid: 'E7FEC35E951B5CCF8BA66793BF6B1314', username: 'OWNER', member_role: 'owner' },
+    author: { member_openid: '00000000000000000000000000000001', username: 'OWNER', member_role: 'owner' },
     content: '<qqbot-at-user id="' + SELF_OPENID + '" /> 在吗',
     timestamp: '2026-10-10T16:46:00.000Z',
     mentions: [{ id: SELF_OPENID, bot: true }],
@@ -284,7 +284,7 @@ test('官 Bot：回声的 openid 是**运行期学到**的，学到之后它不�
   const spoken = [{ text: '那条重复的撤了退群不可逆你点哪个群我就退', ts: '2026-10-10T16:46:39.453Z', parts: 3, seq: 900, atMs: Date.parse('2026-10-10T16:46:39.453Z') }];
   const messages = [{
     sid: `qq:group:${GROUP_OPENID}`, channel: 'qq-official', chatType: 'group' as const, chatId: GROUP_OPENID,
-    person: 'E7FEC35E951B5CCF8BA66793BF6B1314', nickname: 'OWNER', text: '你点哪个群我就退',
+    person: '00000000000000000000000000000001', nickname: 'OWNER', text: '你点哪个群我就退',
     messageId: 'm-1', msgSeq: 3, seq: 901, ts: '2026-10-10T16:46:40.000Z',
   }];
   const tk = createAdminTools({
@@ -293,7 +293,7 @@ test('官 Bot：回声的 openid 是**运行期学到**的，学到之后它不�
     channelSpokenReader: async () => spoken,
     selfIds: () => self.values(),
     timezone: 'UTC',
-    resolvePersonName: (person) => (person.startsWith('E7FEC') ? '用户（OWNER）' : null),
+    resolvePersonName: (person) => (person === '00000000000000000000000000000001' ? '用户（OWNER）' : null),
   });
   const out = await tk.byName('read_channel').handler({ sid: `qq:group:${GROUP_OPENID}`, limit: 20 }, CTX);
   assert.match(out.content, /（我）：那条重复的撤了退群不可逆你点哪个群我就退/u,
@@ -325,11 +325,11 @@ test('OneBot：self_id 是**首条事件**教的（不是启动时就知道）�
   await waitFor(() => channel.snapshot().connected, 8000, 'OneBot 链路握手完成');
 
   // 协议端推来**第一条消息事件**：`self_id` 就在这里（这条链路里"我是谁"的唯一权威来源）
-  const BOT_QQ = '2175258788';
+  const BOT_QQ = '1234567891';
   fake.sendJson({
     post_type: 'message', message_type: 'group', self_id: BOT_QQ,
-    group_id: 705463642, user_id: '1109841333', message_id: 555001, message_seq: 11,
-    sender: { user_id: '1109841333', nickname: 'Kalo' },
+    group_id: 123456782, user_id: '1234567892', message_id: 555001, message_seq: 11,
+    sender: { user_id: '1234567892', nickname: 'Kalo' },
     raw_message: '在吗', message: [{ type: 'text', data: { text: '在吗' } }],
   });
   await waitFor(() => channel.selfIds().length > 0, 8000, '适配器学到 self_id');
@@ -339,21 +339,21 @@ test('OneBot：self_id 是**首条事件**教的（不是启动时就知道）�
   // 现在协议端把她自己的那条推回来（`reportSelfMessage` 打开时的形状；本机是 false，所以这条
   // 只有在"哪天打开了"时才真会发生——判据补上之后那一天也不会出问题）
   const echo: WakeChannel['data'] = {
-    channel: 'onebot', chatType: 'group', person: BOT_QQ, chatId: '705463642',
+    channel: 'onebot', chatType: 'group', person: BOT_QQ, chatId: '123456782',
     text: '那条重复的撤了', messageId: '555002', msgSeq: 12,
   };
   assert.equal(channelGate(echo, self), true, 'OneBot 侧：认出是自己发的 ⇒ 不落库（哪怕协议端哪天开始上报）');
   assert.equal(groupMemberGate({ ...echo, chatType: 'group-at', mentionsMe: true }, self), true,
     'OneBot 侧：也不会被注册成群友');
   // 群里**别人**的话照旧放行（不许因为认自己而误伤别人）
-  assert.equal(channelGate({ ...echo, person: '1109841333' }, self), false, '别人的话一个字都不许拦');
+  assert.equal(channelGate({ ...echo, person: '1234567892' }, self), false, '别人的话一个字都不许拦');
   // 落库口的数据也照旧到（"别人的话"那条路没被这条闸影响）
-  await waitFor(() => delivered.some((item) => item.person === '1109841333'), 8000, 'Kalo 那条投给宿主');
-  assert.ok(delivered.some((item) => item.person === '1109841333'), 'Kalo 那条照常投给宿主');
+  await waitFor(() => delivered.some((item) => item.person === '1234567892'), 8000, 'Kalo 那条投给宿主');
+  assert.ok(delivered.some((item) => item.person === '1234567892'), 'Kalo 那条照常投给宿主');
 });
 
 test('OneBot：`get_login_info` 是另一条来路（事件里没有 self_id 时靠它兜底），同样报给宿主', async (t) => {
-  const fake = await startFakeProtocolSide(t, { loginInfoUserId: '2175258788' });
+  const fake = await startFakeProtocolSide(t, { loginInfoUserId: '1234567891' });
   const channel = new OneBotChannel({ wsUrl: fake.url, log: { info: () => {}, warn: () => {} } });
   const self = new SelfIdentity([() => channel.selfIds()]);
   channel.setSelfIdListener((id) => { self.add(id); });
@@ -365,7 +365,7 @@ test('OneBot：`get_login_info` 是另一条来路（事件里没有 self_id 时
   fake.sendJson({ post_type: 'meta_event', meta_event_type: 'lifecycle', sub_type: 'connect' });
   await waitFor(() => channel.selfIds().length > 0, 8000, 'get_login_info 兜底拿到机器人 QQ 号');
   assert.ok(fake.actions().some((call) => call['action'] === 'get_login_info'), '确实问了协议端');
-  assert.equal(isSelfMessage({ channel: 'onebot', person: '2175258788' }, self), true);
+  assert.equal(isSelfMessage({ channel: 'onebot', person: '1234567891' }, self), true);
 });
 
 // ──────────────────────────────── ④ 官方那侧"我是谁"的最后一个来源 ────────────────────────────────
@@ -375,12 +375,12 @@ test('官 Bot：`GET /users/@me` 探针（既有握手）取到就记、取不�
   const http: HttpJsonFn = async (request) => {
     calls.push({ url: request.url, method: request.method });
     if (request.url.endsWith('/users/@me')) {
-      return { status: 200, body: { id: '86F07678EEB2533A51B1ADA03670C730', username: '伊尔弥亚2号' } };
+      return { status: 200, body: { id: '00000000000000000000000000000003', username: '伊尔弥亚2号' } };
     }
     return { status: 200, body: {} };
   };
   const info = await fetchBotLoginInfo({ apiBase: 'https://api.bot.qq.com', token: async () => 'T', http });
-  assert.deepEqual(info, { openid: '86F07678EEB2533A51B1ADA03670C730', username: '伊尔弥亚2号' });
+  assert.deepEqual(info, { openid: '00000000000000000000000000000003', username: '伊尔弥亚2号' });
   assert.equal(calls[0]!.url, 'https://api.bot.qq.com/users/@me');
 
   // 取不到（平台没给 id）⇒ **null**，绝不猜一个
@@ -404,10 +404,10 @@ test('两侧对照：官 Bot ↔ OneBot（同一场景各一次，结论必须�
 
   // 官 Bot 侧：openid 由 @ 我的事件学到
   const qqSelf = new SelfIdentity();
-  const GROUP_OPENID = '0AE5BFDC4E3C03A66B6356CB86A71B21';
-  for (const id of botOpenidsOf({ mentions: [{ id: '86F07678EEB2533A51B1ADA03670C730', bot: true }] })) qqSelf.add(id);
+  const GROUP_OPENID = '00000000000000000000000000000002';
+  for (const id of botOpenidsOf({ mentions: [{ id: '00000000000000000000000000000003', bot: true }] })) qqSelf.add(id);
   const qqEcho: WakeChannel['data'] = {
-    channel: 'qq-official', chatType: 'group', person: '86F07678EEB2533A51B1ADA03670C730',
+    channel: 'qq-official', chatType: 'group', person: '00000000000000000000000000000003',
     chatId: GROUP_OPENID, text: '退群不可逆', messageId: 'e1', msgSeq: 1,
   };
   rows.push({
@@ -419,10 +419,10 @@ test('两侧对照：官 Bot ↔ OneBot（同一场景各一次，结论必须�
 
   // OneBot 侧：QQ 号由 self_id 学到
   const obSelf = new SelfIdentity();
-  obSelf.add('2175258788');
+  obSelf.add('1234567891');
   const obEcho: WakeChannel['data'] = {
-    channel: 'onebot', chatType: 'group', person: '2175258788',
-    chatId: '705463642', text: '退群不可逆', messageId: 'e2', msgSeq: 2,
+    channel: 'onebot', chatType: 'group', person: '1234567891',
+    chatId: '123456782', text: '退群不可逆', messageId: 'e2', msgSeq: 2,
   };
   rows.push({
     side: 'onebot',
@@ -454,7 +454,7 @@ test('端到端：群里的动静从适配器走到 read_channel 的那一行（
   t.after(() => { log.close(); rmSync(dir, { recursive: true, force: true }); });
 
   const projection = fold([]);
-  const GROUP = '705463642';
+  const GROUP = '123456782';
   const SID = `onebot:group:${GROUP}`;
   const append = (type: string, data: unknown, ts: string): void => {
     const event = {
@@ -468,20 +468,20 @@ test('端到端：群里的动静从适配器走到 read_channel 的那一行（
   // ① + ②：协议端推来的四条 notice，逐条走适配器的映射再落库（形状照 OneBot 11）
   const raws: Array<Record<string, unknown>> = [
     // 别人（用户）开了全员禁言：`user_id === group_id`、duration 0
-    { post_type: 'notice', notice_type: 'group_ban', sub_type: 'ban', group_id: Number(GROUP), user_id: Number(GROUP), operator_id: 1269541505, duration: 0, self_id: 2175258788 },
+    { post_type: 'notice', notice_type: 'group_ban', sub_type: 'ban', group_id: Number(GROUP), user_id: Number(GROUP), operator_id: 1234567890, duration: 0, self_id: 1234567891 },
     // 某个群成员被禁言 600 秒
-    { post_type: 'notice', notice_type: 'group_ban', sub_type: 'ban', group_id: Number(GROUP), user_id: 1109841333, operator_id: 1269541505, duration: 600, self_id: 2175258788 },
-    { post_type: 'notice', notice_type: 'group_admin', sub_type: 'set', group_id: Number(GROUP), user_id: 1109841333, operator_id: 1269541505, self_id: 2175258788 },
-    { post_type: 'notice', notice_type: 'group_increase', sub_type: 'approve', group_id: Number(GROUP), user_id: 1109841333, operator_id: 1269541505, self_id: 2175258788 },
-    { post_type: 'notice', notice_type: 'group_recall', group_id: Number(GROUP), user_id: 1109841333, operator_id: 1109841333, message_id: 555, self_id: 2175258788 },
+    { post_type: 'notice', notice_type: 'group_ban', sub_type: 'ban', group_id: Number(GROUP), user_id: 1234567892, operator_id: 1234567890, duration: 600, self_id: 1234567891 },
+    { post_type: 'notice', notice_type: 'group_admin', sub_type: 'set', group_id: Number(GROUP), user_id: 1234567892, operator_id: 1234567890, self_id: 1234567891 },
+    { post_type: 'notice', notice_type: 'group_increase', sub_type: 'approve', group_id: Number(GROUP), user_id: 1234567892, operator_id: 1234567890, self_id: 1234567891 },
+    { post_type: 'notice', notice_type: 'group_recall', group_id: Number(GROUP), user_id: 1234567892, operator_id: 1234567892, message_id: 555, self_id: 1234567891 },
     // 认不出的类别：**不落库**（宁可这一条没有，也不编一件没发生的事）
-    { post_type: 'notice', notice_type: '不认识的类别', group_id: Number(GROUP), user_id: 1109841333, self_id: 2175258788 },
+    { post_type: 'notice', notice_type: '不认识的类别', group_id: Number(GROUP), user_id: 1234567892, self_id: 1234567891 },
   ];
   const self = new SelfIdentity();
-  self.add('2175258788');
+  self.add('1234567891');
   let at = Date.parse('2026-10-10T16:46:00.000Z');
   for (const raw of raws) {
-    const data = noticeDataOf(raw, { selfId: '2175258788' });
+    const data = noticeDataOf(raw, { selfId: '1234567891' });
     if (data === null) continue;
     if (noticeLineText(data, () => '', new Set(self.values())) === null) continue; // 宿主那层的形状/类别闸
     append('channel/notice', data, new Date(at).toISOString());
@@ -522,8 +522,8 @@ test('端到端：群里的动静从适配器走到 read_channel 的那一行（
     selfIds: () => self.values(),
     timezone: 'UTC',
     resolvePersonName: (person) => ({
-      '1269541505': '用户（OWNER）',
-      '1109841333': 'Kalo',
+      '1234567890': '用户（OWNER）',
+      '1234567892': 'Kalo',
     } as Record<string, string>)[person] ?? null,
   });
   const out = await tk.byName('read_channel').handler({ sid: SID, limit: 20 }, CTX);
@@ -545,32 +545,32 @@ test('端到端：群里的动静从适配器走到 read_channel 的那一行（
 // ──────────────────────────────── ⑦ notice 那一行（纯函数：逐字与边界） ────────────────────────────────
 
 test('notice 数据 → 逐字一行：拿不到的不编、认不出的不猜', () => {
-  const namer = (id: string): string => (id === '1269541505' ? '用户（OWNER）' : '');
-  const self = new Set(['2175258788']);
+  const namer = (id: string): string => (id === '1234567890' ? '用户（OWNER）' : '');
+  const self = new Set(['1234567891']);
   const line = (raw: Record<string, unknown>, ctxSelf = self): string | null =>
-    noticeLineText(noticeDataOf(raw, { selfId: '2175258788' })!, namer, ctxSelf);
+    noticeLineText(noticeDataOf(raw, { selfId: '1234567891' })!, namer, ctxSelf);
 
-  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 705463642, user_id: 1269541505, operator_id: 1269541505, duration: 0 }), '[用户（OWNER） 开启了全员禁言]');
+  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 123456782, user_id: 1234567890, operator_id: 1234567890, duration: 0 }), '[用户（OWNER） 开启了全员禁言]');
   // 全员禁言那一条的协议形状是 `user_id === group_id`（duration 为 0）——两条判据都认
-  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 705463642, user_id: 705463642, operator_id: 1269541505, duration: 0 }), '[用户（OWNER） 开启了全员禁言]');
-  assert.equal(line({ notice_type: 'group_ban', sub_type: 'lift_ban', group_id: 705463642, user_id: 1269541505, operator_id: 1269541505, duration: 0 }), '[用户（OWNER） 解除了全员禁言]');
-  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 705463642, user_id: 999, operator_id: 1269541505, duration: 600 }), '[用户（OWNER） 把 某个群成员（…0999） 禁言 600 秒]');
-  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 705463642, user_id: 999, duration: 600 }), '[某个群成员（…0999） 被禁言 600 秒]');
+  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 123456782, user_id: 123456782, operator_id: 1234567890, duration: 0 }), '[用户（OWNER） 开启了全员禁言]');
+  assert.equal(line({ notice_type: 'group_ban', sub_type: 'lift_ban', group_id: 123456782, user_id: 1234567890, operator_id: 1234567890, duration: 0 }), '[用户（OWNER） 解除了全员禁言]');
+  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 123456782, user_id: 999, operator_id: 1234567890, duration: 600 }), '[用户（OWNER） 把 某个群成员（…0999） 禁言 600 秒]');
+  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 123456782, user_id: 999, duration: 600 }), '[某个群成员（…0999） 被禁言 600 秒]');
   // 拿不到 duration ⇒ **不写秒数**（不许编一个 0 或 600 出来），而且**不许**读成全员禁言
-  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 705463642, user_id: 999 }), '[某个群成员（…0999） 被禁言]');
-  assert.equal(line({ notice_type: 'group_admin', sub_type: 'set', group_id: 705463642, user_id: 999 }), '[某个群成员（…0999） 被设为管理员]');
-  assert.equal(line({ notice_type: 'group_admin', sub_type: 'unset', group_id: 705463642, user_id: 1269541505 }), '[用户（OWNER） 被取消管理员]');
-  assert.equal(line({ notice_type: 'group_increase', sub_type: 'approve', group_id: 705463642, user_id: 999 }), '[某个群成员（…0999） 加入了群聊]');
-  assert.equal(line({ notice_type: 'group_decrease', sub_type: 'kick', group_id: 705463642, user_id: 999, operator_id: 1269541505 }), '[某个群成员（…0999） 被移出群聊]');
-  assert.equal(line({ notice_type: 'group_decrease', sub_type: 'kick_me', group_id: 705463642, user_id: 2175258788 }), '[我被移出群聊]');
-  assert.equal(line({ notice_type: 'group_recall', group_id: 705463642, user_id: 999, operator_id: 1269541505 }), '[用户（OWNER） 撤回了 某个群成员（…0999） 的一条消息]');
-  assert.equal(line({ notice_type: 'group_recall', group_id: 705463642, user_id: 999, operator_id: 999 }), '[某个群成员（…0999） 撤回了一条消息]');
+  assert.equal(line({ notice_type: 'group_ban', sub_type: 'ban', group_id: 123456782, user_id: 999 }), '[某个群成员（…0999） 被禁言]');
+  assert.equal(line({ notice_type: 'group_admin', sub_type: 'set', group_id: 123456782, user_id: 999 }), '[某个群成员（…0999） 被设为管理员]');
+  assert.equal(line({ notice_type: 'group_admin', sub_type: 'unset', group_id: 123456782, user_id: 1234567890 }), '[用户（OWNER） 被取消管理员]');
+  assert.equal(line({ notice_type: 'group_increase', sub_type: 'approve', group_id: 123456782, user_id: 999 }), '[某个群成员（…0999） 加入了群聊]');
+  assert.equal(line({ notice_type: 'group_decrease', sub_type: 'kick', group_id: 123456782, user_id: 999, operator_id: 1234567890 }), '[某个群成员（…0999） 被移出群聊]');
+  assert.equal(line({ notice_type: 'group_decrease', sub_type: 'kick_me', group_id: 123456782, user_id: 1234567891 }), '[我被移出群聊]');
+  assert.equal(line({ notice_type: 'group_recall', group_id: 123456782, user_id: 999, operator_id: 1234567890 }), '[用户（OWNER） 撤回了 某个群成员（…0999） 的一条消息]');
+  assert.equal(line({ notice_type: 'group_recall', group_id: 123456782, user_id: 999, operator_id: 999 }), '[某个群成员（…0999） 撤回了一条消息]');
   // 认不出的类别 ⇒ **整条丢**（不编一件没发生的事）
-  assert.equal(line({ notice_type: 'group_upload', group_id: 705463642, user_id: 999 }), '[某个群成员（…0999） 上传了群文件]');
-  assert.equal(line({ notice_type: '不认识的类别', group_id: 705463642, user_id: 999 }), null);
-  assert.equal(line({ notice_type: 'notify', sub_type: 'input_status', group_id: 705463642, user_id: 999 }), null);
+  assert.equal(line({ notice_type: 'group_upload', group_id: 123456782, user_id: 999 }), '[某个群成员（…0999） 上传了群文件]');
+  assert.equal(line({ notice_type: '不认识的类别', group_id: 123456782, user_id: 999 }), null);
+  assert.equal(line({ notice_type: 'notify', sub_type: 'input_status', group_id: 123456782, user_id: 999 }), null);
   // 我自己那一条：写成"我"（自我标识是运行期学到的，所以这里现取）
-  assert.equal(line({ notice_type: 'group_admin', sub_type: 'set', group_id: 705463642, user_id: 2175258788 }), '[我 被设为管理员]');
-  assert.equal(line({ notice_type: 'group_admin', sub_type: 'set', group_id: 705463642, user_id: 2175258788 }, new Set()), '[某个群成员（…8788） 被设为管理员]',
+  assert.equal(line({ notice_type: 'group_admin', sub_type: 'set', group_id: 123456782, user_id: 1234567891 }), '[我 被设为管理员]');
+  assert.equal(line({ notice_type: 'group_admin', sub_type: 'set', group_id: 123456782, user_id: 1234567891 }, new Set()), '[某个群成员（…7891） 被设为管理员]',
     '还不知道自己是谁时照实写锚，不猜');
 });

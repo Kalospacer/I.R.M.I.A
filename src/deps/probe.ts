@@ -33,6 +33,8 @@ import { spawn } from 'node:child_process';
 import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { decodeText, utf8ConsoleEnv } from '../util/bytes-text.ts';
+
 // ──────────────────────────────── 常量 ────────────────────────────────
 
 /** 默认探测超时：起一个进程读版本号，10 秒足够（与 pwsh.ts 的 PROBE_TIMEOUT_MS 同尺度） */
@@ -44,8 +46,43 @@ export const TOOLS_DIR_NAME = 'tools';
 /** 探测结果来源。三段的顺序即优先级，枚举值直接作为报告字段给界面用 */
 export type DepSource = 'config' | 'managed' | 'path';
 
+/**
+ * 命中来源的两档归类（**给界面与回执用的人话口径**，不是探测内部顺序）。
+ *
+ * 为什么要有它（用户 2026-10-17 的口径）：python 这件事上"哪一份"是有意义的——
+ * 「**PATH 上那个可用就是可用**」，界面与回执都该说清用的是**系统那一份**还是
+ * **框架托管那一份**，而不是笼统说一句"已就绪"。
+ *   · `system`  = 机器上本来就有：`config`（用户明确指的）与 `path`（PATH / 常见安装位置）；
+ *   · `managed` = 框架装到 `<dataDir>/tools/<name>/` 的那一份。
+ */
+export type DepSourceKind = 'system' | 'managed';
+
+/** 命中来源归类：框架托管的那一份是唯一一个 `managed`，其余（用户指定 / 系统 PATH）都是系统那份 */
+export function sourceKindOf(source: DepSource | null): DepSourceKind | null {
+  if (source === null) return null;
+  return source === 'managed' ? 'managed' : 'system';
+}
+
+/**
+ * "命中的是不是框架托管那一份"。
+ *
+ * 判据是**路径落在托管目录里**（`dir` 那一格是探测第二段填的），不是"来源枚举是不是 managed"——
+ * 这样"用户明确指的正好就是托管目录里那个"也算托管：它旁边那份 `pip.ini` 一样适用。
+ */
+export function isManagedHit(outcome: Pick<DependencyProbeOutcome, 'dir'>, managedDir: string): boolean {
+  return outcome.dir !== null && normalizeSlashes(outcome.dir) === normalizeSlashes(managedDir);
+}
+
+/** 路径比较用的归一化（Windows 上 `\` 与 `/` 是同一个意思，写成哪一种都不该影响判定） */
+function normalizeSlashes(path: string): string {
+  return path.replace(/[\\/]+/gu, '/').replace(/\/+$/u, '').toLowerCase();
+}
+
+/** 探测的段名（`sourceOrder` 用它表达顺序，报告也用同一套词） */
+export type DepStageName = 'config' | 'managed' | 'path';
+
 /** 依赖名的唯一清单：定义、安装、报告、界面都按它遍历，不另立一份名单 */
-export const DEP_NAMES = ['pwsh', 'rg', 'es'] as const;
+export const DEP_NAMES = ['pwsh', 'rg', 'es', 'python'] as const;
 export type DepName = (typeof DEP_NAMES)[number];
 
 /** 状态三态：就绪 / 版本不符 / 未安装。界面徽章与建议动作都由它决定 */
@@ -67,6 +104,13 @@ export const ES_DOWNLOAD_PAGE = 'https://www.voidtools.com/downloads/#everything
 /** PowerShell 7 的官方下载页（自动安装代价过高，只做提示 + 一键打开） */
 export const PWSH_DOWNLOAD_PAGE = 'https://github.com/PowerShell/PowerShell/releases/latest';
 export const PWSH_WINGET_HINT = 'winget install Microsoft.PowerShell';
+
+/**
+ * Python 的下载页（人看的）。**指向 Windows 那一页**，因为一键安装给的是
+ * Windows 的 embeddable zip（见 install.ts 的 `PYTHON_EMBED_URL`）——
+ * 把人引到 `/downloads/` 首页会让他去下那个要 UAC 的安装器，那正是我们不用的那条路。
+ */
+export const PYTHON_DOWNLOAD_PAGE = 'https://www.python.org/downloads/windows/';
 
 // ──────────────────────────────── 类型 ────────────────────────────────
 
@@ -104,6 +148,19 @@ export interface DependencySpec {
   downloadPage: string | null;
   /** 候选可执行名（按顺序试；只用于第三段 PATH 与第二段自装目录内的文件名匹配） */
   candidates: readonly string[];
+  /**
+   * **自装目录那一段与 PATH 那一段谁先试**（不写 = `managed-first`，即既有那三件的口径）。
+   *
+   * 为什么做成依赖定义里的一格，而不是在 `probeDependency` 里按名字 `if`：
+   * "先看哪儿"是**这一件依赖的性质**，和版本判据、候选名一样属于定义，不属于探测流程。
+   * `config` 那一段**永远在最前**，两种顺序都不动它（人明确指过就以他为准，见文件头）。
+   *
+   * 用户 2026-10-17 的口径（python 与另外三件不同）：
+   * > 「**Python 和 pip 不应该是默认要求装的，而是有就用 PATH 里的。没有的话就要求装。**」
+   * ⇒ python 是 `path-first`：**PATH 上有一个可用的就用它**（那一件就是"已就绪"），
+   * 框架托管那一份（一键安装的落点）**降级为兜底**——只在这台机器一个都没有时才用。
+   */
+  sourceOrder?: 'managed-first' | 'path-first' | undefined;
   /** 版本探测参数。做成函数是因为 pwsh 走 -EncodedCommand（见 pwsh.ts 的实测依据） */
   versionArgs: () => readonly string[];
   /** 版本探测的额外 spawn 选项 */
@@ -147,6 +204,12 @@ function toEncodedCommand(script: string): string {
 /**
  * 跑一次版本命令并收集输出。ENOENT（没这个文件）与超时都只是"这个候选不可用"，
  * 不是异常——探测链的整条意义就是"一路试过去"，任何一处失败都不该中断它。
+ *
+ * **收原始字节、在结束时一次解码**（2026-10-18 收口）：原来是
+ * `child.stdout.setEncoding('utf8')`，而 `python --version` 之类的 stderr/诊断文本
+ * 在中文 Windows 上是 GBK（cp936）字节，流式 utf8 会当场把非法字节换成 U+FFFD。
+ * 版本串本身是 ASCII 所以历史上一直没炸，但"没炸"不等于"对的"——同一个函数产出的
+ * `reason` 会一路进 doctor 与 GUI，那里面的中文必须是真的。
  */
 export function runProbeCommand(
   exe: string,
@@ -165,11 +228,24 @@ export function runProbeCommand(
 
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(exe, [...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      child = spawn(exe, [...args], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        // 「请它按 UTF-8 写」从这里取（`util/bytes-text.ts`）：python 的 stdout/stderr 在
+        // 中文 Windows 上默认走控制台代码页 936，这一句把它掰到 UTF-8。
+        env: utf8ConsoleEnv(),
+      });
     } catch (err) {
       finish({ code: null, stdout: '', stderr: String(err), failed: true, timedOut: false });
       return;
     }
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    const decodeStreams = (): { stdout: string; stderr: string } => ({
+      stdout: decodeText(Buffer.concat(stdoutChunks)).text,
+      stderr: decodeText(Buffer.concat(stderrChunks)).text,
+    });
 
     timer = setTimeout(() => {
       // 探测超时只杀直接子进程：这里没有"命令派生出后代"的场景（与 pwsh 工具不同），
@@ -179,25 +255,25 @@ export function runProbeCommand(
       } catch {
         /* 已经退出 */
       }
+      const { stdout, stderr } = decodeStreams();
       finish({ code: null, stdout, stderr, failed: true, timedOut: true });
     }, timeoutMs);
 
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.setEncoding('utf8');
-    child.stderr?.setEncoding('utf8');
-    child.stdout?.on('data', (chunk: string) => {
-      stdout += chunk;
+    // 不设 setEncoding：解码推迟到 close（见函数注释）
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
     });
-    child.stderr?.on('data', (chunk: string) => {
-      stderr += chunk;
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrChunks.push(chunk);
     });
     child.stdout?.on('error', () => undefined);
     child.stderr?.on('error', () => undefined);
     child.on('error', (err: Error) => {
+      const { stdout, stderr } = decodeStreams();
       finish({ code: null, stdout, stderr: stderr === '' ? err.message : stderr, failed: true, timedOut: false });
     });
     child.on('close', (code: number | null) => {
+      const { stdout, stderr } = decodeStreams();
       finish({ code, stdout, stderr, failed: false, timedOut: false });
     });
   });
@@ -207,7 +283,7 @@ export function runProbeCommand(
 
 /**
  * 把 `7.4.6` / `5.1.26100.9444` 这类版本串取前两段做比较。
- * 只做"主版本够不够"这一件事：三个依赖的判据都是主版本级别（7+ / 13+ / 1.1+），
+ * 只做"主版本够不够"这一件事：四个依赖的判据都是主版本级别（7+ / 13+ / 1.1+ / 3.8+），
  * 写一个完整的 semver 比较器只会带来没人用的复杂度。
  */
 export function versionAtLeast(version: string, min: readonly number[]): boolean {
@@ -245,6 +321,20 @@ function parsePowerShellVersion(stdout: string): string | null {
   return /^\d+(\.\d+)*$/u.test(first) ? first : null;
 }
 
+/**
+ * Python 的版本串。`python --version` 说的是 `Python 3.11.5`（**带 `Python ` 前缀**，
+ * 与 pwsh 那一行纯数字不同），所以这里连着前缀一起认。
+ *
+ * 为什么必须认前缀、不许只挑一行数字：Python 2 的 `--version` 写的是 **stderr**
+ * （`Python 2.7.18`），而且它照样能匹配"一行版本号"。认前缀是为了让
+ * 「装了但是 2.x」这件事**能被说出来**（`parseAnyVersion` 拿得到 `2.7.18`，
+ * 于是状态是"版本不符"而不是"未安装"——前者该升级、后者该安装，两句话不能混）。
+ */
+function parsePythonVersion(stdout: string): string | null {
+  const matched = /Python\s+(\d+\.\d+(?:\.\d+)?)/u.exec(stdout);
+  return matched === null ? null : matched[1]!;
+}
+
 /** pwsh 的版本探测参数：`-EncodedCommand` 是本仓库唯一不会误解码的通道（含中文路径） */
 function pwshVersionArgs(): readonly string[] {
   return ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
@@ -252,7 +342,7 @@ function pwshVersionArgs(): readonly string[] {
 }
 
 /**
- * 三个内置依赖的定义。`candidates` 只列**真实存在的可执行名**，
+ * 内置依赖的定义。`candidates` 只列**真实存在的可执行名**，
  * 不在这里写死 `C:\Program Files\...` 这种安装位置——那种路径进了候选表就意味着
  * 每次探测都要为它们各付一次 ENOENT（review v27 的 Σ-5 就是这么攒出来的）。
  * 系统装机位置由 `extraSearchDirs` 一处集中处理（见下），只在自装目录没命中时才用。
@@ -316,6 +406,53 @@ export const DEP_SPECS: Readonly<Record<DepName, DependencySpec>> = {
     },
     parseAnyVersion: parseEsVersion,
     minVersion: '1.1',
+  },
+  python: {
+    name: 'python',
+    label: 'Python 运行环境',
+    // 用户 2026-10-16：把 python 加进外部依赖，"方便后续进展"——它服务的不是 agent 进程本身，
+    // 而是**她跑脚本的那条路**与将来的扩展。
+    purpose: '给她自己扩展能力用的运行环境（含 pip）：pwsh 工具的 lang:\'python\' 档，'
+      + '将来的 Office 工具包与 computer use 插件也挂在它上面',
+    impact: '没有它时 pwsh 的 lang:\'python\' 如实报"找不到解释器"（那一段脚本不会执行，'
+      + '也不偷偷换 PowerShell 去跑）；这台机器上 PATH 与框架自装目录都没有它，'
+      + '所以框架会建议由它替你装一份（设置页「外部依赖」一键装）',
+    // 与 rg / es 同一档：官方 embeddable zip 能进既有那条"下载 → 解压 → 复检"的流水线。
+    // 为什么不是完整安装器（用户问过这条）：它的 per-machine 装法要 UAC，而无人值守进程里弹 UAC
+    // 只会得到一个卡住的安装器（与 pwsh 那条理由同一个）；它还会把解释器装到
+    // `%LOCALAPPDATA%\Programs\Python`——**脱离 `<dataDir>/tools/<name>/` 这个落点约定**。
+    // 代价是 embeddable 包**不带 pip**（要补的话是 `._pth` 放开 `import site` + `-m ensurepip`，
+    // 见 docs/design.md 的「外部依赖」那一节）。
+    install: 'zip',
+    manualHint: null,
+    downloadPage: PYTHON_DOWNLOAD_PAGE,
+    // 官方安装器给的是 `python.exe`；微软商店版是 `python3.exe`；某些环境下还有 `py.exe`。
+    // **顺序实测校准过两次**，别照直觉改：
+    //   · `python.exe` 在前 —— 官方安装器与自装目录里落地的一定是它（embeddable 包首成员就叫这个名）；
+    //   · `python3.exe` 第二 —— 微软商店版的 App Execution Alias 是这个名字；
+    //   · `python` 第三 —— 本机实测 **PATH 上只有 `python`**（3.11.5，`python3` 不存在），
+    //     所以它必须排在 `python3` 前面，否则这台机器会白试两个不存在的候选；
+    //   · `py` 最后兜底 —— 它是启动器不是解释器（`py.exe` 由系统装），前面都找不到时才用它。
+    candidates: ['python.exe', 'python3.exe', 'python', 'python3', 'py.exe', 'py'],
+    /**
+     * **PATH 先试、自装目录后试**（用户 2026-10-17 的口径，与另外三件相反）。
+     *
+     * 上一版是 `managed-first`（"框架装的那个永远优先"）。用户把口径翻了过来：
+     * > 「**Python 和 pip 不应该是默认要求装的，而是有就用 PATH 里的。没有的话就要求装。**」
+     * ⇒ 机器上已经有 python 的，就用它（这一件当场就是"已就绪"，界面上**不再**出现
+     * "建议安装"）；只有**一个都没有**时，托管那一份才登场（一键安装那条路原样保留）。
+     */
+    sourceOrder: 'path-first',
+    versionArgs: () => ['--version'],
+    // 判据是 **3.8+**：只要求 Python 3。2.x 装上了也不算满足（它是"版本不符"该升级，
+    // 不是"未安装"该安装）——所以下面两处都调同一个解析函数。
+    parseVersion: (stdout) => {
+      const version = parsePythonVersion(stdout);
+      if (version === null) return null;
+      return versionAtLeast(version, [3, 8]) ? version : null;
+    },
+    parseAnyVersion: parsePythonVersion,
+    minVersion: '3.8',
   },
 };
 
@@ -416,6 +553,14 @@ export interface DependencyProbeOutcome {
   reason: string;
   /** 试过的位置（人话），顺序即探测顺序 */
   attempts: string[];
+  /**
+   * 只有 python 会填：**`python -m pip --version` 探到的 pip 版本**（`26.2.1`）。
+   * 空串 = 探了但没有 pip（`pipReason` 里是那句"为什么"）。
+   * 别的依赖不填这一格（它们没有"自带的包管理器"这回事）。
+   */
+  pipVersion?: string | undefined;
+  /** pip 探测失败时的一句人话（没有 pip / 起不来 / 超时）。成功时为空串 */
+  pipReason?: string | undefined;
 }
 
 export interface ProbeDependencyInput {
@@ -436,6 +581,15 @@ export interface ProbeDependencyInput {
    * 不是判定：版本解析与三段顺序仍然是真代码在跑。
    */
   runProbe?: ((exe: string) => Promise<DepProcessResult>) | undefined;
+  /**
+   * **pip 探测的注入点**（只有 `python` 用得上）。
+   *
+   * 为什么不在这里 import `pip.ts`：依赖方向是单向链 `probe`（叶子）← `install` ← `manager`，
+   * 而"怎么问 pip"住在 pip.ts。让叶子反向 import 会当场制造一个环
+   * （pip.ts 已经 import 了 install.ts 的 zip 件）。所以做成一个函数参数，由 manager 传进来。
+   * 不传 = 不探 pip（窄路径与大多数单测）。
+   */
+  probePip?: ((exe: string) => Promise<{ ok: boolean; version: string; reason: string }>) | undefined;
 }
 
 /** 把一个候选交给探测判定；`run` 是注入点，默认是真 spawn */
@@ -458,6 +612,8 @@ export async function probeDependency(
   const listDir = input.listDir ?? defaultListDir;
   const attempts: string[] = [];
   let sawVersion = '';
+  /** PATH 那一段最近一次失败的原因（末尾那句"最近一次失败"用；两段顺序颠倒后不能再靠局部变量带出来） */
+  let lastPathFailure = '';
 
   const record = (
     status: DepStatus,
@@ -467,9 +623,50 @@ export async function probeDependency(
     source: DepSource | null,
     dir: string | null,
     reason: string,
+    pip: { version: string; reason: string } | null = null,
   ): DependencyProbeOutcome => ({
-    name: spec.name, status, path, version, anyVersion, source, dir, reason, attempts,
+    name: spec.name,
+    status, path, version, anyVersion, source, dir, reason, attempts,
+    // 只有 python 会带上这两格；别的依赖**连键都不出现**（不写 undefined 键，
+    // 免得报告里多出一格永远为空的字段让界面去猜）
+    ...(pip === null ? {} : { pipVersion: pip.version, pipReason: pip.reason }),
   });
+
+  /**
+   * python 专属：解释器找到之后**顺手探一次 pip**（用户 2026-10-16：「pip 必须要」）。
+   *
+   * 为什么放在探测里而不是只在安装时探：界面那一行要显示 `pip 26.2.1`，
+   * 而"这个 python 到底带不带 pip"是**探测期的事实**（PATH 上那个官方安装版的 python
+   * 通常自带 pip，自装的那个要引导才有）。只在安装时探的话，PATH 上那个现成的 python
+   * 在界面上会永远没有 pip 那一句。
+   *
+   * 代价认了：探测次数最多的场景是启动时一次（结论进缓存），多付一次 `python -m pip --version`。
+   *
+   * **`kind` 是给"没有 pip"那句话用的**（用户 2026-10-17）：PATH 上那份没有 pip 时要如实说
+   * "**系统这份**没有 pip"并给出两条出路，而不是把整件判成"未就绪"——python 可用就是可用，
+   * pip 是**单独一行**的事。托管那份没有 pip 是另一句话（那是框架装的那一份，重装即可）。
+   */
+  const pipOf = async (
+    exe: string,
+    kind: DepSourceKind,
+  ): Promise<{ version: string; reason: string } | null> => {
+    if (spec.name !== 'python' || input.probePip === undefined) return null;
+    const missing = kind === 'managed'
+      ? '框架托管的那份 Python 上没有可用的 pip（可在设置页「外部依赖」重新一键安装，'
+        + '安装时会自动引导 pip）'
+      : '系统这份 Python 上没有可用的 pip（`python -m pip --version` 没给出 pip 版本）'
+        + '——**不影响用它跑脚本**，但要装包得先补 pip：'
+        + '可以在设置页「外部依赖」一键装框架托管的那一份（带 pip），或自己跑 `python -m ensurepip`';
+    try {
+      const probed = await input.probePip(exe);
+      return probed.ok ? { version: probed.version, reason: '' } : { version: '', reason: missing };
+    } catch (err) {
+      return {
+        version: '',
+        reason: `pip 探测抛错：${err instanceof Error ? err.message : String(err)}（${missing}）`,
+      };
+    }
+  };
 
   // ① 用户在 config 里指定的路径：人明确指过就以他为准。
   // 指错了不静默落到后两段——那会变成"我配了却不生效"，比直接报错难查得多。
@@ -478,7 +675,7 @@ export async function probeDependency(
     attempts.push(`config: ${configured}`);
     const probed = await probeCandidateWith(spec, configured, 'config', { ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }) }, input.runProbe);
     if (probed.result.ok) {
-      return record('ready', configured, probed.result.version, probed.anyVersion, 'config', null, '');
+      return record('ready', configured, probed.result.version, probed.anyVersion, 'config', null, '', await pipOf(configured, 'system'));
     }
     sawVersion = sawVersion === '' ? probed.anyVersion : sawVersion;
     return record(
@@ -490,35 +687,53 @@ export async function probeDependency(
   }
   attempts.push('config: 未指定');
 
-  // ② 框架自装目录：一键安装的落点
-  const managed = findExecutableInDir(spec.candidates, input.managedDir, exists, listDir);
-  if (managed !== null) {
+  /** ② 框架自装目录：一键安装的落点。命中就停在这里（这一段的顺序见 `spec.sourceOrder`） */
+  const probeManaged = async (): Promise<DependencyProbeOutcome | null> => {
+    const managed = findExecutableInDir(spec.candidates, input.managedDir, exists, listDir);
+    if (managed === null) {
+      attempts.push(`managed: ${input.managedDir} 下没有 ${spec.candidates.join(' / ')}`);
+      return null;
+    }
     attempts.push(`managed: ${managed}`);
     const probed = await probeCandidateWith(spec, managed, 'managed', { ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }) }, input.runProbe);
     if (probed.result.ok) {
-      return record('ready', managed, probed.result.version, probed.anyVersion, 'managed', input.managedDir, '');
+      return record('ready', managed, probed.result.version, probed.anyVersion, 'managed', input.managedDir, '', await pipOf(managed, 'managed'));
     }
     sawVersion = sawVersion === '' ? probed.anyVersion : sawVersion;
     attempts.push(`managed 内的 ${managed} 不可用：${probed.result.reason}`);
-  } else {
-    attempts.push(`managed: ${input.managedDir} 下没有 ${spec.candidates.join(' / ')}`);
-  }
+    return null;
+  };
 
-  // ③ PATH（+ 系统常见安装位置）
-  const pathCandidates: string[] = [...spec.candidates];
-  for (const dir of input.extraSearchDirs ?? []) {
-    for (const name of spec.candidates) pathCandidates.push(join(dir, name));
-  }
-  const failures: string[] = [];
-  for (const candidate of pathCandidates) {
-    const probed = await probeCandidateWith(spec, candidate, 'path', { ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }) }, input.runProbe);
-    if (probed.result.ok) {
-      return record('ready', candidate, probed.result.version, probed.anyVersion, 'path', null, '');
+  /** ③ PATH（+ 系统常见安装位置）：机器上早就装好的那些 */
+  const probePath = async (): Promise<DependencyProbeOutcome | null> => {
+    const pathCandidates: string[] = [...spec.candidates];
+    for (const dir of input.extraSearchDirs ?? []) {
+      for (const name of spec.candidates) pathCandidates.push(join(dir, name));
     }
-    if (probed.anyVersion !== '' && sawVersion === '') sawVersion = probed.anyVersion;
-    failures.push(probed.result.reason);
+    const failures: string[] = [];
+    for (const candidate of pathCandidates) {
+      const probed = await probeCandidateWith(spec, candidate, 'path', { ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }) }, input.runProbe);
+      if (probed.result.ok) {
+        return record('ready', candidate, probed.result.version, probed.anyVersion, 'path', null, '', await pipOf(candidate, 'system'));
+      }
+      if (probed.anyVersion !== '' && sawVersion === '') sawVersion = probed.anyVersion;
+      failures.push(probed.result.reason);
+    }
+    attempts.push(`path: 试过 ${pathCandidates.join(' / ')}`);
+    // 只留给末尾那句"最近一次失败"：写得进 attempts 的是顺序，这里补的是原因
+    lastPathFailure = failures.length > 0 ? failures[failures.length - 1] ?? '' : '';
+    return null;
+  };
+
+  // ②③ 两段的先后由依赖定义说了算（不写 = 托管优先，既有那三件的口径；
+  //     python 是 `path-first`：见 `DEP_SPECS.python.sourceOrder` 的注释）。
+  const stages: readonly DepStageName[] = spec.sourceOrder === 'path-first'
+    ? ['path', 'managed']
+    : ['managed', 'path'];
+  for (const stage of stages) {
+    const hit = stage === 'managed' ? await probeManaged() : await probePath();
+    if (hit !== null) return hit;
   }
-  attempts.push(`path: 试过 ${pathCandidates.join(' / ')}`);
 
   if (sawVersion !== '') {
     return record(
@@ -529,8 +744,42 @@ export async function probeDependency(
   return record(
     'missing', '', '', '', null, null,
     `未找到 ${spec.name}（最低要求 ${spec.minVersion}）。已试：${attempts.join('；')}。`
-    + (failures.length > 0 ? `最近一次失败：${failures[failures.length - 1]}` : ''),
+    + (lastPathFailure !== '' ? `最近一次失败：${lastPathFailure}` : ''),
   );
+}
+
+/**
+ * **托管那一份解释器的候选槽**（只有 python 用得上：`pwsh` 工具的 `lang:'python'` 档要
+ * 分两槽拿人——PATH 一槽、托管一槽——再自己按 PATH 优先的顺序定夺，见 `resolveInterpreter`）。
+ *
+ * 为什么要单独给"托管那一槽"：依赖探测的结论只有**一个赢家**，而工具那一侧要能在
+ * "PATH 上那个起不来"时**如实说清**、并且知道**框架装机器的兜底那一份在哪**。
+ * 判据与探测第二段**逐字相同**（`main` 那个反例就是它：`python.exe` 不在 PATH 上、
+ * 候选名表里也没有，所以只能由这一段给出）。
+ */
+export function managedInterpreterOf(
+  candidates: readonly string[],
+  managedDir: string,
+  exists: (path: string) => boolean,
+  listDir: (dir: string) => string[],
+): string | null {
+  return findExecutableInDir(candidates, managedDir, exists, listDir);
+}
+
+/**
+ * **PATH / 用户指定那一槽**（"系统那份"）。
+ *
+ * 命中来自 `path` 或 `config` 时，`path` 那一格就是它（PATH 上的裸名，或常见安装位置里的
+ * 完整路径）；托管命中时退到候选名本身——它们是 PATH 上的裸名（`spawn` 自己去解析 PATH），
+ * 于是工具那一侧的 PATH 优先顺序在**任何来源下都不会退化成"只认托管"**。
+ */
+export function pathInterpreterSlotOf(
+  outcome: Pick<DependencyProbeOutcome, 'status' | 'path' | 'source'>,
+  fallbackNames: readonly string[],
+): string | null {
+  if (outcome.status !== 'ready') return null;
+  if (outcome.source !== 'managed' && outcome.path !== '') return outcome.path;
+  return fallbackNames[0] ?? null;
 }
 
 /**

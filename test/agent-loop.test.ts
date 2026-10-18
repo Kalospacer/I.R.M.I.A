@@ -8,6 +8,7 @@
  *   - ④ 刹车钩子：checkBeforeStep 返回结局即结束 turn，不再发起下一步模型调用
  *   - ⑤ 请求可重建（M2-2）：用同一批日志事件 + step/start.ts 重新派生，请求字节一致
  *   - ⑥ 错误分类：429 重试耗尽 → turn/end{rate-limited}；失败也进 budget/consumed 账本
+ *   - ⑥b 超时型失败的两种结局（2026-10-16）：首步超时 ⇒ 退回队列；非首步超时 ⇒ 不退回、不重发
  *
  * 说明：Node 的类型剥离不做 `.js` → `.ts` 映射，所以这里用显式 `.ts` 说明符导入源码；
  * tsconfig 的 include 只有 src/，测试文件由 node --test 直接执行。
@@ -297,8 +298,9 @@ test('M2-3/M2-6 一轮工具调用：两阶段落库、step/end 两条、第二�
   assert.equal(assistants[0]!.data.toolCalls.length, 1);
   assert.equal(assistants[1]!.data.toolCalls.length, 0);
 
-  // 第二步的请求必须是配对完整的：function_call 与 function_call_output 一一对应，
-  // 且不含 reasoning（缓存铁律 3 与 4）
+  // 第二步的请求必须是配对完整的：function_call 与 function_call_output 一一对应。
+  // 这里**没有** reasoning item 是因为脚本里的模型没回思维链（`reasoning: ''`），不是因为渲染层剥离
+  // ——v68 起有思维链时它按帽回传（见 `test/reasoning-echo.test.ts`）。
   const second = model.requests[1]!;
   const items = second.input as Array<Record<string, unknown>>;
   assert.equal(items.filter(item => item['type'] === 'function_call').length, 1);
@@ -365,6 +367,129 @@ test('外部取消（aborted）不是错误：turn 结局为 aborted', async (t)
   assert.deepEqual(reason, { kind: 'aborted', cause: 'signal' });
   const consumed = (await harness.readAll()).filter(event => event.type === 'budget/consumed');
   assert.equal(consumed[0]!.data.finishReason, 'aborted');
+});
+
+// ─────────────────── ③b 上游终态失败（response.failed，P0 2026-10-17） ───────────────────
+
+/**
+ * 现场：客户端用 `status`/`failure` 表达终态失败，循环层只认 `interrupted` ⇒ `response.failed`
+ * 走了"成功收尾"：半截工具调用照执行、turn 记 completed、输入不退回、只在账本上留一行 failed。
+ *
+ * 修法把判据收成一条（客户端合同：`failure !== null` ⇔ 没有正常收尾），本组用例正反两面钉住：
+ *   · 终态 failed ⇒ turn/end.kind 必须是 **error**（不是 completed），且进既有失败处置
+ *     （记账 / 退队 / 失败刹车）；工具一个都不许执行、成功类事件一条都不许写；
+ *   · 正常 `response.completed` ⇒ 照旧 completed，不误伤。
+ */
+test('终态失败（response.failed）：turn 收尾是 error，工具不执行、半截调用不落库，记账按既有失败口径', async (t) => {
+  const harness = await makeHarness(t);
+  const wake = wakeManual(harness, '查一下日志');
+  const model = fakeModel([
+    {
+      status: 'failed',
+      text: '我先看一眼',
+      interrupted: false,
+      failure: { code: 'server_error', message: '上游在这次生成里崩了' },
+      // 失败那一拍可能已经吐了半个（甚至完整的）调用：绝不能拿去执行
+      toolCalls: [{ callId: 'call_1', name: 'read_file', arguments: '{"file_path":"a.txt"}' }],
+      usage: { inputTokens: 321, outputTokens: 21, cachedTokens: 300, reasoningTokens: 7 },
+    },
+  ]);
+
+  const reason = await runTurn(harness.depsOf(model.ds), [wake]);
+
+  // ① 结局是失败，且走的是既有的 error 收尾（与中断/抛错同一条路，不是一个新结局）
+  assert.deepEqual(reason, {
+    kind: 'error',
+    code: 'server_error',
+    message: '上游在这次生成里崩了',
+  });
+  const events = await harness.readAll();
+  const end = ofType<TurnEnd>(events, 'turn/end')[0]!;
+  assert.equal(end.data.reason.kind, 'error');
+  assert.notEqual(end.data.reason.kind, 'completed');
+  assert.equal(end.data.spoke, true, '已推送出去的那半句算"说过话"（与中断口径一致）');
+
+  // ② 工具执行：一条 tool/call 都不许落，更没有 tool/result（失败后不可能有"执行过了"）
+  assert.equal(events.filter(event => event.type === 'tool/call').length, 0);
+  assert.equal(events.filter(event => event.type === 'tool/result').length, 0);
+  assert.equal(model.requests.length, 1, '失败即收束，不许带着半截调用再发第二步');
+
+  // ③ 已推送的部分照既有 interrupted 语义留档；toolCalls 丢弃（不写"成功类"的调用清单）
+  const assistants = ofType<AssistantMessage>(events, 'message/assistant');
+  assert.equal(assistants.length, 1);
+  assert.equal(assistants[0]!.data.text, '我先看一眼');
+  assert.equal(assistants[0]!.data.interrupted, true);
+  assert.deepEqual(assistants[0]!.data.toolCalls, []);
+  assert.equal(ofType<StepEnd>(events, 'step/end').length, 1);
+
+  // ④ 记账：服务端给了 usage 就照记（"该记用量记用量"），finishReason=failed ⇒ failStreak 会涨
+  const consumed = ofType<BudgetConsumed>(events, 'budget/consumed');
+  assert.equal(consumed.length, 1);
+  assert.equal(consumed[0]!.data.finishReason, 'failed');
+  assert.equal(consumed[0]!.data.inputTokens, 321);
+  assert.equal(consumed[0]!.data.outputTokens, 21);
+  assert.equal(consumed[0]!.data.cacheHitTokens, 300);
+  assert.equal(harness.projection.failStreak, 1, '失败刹车的折叠来源是 budget/consumed.finishReason');
+
+  // ⑤ 退队/重投：与整轮失败同一条处置（input/requeued{reason:'turn-error'}，认领次数 +1）
+  const requeued = ofType<InputRequeued>(events, 'input/requeued');
+  assert.equal(requeued.length, 1);
+  assert.deepEqual(requeued[0]!.data.wakeSeqs, [wake.seq]);
+  assert.equal(requeued[0]!.data.reason, 'turn-error');
+  assert.deepEqual(harness.projection.pending.map(item => item.wakeSeq), [wake.seq]);
+});
+
+test('终态失败且没有任何输出：不许落到「没有调用 ⇒ completed」那条路', async (t) => {
+  const harness = await makeHarness(t);
+  const wake = wakeManual(harness, '这一拍什么都没答出来');
+  const model = fakeModel([
+    {
+      status: 'failed',
+      interrupted: false,
+      failure: { code: 'response_failed', message: '上游响应状态 failed' },
+    },
+  ]);
+
+  const reason = await runTurn(harness.depsOf(model.ds), [wake]);
+
+  assert.equal(reason.kind, 'error');
+  assert.ok(reason.kind === 'error');
+  assert.equal(reason.code, 'response_failed');
+  const events = await harness.readAll();
+  assert.equal(ofType<TurnEnd>(events, 'turn/end')[0]!.data.reason.kind, 'error');
+  // 没有 usage 回来 ⇒ 记 0（与 failStep 的"抛错记 0"同口径），但 finishReason 仍是 failed
+  const consumed = ofType<BudgetConsumed>(events, 'budget/consumed')[0]!;
+  assert.equal(consumed.data.finishReason, 'failed');
+  assert.equal(consumed.data.inputTokens, 0);
+  assert.equal(consumed.data.outputTokens, 0);
+  assert.equal(ofType<InputRequeued>(events, 'input/requeued').length, 1, '失败处置照旧：输入退回队列');
+});
+
+test('反面：正常 response.completed 照旧以 completed 收尾（不误伤）', async (t) => {
+  const harness = await makeHarness(t);
+  const wake = wakeManual(harness, '正常答一句');
+  const model = fakeModel([
+    {
+      status: 'completed',
+      text: '看完了，没事。',
+      interrupted: false,
+      failure: null,
+      usage: { inputTokens: 50, outputTokens: 5, cachedTokens: 0, reasoningTokens: 0 },
+    },
+  ]);
+
+  const reason = await runTurn(harness.depsOf(model.ds), [wake]);
+
+  assert.deepEqual(reason, { kind: 'completed' });
+  const events = await harness.readAll();
+  const end = ofType<TurnEnd>(events, 'turn/end')[0]!;
+  assert.equal(end.data.reason.kind, 'completed');
+  const assistant = ofType<AssistantMessage>(events, 'message/assistant')[0]!;
+  assert.equal(assistant.data.interrupted, undefined, '正常收尾不许挂 interrupted 标记');
+  const consumed = ofType<BudgetConsumed>(events, 'budget/consumed')[0]!;
+  assert.equal(consumed.data.finishReason, 'completed');
+  assert.equal(consumed.data.inputTokens, 50);
+  assert.equal(ofType<InputRequeued>(events, 'input/requeued').length, 0, '成功不退回输入');
 });
 
 // ──────────────────────────────── ④ 刹车钩子 ────────────────────────────────
@@ -663,6 +788,98 @@ test('M2-6 请求被拒（invalid）不重试语义：一次调用即结束，�
     message: '请求被拒绝（400）：重试同样的请求必然同样失败',
   });
   assert.equal(model.requests.length, 1);
+});
+
+// ──────────────────────────────── ⑥b 超时型失败的两种结局（2026-10-16） ────────────────────────────────
+
+/**
+ * 用户报的那个循环是这么转起来的：总时限掐断一条**正在活跃输出**的流 → `timeout` 在可重试类别里
+ * → 这一轮整轮失败 → 输入退回队列 → 下一轮**从第 1 步重跑同一个请求** → 再撞同一堵墙。
+ *
+ * 这两条用例钉的是"退回到什么状态"那一半（掐流那一半在 `request-timeout.test.ts`）：
+ *   · **首步超时** ⇒ 这一轮还什么都没做 ⇒ 退回队列（下一轮是完整的一次重试）；
+ *   · **非首步超时** ⇒ 这一轮已经花掉的工作不作废 ⇒ **不退回**（`retry: 'none'`），
+ *     也绝不原样重发同一个请求。
+ * 两条同时钉住观测：`durationMs` 是实测值（原来写死 0）、`retryCount` 有通道。
+ */
+test('⑥b 首步超时：结局是可读的 error，输入**退回队列**（下一轮完整重试）', async (t) => {
+  const harness = await makeHarness(t);
+  const wake = wakeManual(harness, '这件活要跑很久');
+  const timeout = new DsClientError({
+    kind: 'timeout',
+    code: 'timeout_silent',
+    message: '流式请求静默超时（120000ms 没有收到任何数据），已中止',
+    attempts: 2,
+  });
+  const model = fakeModel([{ throws: timeout }]);
+
+  const reason = await runTurn(harness.depsOf(model.ds), [wake]);
+
+  assert.equal(reason.kind, 'error');
+  assert.ok(reason.kind === 'error');
+  assert.equal(reason.code, 'timeout_silent', '是哪只闸掐的要说得出');
+  assert.match(reason.message, /超时型失败/u);
+  assert.match(reason.message, /本轮第一步/u, '退不退这件事要写在结局里');
+  assert.match(reason.message, /输入退回队列/u);
+  assert.equal(reason.retry, 'next-turn');
+
+  const events = await harness.readAll();
+  const end = ofType<TurnEnd>(events, 'turn/end')[0]!;
+  assert.deepEqual(end.data.reason, reason, '日志里那一格与返回值是同一份');
+  // **退回队列**：既有 `input/requeued{reason:'turn-error'}`，认领次数照旧累计
+  const requeued = ofType<InputRequeued>(events, 'input/requeued');
+  assert.equal(requeued.length, 1);
+  assert.deepEqual(requeued[0]!.data.wakeSeqs, [wake.seq]);
+  assert.equal(requeued[0]!.data.reason, 'turn-error');
+  assert.equal(harness.projection.pending.length, 1, '它回到队列里等着下一次');
+  assert.equal(ofType(events, 'input/dead-letter').length, 0);
+  assert.equal(ofType(events, 'input/discarded').length, 0, '退回 ≠ 作废');
+
+  // 观测两格：耗时是**实测值**（原来写死 0），重试计数走 `error.attempts - 1`（测试替身没有订阅口）
+  const consumed = ofType(events, 'budget/consumed').filter(e => e.data.finishReason === 'failed');
+  assert.equal(consumed.length, 1);
+  assert.ok(consumed[0]!.data.durationMs >= 0);
+  assert.notEqual(consumed[0]!.data.durationMs, undefined);
+  assert.equal(consumed[0]!.data.retryCount, 1, 'attempts=2 ⇒ 重试了 1 次');
+});
+
+test('⑥b 非首步超时：step 标失败但本轮的活不作废 —— **输入不退回**、也不重发同一个请求', async (t) => {
+  const harness = await makeHarness(t);
+  const wake = wakeManual(harness, '先看一眼再决定');
+  const timeout = new DsClientError({
+    kind: 'timeout',
+    code: 'timeout_hard_cap',
+    message: '流式请求撞到硬顶（10800000ms）仍未结束，已中止',
+  });
+  const model = fakeModel([
+    // 第 1 步：正常产出一个工具调用（这一轮的"活"就发生在这里）
+    { toolCalls: [{ callId: 'call_1', name: 'read_file', arguments: '{"file_path":"a.txt"}' }] },
+    // 第 2 步：超时
+    { throws: timeout },
+  ]);
+
+  const reason = await runTurn(harness.depsOf(model.ds), [wake]);
+
+  assert.equal(reason.kind, 'error');
+  assert.ok(reason.kind === 'error');
+  assert.equal(reason.code, 'timeout_hard_cap');
+  assert.match(reason.message, /不是第一步/u);
+  assert.match(reason.message, /不退回/u);
+  assert.equal(reason.retry, 'none', '★ 这就是"不退回"的开关');
+
+  const events = await harness.readAll();
+  // 第一步的成果照旧在账上：工具真的被调用过、结果也在
+  assert.equal(ofType(events, 'tool/call').length, 1);
+  assert.equal(ofType(events, 'tool/result').length, 1);
+  assert.equal(ofType(events, 'step/start').length, 2, '两步都开过');
+  // **不退回**：没有 requeued、没有 discarded（它没被作废，只是这一轮不重投）
+  assert.equal(ofType(events, 'input/requeued').length, 0, '退回就等于"下一拍再干一遍同一段活"');
+  assert.equal(ofType(events, 'input/discarded').length, 0);
+  assert.equal(harness.projection.pending.length, 0, '这一轮认领的输入留在这一轮（不再回队列）');
+
+  const consumed = ofType(events, 'budget/consumed').filter(e => e.data.finishReason === 'failed');
+  assert.equal(consumed.length, 1);
+  assert.equal(consumed[0]!.data.step, 2, '记在失败的那一步上');
 });
 
 // ──────────────────────────────── ⑦ 投影增量一致性 ────────────────────────────────

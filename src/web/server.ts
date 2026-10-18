@@ -62,10 +62,19 @@ import type { AppConfig, JsonObject, JsonValue } from '../config/config.js';
 import { CONFIG_FILE_NAME, MENTION_KEYWORD_LEN_MAX, MENTION_KEYWORD_MAX, configHash, loadConfig } from '../config/config.ts';
 import { classifyConfigField, diffConfigFields } from '../config/watcher.ts';
 import { resolveRestartShell } from '../runtime/restart-shell.ts';
+import { decodeText } from '../util/bytes-text.ts';
 import { chooseRestartPath, parseRestartPath, restartReasonText, restartTraceLine, backendEntry, BUNDLED_NODE_REL, RESTART_FAILURE_REASONS, type RestartPath } from '../runtime/restart-chain.ts';
 import { deriveRequest } from '../runtime/agent-loop.ts';
+/**
+ * `/stop` 的结局类型**只借型不借值**（`import type`）：本模块要的是那一格的形状
+ * （`receipt` / `outcome` / `cleared` …），而判据与动作仍然只有 `real-loop` 一份实现
+ * （`RealLoop.ownerStopCommand`）。`import type` 在编译后完全消失，所以这里不会因为
+ * "web 层 import 了循环层"而多出一条运行期依赖。
+ */
+import type { StopOutcome } from '../runtime/real-loop.js';
 import {
-  contactFactsForReplay, memoryIndexTextForRebuild, turnBlockFactsForReplay, warnExemptJudgeOf,
+  contactFactsForReplay, contextEventsForRebuild, memoryIndexTextForRebuild, skillCatalogForReplay,
+  turnBlockFactsForReplay, warnExemptJudgeOf,
 } from '../runtime/replay.ts';
 import { GroupMemberBook } from '../channel/group-members.ts';
 import { WarnExemptBook } from '../channel/warn-exempt.ts';
@@ -76,7 +85,7 @@ import { groupsForTools, groupIdOfTool, mcpGroupId, mcpServerOfTool } from '../t
 // 唯一实现在 `grant/mcp-grant.ts`（判据、落地、卡面文案、回执与唤醒都在那里）
 import {
   GRANT_REJECT_REASON_MAX, applyGrant, grantReceiptLine, grantsResolvedDirOf, grantsDirOf,
-  listGrants, readConfiguredServer, wakeForGrant, writeGrantOutcome,
+  isSkillKind, listGrants, readConfiguredServer, wakeForGrant, writeGrantOutcome,
   type GrantApplyResult, type GrantWakeFacts,
 } from '../grant/mcp-grant.ts';
 // `desc` 那一句的来源与判据（唯一实现：索引行、申请单、界面回执三处读同一份）
@@ -449,6 +458,25 @@ export const DANGEROUS_FIELDS: Record<string, string> = {
 };
 
 /**
+ * `mcp.servers` **不接受** `config-update` 的整段改写（P1-21，2026-10-18）。
+ *
+ * 病：`config-update` 按点路径写入，一条 `{"mcp.servers": [...]}` 就把整个声明面**整段换掉**
+ * ——于是同一件事有了两条写入口，而其中一条（`mcp-save`）要 X-Confirm 短语、另一条不要，
+ * 那道"加一个 server = 扩大能力边界"的确认门从旁边被绕开了。
+ *
+ * 代价远不止短语：`mcp-save` / `mcp-remove` 还会逐条校验 server 形状、写回执、按热更接线的
+ * 实际状态回答"要不要重启"，并在改完之后叫她一次；`config-update` 这些一件都不做，
+ * 它只会把数组换掉再写一条 `config/changed`。
+ *
+ * 修：**显式拒绝并指路**，而不是"在这里再加一道同样的短语"。放它进来就得在这条路上
+ * 把条目校验与回执再实现一遍——同一份语义写第二遍，两份迟早分岔（`applyConfigUpdate`
+ * 自己的注释里已经为"数组整段换"这件事踩过一次）。
+ * `mcp.servers` 的写入口只有两个：`mcp-save` / `mcp-remove`（人批过的申请走
+ * `grant/mcp-grant.ts`，那条路改的也是同一段，但它有申请单可查）。
+ */
+export const MCP_SERVERS_FIELD = 'mcp.servers';
+
+/**
  * 前后端契约里出现过、但**当前无法诚实实现**的命令：一律 501 + 原因。
  * 不造假事件的理由是硬的：事件日志是唯一真相源，没有对应事件类型的"状态变更"写下去就是脏数据。
  */
@@ -670,7 +698,41 @@ export interface WebServerDeps {
    * 踩过同一个坑，见下面 `'dream'` 分支的注释）。它要的是"真的起一个 turn"，而那条路
    * 不需要本口子：`appendSync` 已经把它折进 `projection.pending`，主循环下一拍自己会认领。
    */
-  noteUserSpoke?: ((seq: number, type: string, data: unknown) => void) | undefined;
+  noteUserSpoke?: ((seq: number, type: string, data: unknown) => boolean | void) | undefined;
+  /**
+   * **用户急停（`/stop`）的两步口**（2026-10-16 加）。
+   *
+   * 为什么界面这条路要拆成两步、而不是照 `/compact` 那样"落一条 `wake/manual` 让循环下一拍去办"：
+   * 急停的语义是"**现在就停**"。走队列时这条指令要等下一拍才被处理，而下一拍正好会被那个长 turn
+   * 占着（`tickOnce` 的 `busy` 早退）⇒ "现在停"退化成"等这一轮跑完再停"，而那正是用户要打断的事。
+   * 反过来也不能把判据搬到这一层：那会变成第二份"什么算 `/stop`、谁算用户"的实现。
+   * 所以照**既有的两步节奏**走（与聊天框里任何一句话同一处、同一顺序）：
+   *
+   *   ① `wake` 动作里、**落库之前**调 {@link WebServerDeps.ownerStopCommand}：
+   *      是急停就当场**掐流 + 清队列**（同步，当帧完成），返回一份回执；
+   *   ② 紧接着的 `appendSync('wake/manual')` 之后那一帧，`noteUserSpoke` 的返回值告诉本模块
+   *      "这一条刚才就是急停"——于是 **不把它当成人开口**，并把留痕落掉（
+   *      {@link WebServerDeps.consumeStopCommand}），正文与 ① 的回执逐字相同。
+   *
+   * 中间**不许有 await**（这条纪律本身没变：`noteUserSpoke` 与 speak 的 100ms 轮询之间有竞态）。
+   *
+   * 缺省（不注入）= 界面上的 `/stop` 按老路走（落 `wake/manual`，由循环下一拍处理）：
+   * CLI、测试与别的嵌入方不受影响。
+   */
+  ownerStopCommand?: ((type: string, data: unknown) => StopOutcome | null) | undefined;
+  /** ② 落留痕 + 回收执（返回 null = "这一条不是刚办的急停"，照常当人开口）；`wakeSeq` 是刚那条 `wake/manual` 的 seq */
+  consumeStopCommand?: ((type: string, data: unknown, wakeSeq?: number) => StopOutcome | null) | undefined;
+  /**
+   * **急停的第三步**（2026-10-16 修 bug 时拆出来的）：把那条"按钮载体" `wake/manual`
+   * 摘出 `pending`。**必须在本模块那次 `appendSync` 返回之后调**——载体是在
+   * `appendSync` 内部、`afterAppend` **之后**的 `applyOne(投影)` 那一步才进 `pending` 的，
+   * 早一帧（也就是上面那个 `consumeStopCommand`）查队列只会查到空的。
+   *
+   * 缺省不注入 = 不摘（老行为：那条载体留在队列里，会被下一拍的 turn 收走并丢掉）。
+   * 不摘**不会**再引发压缩（通用 slash 管线已经不收 `kind:'stop'`），所以这是个窄口子：
+   * 它只负责"队列看起来清干净了"这一件事。
+   */
+  dropPendingStopInput?: (() => number) | undefined;
   /**
    * `self-restart` 走到"旧实例该让位了"时的那一下（缺省见 `WebServer.requestGracefulRestartExit`）。
    *
@@ -1151,7 +1213,9 @@ async function readBody(req: IncomingMessage, limitBytes: number): Promise<BodyR
       message: `请求体超过 ${limitBytes} 字节上限`,
     };
   }
-  return { ok: true, text: Buffer.concat(chunks).toString('utf8'), code: '', message: '' };
+  // JSON 请求体按规范就是 UTF-8；这里仍走共享解码链，只为**不再有静默替换字符**：
+  // 一个 GBK 的客户端（或手工 curl）发来的中文会因为这条链被正确解出来，而不是变成一片 U+FFFD。
+  return { ok: true, text: decodeText(Buffer.concat(chunks)).text, code: '', message: '' };
 }
 
 function parseJsonObject(text: string): Record<string, unknown> {
@@ -2647,6 +2711,16 @@ export function buildReplay(input: {
   personaRoot: string;
   config: AppConfig;
   registry: ToolRegistry | null;
+  /**
+   * 技能根基准目录（`skills/`、`.agents/skills/` 的父目录）；缺省 `process.cwd()`。
+   *
+   * 与 `skillsView` / `skill-confirm` 那几处读的是**同一个**根（`deps.skillsRoot ?? process.cwd()`），
+   * 也是运行期那份 `SkillManager` 的同一个基准——预览的技能索引必须与**当时那个**同源
+   * （REVIEW P1-16：这一段原来根本没传给预览，每次少 555 token / 2,460 字节，且不报错）。
+   */
+  skillsRoot?: string | undefined;
+  /** 技能索引文本覆盖点（测试注入）；缺省按**当前**技能目录 + 到该步为止的信任事件重建 */
+  skillCatalog?: string | null | undefined;
 }): ReplayView {
   const stepStart = input.events.find(
     (event) => event.type === 'step/start' && event.data.turn === input.turn && event.data.step === input.step,
@@ -2729,12 +2803,20 @@ export function buildReplay(input: {
   // `summarizeEvent` 是给日志页"一行摘要"用的，不是任务卡口径；两者混用过一次，
   // 代价是预览的任务卡与当时发出去的不是同一串字节。
   const cardTitle = wakeEvent === null ? `turn ${input.turn}` : clipTaskTitle(wakeTitle(wakeEvent));
-  const eventsBefore = input.events.filter(
-    // 扣掉本轮那条 wake：与运行期同一个契约（首 step 的本轮输入**不在** events 里，见 agent-loop
-    // 的协同契约；CLI 的 rebuildRenderedRequest 也是这么过滤的）。不扣就会在重建里出现两遍
-    // ——一遍在事件流、一遍在本轮输入（2026-10-02 实测到的重放失真）。
-    (event) => event.seq < stepStart.seq && event.seq !== wakeEvent?.seq,
-  );
+  // **进预览上下文的事件流：与 CLI 重建同一处判据**（REVIEW P1-17）。
+  //
+  // 这里原来是自己写的一份过滤——只扣了 `seq < stepStart`（与运行期"本轮输入不在事件流里"的
+  // 契约），于是同一份日志在界面上比 CLI 重建**多出**：子代理链的事件、框架指令行
+  // （`/compact` / `/handoff` / `/stop`）、每日整理那条定时器唤醒。三刀（归属 / 框架指令 /
+  // 框架唤醒）现在只有一处实现（`replay.ts` 的 `contextEventsForRebuild`），两条重建路径都调它。
+  //
+  // 本轮那条 wake 仍要单独扣（首 step 的本轮输入**不在** events 里，见 agent-loop 的协同契约）
+  // ——与 CLI 的 `rebuildRenderedRequest` 同一个口径；不扣就会在重建里出现两遍。
+  const eventsBefore = contextEventsForRebuild(
+    input.events,
+    stepStart.parentCallId,
+    stepStart.seq,
+  ).filter((event) => event.seq !== wakeEvent?.seq);
   // 联络事实：与 CLI 的重放共用同一份重建（会话簿/话题折事件，联系人与别名取现在这份）。
   //
   // **会话清单要把本轮那条 wake 一起折**（2026-10-04 补）：`wake/channel` 本身就是一条会话事件
@@ -2794,6 +2876,14 @@ export function buildReplay(input: {
     lane: stepStart.data.lane,
     // 联络事实：上面按"要把本轮 wake 一起折"的口径算好了，这里只转手
     contact,
+    // 技能索引（长期记忆层的第一段）：这条预览路径原来**整段没传**——缺省 null 在渲染层是
+    // "没有可用技能"（该段不出现），于是预览每份请求都比当时少一截（实测 555 token / 2,460 字节）。
+    // 2026-10-11 起与 CLI 的重放走**同一个分派**（`skillCatalogForReplay`）：新日志读
+    // `skill/index` 快照（与运行期逐字节同源；技能目录之后被改过也不影响），老日志退回
+    // 当时的来源（`skillCatalogForRebuild`：同一个 `SkillManager` + 到这一步为止的信任事件）。
+    skillCatalog: input.skillCatalog !== undefined
+      ? input.skillCatalog
+      : skillCatalogForReplay(input.skillsRoot ?? process.cwd(), input.events, stepStart.seq),
     // 豁免判据（2026-10-04 补）：**与运行期、与 CLI 的重放同一处判据**。原来这条预览路径漏了它，
     // 于是对豁免会话，预览里会多出那句规则提示而真实请求没有——"重建与当时逐字节一致"当场作废。
     // dataDir 从 personaRoot 的父目录取，与上面 contactFactsForReplay 的 aliasesUnder 同源
@@ -2842,6 +2932,16 @@ export function buildReplay(input: {
     // 与 CLI 重建（replay.ts 从 config.json 读）读的是同一个字段，所以"预览里有没有那一行"
     // 与"她当时看不看得见"不会分岔。
     stateBudgetBytes: input.config.persona.stateBudgetBytes,
+    // ⚠ **这里有意不传 `previousNowLayer`**（v66 留下的**已知边界**，如实记在这里）：
+    // 运行期第 ≥2 步的此刻层只发"变了的字段"（见 render.ts 的 renderNowLayer），而这条预览
+    // 路径**每个字段都渲染** ⇒ 第 ≥2 步的预览会比当时多出那几行（第 1 步不受影响：那时也没有
+    // 参照物）。CLI 那条重建路不受影响——它有自己的遍历（`replay.ts` 的 `previousNowLayerFor`，
+    // 与 `rebuildRenderedRequest` 同源）。
+    // 为什么不在这里顺手补上：这一步要"把上一步按同样的装配再渲染一次"，而这一整个函数就是
+    // 那份装配本身（局部变量几十个）⇒ 只能把它整个抽成一个可递归的函数，那是一处**大重构**，
+    // 与"最小锚点替换"相抵。界面是给人看的（界面上那几行多出来不影响她），而 CLI 那条
+    // 逐字节比对的路已经是对的 ⇒ 取舍是"界面这一侧留一条已知边界，不动它的装配"。
+    // 要补的话，做法是现成的：把上面这段装配抽成 `buildPreviewAt(turn, step)`，递归调一次。
   });
 
   const currentConfigHash = configHash(input.config);
@@ -3542,7 +3642,7 @@ class WebServerImpl implements WebServer {
       return {
         available: false,
         reason: '本进程没有注入外部依赖管理器（WebServerDeps.deps 缺省）：'
-          + '无法报告 pwsh / rg / es 的状态，也无法一键安装。',
+          + '无法报告 pwsh / rg / es / python 的状态，也无法一键安装。',
         entries: [],
       };
     }
@@ -4194,6 +4294,9 @@ class WebServerImpl implements WebServer {
       personaRoot: this.deps.personaRoot,
       config: this.deps.config,
       registry: this.deps.registry ?? null,
+      // 技能根：与 `skillsView` / `skill-grant` 落地 / 运行期那份 `SkillManager` 同一句
+      // （`deps.skillsRoot ?? process.cwd()`）——预览的技能索引因此与"她当时看到的"同源
+      skillsRoot: this.deps.skillsRoot ?? process.cwd(),
     });
   }
 
@@ -4652,6 +4755,14 @@ class WebServerImpl implements WebServer {
       }
       case 'wake': {
         const note = typeof payload['note'] === 'string' ? payload['note'] : '';
+        /**
+         * ───────── 用户急停（`/stop`）第一步：**当场掐流 + 清队列**（2026-10-16 加）─────────
+         *
+         * 在**落库之前**问一句（判据与动作都在循环层：`RealLoop.ownerStopCommand`，
+         * 与 QQ 单聊入口同一份实现）。是急停就当场动手——"现在停"不能等下一拍
+         * （下一拍会被那个长 turn 占着）。返回 null = 不是急停 ⇒ 一个字都不动，照老路走。
+         */
+        const stopped = this.deps.ownerStopCommand?.('wake/manual', { note }) ?? null;
         const explicitKey = typeof payload['dedupeKey'] === 'string' && payload['dedupeKey'] !== ''
           ? payload['dedupeKey']
           : null;
@@ -4671,7 +4782,38 @@ class WebServerImpl implements WebServer {
         }, 'model',
         // 人开口了：她若正在发言，立刻停下没发的那几段（见 WebServerDeps.noteUserSpoke）。
         // 放在这里而不是 handler 末尾：那条"尚未发完"的 speak 正在另一个栈里等着看计数。
-        (event) => { this.deps.noteUserSpoke?.(event.seq, event.type, event.data); });
+        //
+        // **急停的第二步也搭在这一帧**：`consumeStopCommand` 的返回值**非 null = "这一条就是
+        // 刚办的急停"**——那就不通报"人开口了"（它不是对她说的话），并且当帧把留痕落掉
+        // （取走即清 ⇒ 一次按下只落一条 `slash/handled`）。
+        // 中间不许有 await：这条纪律与 speak 的打断回执同源（见 WebServerDeps 那一段注释）。
+        (event) => {
+          if (this.deps.consumeStopCommand?.(event.type, event.data, event.seq) != null) return;
+          this.deps.noteUserSpoke?.(event.seq, event.type, event.data);
+        });
+        // 急停它**根本没进队列**（判据在循环层，这一层只读结论）：`deduped` 那格若照常算，
+        // 会把"我按下去了"报成"重复提交、没有重复入队"——用户看到的就是"按了没反应"。
+        if (stopped !== null) {
+          // **投影已经折完了**（上面那次 `appendSync` 返回时折的）——急停留下的那条"按钮载体"
+          // `wake/manual` 现在才真的在 `pending` 里，这一刻才摘得掉（`RealLoop.dropStopInput`
+          // 的注释写清了为什么不能在 `consumeStopCommand` 那一帧摘：那时它还没进投影）。
+          // 不摘的后果实测过一次：它留在队列里，下一拍被通用 slash 管线当成 `/compact`
+          // 压一次历史——用户 2026-10-16 报的「按 /stop 触发了上下文压缩」就是它。
+          this.deps.dropPendingStopInput?.();
+          // 留痕已在上面那一帧落好，`consumeStopCommand` 给的就是**回填了 seq 的**那份结局
+          const settled = this.deps.consumeStopCommand?.('wake/manual', { note }) ?? stopped;
+          sendJson(res, 200, {
+            ok: true,
+            outcome: settled.outcome,
+            receipt: settled.receipt,
+            // 回执正文与日志里那一格**逐字相同**（都在 `slash/handled.receipt` 上），
+            // seq 也就是那条留痕
+            seq: settled.seq,
+            turnStopped: settled.turnStopped,
+            cleared: settled.cleared,
+          });
+          return;
+        }
         // 回执里如实说明它**有没有真的进队列**：幂等键撞上时 fold 会静默丢弃，
         // 而“说了没反应”与“她正在想”在界面上长得一模一样（这次事故最难的地方就在这）。
         const queued = this.deps.projection.pending.some((item) => item.wakeSeq === event.seq);
@@ -4889,14 +5031,30 @@ class WebServerImpl implements WebServer {
           outcome: decision === 'approve' ? 'approved' : 'rejected',
           reason: decision === 'approve' ? null : reasonRaw,
           exec,
+          // 技能那一支："它带几个可执行脚本"（批准卡上那份摘要就在这一格）——
+          // 唤醒正文据此说清「框架没有跑它们」，MCP 那一支恒为 0（那句话因此不出现）
+          scriptCount: item.scriptNames.length,
         };
-        // "要不要重启"走**那一格唯一的那份判据**（`mcpRestartOutcome` 的方法头）：
-        // 批准这条路写的就是 `mcp.servers`；驳回时什么都没写 ⇒ `changedAnything: false`
-        // （它的第一种情形：没有要生效的东西，不必重启）。
-        const restart = this.mcpRestartOutcome({
-          changedAnything: exec.state === 'ok',
-          appliedFields: ['mcp.servers'],
-        });
+        // "要不要重启"：**MCP 那一支**走那一格唯一的那份判据（`mcpRestartOutcome` 的方法头）——
+        // 批准这条路写的就是 `mcp.servers`，驳回时什么都没写 ⇒ `changedAnything: false`。
+        //
+        // **技能那一支根本不写 config.json**（写的是技能根里的目录 + 一条 `skill/installed`），
+        // 所以拿 `mcp.servers` 去问"要不要重启"会答出一句假话（实测到的：技能装好了，
+        // 回执却写着"它不在热更名单里：mcp.servers"）。它要说的另一件事是**什么时候进索引**：
+        // 与 MCP 索引同一套缓存保护 ⇒ 下一次归集才改字节（判据在 `real-loop.skillIndexSync`）。
+        const restart = isSkillKind(item.kind)
+          ? {
+            required: false,
+            effect: 'updated' as const,
+            note: exec.state === 'ok'
+              ? '不用重启：技能目录与信任门凭据都已经落库（config.json 一个字节没动）；'
+                + '她的常驻技能索引在下一次归集（压缩/重启）之后才改字节，与 MCP 索引同一套缓存保护。'
+              : '这次没有改动任何文件，不必重启。',
+          }
+          : this.mcpRestartOutcome({
+            changedAnything: exec.state === 'ok',
+            appliedFields: ['mcp.servers'],
+          });
         const wroteOutcome = writeGrantOutcome(this.deps.dataDir, {
           id,
           outcome: decision === 'approve' ? 'approved' : 'rejected',
@@ -5360,9 +5518,12 @@ class WebServerImpl implements WebServer {
         const trace = (): string => `路径=${choice.path}（${choice.why}）`
           + ` · guiExe=${guiExe === '' ? '（空：只重启后端）' : guiExe}`
           + ` · 盘上存在=${guiExeExists} · 命令行=${command}`;
-        const created = spawnSync('powershell.exe', ['-NoProfile', '-Command', wmi], { encoding: 'utf8' });
+        // **不收 `encoding:'utf8'`**（2026-10-18）：WMI 失败时的中文诊断是 GBK 字节，
+        // 而 `created.stderr` 会被写进事件与服务端日志（人要看的就是那句话）。
+        const created = spawnSync('powershell.exe', ['-NoProfile', '-Command', wmi], {});
+        const createdStderr = created.stderr === null ? '' : decodeText(created.stderr).text;
         const createdDetail = `status=${created.status === null ? '未知' : created.status}`
-          + ` stderr=${(created.stderr ?? '').trim()}`;
+          + ` stderr=${createdStderr.trim()}`;
         if (created.status !== 0) {
           this.write(`[重启] 启动失败：${trace()} · ${createdDetail}`);
           this.appendSync(
@@ -5370,13 +5531,13 @@ class WebServerImpl implements WebServer {
             {
               fields: ['restart'], configHash: 'restart-failed',
               guiExe, guiExeExists, command, path: choice.path, wmiStatus: created.status,
-              wmiError: (created.stderr ?? '').trim(), reason: RESTART_FAILURE_REASONS.wmiFailed,
+              wmiError: createdStderr.trim(), reason: RESTART_FAILURE_REASONS.wmiFailed,
             },
             'internal',
           );
           throw badRequest(
             `重启没能启动（${choice.path}：WMI 返回码 ${created.status === null ? '未知' : created.status}）：`
-            + `${(created.stderr ?? '').trim()}`,
+            + `${createdStderr.trim()}`,
             'restart-failed',
           );
         }
@@ -5823,7 +5984,9 @@ class WebServerImpl implements WebServer {
 
         // 装完立刻带回新的探测结论：界面不必再问一次 /api/deps 就能把徽章点亮
         const after = await manager.get(name);
-        this.write(`[依赖] ${name} 已就绪：${outcome.exePath}（${outcome.version}）`);
+        const aux = outcome.auxiliaryVersion === undefined ? '' : `，pip ${outcome.auxiliaryVersion}`;
+        const auxFail = outcome.auxiliaryOk === false ? '（pip 未引导成功）' : '';
+        this.write(`[依赖] ${name} 已就绪：${outcome.exePath}（${outcome.version}${aux}）${auxFail}`);
         sendJson(res, 200, {
           ok: true,
           name,
@@ -5833,6 +5996,9 @@ class WebServerImpl implements WebServer {
           version: outcome.version,
           sourceUrl: outcome.sourceUrl,
           bytes: outcome.bytes,
+          /** 收尾步骤（python 的 pip 引导）的结果：**失败了也要让界面看得见**，不许静默 */
+          ...(outcome.auxiliaryVersion === undefined ? {} : { auxiliaryVersion: outcome.auxiliaryVersion }),
+          ...(outcome.auxiliaryOk === undefined ? {} : { auxiliaryOk: outcome.auxiliaryOk }),
           details: outcome.details,
           /** 复检后的探测结论（与 /api/deps 的单项同形） */
           probe: {
@@ -5841,6 +6007,9 @@ class WebServerImpl implements WebServer {
             version: after.version,
             source: after.source,
             reason: after.reason,
+            // python 才有这两格（界面在那一行显示 pip 状态）
+            pipVersion: after.pipVersion ?? null,
+            pipReason: after.pipReason ?? '',
           },
         });
         return;
@@ -6585,6 +6754,17 @@ class WebServerImpl implements WebServer {
       }
       if (path === 'schemaVersion') {
         throw badRequest('schemaVersion 由配置迁移链管理，不接受来自界面的修改');
+      }
+      // MCP 声明面整段改写要从 mcp-save / mcp-remove 走（P1-21：这两条路的门不一样）。
+      // 点路径与嵌套写法会折成同一格，所以按前缀判就够——`mcp.servers.0.command` 这种写法
+      // 实际上会被当成"把数组换成对象"，同样必须挡。
+      if (path === MCP_SERVERS_FIELD || path.startsWith(`${MCP_SERVERS_FIELD}.`)) {
+        throw badRequest(
+          `${MCP_SERVERS_FIELD} 不接受 config-update 的整段改写：这条路的写入口是 mcp-save / mcp-remove`
+          + '（它们会逐条校验 server 形状、留下回执，并按热更接线回答"要不要重启"）。'
+          + '请走 POST /api/commands/mcp-save（X-Confirm: mcp-save）或 mcp-remove（X-Confirm: mcp-remove）。',
+          'use-mcp-save',
+        );
       }
       const dangerous = DANGEROUS_FIELDS[path];
       if (dangerous !== undefined && !phrases.includes(dangerous)) {
@@ -8237,7 +8417,7 @@ interface McpProbeOutcome {
  */
 class McpProbeHost implements McpConnectionHost {
   // version 与 `main.ts` 的 AGENT_VERSION 同步（两处必须一起改）
-  readonly clientInfo = { name: 'irmia-agent', version: '0.1.0-beta.10' };
+  readonly clientInfo = { name: 'irmia-agent', version: '0.1.0-beta.11' };
   readonly protocolVersion = DEFAULT_PROTOCOL_VERSION;
   readonly progressHardCapMs = 60_000;
   readonly defaultRequestTimeoutMs: number;

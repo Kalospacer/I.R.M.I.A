@@ -53,7 +53,7 @@ import { checkStdioLauncher } from '../mcp/launcher-guard.ts';
 import { mcpDescProblem, sanitizeMcpDescText } from '../mcp/description.ts';
 import {
   applySkillGrant, parseSkillGrantRequest, skillGrantContextOf, skillGrantHash,
-  skillGrantQuestionOf, skillGrantSummaryOf,
+  skillGrantQuestionOf, skillGrantReceiptLine, skillGrantSummaryOf, skillGrantWakeNoteOf,
   type SkillGrantParse, type SkillGrantRequest,
 } from './skill-grant.ts';
 import { humanAskSourceOf, type AppEvent, type GrantKind, type GrantRequested, type GrantResolved } from '../log/types.ts';
@@ -343,6 +343,11 @@ export function grantContentHash(request: GrantRequest): string {
 }
 
 // ──────────────────────────────── 卡面（人看到的那两段话） ────────────────────────────────
+
+/** 这一格 `kind` 是技能那一支吗（判据只有这一处：`grantBranchOf` 的同一套取值） */
+export function isSkillKind(kind: GrantKind): boolean {
+  return kind === 'skill-install' || kind === 'skill-remove';
+}
 
 /** `grantContentHash` 的两支入口（MCP 那支是它自己，技能那支在 `skill-grant.ts`） */
 export function isMcpRequest(request: GrantRequest | SkillGrantRequest): request is GrantRequest {
@@ -990,6 +995,13 @@ export interface GrantWakeFacts {
   /** 人写的驳回理由（**允许为空**：那时照实说"没给理由"，不许编一句） */
   reason: string | null;
   exec: GrantExecFacts;
+  /**
+   * 技能那一支装成功时带几个**可执行脚本**（`scripts/`）。
+   *
+   * 为什么放进这一格：技能是可执行内容（方案稿 D8），而"框架有没有跑它们"是她与人都该读到
+   * 的一句话——`0`/缺省时那句话**根本不出现**（不编一句"它没有脚本"）。
+   */
+  scriptCount?: number;
 }
 
 export interface GrantExecFacts {
@@ -998,8 +1010,15 @@ export interface GrantExecFacts {
   landed?: string;
 }
 
-/** 被她读的那句话（人类写的理由已洗净：它进的是**一行**上下文） */
+/**
+ * 被她读的那句话（人类写的理由已洗净：它进的是**一行**上下文）。
+ *
+ * **两支共用这一个入口**（与 `grantQuestionOfAny` / `grantContextOfAny` 同一手法）：
+ * 调用点（`wakeForGrant`）只管"发一条 `wake/manual{via:'grant'}`"，措辞按 `kind` 分派——
+ * 这样"技能批准与 MCP 批准是**同一条通知**"不是文档承诺，而是**只有一条路**。
+ */
 export function grantWakeNoteOf(facts: GrantWakeFacts): string {
+  if (isSkillKind(facts.kind)) return skillGrantWakeNoteOf(facts);
   const what = facts.kind === 'mcp-add' ? `加 MCP server「${facts.name}」` : `删 MCP server「${facts.name}」`;
   if (facts.outcome === 'rejected') {
     // 驳回：三件事都要说清（①这是人的决定 ②他没写理由也别当成"没人理" ③下一步怎么做）
@@ -1060,8 +1079,11 @@ export function wakeForGrant(input: {
  *
  * 它是人写的话（驳回理由）与框架算的事实（执行结果）拼起来的**一行**，
  * 所以理由已经洗净（`sanitizeGrantLine`）——它会进她下一拍的上下文。
+ * 两支的措辞在这里分派（MCP 那支说"写进配置"，技能那支说"装进技能根/移进回收站"）：
+ * 同一个入口、同一种口气，读的人不必知道自己在哪一支上。
  */
 export function grantReceiptLine(facts: GrantWakeFacts): string {
+  if (isSkillKind(facts.kind)) return skillGrantReceiptLine(facts);
   if (facts.outcome === 'rejected') {
     return facts.reason === null || facts.reason === ''
       ? '人驳回了这张申请单，没有给理由。'

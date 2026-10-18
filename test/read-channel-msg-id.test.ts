@@ -47,7 +47,7 @@ function message(patch: Partial<ChannelMessageView> & { chatId: string }): Chann
     sid: `onebot:${chatType}:${patch.chatId}`,
     channel: 'onebot',
     chatType,
-    person: '1269541505',
+    person: '1234567890',
     text: '你好',
     messageId: '-754521710',
     msgSeq: 1,

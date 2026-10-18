@@ -645,7 +645,12 @@ export function createWebSearchTool(
     name: WEB_SEARCH_TOOL_NAME,
     description:
       '联网搜索（AnySearch）：给 query 拿回标题+链接+摘要的 Markdown。'
-      + '垂类要 domain+sub_domain；一次最多 10 条；extract 取前两条正文。',
+      // v64（她的实测）：`domain` 本地有表（`WEB_SEARCH_DOMAINS`，handler 里校验），但
+      // **`sub_domain`（tag）与它要求的参数没有本地表** ⇒ 配错拿到的是上游报错
+      // （`code.repo` ⇒ `Invalid tag`；`finance.quote` ⇒ `Missing required params: type`）。
+      // 判据：不编一张会漂的表，只把真相与"日常走通用模式"写给她（用户 2026-10-13 的裁决）。
+      + '垂类（domain+sub_domain）的 tag 与必需参数由上游定，配错拿到的是上游报错——'
+      + '日常搜索不要传 domain。一次最多 10 条；extract 取前两条正文。',
     parameters: {
       type: 'object',
       properties: {

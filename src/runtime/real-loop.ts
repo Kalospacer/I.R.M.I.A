@@ -55,7 +55,7 @@ import { InjectionJudge, type InjectionVerdict } from '../channel/injection-judg
 import {
   injectionNoteOf, noteForFlagged, quotesOfHints, reasonOfHints, scanForInjection, speakerWordsOf,
 } from '../channel/injection.ts';
-import { TopicSummarizer } from '../channel/topic.ts';
+import { TopicSummarizer, isUnattendedGroup } from '../channel/topic.ts';
 import type { WakeEmission } from '../wake/sources.js';
 import type { EventLog } from '../log/event-log.js';
 import type { DsClient } from '../model/ds-client.js';
@@ -87,11 +87,12 @@ import {
   readAttachmentImage,
   readFileImage,
 } from '../channel/attachment-store.ts';
-import { deliveredToSid, replyableWakeChannel } from '../tools/admin.ts';
-import type { ContactFacts } from '../model/self-brief.ts';
+import { deliveredToSid, replyableWakeChannel, type ChannelSessionRow } from '../tools/admin.ts';
+// 频次窗口那一个数：会话清单用它数条数（渲染层），这里用它剪掉窗口外的素材（内存）——同一个常量
+import { SESSION_FREQ_WINDOW_MS, type ContactFacts } from '../model/self-brief.ts';
 import type { MachineFacts, MaintenanceWindowNote, RenderChannelContext, RenderImageRef, TurnBlockFacts, UsageFacts } from '../model/render.ts';
 import { COMPACTION_WARNING_RATIO, compactionSoonNote, planCompactionWarning } from '../model/compaction-warning.ts';
-import { RENDER_VERSION, lastCompactionReading, lastMaintenanceWindowAt, localHourOf, maintenanceWindowOf, mcpIndexOf, wakeTitle } from '../model/render.ts';
+import { RENDER_VERSION, lastCompactionReading, lastMaintenanceWindowAt, localHourOf, maintenanceWindowOf, mcpIndexOf, skillIndexOf, wakeTitle } from '../model/render.ts';
 // 只借一个**类型**（`import type` 在运行时被擦掉）：循环要知道"热更刚刚发生了什么"，
 // 而那份账的形状归 watcher（它是唯一生产者）。这不引入运行时依赖，也不让循环认识 watcher。
 import type { ConfigReloadOutcome } from '../config/watcher.js';
@@ -144,7 +145,9 @@ import {
 } from './topup.ts';
 import {
   COMPACT_EMPTY_RECEIPT, COMPACT_RECEIPT, HANDOFF_EMPTY_RECEIPT, HANDOFF_RECEIPT,
-  isSlashCommandEvent, parseSlashCommand, unknownCommandReply, type SlashCommand,
+  STOP_IDLE_RECEIPT, STOP_RECEIPT,
+  isFrameworkCommandEvent, isSlashCommandEvent, isStopCommandText, parseSlashCommand,
+  unknownCommandReply, type SlashCommand,
 } from './slash-commands.ts';
 import { mechanicalSummaryText, renderHandoffNote } from '../persona/handoff-note.ts';
 import { sha256Hex } from '../persona/versions.ts';
@@ -160,6 +163,13 @@ const CATEGORY = {
   stall: 'stall',
   /** 人审挂起超时（design §4.21）：与预算耗尽分开成类——两类事的救法不同，不该共用限流指纹 */
   human: 'human-timeout',
+  /**
+   * 用户急停（`/stop`，2026-10-16 加）：**单独成类**，理由与上面那条同源——
+   * 它不是故障（`level: 'info'`），与预算耗尽/失败刹车/停滞的处置完全不同；
+   * 共用指纹会让"用户按了停止"跟"预算又爆了"互相顶掉限流窗口。人不会连按这个按钮，
+   * 限流窗口按类别各自算即可。
+   */
+  stop: 'owner-stop',
 } as const;
 
 /**
@@ -239,7 +249,7 @@ function formatTokens(value: number): string {
  */
 function contextEventFilter(event: AppEvent): boolean {
   if (!isTopLevelEvent(event)) return false;
-  return !isSlashCommandEvent(event);
+  return !isFrameworkCommandEvent(event);
 }
 
 /**
@@ -1039,6 +1049,106 @@ export function imageAimedAtHer(data: { chatType?: string; mentionsMe?: boolean 
   return data.chatType === 'c2c' || mentionedInMessage(data);
 }
 
+/**
+ * 折三格"清单要不要列这个会话"的素材（v66 两格，v67 加第三格）：`spokeAt`（她最后在这个会话里
+ * 说话的时刻）、`mentionedAt`（最近一次有人 @/提及她）、`spokeTimes`（她在这个会话里说过话的
+ * **全部时刻** —— 频次的素材）。
+ *
+ * **纯函数、导出**（不是 `RealLoop` 的方法）：重放/界面预览那条路（`replay.ts` 的
+ * `contactFactsForReplay`）必须用**同一个函数**折同一批事件——两处各写一遍的代价是
+ * "预览里的会话清单"与"当时真发出去的那一份"不是同一份（实测踩到：预览会把一个刚 @ 过她、
+ * 但她还没回过的群从清单里滤掉，而当时那一份列着它）。渲染层是纯函数、算不出这三格
+ * （素材在事件里），所以判据只能收在这里一处。
+ *
+ * **幂等**：前两格取最大值，第三格由宿主的**事件序号水位**（`spokeFoldedUpTo`）保证——
+ * 同一个事件折两遍不会算两条。这一点是必需的——warmUp 读全量、而 `channelBookSeq` 从 0 起，
+ * 重启后下一拍会把同一批事件再折一遍。
+ *
+ * 判据来源（都不是新写的）：
+ *   · 她说过话 ⇒ `speak/sent` + `deliveredToSid`（**真的投递到那个会话**的那些；
+ *     与 `readChannelSpoken` 的"我自己的发言"同一个函数）；
+ *   · 有人叫她 ⇒ `wake/channel` / `channel/message` 上的 `mentionedInMessage`
+ *     （群 @ 或 `mentionsMe`），**私聊不算**——私聊里没有"提及"这回事。
+ *
+ * `spokeTimes` 为什么是**时刻数组**而不是一个计数（v67，用户要"回复频次最高的前 3 个"）：
+ * 频次带**滚动窗口**（`SESSION_FREQ_WINDOW_MS`），而"窗口里的条数"**不是可合并的摘要**——
+ * 两批事件各折出一个数，相加会在重折时翻倍、取最大会漏掉另一批，只存进程内存又撑不过重启。
+ * 时刻数组按 sid 并起来既幂等（靠序号水位，见上）又能跨重启从日志折出来，窗口判断因此留在
+ * **渲染层**（纯函数、可复算：`selfBrief.spokeFreqOf`）。
+ *
+ * ⚠ 这一格**一件事算一条**：同一个会话同一毫秒里的两条发言是**两条**（频次各算一次）——
+ * 所以去重键是事件序号、不是时刻本身。
+ */
+export function foldSpokeAndMention(events: readonly AppEvent[]): {
+  spokeAt: Map<string, number>;
+  mentionedAt: Map<string, number>;
+  spokeTimes: Map<string, number[]>;
+} {
+  const spokeAt = new Map<string, number>();
+  const mentionedAt = new Map<string, number>();
+  /** 她说过话的时刻：一件事一条（同一毫秒的两条不会被并成一条），最后排成升序 */
+  const times = new Map<string, number[]>();
+  /** 取最大值：同一事件折两遍（重启后的重折）结果必须一样 */
+  const bump = (map: Map<string, number>, sid: string, at: number): void => {
+    if (!Number.isFinite(at)) return;
+    const prev = map.get(sid);
+    if (prev === undefined || at > prev) map.set(sid, at);
+  };
+  for (const event of events) {
+    if (event.type === 'speak/sent') {
+      const delivered = deliveredToSid(event.data);
+      if (delivered === null) continue;
+      const sid = normalizeSid(delivered);
+      const at = Date.parse(event.ts);
+      bump(spokeAt, sid, at);
+      if (!Number.isFinite(at)) continue;
+      const list = times.get(sid);
+      if (list === undefined) times.set(sid, [at]);
+      else list.push(at);
+      continue;
+    }
+    if (event.type !== 'wake/channel' && event.type !== 'channel/message') continue;
+    const d = event.data;
+    if (d.chatType === 'c2c' || !mentionedInMessage(d)) continue;
+    bump(mentionedAt, sidOf(d.channel, d.chatType, d.chatId), Date.parse(event.ts));
+  }
+  const spokeTimes = new Map<string, number[]>();
+  for (const [sid, list] of times) spokeTimes.set(sid, list.sort((a, b) => a - b));
+  return { spokeAt, mentionedAt, spokeTimes };
+}
+
+/**
+ * 两个**升序**的时刻表并起来（v67）：`cutoff` 之前的丢掉。
+ *
+ * **不在这里去重**：去重是**事件序号水位**那件事（`RealLoop.spokeFoldedUpTo`）——同一毫秒里的
+ * 两条发言是两条（频次各算一次），只有"同一个事件被折两遍"才必须合成一条，而那种情况已经被
+ * 水位挡在门外。所以这一层只管合并与剪枝，两件事各归各的一处判据。
+ *
+ * `cutoff` 不是有效数（时钟坏了）时**不剪**：宁可多留几条，也不因为一个坏值把素材清空——
+ * 与渲染层"拿不到现在就不按窗口藏会话"同一个取舍。
+ */
+function mergeSpokeTimes(prev: readonly number[], add: readonly number[], cutoff: number): number[] {
+  const out: number[] = [];
+  const keep = (at: number): void => {
+    if (Number.isFinite(cutoff) && at < cutoff) return;
+    out.push(at);
+  };
+  let i = 0;
+  let j = 0;
+  while (i < prev.length || j < add.length) {
+    const a = i < prev.length ? prev[i]! : Number.POSITIVE_INFINITY;
+    const b = j < add.length ? add[j]! : Number.POSITIVE_INFINITY;
+    if (a <= b) {
+      keep(a);
+      i += 1;
+    } else {
+      keep(b);
+      j += 1;
+    }
+  }
+  return out;
+}
+
 function groupMemberCandidateOf(event: AppEvent, selfMessages?: SelfIdentity): GroupCallingEvent | null {
   if (event.type !== 'wake/channel') return null;
   const data = event.data;
@@ -1120,8 +1230,25 @@ function readDiskFacts(path: string): { path: string; freeBytes: number; totalBy
   }
 }
 
-export interface RealLoopDeps {
-  log: EventLog;
+/**
+ * 一次 `/stop` 的结局（回给消息入口那一层用）。
+ *
+ * 四个字段都是**事实**（不是推断）：`turnStopped` 说当时有没有在跑的活、`cleared` 说清掉了
+ * 几条待处理输入、`seq` 是那条 `slash/handled` 留痕（要追"这一刻到底发生了什么"从它查）、
+ * `receipt` 是**回给用户的原话**（与日志里那一格逐字相同——两处各写一遍迟早不一样）。
+ */
+export interface StopOutcome {
+  outcome: 'stopped' | 'idle';
+  receipt: string;
+  /** 当时确实有一轮在跑（掐了它的流） */
+  turnStopped: boolean;
+  /** 从队列清进死信的输入条数（`reason: 'stopped-by-owner'`） */
+  cleared: number;
+  /** `slash/handled` 留痕的 seq */
+  seq: number;
+}
+
+export interface RealLoopDeps {  log: EventLog;
   dataDir: string;
   projection: Projection;
   now: () => Date;
@@ -1446,6 +1573,31 @@ export class RealLoop {
   private mcpIndexText = '';
 
   /**
+   * 这一拍该进上下文的**技能常驻索引文本**（2026-10-11；空串 = 那一刻一个可用技能都没有）。
+   *
+   * 与 `mcpIndexText` **逐个理由同形**（那份注释就是这一份的理由）：它紧挨着 `instructions` /
+   * `tools` 两段常驻前缀，若每轮现问 `SkillManager.catalogText()`，那么**批准装一个技能 /
+   * 删一个技能**就会把请求前缀改一次（整段历史掉出 KV 缓存，实测口径 ≈9.6 万 token 一轮）。
+   * 用户这一轮的判据是「skill 索引的进入和退出也要有类似 mcp 的进入和退出那样的缓存保护的机制」
+   * ⇒ 字节只来自日志里那条 `skill/index` 快照，而快照只在下面三个点上重建
+   * （`skillIndexSync` 的方法头：首次 / 模板换代 / 压缩之后）。
+   *
+   * 记在实例上还有一个**本轮内不许抖动**的用处：`agentDeps()` 一轮调一次，它读的就是这一格
+   * ⇒ 同一轮里哪怕中途批了一个技能，这一轮所有 step 用的仍是**同一个**字节串
+   * （下一拍归集才会换，那才是"一轮之内只允许变一次"）。
+   */
+  private skillIndexText = '';
+
+  /**
+   * 信任表折到哪一条了（`skillIndexSync` 的增量折叠用；seq 只增）。
+   *
+   * 为什么需要它：归集点可能很密（"一个可信技能都没有"那种退化形状下每一拍都走得到重建判据），
+   * 每拍全量重折 `skill/installed` 是 O(事件数)。而信任事件很稀疏 ⇒ 记一个水位，
+   * 每次只折它之后的。0 表示"这一任还没折过"（第一次会从头折一遍，与 `setTrustEvents` 等价）。
+   */
+  private skillTrustSeq = 0;
+
+  /**
    * **本拍读过的事件快照**（`mcpIndexSync` 每拍全量读一次日志，顺手留在这里）。
    *
    * 谁用它：`settleGrants`（判"这张申请单拾取过没有"）。它**不能 await**——拾取必须在
@@ -1470,6 +1622,54 @@ export class RealLoop {
    * 它是**纯观测 + 一句提示**：不改任何判据、不动任何文档（用户的红线："框架只给信号"）。
    */
   private maintenanceWindowNow: MaintenanceWindowNote | null = null;
+
+  /**
+   * **用户急停用的那一条中断信号**（`/stop`，2026-10-16 加）。
+   *
+   * 为什么在实例上、为什么整轮共用一条：`AgentLoopDeps.signal` 这个字段**早就在了**
+   * （注释写着"外部取消（shutdown）：透传给模型请求与工具执行"），而生产（`real-loop` 的
+   * `agentDeps`）**从来没接过线** —— 所以在此之前，除了"关进程"，没有任何东西能取消一条在飞的模型流。
+   * `/stop` 要的正是那件事，于是这里补上这条线。
+   *
+   * ⚠ **一次 stop 一条新控制器**：`AbortSignal` 一旦 abort 就永远是 aborted，
+   * 而这里要的是"这一轮被停掉"、下一轮照常能跑。所以 `abort` 之后**立刻换一条新的**
+   * （见 `handleStopCommand` 里那两行），下一轮 `agentDeps` 拿到的是干净的信号。
+   * 这也正是 `interruptEpoch` 当初为什么不用 AbortSignal 的那个理由（见它的注释），
+   * 区别在于那条是"一次发言"，而这条是"整轮取消"——轮次边界上换一条新的是对的。
+   */
+  private stopController = new AbortController();
+
+  /**
+   * 「本轮的取消是用户按 `/stop` 要的」这一格事实（`/stop` 专用，2026-10-16 加）。
+   *
+   * 为什么要它：`agent-loop` 从 `AbortSignal` 上**看不出是谁掐的**（所有取消长一个样），
+   * 而两条路的处置完全不同——关机/信号取消要让输入退回队列（下次启动还能接着做），
+   * 用户急停则**不许退回**（他刚说完"停下来"）。判据只能有一个来源：按下去的那一处。
+   * 它在 `agentDeps()` 里被读走、`runTurn` 返回后清掉（见 `stoppableTurn` 的注释）。
+   */
+  private stoppedByOwner = false;
+
+  /**
+   * 界面那条路上"已经掐了流、还没落留痕"的那一次急停（见 `ownerStopCommand` / `consumeStopCommand`）。
+   *
+   * 为什么需要这一格：界面那条路的两步（`appendSync('wake/manual')` 与 `noteUserSpoke`）
+   * 在 `web/server.ts` 里是同一个同步块里的两个调用，中间**不许有 await**
+   * （那条纪律是为了 speak 的打断回执，见 `WebServerDeps.noteUserSpoke`）。
+   * 所以急停也拆成"先动手、后落痕"两步，而中间那一小段时间需要一个落脚点。
+   * 取走即清 ⇒ 同一次按下只会落一条 `slash/handled`（幂等）。
+   */
+  private pendingStop: { stop: { where: string; text: string }; result: StopOutcome } | null = null;
+
+  /**
+   * 界面那条路里"那条 `wake/manual` 的 seq"——两步之间的那一帧把它记下来，
+   * 由 `dropStopInput` 摘出队列（它是框架按钮的载体，不是给她的输入）。
+   * **只有界面那条路会用到它**（通道那条路根本没落库）。
+   *
+   * ⚠ 摘的**时机**是这件事的全部难点：必须在载体**已经被折进投影之后**。
+   * 判据不是"在哪条路上"、也不是"哪一步的顺序"，而是**投影折没折**——
+   * 见 `dropStopInput` 里那段注释（它写清了 `web/server.ts` 的 `appendSync` 三步顺序）。
+   */
+  private pendingStopWakeSeq: number | null = null;
 
   /**
    * 预热跑完之前到达的**配置热更通报**（一次重载最多一条，见 `notifyConfigReloaded`）。
@@ -1568,6 +1768,57 @@ export class RealLoop {
 
   /** 会话话题（`channel/topic` 折出来的最近一条）：清单那一行缀的那半句 */
   private channelTopics = new Map<string, string>();
+
+  /**
+   * sid → **她最后一次在这个会话里说过话**的时刻（毫秒，v66）。
+   *
+   * 素材是 `speak/sent` 里真的投递到某个会话的那些（判据 `deliveredToSid`，与 `read_channel`
+   * 的「我自己的发言」**同一个函数**）。两处用它：会话清单那行的「最后 …」与"没人理的群"
+   * 那道闸（`isUnattendedGroup`：她最后一次发言早于 7 天 ⇒ 不给它跑话题概括）。
+   *
+   * 折叠口径与 `channelTopics` 同形（warmUp 全量一次 + foldChannelEvents 增量），
+   * 而且**取最大值**：同一个事件被折两遍（重启后 warmUp 重读）结果一样，天然幂等。
+   */
+  private spokeAt = new Map<string, number>();
+
+  /**
+   * sid → **她在这个会话里说过话的时刻**（毫秒，升序；一件事占一格，v67）。
+   *
+   * 与上面 `spokeAt` 同一批判据、同一批事件，区别只在这格留**全部时刻**：会话清单的
+   * "回复频次最高的前 3 个"要在**滚动窗口**（`SESSION_FREQ_WINDOW_MS`）里数条数，而
+   * "窗口里的条数"不是可合并的摘要（见 `foldSpokeAndMention` 那段）——只有时刻表能既跨重启
+   * 从日志折出来、又把窗口判断留给渲染层。
+   *
+   * **只留窗口内的**：窗口外的时刻既不进频次也没有别的用处，留着只会让内存随日志一起长。
+   * 剪枝界限取 `现在 − 窗口`（`this.deps.now()`，与此刻层同一把尺子）：渲染层的窗口以
+   * `nowMs` 为锚，而 `nowMs` 永远不早于这一折，所以剪掉的一定在窗口之外——钟偏到未来也
+   * 不会把窗口内的素材剪掉。
+   */
+  private spokeTimes = new Map<string, number[]>();
+
+  /**
+   * 已经折进上面那张时刻表的**最大事件 seq**（`-1` = 一条都还没折）。
+   *
+   * 它管的是"**同一批事件折两遍**"这件事（warmUp 全量之后，`foldChannelEvents` 从
+   * `channelBookSeq` 起还会再折一遍）：折之前先按这个水位把已折过的筛掉。
+   *
+   * 为什么去重键是**序号**而不是"时刻"：时刻是**素材**（同一毫秒里的两条发言就是两条，频次
+   * 各算一次），而"这条事件折过没有"是**记账**——两件事用两个键，才不会为了防重折而把
+   * 真正的第二条发言吃掉。重启时新实例的水位回到 -1，于是 warmUp 照样把全量日志重折一遍
+   * （这就是"跨重启成立"：素材只从日志来，进程内存里没有独一份）。
+   */
+  private spokeFoldedUpTo = -1;
+
+  /**
+   * sid → **最近一次有人 @/提及她**的时刻（毫秒，v66）。
+   *
+   * 判据**复用** `mentionedInMessage()`（群 @ 或 `mentionsMe`），不另写一套——两处各写一份
+   * 迟早漂成"清单说没人叫她、而唤醒列表里明明有"。私聊不算（私聊里没有"提及"这回事，
+   * 与 `imageAimedAtHer` / `mentionSidOf` 同一个口径）。
+   *
+   * 会话清单用它回答"最近 1 小时有人点我的名吗"——是就进清单。
+   */
+  private mentionedAt = new Map<string, number>();
 
   /**
    * sid → **上次概括覆盖到的事件 seq**（`channel/topic.toSeq`）。
@@ -1684,6 +1935,45 @@ export class RealLoop {
   }
 
   /**
+   * 会话簿的**工具层形态**（v66）：`read_channel` 不给 `sid` 时列的那一份。
+   *
+   * 为什么不直接把 `sessionBook` 递出去：那一份是**投影的内部形状**（带 `lastText`、
+   * `readUpToSeq`、`messages` 这些"折叠用得上、她看了没用"的格子）。工具层要的是
+   * "外面有哪些会话、各有多少没看、最后什么时候响的、在聊什么"——多给几格就是让她
+   * 每次列会话都多读几行噪音（这正是这一版在治的东西）。
+   *
+   * `topic` 从 `channelTopics` 现取（与此刻层那张清单**同一个 map**）：
+   * 所以"清单上缀着在聊什么"与"列会话时缀着在聊什么"不可能不一致。
+   * 空话题**缺席**（不是空串）：`?? ''` 之后判一次，免得给出去一个空占位。
+   */
+  sessionRows(): readonly ChannelSessionRow[] {
+    return this.sessionBook.map((entry) => {
+      const topic = this.channelTopicOf(entry.sid) ?? '';
+      const label = this.resolveChannelName(entry.sid);
+      return {
+        sid: entry.sid,
+        chatType: entry.chatType,
+        unread: entry.unread,
+        lastSeenAt: entry.lastSeenAt,
+        ...(topic.trim() === '' ? {} : { topic }),
+        ...(label === null ? {} : { label }),
+        /**
+         * 「她上次读到哪」（v67）：`channel/read` 折出来的已读位，**这里只是把它递出去**。
+         *
+         * 为什么要递（2026-10-17）：`read_channel` 默认那一屏改成"只给上次查看之后的"，
+         * 而"上次查看"必须跨重启成立。进程里那份 `readState` 是缓存（重启就空），
+         * 账在日志的 `channel/read` 里——`collectSessions` 启动时把它折进 `sessionBook`，
+         * 这里原样带上（`readUpToSeq` 就是那一格，**不另立第二份状态**）。
+         *
+         * 它**不改**会话清单那一支的渲染：`sessionsListResult` 只按名字取它要的那几格
+         *（`unread`/`lastSeenAt`/`topic`/`label`），多带的这一格一个字节都不进回执。
+         */
+        readUpToSeq: entry.readUpToSeq,
+      };
+    });
+  }
+
+  /**
    * WakeSink：唤醒事件（model，承诺类；返回时已在磁盘上）。
    *
    * **`msgSeq` 在这里兜底补成事件 seq**（2026-10-07，且这条兜底对所有唤醒源生效）：
@@ -1703,6 +1993,25 @@ export class RealLoop {
    * 再原样交给同一个写入口，比让每个调用方各自拼一遍可靠得多。
    */
   wake(emission: WakeEmission): void {
+    /**
+     * ───────────── 用户急停的**通道入口**（`/stop`，2026-10-16 加）─────────────
+     *
+     * 放在**最前面、落库之前**，两件事一次办完：
+     *   · 这条 `/stop` **不进队列、不落库**：它是给框架的按钮，不是对她说的话。落库的后果很具体
+     *     ——它会在 `pending` 里等下一拍，而下一拍正好被那个长 turn 占着（`busy` 早退），
+     *     于是"现在停"变成"等这一轮跑完再停"；而且它还会以一条 user 消息的样子出现在她眼前。
+     *   · 判据与动作都在 {@link stopCommandOf} / {@link handleStopCommand} 里（一处）。
+     *
+     * 注意 seq 的消耗：这里在 `nextSeq()` **之前** return，所以那条被丢掉的输入不占 seq
+     * （日志里没有它的位置，正合"它从来没存在过"这件事）。代价是**没有任何留痕**——
+     * 留痕落在 `slash/handled{kind:'stop'}` 那一条上（它有 seq），用户按过什么仍然查得到。
+     */
+    const stop = this.stopCommandOf(emission);
+    if (stop !== null) {
+      // 掐流 + 清队列（同步、当帧）+ 留痕 + 回执：**四步一次办完**
+      this.handleStopCommandOwn(stop);
+      return;
+    }
     // seq 在这里先取（原来是 `appendSync` 里取的）：`msgSeq` 的兜底要用它，
     // 而"分配即消耗"的 seq 只能取一次——所以先取、再把同一个数交给写入口。
     const seq = this.deps.log.nextSeq();
@@ -1714,6 +2023,296 @@ export class RealLoop {
     // 记的是**刚落的这条事件的 seq**：speak 真被打断时要拿它销账（见 claimInterruption）
     const spoke = userSpokeTextOf(emission);
     if (spoke !== null) this.noteUserSpoke(spoke, logged.seq);
+  }
+
+  // ── 用户急停（`/stop`） ──
+
+  /**
+   * 这条唤醒是不是**用户**按下的 `/stop`（纯判据，不写任何东西）。
+   *
+   * 返回 null = 不是（照常走唤醒那条路）。返回 `{where, text}` = 是，`where` 只用来说清
+   * "他从哪条通道按的"（回执与留痕里各出现一次）。
+   *
+   * ## 权限判据（**这里就是唯一的判据点**）
+   *
+   * 三条路各自成一条"这是用户"的证据，一条都不许省：
+   *   · `wake/manual` —— **界面那条路已经过了会话凭据**（`/api/commands/*` 的认证在
+   *     `web/server.ts` 的入口，`trust.ts:99-102` 也把 `wake/manual` 定为 `owner`）。
+   *     所以"它到了这里"就是"本机用户按的"。`via` 有值的不算（框架自己拼的通报，
+   *     `/dream` 那一条就是这么来的）。
+   *   · `wake/channel` **单聊（c2c）** —— 复用 `trust.ts` 那一套（联系人表里的 sid +
+   *     `isOwnerLabel` + 已声明的用户 id）：判据与"她眼里谁是用户"**同源**，
+   *     所以不会出现"她被允许回他、但他按不动停止"这种自相矛盾。
+   *   · 群聊一律**不认**（`chatType !== 'c2c'` 直接 false）：群里谁都能打 `/stop`，
+   *     那是"任何人可以让她的活白干"，不是用户特权。这与 `/compact` 只认本机对话流、
+   *     以及 `trust.ts` 对群成员的处置是同一条纪律。
+   */
+  private stopCommandOf(emission: WakeEmission): { where: string; text: string } | null {
+    const data = (emission.data ?? {}) as Record<string, unknown>;
+    if (emission.type === 'wake/manual') {
+      if (data['via'] !== undefined) return null;
+      const note = typeof data['note'] === 'string' ? data['note'] : undefined;
+      if (!isStopCommandText('wake/manual', note)) return null;
+      return { where: 'GUI', text: (note ?? '').trim() };
+    }
+    if (emission.type !== 'wake/channel') return null;
+    if (data['chatType'] !== 'c2c') return null;
+    const channel = typeof data['channel'] === 'string' ? data['channel'] : '';
+    const chatId = typeof data['chatId'] === 'string' ? data['chatId'] : '';
+    const person = typeof data['person'] === 'string' ? data['person'] : '';
+    const text = typeof data['text'] === 'string' ? data['text'] : '';
+    if (!isStopCommandText('wake/channel', text)) return null;
+    const contacts = this.deps.config.persona.contacts;
+    const label = contacts[normalizeSid(sidOf(channel, 'c2c', chatId))];
+    const declared = label !== undefined && isOwnerLabel(label, this.deps.config.persona.owner);
+    // "已声明的用户 id"那条路（`ownerIds()` 与 `trust.ts` 的群聊分支同源）：
+    // 单聊里它兜的是"联系人表还没来得及填、但用户 id 早就声明过"的情形
+    const byId = person !== '' && this.ownerIds().has(person);
+    if (!declared && !byId) return null;
+    return { where: `QQ 单聊（${person === '' ? chatId : person}）`, text: text.trim() };
+  }
+
+  /**
+   * 执行一次急停。**五步都不许省**（顺序也是刻意的）：
+   *
+   *   ① **掐流**（最先做）：用户要的是"现在就停"，而这一步是唯一"越快越值钱"的动作；
+   *   ② **清队列**：`pending` 里的输入进死信并标 `stopped-by-owner`——它们**不会自己回来**
+   *      （这正是用户今天最痛的那件事：「我重启了又 tm 重投了」）；
+   *   ③ **作废本轮已认领的输入**：在跑的那一轮被掐之后，`agent-loop` 会按 `turn/end{aborted,stop}`
+   *      走 `discardClaimedOnStop`（**不退回**，否则"刚停又重投"）；
+   *   ④ **落留痕**：`slash/handled{kind:'stop'}`（回执正文逐字留在 `receipt` 上）；
+   *   ⑤ **回执走既有对用户通道**（`notifier.alert`，与 `/compact` 同一条）——**不走她的 speak**：
+   *      这是框架的动作，不是她说的话。
+   *
+   * ## 幂等
+   *
+   * 没有在跑的活、队列也空 ⇒ `outcome: 'idle'` + 那句"没有在跑的活"。
+   * 判据是**当刻的事实**（`pending.length` 与 `busy`），不靠内存记账：
+   * 连按两次，第二次必然落在 `idle` 上。
+   *
+   * ## 同步还是异步
+   *
+   * 前三步全是同步的（`abort()` 与 `log.append` 都是同步 API），**在入口那一帧就做完了**；
+   * 只有告警投递（真的发 webhook）是异步的，它 `void` 出去不阻塞用户那一下。
+   * 这条"同步"是刻意的：`wake()` 是消息落库口，它不该因为"发一条告警"而把整条通道卡住。
+   */
+  private handleStopCommand(stop: { where: string; text: string }): StopOutcome {
+    const hadTurn = this.busy;
+    // ① 掐流：abort 会让在途的 `fetch`/`read()` 当场抛，`ds-client` 把它分类成 `aborted`
+    //    （中断不是错误：已收到的部分照既有 `interrupted` 语义留档）。
+    //    **先看看有没有在跑的**再 abort：`AbortController` 一旦 abort 就永远是 aborted 态，
+    //    而这一条信号是**整轮共用**的（见 `stopSignal()`），提前 abort 会把下一个 turn
+    //    的第一步直接判成"被中断"。没有在跑就不动它。
+    if (hadTurn && !this.stopController.signal.aborted) {
+      // `stoppedByOwner = true` 是给 `agent-loop` 看的：`failStep` 靠它把这条 `aborted`
+      // 标成 `cause:'stop'`（而不是 `'signal'`），`endTurn` 才走"作废本轮输入"那一支。
+      this.stoppedByOwner = true;
+      this.stopController.abort(new Error('用户按下 /stop'));
+      // 立刻换一条新的：`abort` 之后的信号永远是 aborted 态，而下一轮要能照常跑
+      // （见 `stopController` 的注释）。换的时机在 abort 之后、任何 await 之前。
+      this.stopController = new AbortController();
+    }
+    // ② 清队列 → 死信（`input/dead-letter{reason:'stopped-by-owner'}`）：原文不会丢，
+    //    它在日志里；界面的死信面板可以逐条重投（`requeue`，认领次数归零）或丢弃。
+    const cleared = this.deps.projection.pending.length;
+    for (const item of [...this.deps.projection.pending]) {
+      this.appendSync('input/dead-letter', {
+        inputSeq: item.wakeSeq,
+        claimCount: item.claimCount,
+        lastError: '用户按下 /stop：队列被清空，不再自动重投',
+        reason: 'stopped-by-owner',
+      }, 'internal');
+    }
+    /**
+     * 留痕与回执**不在这里落**：那两步由 `recordStop` 统一办（`wake()` 那条路紧随其后调它，
+     * 界面那条路紧随 `appendSync('wake/manual')` 调它）。这样"按了一次 /stop"在日志里
+     * 无论从哪条通道来都只有**一条** `slash/handled`，不会一次按出两条。
+     *
+     * ⚠ **这里不许先占 seq**（`log.nextSeq()` 只增不减，占了就必须由**紧接着**那一次
+     * `append` 用掉）：界面那条路会在两步之间写一条 `wake/manual`，先占就会让留痕的 seq
+     * 落在那条之后 ⇒ `EventLog.append` 当场抛"seq 必须严格递增"（这个错实测踩过一次）。
+     * 所以 `seq` 先记 0，由 {@link recordStop} 写完留痕后回填（见那里）。
+     */
+    const stopped = hadTurn || cleared > 0;
+    const outcome: 'stopped' | 'idle' = stopped ? 'stopped' : 'idle';
+    const receipt = stopped
+      ? (cleared > 0 ? `${STOP_RECEIPT}（本次清掉 ${cleared} 条待处理输入）` : STOP_RECEIPT)
+      : STOP_IDLE_RECEIPT;
+    return { outcome, receipt, turnStopped: hadTurn, cleared, seq: 0 };
+  }
+
+  /**
+   * **用户急停的公开入口**（给消息入口那一层用：GUI 的 `/api/commands/wake`）。
+   *
+   * 界面那条路**不经过 `wake()`**（`web/server.ts` 直接 `appendSync('wake/manual')`），
+   * 所以判据要在这里再被问一次——但**动作与判据仍然只有一份实现**
+   * （{@link stopCommandOf} / {@link handleStopCommand}），界面与 QQ 单聊不会漂成两套口径。
+   *
+   * 返回 null = "这不是给我的指令"（照常走唤醒那条路，调用方一个字节都不用改）。
+   *
+   * ## 为什么返回值只是"一份回执"，而不是"这件事办完了"
+   *
+   * `web/server.ts` 的 `wake` 动作与 `wake/manual` 的落库是**同一个同步块**里的两步
+   * （先 `appendSync` 再 `noteUserSpoke`，中间不许有 await——见 `WebServerDeps.noteUserSpoke`）。
+   * 所以急停也照这个顺序走：这里只**掐流 + 清队列**（同步、当帧完成），
+   * 留痕与回执由紧随其后的 {@link consumeStopCommand} 落——两处共用同一个 `stopCommandOf`，
+   * 于是"从界面按"与"从通道按"在日志里长得一模一样。
+   */
+  ownerStopCommand(type: string, data: unknown): StopOutcome | null {
+    const stop = this.stopCommandOf({ type, data } as WakeEmission);
+    if (stop === null) return null;
+    const result = this.handleStopCommand(stop);
+    // 交给紧随其后的那一步（`consumeStopCommand`）：它落留痕、回收执、把回执给界面。
+    // 判据用的是**原文**（同一条 note），所以两步认的是同一件事。
+    this.pendingStop = { stop, result };
+    // `seq` 此刻还是 0（留痕还没落，见 `handleStopCommand` 末尾那段）——
+    // 调用方拿它只为把 `consumeStopCommand` 的结果送回前端，回执正文两边逐字相同。
+    return result;
+  }
+
+  /**
+   * 一次办完（`wake()` 那条路：入口就在框架里，不必分两步）。
+   *
+   * 这条路**没有"两步之间"**：`wake()` 那条 `/stop` 在 `nextSeq()` 之前就 return 了，
+   * 那条按钮根本没落库 ⇒ `pendingStopWakeSeq` 是 null，摘除是空操作。照调不误：
+   * 摘除的时机由**投影折没折**决定，而不是由"哪条路"决定——两条路各写一遍时机，
+   * 迟早又漂成今天这个 bug。
+   */
+  private handleStopCommandOwn(stop: { where: string; text: string }): StopOutcome {
+    const result = this.handleStopCommand(stop);
+    const settled = this.recordStop(stop, result);
+    this.dropStopInput();
+    return settled;
+  }
+
+  /**
+   * 把"这条急停自己的输入"从队列里摘掉（界面那条路两步之间的那一笔）。
+   *
+   * 为什么需要它：界面那条路的两步之间会**照常**落一条 `wake/manual`（那条落库动作是既有的
+   * 顺序，见 `web/server.ts` 的 `wake` 动作），于是它会被折进 `pending`——而它**不是**给她的输入。
+   * 不摘的后果有二：① 队列看起来没被清空（"我按了停止，队列里还有一条"）；
+   * ② 下一拍它会作为一个 turn 的输入被送到她眼前。所以摘掉它、并留一条痕。
+   *
+   * ## 为什么用 `input/claimed{turn:0}` 而不是 `input/discarded`
+   *
+   * 判据在 `state/fold.ts`：**从 `pending` 里摘除的唯一写入点是 `input/claimed`**
+   * （`fold.ts` 的 `case 'input/claimed'`；`input/discarded` 只从 `deadLetters` 里摘，
+   * 它服务的场景是"人去死信面板点丢弃"）。用 `input/discarded` 摘 pending 里那条，
+   * 在运行期看不出来（下一条 `input/dead-letter` 会顺手把它带走），但在**只折这一条事件**的
+   * 路径上（重放、测试）它会**留在队列里**——那种"运行期对、重放不对"的漂移正是最要命的。
+   * `turn: 0` 是既有的"这条账不属于某个 turn"口径（`runSlashCommand` 与 `judgeChannelWakes`
+   * 两处先例）：它不会让 `claimedByTurn` 长出一个假 turn。
+   *
+   * 返回"摘掉了几条"（0 = 它本来就不在队列里，例如通道那条路根本没落库）。
+   *
+   * ## ⚠ 调用时机是这件事的全部难点（2026-10-16 修）
+   *
+   * **必须在载体已经被折进投影之后调**。界面那条路上载体是 `web/server.ts` 的
+   * `appendSync('wake/manual', …, afterAppend)` 落的，而那个 `appendSync` 的顺序是
+   * `log.append → afterAppend → applyOne(投影)`——`afterAppend` 里（也就是 `recordStop` 里）
+   * 查 `pending` 时载体**还没折进去**，一条也摘不掉。所以现在是**调用方显式调两步**：
+   *   ① 落库那一帧：`consumeStopCommand`（判据、留痕、回执）；
+   *   ② 投影折完之后：本方法（见 `web/server.ts` 的 `wake` 动作里那句调用）。
+   *
+   * 顺带满足一条硬约束（既有注释）：`input/claimed` 的 seq 必须**大于**那条 `slash/handled` 的
+   * ——放 append 之后正好如此，放之前会让 `log.append` 当场抛"seq 必须严格递增"。
+   */
+  dropStopInput(): number {
+    const wakeSeq = this.pendingStopWakeSeq;
+    this.pendingStopWakeSeq = null;
+    if (wakeSeq === null) return 0;
+    const item = this.deps.projection.pending.find((entry) => entry.wakeSeq === wakeSeq);
+    if (item === undefined) return 0;
+    this.appendSync('input/claimed', {
+      turn: 0,
+      wakeSeqs: [wakeSeq],
+      claimCounts: [item.claimCount + 1],
+    }, 'internal');
+    return 1;
+  }
+
+  /**
+   * 界面那条路专用：**落留痕 + 给出回执**，并把这件急停**作废掉**（返回非 null 时调用方
+   * 不许再把它当成"人开口"——它不是对她说的话）。
+   *
+   * 叫它的地方是 `web/server.ts`（与聊天框里任何一句话同一个调用点）。返回 null =
+   * 这一条不是急停（或者已经被 `wake()` 那条路办过了）⇒ 调用方按原样继续。
+   *
+   * 返回值就是 {@link StopOutcome}（**`seq` 已回填成那条留痕的真实 seq**）：界面据此回话，
+   * 所以"回给用户的 seq"与"日志里那条留痕"永远是同一个数。
+   *
+   * 幂等：`pendingStop` 取走即清，所以"同一条 note 被问两次"只会有一次留痕。
+   */
+  consumeStopCommand(type: string, data: unknown, wakeSeq?: number): StopOutcome | null {
+    const pending = this.pendingStop;
+    if (pending === null) return null;
+    // 认的还是**原文**：payload 不一致就不是同一条（防"两次调用被凑到一起"）
+    const again = this.stopCommandOf({ type, data } as WakeEmission);
+    if (again === null || again.text !== pending.stop.text) return null;
+    // 界面那条路会把**刚落的那个 seq** 递进来（那条 `wake/manual` 是它写的）：
+    // 它现在起**不算给她的输入**，折投影之后由 `dropStopInput` 摘掉（见那里的注释）。
+    // 没有 seq（通道那条路：根本没落库）⇒ 什么都不用摘。
+    this.pendingStopWakeSeq = wakeSeq ?? null;
+    this.pendingStop = null;
+    // 结局里的 `stopped` 取的是**按下去那一刻**的快照（`pending.result`），不是此刻重算：
+    // 此刻队列里刚被那条 `wake/manual` 动过，拿现在算会把"什么都没停"报成已执行。
+    return this.recordStop(pending.stop, pending.result);
+  }
+
+  /**
+   * 落留痕（`slash/handled{kind:'stop'}`）+ 把回执发给用户，返回**回填了 seq 的**那份结局。
+   *
+   * **回执走既有那条给用户回话的通道**（`notifier.alert`，与 `/compact` 同一条），
+   * **不走她的 `speak`**：这是框架的动作，不是她说的话。
+   * 指纹里带上留痕的 seq：**每一次按下都要有回答**（限流把回执吞掉，在界面上就是"按了没反应"，
+   * 那是 `/dream` 那次事故的教训）。
+   */
+  private recordStop(stop: { where: string; text: string }, result: StopOutcome): StopOutcome {
+    /**
+     * ⚠ **载体的摘除不在这里**——它在 {@link dropStopInput}，由调用方在**投影折完之后**单独调
+     * （界面那条路是 `web/server.ts` 的 `wake` 动作，通道那条路见 {@link handleStopCommandOwn}）。
+     *
+     * 为什么不能顺手在这里调（2026-10-16 修的，位置原来就在这一行）：这条方法跑在
+     * `web/server.ts` 的 `afterAppend` 里，而那一步在 `applyOne(投影)` **之前**——
+     *
+     * ```
+     * log.append(event, {sync:true})
+     * afterAppend?.(event)                   // ← consumeStopCommand → recordStop 在这里
+     * applyOne(this.deps.projection, event)  // ← 载体**到这一步**才进 pending
+     * ```
+     *
+     * 所以在这个位置查 `projection.pending` 时，`pending` 还是**空的那个**（探针实测：在
+     * `consumeStopCommand` 返回之后打印 `pending=[]`，紧接着 `applyOne` 之后才是 `[<载体>]`）
+     * ⇒ `dropStopInput` 一条都摘不掉，载体留在队列里。而它的 kind 是 `'stop'`——
+     * `handleSlashCommands` 若放它过去就会把它当 `/compact` 压一次历史，那正是用户 2026-10-16
+     * 报的那个 bug（另一半的判据见 `handleSlashCommands` 里那段注释）。
+     *
+     * 顺序上还有一条硬约束（既有注释，别动）：`seq` 由**这一次 append 自己取**
+     * （不在 `handleStopCommand` 里预占）——界面那条路的两步之间还会写一条 `wake/manual`，
+     * 预占的号会被那条先写走 ⇒ append 当场抛"seq 必须严格递增"。
+     * 现在的摘除（调用方在投影折完后调）天然满足它：`input/claimed` 的号必定更大。
+     */
+    const event = this.appendSync('slash/handled', {
+      kind: 'stop',
+      name: 'stop',
+      argument: '',
+      outcome: result.outcome,
+      // 这条指令**没有**输入事件（入口就拦下了，见 `wake()`）：报 0 而不是编一个 seq，
+      // "它从来没进过队列"这件事本身就是这一格的答案。
+      inputSeq: 0,
+      receipt: result.receipt,
+    }, 'internal');
+    const settled: StopOutcome = { ...result, seq: event.seq };
+    this.write(`[指令] /stop（${stop.where}）→ ${settled.outcome}`
+      + `：掐流=${settled.turnStopped ? '是' : '否'}、清队列=${settled.cleared} 条`);
+    void this.notifier.alert({
+      category: CATEGORY.stop,
+      level: 'info',
+      title: settled.outcome === 'stopped' ? '已执行 /stop' : '收到 /stop：没有在跑的活',
+      body: settled.receipt,
+      params: { where: stop.where, cleared: settled.cleared, running: settled.turnStopped ? 1 : 0, seq: settled.seq },
+    }).catch(() => { /* 回执投递失败不该反过来影响"已经停下来"这件事 */ });
+    return settled;
   }
 
   /**
@@ -1787,6 +2386,9 @@ export class RealLoop {
     // 放在这里（而不是 wake 处理那一段）是为了它不依赖"这一拍有没有 pending"：
     // 索引进的是请求头部，任何一条请求（含心跳拍）都得用同一版。
     await this.mcpIndexSync();
+    // 技能常驻索引（2026-10-11）：**与上一条同一拍、同一组触发点**（见 `skillIndexSync` 的方法头）。
+    // 必须排在它之后：本拍的事件快照由那一条读下，这一条只读不再读盘。
+    await this.skillIndexSync();
     await this.healthCheck();
     // 图片附件：每拍补下最近到达的（**包括 turn 进行中到达的那张**——它会立刻出现在她
     // 后续 step 的历史里）。放在 busy 检查之前：她正忙的时候恰恰是图片最容易到场的时候。
@@ -1856,6 +2458,8 @@ export class RealLoop {
       // ── 人打的指令（B1 第二步：`/compact` 与 `/handoff`）──
       // 放在攒批门与唤醒门**之前**：指令是框架自己就能办的事（收紧她的上下文 / 写一份交接笔记），
       // 既不该被群消息的攒批窗口压住，也不该被预算暂停拦住——**撞上限时人恰恰更需要它**。
+      // ⚠ `/stop` **不在这条路上**：它更早（入口就掐流、清队列、落留痕），
+      //    而且 `handleSlashCommands` 里明确把它挡在外面（见那里的注释）。
       await this.handleSlashCommands();
       // 指令已把队列里那几条摘走（input/claimed），可能这一拍就没别的可做了
       if (p.pending.length === 0) return;
@@ -1915,6 +2519,10 @@ export class RealLoop {
         // 插话计数**不清零**（它只增不减，speak 每次开口时重新取基准值）。
         this.wakeChannelData = null;
         this.userSpokeNote = null;
+        // **急停那一格也是本轮的**：它只在"这一轮被用户掐掉"时有意义。
+        // 不清的后果很具体：下一次关机（`signal` 取消）会被误判成用户急停，
+        // 于是输入被作废而不是退回队列——那是"关机后活丢了"。
+        this.stoppedByOwner = false;
         // 计时在 finally 里收口：整轮抛错时这一段照样是"这一拍照它耗了多久"的事实
         // （那种拍的 `compactMs` 仍为 0——收尾根本没跑到，如实缺席，不编一个数）。
         this.lastTurnMs = Date.now() - turnStartedAt;
@@ -1933,6 +2541,10 @@ export class RealLoop {
       // 处理完一批真实事件 = 发生过活动：安静计时复位。心跳批次不复位，概率才长得起来。
       if (wakeEvents.some(event => event.type !== 'wake/heartbeat')) this.heartbeat.noteActivity();
       if (reason.kind === 'budget-exhausted') await this.notifyBudgetExhausted(reason.layer);
+      // 思维链没回传的 400（2026-10-17）：与上面那条**同一个处置时机**（turn 收尾之后）、
+      // 同一个告警出口。判据是循环层落的指纹（`turn/end.reason.reasoningEcho`），这里不重判。
+      // 为什么它非报不可：这条路两个现成刹车都到不了，详见 `notifyReasoningEcho` 的注释。
+      if (reason.kind === 'error' && reason.reasoningEcho === true) await this.notifyReasoningEcho(reason);
     } finally {
       this.busy = false;
     }
@@ -2191,6 +2803,88 @@ export class RealLoop {
   }
 
   /**
+   * **技能常驻索引的快照同步**（2026-10-11）：把"这一版技能索引是什么"定下来，并落一条 `skill/index`。
+   *
+   * 用户这一轮的判据（逐字）：「skill 索引的进入和退出也要有类似 mcp 的进入和退出那样的
+   * 缓存保护的机制」。这一格因此是 `mcpIndexSync` 的**逐条同形**版本：同一拍、同一组触发点、
+   * 同一种落库（快照事件）、同一个渲染位置（长期记忆层里技能在前、MCP 紧随其后）。
+   * 判据的来龙去脉写在 `mcpIndexSync` 的方法头上，这里只记**技能这一支特有**的三件事：
+   *
+   *   ① **来源是技能系统自己**：`SkillManager.catalog()`——信任门（`skill/installed`）、单条与总
+   *      token 预算、截断全在里面，这里一个字节都不重拼。由此有一条重要推论：**只有过了信任门
+   *      的技能才进得来** ⇒ 她"申请了但人还没批"的技能连候选都不是（"批准前不生效"落在这里）。
+   *   ② **"技能目录变了"刻意不是触发点**（与"配置改了不是 MCP 索引的触发点"逐字同回事）：
+   *      增删技能在上下文里的样子是**尾部追加**（申请单结局那条 `wake/manual{via:'grant'}`，
+   *      正文里明说"索引不会立刻改字节"），到**下一次归集**（压缩 / reset / 重启）才把那一行
+   *      进到索引里。在这一格按"目录变了"重建，就等于每装一个技能改一次请求前缀
+   *      ——缓存保护等于没做（那正是用户这一条要治的毛病）。
+   *   ③ **空索引不落事件**（与 `mcpIndexSync` 同一条口径）：一个可用技能都没有时该段整段不出现，
+   *      写一条空快照只会在事件流里多一行没人读的东西，还会让"事件序列逐字相同"的基线无故变红。
+   *
+   * ⚠ 它**必须排在 `mcpIndexSync` 之后**（两个调用点都是这样：`warmUp` 与 `tickOnce` 的轮首）：
+   * 事件快照 `eventView` 由那条先跑时读下，这里只读它、不再自己读一遍盘。
+   *
+   * 返回"这一拍定下的文本"，便于测试直接断言（生产调用点不需要它）。
+   */
+  async skillIndexSync(): Promise<string> {
+    const point = skillIndexOf(this.eventView);
+    const version = RENDER_VERSION;
+    // 与 `mcpIndexSync` 的 `stale` 逐条同形：首次 / 模板换代 / 压缩之后（那三条的理由写在那处）
+    const stale = point.seq === 0
+      || point.version !== version
+      || point.seq < point.coveredSeq;
+    if (!stale) {
+      this.skillIndexText = point.text ?? '';
+      return this.skillIndexText;
+    }
+
+    // 信任门的真相源是日志：重建**之前**把**还没折过**的 `skill/installed` 折进来。
+    //
+    // 为什么非折不可（2026-10-11 实测的洞）：`applyTrustEvent` 只覆盖**本进程自己写的**那条
+    // `skill/installed`（`appendSync` 顺手折）。而"用户批准装技能"那条是 **web 层**写的
+    // ⇒ 循环里这张表原先要等**下一次进程启动**才认得它：批准装好的技能即使到了归集点也进不了
+    // 索引，表现成"装了、批了、重启才看见"。缓存保护要说的是"下一次归集才改字节"，
+    // 不是"要重启才生效"——两件事混在一起，人就分不清是设计还是坏了。
+    //
+    // 为什么是**增量**而不是 `setTrustEvents(全量)`：归集点可能很密（"空索引"那种退化形状下
+    // 每一拍都走得到这条判据），全量重折是 O(事件数)；而信任事件很稀疏，折过一次之后大多数拍
+    // 一个新事件都没有。`skillTrustSeq` 记"折到哪一条了"。
+    for (const event of this.eventView) {
+      if (event.seq <= this.skillTrustSeq) continue;
+      this.skills?.applyTrustEvent(event);
+      this.skillTrustSeq = event.seq;
+    }
+
+    const catalog = this.skills?.catalog() ?? null;
+    const text = catalog?.text ?? '';
+    // 空索引：不写事件（判据见方法头 ③），但**缓存要跟着置空**（与 `mcpIndexSync` 那一支同形）
+    if (text === '') {
+      this.skillIndexText = '';
+      return this.skillIndexText;
+    }
+    this.appendSync('skill/index', {
+      version,
+      text,
+      skills: catalog!.entries.map((entry) => ({
+        name: entry.name,
+        // 存的是**进索引的那一句**（已截断；正文永不在此出现，那是渐进披露第二层）
+        description: entry.description,
+        tokens: entry.tokens,
+        ...(entry.truncated ? { truncated: true } : {}),
+      })),
+    }, 'internal');
+    this.skillIndexText = text;
+    const reason = point.seq === 0
+      ? '首次（日志里还没有快照）'
+      : point.version !== version
+        ? `模板换代（快照是 v${point.version ?? '?'}）`
+        : '上下文重大变化后归集';
+    this.write(`[技能] 常驻索引已重建（${reason}）：${catalog!.entries.length} 个技能进索引，`
+      + `${catalog!.pending.length} 个在等信任门`);
+    return this.skillIndexText;
+  }
+
+  /**
    * **配置热更之后的循环侧收尾**（2026-10-10 加；宿主接在 `RealLoopDeps.onConfigReloaded` 上）。
    *
    * 它**只做一件事**：如实说清"声明面变了，但索引那一段的字节不动"。
@@ -2427,7 +3121,11 @@ export class RealLoop {
   // ──────────────────────────────── 指令（B1 第二步） ────────────────────────────────
 
   /**
-   * 人打进来的那两条指令：`/compact` 与 `/handoff`（解析口径见 `slash-commands.ts` 的文件头）。
+   * 人打进来的指令：`/compact` 与 `/handoff`（解析口径见 `slash-commands.ts` 的文件头）。
+   *
+   * ⚠ **`/stop` 不归这里管**（它也是斜杠指令，但作用相反）：急停在**入口**就办完了
+   * （`isStopCommand` / `handleStopCommand` / `recordStop`——掐流、清队列、留痕、回执），
+   * 而且它**绝不该触发压缩**。本循环只放行真会压缩的那两类，判据见循环里那一段注释。
    *
    * **当场执行，不唤醒 turn**：人要的是"现在压一次"或"现在把交接写下来"，不是要她回话。
    * 所以这条路既不写 `turn/start` 也不调模型——它只把那条输入摘出队列、落一条留痕、
@@ -2453,6 +3151,34 @@ export class RealLoop {
       if (!isSlashCommandEvent(wake)) continue;
       const command = parseSlashCommand((wake.data as { note: string }).note);
       if (command === null) continue; // 与上面同一判据，理论上到不了这里
+      /**
+       * ───────── `/stop` **完全不进这条管线**（2026-10-16 修）─────────
+       *
+       * `/stop` 是本文件里唯一一条 kind **不是"让她做点什么"、而是"用户自己动手"** 的指令：
+       * 它的动作（掐流、清队列）在 {@link handleStopCommand} 里，留痕与回执在
+       * {@link recordStop} 里——**在这个循环跑到之前就已经办完了**。它落到这里，只有一种可能：
+       * 那条 `wake/manual`（界面那条路落库的"按钮载体"）还在 `pending` 里。
+       *
+       * 放它过去的后果实测过一次（用户 2026-10-16 报的「新加的 `/stop` 有问题……**触发了上下文
+       * 压缩**？」）：`runSlashCommand` 的 `kind === 'unknown' ? null : planSlashCompaction()`
+       * 把它**当成可以压缩的那一类**，于是按一次急停顺手压一次历史——
+       * 日志实证（`data/events/000000133676.jsonl`）：一条 `/stop` 落出**两条** `slash/handled`
+       * （`{outcome:'stopped', inputSeq:0}` + `{outcome:'compacted', inputSeq:136170,
+       * coveredUpToSeq:136179}`）外加一条 `compaction/summary`。这是**净损失**：急停是"别再动了"，
+       * 它绝不该顺带改掉她的上下文。
+       *
+       * 判据写成"**只排除那一条不会压缩的**"而不是"只放行会压缩的两条"：
+       * `unknown` 必须照旧流下去——它要走 `runSlashCommand` 里那一支"回一句『没有这个指令 <name>』"
+       * （`outcome:'rejected'`），那**不是**压缩，把 `unknown` 一起挡掉就等于把用户的打错字变成
+       * "按了没反应"，正是 `/dream` 那次事故的教训。所以这里排除的条件恰好是
+       * **"这一条不会写 `compaction/summary` 却又不是 unknown"**——今天只有 `stop` 落在这上面，
+       * 将来再加"只动手、不动上下文"的指令，它默认也进不来。
+       * `/compact` 与 `/handoff` 两条路径**一个字节都不动**。
+       *
+       * ⚠ 摘除载体**不在这里补**：`dropStopInput` 已经在做（`web/server.ts` 的 `wake` 动作里、
+       * 投影折完之后那一句）。这里再摘一次会与它各写一条 `input/claimed`。
+       */
+      if (command.kind !== 'compact' && command.kind !== 'handoff' && command.kind !== 'unknown') continue;
       await this.runSlashCommand(command, item);
       handled += 1;
     }
@@ -2738,6 +3464,55 @@ export class RealLoop {
         + '新上限仍不高于已用量则照旧停着，那就只剩加注这条路。'
         + `② 加注：irmia topup --layer ${layer} --tokens <N> —— 不用重启，循环下一拍拾取后接着跑。`,
       params: { layer },
+    });
+  }
+
+  /**
+   * 「思维链没回传」的 400 进告警（2026-10-17 加）。
+   *
+   * ───────── 为什么它必须自己一条告警：这条路**两个现成的刹车都到不了** ─────────
+   *
+   *   · `FAILURE_STREAK_MAX`（`agent-loop.ts:268`）是**工具目标**连击守卫：`toolTargetOf` 只认
+   *     `read_channel` 的 sid，而 400 在**调模型**那一步就断了——这一轮根本没有工具调用，
+   *     `admit()` / `settle()` 一次都不会被叫到；
+   *   · 模型级失败刹车（`budget.failStreakMax`，本机 `config.json:37` 是 20）也到不了：实测 10-17
+   *     的每一轮都是「**第 1 步成功**（In≈97k）→ 第 2 步 400（In=0）」，而 `state/fold.ts` 的
+   *     `applyBudgetConsumed` 对**任何非 failed 的 `budget/consumed`** 都把 `failStreak` 归零
+   *     ⇒ 它在 0↔1 之间振荡，永远攒不到阈值。
+   *   于是 10-17 01:33–02:04 那 22 轮（turn 2151–2174 区间）**一条告警都没有**：全日志只有 3 条
+   *   `alarm/sent{model-failure}`，都在 10-05。唯一的兜底是 `MAX_CLAIM_COUNT = 3`
+   *   （`recover.ts:65`，同一条输入认领三次后进死信），人看到的是"这一拍又没吭声"。
+   *
+   * ───────── 走哪条通道：**既有的那一个**，不新造 ─────────
+   *
+   * `alert/notifier.ts` 的 `fail()`：文件档（`data/alarms/`）+ 配了 webhook 就外发 +
+   * `alarm/sent` 事件（界面「告警」面板与框架提示卡读的都是它），与 `budget-exhausted` /
+   * `model-failure` / `stall` 同一条路。
+   *
+   * **刷屏由出口自己的指纹窗口挡**（`notifier.ts` 的 `deliver`：同指纹在
+   * `alerts.rateLimitMin`（默认 30 分钟）内只发一条）——所以 `params` 里**只许放稳定的一格**
+   * （错误码）。放 turn / 次数 / 时间就等于每次换指纹、绕开窗口，22 连炸会变成 22 张卡。
+   *
+   * **没有配一条 `ok()` 销账**：这条故障的"恢复"要等思维链回传口径落地（或它再也不撞上），
+   * 本进程手里没有"它好了"那一刻的判据——按 notifier 的纪律，编一条"已恢复"就是造假事实。
+   *
+   * 级别是 `warn` 不是 `critical`：循环没坏（没有暂停、没有刹车，输入照旧退回队列），
+   * 但它意味着"她一步都走不完"，值得人看一眼；`critical` 留给真把循环停住的那几条。
+   */
+  private async notifyReasoningEcho(reason: { code: string; message: string }): Promise<void> {
+    // 告警正文是给人看的：服务端原话留头一段就够（全文在 `turn/end.reason.message`）
+    const detail = reason.message.length <= 240 ? reason.message : `${reason.message.slice(0, 240)}…`;
+    await this.notifier.fail({
+      category: 'reasoning-echo',
+      level: 'warn',
+      title: '模型拒绝请求：思维链没有回传（这一轮走不完）',
+      body: '思考模式要求把上一轮的 reasoning_text 原样回传，而我们的 message/reasoning 是 internal '
+        + '⇒ 一个 reasoning item 都没回过，这一步被 http_400 拒掉。这一轮以 error 收尾、输入退回队列'
+        + '（同一条输入最多认领 3 次后进死信），并且**不会**进模型失败刹车：每一轮第 1 步是成功的，'
+        + '会把 failStreak 归零。'
+        + `服务端原话：${detail}`,
+      // ⚠ 指纹 = 类别 + params：这里只放稳定的一格（见本方法那段注释）
+      params: { code: reason.code },
     });
   }
 
@@ -3278,6 +4053,11 @@ export class RealLoop {
         this.topicSeq.set(event.data.sid, event.data.toSeq);
       }
     }
+    // **她说过话 / 有人叫过她**（v66，v67 加频次的素材）：与上面那份话题同一条路——warmUp 本来
+    // 就在读全量日志，顺手折，零额外扫描。前两格取**最大值**、第三格按**事件序号水位**去重，
+    // 所以与运行期那条增量折点重复折叠也无害（重启时新实例的水位从 -1 起，warmUp 照样把全量
+    // 日志折一遍；而 `channelBookSeq` 若从低位起，下一拍重折同一批事件也不会算两遍）。
+    this.foldSpokeAndMentionInto(events);
     // 人审挂起的重建（design §4.21）：答复常常是在实例停机期间写下的（CLI answer 与
     // review resolve 同一条纪律：两个进程各自 nextSeq 必然撞号），所以冷启动必须能从日志
     // 还原出「哪个 turn 挂着、它认领了哪些输入」，否则那些输入永远回不了队列。
@@ -3324,6 +4104,9 @@ export class RealLoop {
     // 放在最后：它要读配置面与落盘缓存，且**必须在第一拍认领输入之前**完成
     // （`ensureReady()` 在 `tickOnce` 的第一行，认领在后面）。
     await this.mcpIndexSync();
+    // 技能常驻索引（2026-10-11）：与上一条**同一个"启动也是重大变化点"的判据**，也必须排在
+    // `this.skills?.setTrustEvents(events)` 之后——信任表没装好时重建出来的是一条空索引。
+    await this.skillIndexSync();
     // 进程重启的**留痕 +（异常退出时的）一次真唤醒**（2026-10-11）。也放在最后：
     // 它要与"上一任是怎么没的"的全部素材对齐（`session/end` 已经折完、`mcp/index` 已落），
     // 而那条 `wake/manual` 与其它唤醒同一条路（`applyOne` 折进共享投影 ⇒ 本拍认领 ⇒ 起 turn），
@@ -3729,6 +4512,22 @@ export class RealLoop {
       // 与 workspaceRoot 一样是启动期定下的（它进的是 `AgentLoopDeps`，每 turn 重新装配一次，
       // 但值来自同一份 config，改配置要重启才接管——GUI 的开关也是这么写的）。
       boundaryRoot: trustBoundaryRoot(d.config.trust),
+      /**
+       * **外部取消**（2026-10-16 接线）：`AgentLoopDeps.signal` 这个字段早就在了
+       * （它的注释写着"外部取消（shutdown）：透传给模型请求与工具执行"），而这一格
+       * **生产从来没给过** —— 于是除了关进程，没有别的东西能取消一条在飞的模型流。
+       * 用户的 `/stop` 需要那件事，所以这里接上（见 `stopController` 的注释）。
+       *
+       * 缺省行为一个字节都没变：没按 `/stop` 时这条信号永远是未触发态，
+       * 它只是被透传到 `DsRequest.signal`（`toDsRequest` 那一步）。
+       */
+      signal: this.stopController.signal,
+      /**
+       * 这条取消**是谁要的**（`/stop` 与关机共用同一条信号，处置却相反）：
+       * 用户急停 ⇒ 本轮输入**不退回**（他刚说完"停下来"）；关机/宿主取消 ⇒ 照原口径退回队列。
+       * 判据只在这一处产出（`stoppedByOwner`），循环层只读它。
+       */
+      signalCause: () => (this.stoppedByOwner ? 'stop' : 'signal'),
       now: () => d.now().toISOString(),
       timezone: d.timezone,
       budget: this.budgetHook(),
@@ -3755,8 +4554,12 @@ export class RealLoop {
         budgetTokens: d.config.persona.handoffBudgetTokens,
         foldTokens: d.config.persona.handoffFoldTokens,
       },
-      // 技能索引（§4.19）：每 turn 重扫一次技能根，信任门未放行的不进 catalog
-      skillCatalog: this.skills?.catalogText() ?? null,
+      // 技能索引（§4.19）：与 MCP 索引**同一套缓存保护**（2026-10-11）。
+      // ⚠ 它**不是**每 turn 现问 `SkillManager.catalogText()`（那样"批准装一个技能"会立刻改掉
+      // 请求前缀 ⇒ 整段历史掉出 KV 缓存）：字节只来自日志里那条 `skill/index` 快照，
+      // 由 `skillIndexSync` 在重大变化点（首次 / 模板换代 / 压缩之后）重建。
+      // 读的是**实例上那份缓存**：本拍轮首刚更新过，且一轮只读一会 ⇒ 同一轮里不会抖动。
+      skillCatalog: this.skillIndexText,
       // MCP 常驻索引（v46）：与技能索引**同段素材**（长期记忆层里紧挨着它）。
       // ⚠ 它**不是**每 turn 现渲染的：字节只来自日志里那条 `mcp/index` 快照
       // （轮首由 `mcpIndexSync` 按"重大变化点"重建），这样"加一个 server"不会改掉请求前缀。
@@ -3905,7 +4708,7 @@ export class RealLoop {
       // 发言人 → 名字：**这一个**判据也交给渲染层（v47），此刻层的「预警：」那一行与点名那句
       // 用它写人名。为什么由宿主注入而不是让渲染层自己查表：名字真源的最后一档要读
       // `data/group-members.json`（渲染层不读盘），而少一档就等于第二份判据——两份判据漂移
-      // 的后果正是 2026-10-11 修的那一处（同一份上下文里"用户（OWNER）"与"1269541505"并存）。
+      // 的后果正是 2026-10-11 修的那一处（同一份上下文里"用户（OWNER）"与"1234567890"并存）。
       personNameOf: (person: string) => this.personNameOf(person),
       // 本轮唤醒的那条通道消息：只用来判"这轮是不是群里有人 @ 了我"。
       // 取的是**原始唤醒数据**而不是 `replyableWakeChannel` 的结论：那个判据问的是"能不能
@@ -3914,6 +4717,11 @@ export class RealLoop {
       wakeMessage: this.wakeChannelData,
       // 各会话"在聊什么"（信箱模型的中间那层）：清单那一行缀的半句
       topics: this.channelTopics,
+      // 清单的"该不该列这个会话"素材（v66 两格，v67 加第三格）：1 小时内有人 @ 她 / 她回复的
+      // 频次（时刻表，窗口由渲染层按 `SESSION_FREQ_WINDOW_MS` 数）。这里只给**折出来的事实**。
+      spokeAt: this.spokeAt,
+      mentionedAt: this.mentionedAt,
+      spokeTimes: this.spokeTimes,
     };
   }
 
@@ -4461,9 +5269,11 @@ export class RealLoop {
   private foldChannelEvents(): void {
     const lastSeq = this.deps.projection.lastSeq;
     if (lastSeq <= this.channelBookSeq) return;
+    const fresh: AppEvent[] = [];
     for (let seq = this.channelBookSeq + 1; seq <= lastSeq; seq += 1) {
       const event = this.deps.log.get(seq);
       if (event === null) continue; // 崩溃留下的空洞：跳过，不猜
+      fresh.push(event);
       if (event.type === 'channel/topic') {
         // 话题只留最近一条：清单那一行只缀得下一句，历史话题在日志里（可复盘）
         if (event.data.topic.trim() !== '') {
@@ -4506,6 +5316,50 @@ export class RealLoop {
       this.groupMembersDirty = false;
     }
     this.channelBookSeq = lastSeq;
+    // 她说过话 / 有人叫过她（v66）：与上面那趟同一个游标、同一批事件——折叠判据只有一处
+    // （`foldSpokeAndMention`），warmUp 与这里共用。
+    this.foldSpokeAndMentionInto(fresh);
+  }
+
+  /**
+   * 折这一批事件的 `spokeAt` / `mentionedAt` / `spokeTimes`（v66 两格，v67 加第三格）：判据在
+   * 导出的纯函数 {@link foldSpokeAndMention} 一处（重放那条路也走它——两处各写一遍会让
+   * "预览里的会话清单"与"当时真发出去的那一份"不是同一份）。
+   *
+   * 两个折点（warmUp 全量 / foldChannelEvents 增量）前两格都取最大值、第三格按**事件序号水位**
+   * 去重 ⇒ 重复折叠无害（重启后 warmUp 读全量，而 `channelBookSeq` 从 0 起，下一拍会把同一批
+   * 再折一遍）。并顺手剪掉窗口外的素材（内存）。
+   */
+  private foldSpokeAndMentionInto(events: readonly AppEvent[]): void {
+    // 只折**没折过的**那些事件：这一句就是幂等的保证（去重键是 seq，不是时刻——见水位那段）
+    const fresh = events.filter((event) => event.seq > this.spokeFoldedUpTo);
+    if (fresh.length === 0) return;
+    const next = foldSpokeAndMention(fresh);
+    for (const event of fresh) {
+      if (event.seq > this.spokeFoldedUpTo) this.spokeFoldedUpTo = event.seq;
+    }
+    for (const [sid, at] of next.spokeAt) {
+      const prev = this.spokeAt.get(sid);
+      if (prev === undefined || at > prev) this.spokeAt.set(sid, at);
+    }
+    for (const [sid, at] of next.mentionedAt) {
+      const prev = this.mentionedAt.get(sid);
+      if (prev === undefined || at > prev) this.mentionedAt.set(sid, at);
+    }
+    // 频次的素材（v67）：这批事件里的并进来，窗口外的剪掉。第二个循环管的是**这批事件里没有、
+    // 但已经滑出窗口**的那些会话——不剪它们，内存就只增不减（那个会话已经不在清单里了）。
+    const cutoff = this.deps.now().getTime() - SESSION_FREQ_WINDOW_MS;
+    for (const [sid, times] of next.spokeTimes) {
+      const merged = mergeSpokeTimes(this.spokeTimes.get(sid) ?? [], times, cutoff);
+      if (merged.length === 0) this.spokeTimes.delete(sid);
+      else this.spokeTimes.set(sid, merged);
+    }
+    for (const [sid, times] of [...this.spokeTimes]) {
+      if (next.spokeTimes.has(sid)) continue;
+      const kept = mergeSpokeTimes(times, [], cutoff);
+      if (kept.length === 0) this.spokeTimes.delete(sid);
+      else this.spokeTimes.set(sid, kept);
+    }
   }
 
   /**
@@ -4903,13 +5757,30 @@ export class RealLoop {
   private async summarizeChattySessions(mentionSid: string | null = null): Promise<void> {
     if (typeof this.deps.ds?.generate !== 'function') return;
     const floor = mentionSid === null ? TOPIC_MIN_UNREAD : 1;
-    const wanted = this.sessionBook.filter((entry) => entry.unread >= floor);
+    const nowMs = this.deps.now().getTime();
+    /**
+     * **"没人理的群"这一道闸**（v66）：她 7 天内没在这个群回过话、也没人在群里 @/提及她
+     * ⇒ **不给它跑话题概括**（不产 `channel/topic`）。
+     *
+     * 判据是纯函数 `isUnattendedGroup`（`channel/topic.ts`）——三条全取自投影、可复算：
+     * ①最近一次提及早于窗口（或从来没有）②她最后一次发言早于窗口（或从来没有）③未读 > 0。
+     * 它**不是** `mentionSid` 那条例外能绕开的：被 @ 到的那一刻 `mentionedAt` 就是"刚刚"，
+     * 于是这个群天然落在"有人理"那一侧——两道判据不会互相打架。
+     *
+     * **消息一条不丢**：未读计数、信箱、`read_channel` 全都不动（这一道闸只掐"要不要花一次
+     * light 概括它"）。清单上「在聊：…」只在有 topic 时才出现 ⇒ 那半句自然不缀，不必再删字。
+     */
+    const attended = (entry: KnownSession): boolean => !isUnattendedGroup(
+      entry,
+      { spokeAt: this.spokeAt.get(entry.sid), mentionedAt: this.mentionedAt.get(entry.sid) },
+      nowMs,
+    );
+    const wanted = this.sessionBook.filter((entry) => entry.unread >= floor && attended(entry));
     // 提及那条优先（用户在叫她了）；没有提及就照旧挑未读最多的那个
     const candidate = (mentionSid === null ? undefined : wanted.find((entry) => entry.sid === mentionSid))
       ?? wanted.sort((a, b) => b.unread - a.unread)[0];
     if (candidate === undefined) return;
     const lastAt = this.topicAt.get(candidate.sid);
-    const nowMs = this.deps.now().getTime();
     if (lastAt !== undefined && nowMs - lastAt < TOPIC_MIN_INTERVAL_MS) return;
     // 先记账再跑：概括失败也不该每拍重试同一个会话（那会变成一台烧钱的空转机）
     this.topicAt.set(candidate.sid, nowMs);
@@ -5005,7 +5876,7 @@ export class RealLoop {
    *
    * **2026-10-07：命名空间不再限定 `qq:`**（原来只挑 `parts[1] === 'c2c'` 的键，但**不看**
    * 前缀是什么）。原因是"同一个人在不同通道上有不同的 id"——官方那条路给的是 32 位 openid
-   * （`qq:c2c:E7FE…`），OneBot 那条路给的是**数字 QQ 号**（`onebot:c2c:2175258788`），
+   * （`qq:c2c:0000…`），OneBot 那条路给的是**数字 QQ 号**（`onebot:c2c:1234567891`），
    * 两个值永不相等。只认官方那个，后果是**用户在 OneBot 群里被判成 `external`（客人）**：
    * `tools.groupSceneHardRefusal` 打开时她会拒掉本机类工具，或者要他"报一下身份"——
    * 而那是用户（报告 §3.13）。

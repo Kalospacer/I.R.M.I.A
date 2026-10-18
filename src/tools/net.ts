@@ -25,8 +25,10 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { mkdir, open, rename, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-import { PATH_BOUNDARY_HINT } from './boundary.ts';
-import { resolveInsideRoot } from './fs/path-guard.ts';
+import { PATH_HINT } from './boundary.ts';
+import { decodeText } from '../util/bytes-text.ts';
+import { expandAliases, resolveInsideRoot } from './fs/path-guard.ts';
+import { pathAliasesFor } from './fs/env.ts';
 import {
   TOOL_ERROR_CODES,
   argsRecord,
@@ -453,18 +455,35 @@ export async function readBodyLimited(response: Response, limit: number): Promis
   return { buf, truncated };
 }
 
-/** 按响应头 charset 解码（中文站点常见 gbk），解码器不认识就退回 utf-8 */
-export function decodeBody(buf: Buffer, contentType: string): string {
+/**
+ * 按响应头 charset 解码。**没有 charset 时不再盲按 UTF-8**（2026-10-18 收口）：
+ * 中文站点常见"头里不写 charset、HTML 里写 `<meta charset=gbk>`"，旧的
+ * `new TextDecoder('utf-8').decode(buf)` 会把整页中文换成 U+FFFD 而且一声不吭。
+ * 现在无 charset 时走共享判定链（严格 UTF-8 → 严格 GB18030 → latin1 兜底），
+ * 并把"按什么解、有没有损"带回去（回执里明说，见 `renderHttpResult`）。
+ */
+export function decodeBodyWithInfo(
+  buf: Buffer,
+  contentType: string,
+): { text: string; encoding: string; replaced: number; lossy: boolean } {
   const match = /charset\s*=\s*"?([\w-]+)"?/i.exec(contentType);
   const charset = match?.[1]?.toLowerCase();
   if (charset !== undefined && charset !== 'utf-8' && charset !== 'utf8') {
     try {
-      return new TextDecoder(charset).decode(buf);
+      // 站点自己声明的编码优先（它比任何探测都权威）；但仍按严格模式确认，解不出就走判定链
+      const strict = new TextDecoder(charset, { fatal: true }).decode(buf);
+      return { text: strict, encoding: charset, replaced: 0, lossy: false };
     } catch {
-      /* 不认识的编码 → 走 utf-8 兜底 */
+      /* 声明了却解不出（或解码器不认识）→ 走下面的判定链 */
     }
   }
-  return new TextDecoder('utf-8').decode(buf);
+  const decoded = decodeText(buf);
+  return { text: decoded.text, encoding: decoded.encoding, replaced: decoded.replaced, lossy: decoded.lossy };
+}
+
+/** 只要文本的老入口（保持既有调用点与用例不变） */
+export function decodeBody(buf: Buffer, contentType: string): string {
+  return decodeBodyWithInfo(buf, contentType).text;
 }
 
 function isHtmlType(contentType: string): boolean {
@@ -496,6 +515,8 @@ interface RenderParams {
   totalBytes: number;
   bytesTruncated: boolean;
   binary: boolean;
+  /** 正文是按什么编码解的（可选：二进制/空响应没有这一格） */
+  decoding?: { encoding: string; replaced: number; lossy: boolean };
 }
 
 function renderHttpResult(p: RenderParams): string {
@@ -507,6 +528,15 @@ function renderHttpResult(p: RenderParams): string {
   if (p.binary) {
     lines.push('[提示] 响应是二进制内容，不在本工具返回（会污染上下文）。需要落盘请用 http_download(url, dest_path)。');
     return lines.join('\n');
+  }
+  // 编码那道实话（2026-10-18）：头里没写 charset 时我们是"判定"出来的，判定结果必须写在回执上。
+  const decoding = p.decoding;
+  if (decoding !== undefined && decoding.encoding !== 'utf8') {
+    const loss = decoding.lossy ? `，其中 ${decoding.replaced} 处无法映射` : '';
+    lines.push(
+      `[编码] 响应头没有声明 UTF-8，正文按 ${decoding.encoding} 解码${loss}`
+        + (decoding.lossy ? '；非 ASCII 部分可能不是原文，要保真请用 http_download 落盘后按字节处理。' : '。'),
+    );
   }
   if (p.title !== '') lines.push(`[标题] ${p.title}`);
   const page = sliceChars(p.text, p.offset, p.maxChars);
@@ -608,7 +638,8 @@ export function createNetTools(options: NetToolsOptions = {}, depsOverride: Part
     const { buf, truncated } = await readBodyLimited(response, maxResponseBytes);
     const html = isHtmlType(contentType) || looksLikeHtml(buf);
     const binary = !html && !isTextualType(contentType);
-    const decoded = binary ? '' : decodeBody(buf, contentType);
+    const decoding = binary ? null : decodeBodyWithInfo(buf, contentType);
+    const decoded = decoding === null ? '' : decoding.text;
     const extracted = html ? htmlToText(decoded) : { title: '', text: normalizeWhitespace(decoded) };
 
     const content = renderHttpResult({
@@ -623,6 +654,7 @@ export function createNetTools(options: NetToolsOptions = {}, depsOverride: Part
       totalBytes: buf.byteLength,
       bytesTruncated: truncated,
       binary,
+      ...(decoding === null ? {} : { decoding }),
     });
     if (response.status >= 400) {
       return errorResult(content, `HTTP_${response.status}`, [EXTERNAL_CONTENT_NOTE]);
@@ -689,12 +721,12 @@ export function createNetTools(options: NetToolsOptions = {}, depsOverride: Part
     tools.push({
       name: 'http_download',
       description:
-        `把 http/https 资源下载到指定路径（二进制安全，不经过上下文），返回落盘路径与字节数。上限 ${Math.round(DEFAULT_MAX_DOWNLOAD_BYTES / (1024 * 1024))}MB：Content-Length 预检 + 流式计数双重把关，超限即中止并清理临时文件。默认关闭。${PATH_BOUNDARY_HINT}。`,
+        `把 http/https 资源下载到指定路径（二进制安全，不经过上下文），返回落盘路径与字节数。上限 ${Math.round(DEFAULT_MAX_DOWNLOAD_BYTES / (1024 * 1024))}MB：Content-Length 预检 + 流式计数双重把关，超限即中止并清理临时文件。默认关闭。${PATH_HINT}。`,
       parameters: {
         type: 'object',
         properties: {
           url: { type: 'string', description: '目标 http/https 绝对地址' },
-          dest_path: { type: 'string', description: `落盘路径（相对或绝对），越界拒绝。${PATH_BOUNDARY_HINT}` },
+          dest_path: { type: 'string', description: `落盘路径（相对或绝对），越界拒绝。${PATH_HINT}` },
           headers: { type: 'object', description: '附加请求头（键值字符串）' },
         },
         required: ['url', 'dest_path'],
@@ -714,9 +746,12 @@ export function createNetTools(options: NetToolsOptions = {}, depsOverride: Part
           // 边界与 fs 工具族**同一份**（`ctx.boundaryRoot` 三态原样传，判读只归 boundary.ts）：
           // `trust.mode = 'workspace'` 时落盘目标也只在 trust.workspaceRoot 内——少了这一条，
           // 这个工具就成了那条边界上唯一一个"没人读它"的入口。
-          const guard = await resolveInsideRoot(ctx.workspaceRoot, destInput, {
+          // v64：先过**与 fs 族同一张别名表**（MEMORIES/、diary/ 落记忆目录）——具名根在所有工具里一致。
+          const aliasedDest = expandAliases(destInput, pathAliasesFor(ctx), ctx.workspaceRoot);
+          const guard = await resolveInsideRoot(ctx.workspaceRoot, aliasedDest, {
             allowMissing: true,
             purpose: 'http_download',
+            access: 'write',
             ...(ctx.boundaryRoot === undefined ? {} : { boundaryRoot: ctx.boundaryRoot }),
           });
           if (!guard.ok) return errorResult(`拒绝写入：${guard.reason}`, guard.code);

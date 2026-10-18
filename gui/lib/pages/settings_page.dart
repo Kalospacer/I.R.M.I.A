@@ -1,13 +1,21 @@
+// 本页文案**已经全部**落在 lib/i18n/app_strings.dart（`settings*` 那一族）：页面里不再有
+// 中文字面量，`gui/test/copy_coverage_test.dart` 的闸门盯着这件事。加一句话 = 往文案表加一条
+// （中英各一处），页面里只许 `_s.xxx`。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 import 'dart:async';
-// Process / Platform：只为「打开下载页」那一个动作（用系统默认浏览器打开官方链接）。
-// 刻意不引 url_launcher——这个 GUI 是零第三方依赖的桌面壳，多一个包只为开一个链接不划算。
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 
 import '../app.dart';
+// 开外链只有一条实现（系统默认浏览器）：下载页、打开面板与引导页的推荐链接都走它
+import '../external_link.dart';
+import '../i18n/app_strings.dart';
+import '../i18n/strings_scope.dart';
 import '../theme.dart';
+import '../theme/design_tokens.dart';
 import '../ui_kit.dart';
 // 「关窗时收进托盘」是界面自己的偏好（closeToTray / setCloseToTray），不进服务端配置
 import '../ui_state.dart';
@@ -15,6 +23,8 @@ import '../ui_state.dart';
 // 但表单本身是一段自包含的东西（本地校验 + confirm + 就地换凭据）
 import 'account_security.dart';
 import 'page_chrome.dart';
+// 「文案覆盖」那一格（i18n 覆盖层的设置入口）：独立文件，本页只放一行调用
+import 'settings_strings_section.dart';
 // 「webhook 凭据只显示这一次」那张框：明文只在生成响应里出现一次，本页不留它
 import 'webhook_secret.dart';
 
@@ -51,7 +61,7 @@ class SettingsPage extends StatefulWidget {
 /// 标记——beta 只体现在这里与包名/说明里；后端那边对同一版号的口径是 `AGENT_VERSION`
 /// （不带 v，见 src/main.ts）。
 /// ⚠️ 别把具体版号抄进注释：出包脚本只改这一行的字面量、不改注释，抄一处就留一处对不上。
-const guiVersion = 'v0.1.0-beta.10';
+const guiVersion = 'v0.1.0-beta.11';
 
 /// 锚点侧栏宽度（AstrBot 的左侧 section 导航）
 const _railWidth = 180.0;
@@ -65,47 +75,68 @@ const _activeBand = 24.0;
 
 /// 两条模型 lane（与 src/config/config.ts 的 ModelsConfig.heavy/light 同名）
 const _laneIds = ['heavy', 'light'];
-const _laneLabels = {'heavy': '主循环（heavy）', 'light': '轻量（light）'};
-const _laneNotes = {
-  'heavy': 'turn 主循环使用的模型',
-  'light': '必要性判断、压缩摘要与守卫分类使用的模型',
-};
+/// 两条 lane 的名字（id 是布局判据、永不翻译，名字走文案表）
+String _laneLabel(AppStrings s, String lane) =>
+    lane == 'heavy' ? s.settingsLaneHeavyLabel : s.settingsLaneLightLabel;
+
+/// 两条 lane 的说明
+String _laneNote(AppStrings s, String lane) =>
+    lane == 'heavy' ? s.settingsLaneHeavyNote : s.settingsLaneLightNote;
 
 /// 分区锚点：id 与下方 _sectionBlock 的分区 key 一一对应
-typedef _Anchor = ({String id, String label, IconData icon});
+///
+/// 只留 id 与 icon：名字一律走 [settingsNavLabel]（i18n），**不在常量里留第二份中文**——
+/// 两处各写一份就是两条迟早会漂的真相（`test/i18n_test.dart` 那条"逐字相同"钉的就是它）。
+typedef _Anchor = ({String id, IconData icon});
+
+/// 分区 id → 当前语言的标签。**id 是布局判据、永不翻译**；只有名字跟着语言走。
+String settingsNavLabel(AppStrings s, String id) => switch (id) {
+      'model' => s.settingsNavModel,
+      'ui' => s.settingsNavUi,
+      'speak' => s.settingsNavSpeak,
+      'deps' => s.settingsNavDeps,
+      'protocol' => s.settingsNavProtocol,
+      'webhook' => s.settingsNavWebhook,
+      'memory' => s.settingsNavMemory,
+      'trust' => s.settingsNavTrust,
+      'system' => s.settingsNavSystem,
+      'account' => s.settingsNavAccount,
+      _ => s.settingsNavAbout,
+    };
 
 const _anchors = <_Anchor>[
-  (id: 'model', label: '模型', icon: Icons.tune_rounded),
-  (id: 'ui', label: '界面', icon: Icons.palette_outlined),
-  (id: 'speak', label: '发言', icon: Icons.record_voice_over_outlined),
-  // 外部依赖（v30）：pwsh 7 / ripgrep / es.exe 三件事由框架管，这里只做"看得见 + 一键装"。
+  (id: 'model', icon: Icons.tune_rounded),
+  (id: 'ui', icon: Icons.palette_outlined),
+  (id: 'speak', icon: Icons.record_voice_over_outlined),
+  // 外部依赖（v30；2026-10-16 加第 4 件 Python）：由框架管的这几件外部程序，
+  // 这里只做"看得见 + 一键装"。
   // 位置放在「发言」之后、「系统」之前：它是**可写的运维动作**（安装），
   // 不该混进只读的「系统」快照里，而"她能用什么工具"排在"她怎么说话"之后正合适。
-  (id: 'deps', label: '外部依赖', icon: Icons.extension_outlined),
+  (id: 'deps', icon: Icons.extension_outlined),
   // 内置协议端（v34）：紧跟「外部依赖」之后——它与那张卡是同一类东西（框架管的外部程序），
   // 但**可选**：不开的人照旧用官方通道，开了才多一双"看得见群"的眼睛。
-  (id: 'protocol', label: '协议端', icon: Icons.hub_outlined),
+  (id: 'protocol', icon: Icons.hub_outlined),
   // 外部回调（B9）：`POST /webhook/*` 的专用凭据（生成 / 轮换）。紧跟在「协议端」之后——
   // 它与那两张卡是同一类东西（框架管的外部程序 / 外部系统怎么接进来），
   // 而它是一次**可写的运维动作**（生成），不该混进只读的「系统」快照里。
-  (id: 'webhook', label: '外部回调', icon: Icons.webhook_rounded),
+  (id: 'webhook', icon: Icons.webhook_rounded),
   // 记忆（2026-10-04 加）：**框架代管记忆**的总开关（`persona.memoryEnabled`）。
   // 为什么单独一个分区、而不是塞进「系统」快照里：它是"她怎么活"的一条开关（框架替不替她
   // 管长期记忆），与监听地址/预算那种**整台实例的启动参数**不是一类东西；而它也不是人格资产
   // 本身——人格资产页编的是文件内容，这条决定那些文件由谁维护。紧邻「系统」之前：
   // 两者都是"这台实例这一层"的话，但这条更靠近她。
-  (id: 'memory', label: '记忆', icon: Icons.psychology_outlined),
+  (id: 'memory', icon: Icons.psychology_outlined),
   // 信任范围（`trust.mode`）：**她的活动边界有多宽**——整台电脑，还是只有一个工作目录。
   // 为什么紧挨在「系统」之前、而不是塞进「系统」那张表里：系统卡是"这台实例怎么启动"
   // （监听地址、预算、数据目录），而这一条是"她这个人能碰多远"——它和「记忆」属于同一族
   // （她的行为边界），只是这一条更硬：越过它就是拒绝，不是提醒。
-  (id: 'trust', label: '信任范围', icon: Icons.shield_outlined),
-  (id: 'system', label: '系统', icon: Icons.dns_outlined),
+  (id: 'trust', icon: Icons.shield_outlined),
+  (id: 'system', icon: Icons.dns_outlined),
   // 账号与安全（B10）：改密码与登出。排在这里而不是塞进「模型」卡里：它改的是**进来的方式**
   // （凭据），与"她怎么说话、用哪个模型"毫无关系；而它与「系统」同属"整台实例这一层"，
   // 所以紧跟在系统之后、「关于」之前。
-  (id: 'account', label: '账号与安全', icon: Icons.lock_outline_rounded),
-  (id: 'about', label: '关于', icon: Icons.info_outline_rounded),
+  (id: 'account', icon: Icons.lock_outline_rounded),
+  (id: 'about', icon: Icons.info_outline_rounded),
 ];
 
 /// 协议端官方 Releases（**手动那条路的出路**：一键安装失败、或平台不是 Windows 时人自己去下）。
@@ -127,6 +158,7 @@ class _DepEntry {
     required this.status,
     required this.path,
     required this.version,
+    required this.source,
     required this.reason,
     required this.purpose,
     required this.impact,
@@ -134,6 +166,8 @@ class _DepEntry {
     required this.downloadPage,
     required this.manualHint,
     required this.managedDir,
+    required this.pipVersion,
+    required this.pipReason,
   });
 
   final String name;
@@ -143,6 +177,13 @@ class _DepEntry {
   final String status;
   final String path;
   final String version;
+
+  /// 命中来源（`config` / `managed` / `path` / 空串 = 服务端没给）。
+  ///
+  /// **界面靠它把"已就绪"分成两句话**（用户 2026-10-17 的口径：「Python 和 pip 不应该是默认
+  /// 要求装的，而是有就用 PATH 里的」）：`path` / `config` = 机器上本来就有的那份，
+  /// `managed` = 框架托管那一份（兜底）。判据只在 [readyIsSystem] / [readyIsManaged] 两处。
+  final String source;
   final String reason;
   final String purpose;
   final String impact;
@@ -151,8 +192,34 @@ class _DepEntry {
   final String? manualHint;
   final String managedDir;
 
+  /// 只有 python 有这一格：`python -m pip --version` 探到的 pip 版本（`26.2.1`）。
+  /// `null` = 服务端没给这一格（别的依赖就是这样，它们没有"自带的包管理器"这回事）；
+  /// 空串 = 服务端给了但没探到 pip ⇒ 界面上**要明确标出来**，不许静默。
+  final String? pipVersion;
+
+  /// pip 不可用时的那句人话（成功或这一件不是 python 时为空串）
+  final String pipReason;
+
   bool get ready => status == 'ready';
   bool get mismatch => status == 'version-mismatch';
+
+  /// 已就绪、而且用的是**机器上本来就有的那份**（PATH 或人自己指的路径）。
+  /// 这一类**不是**框架要求装的——界面上要说清，别让"框架建议安装"的印象落在它头上。
+  bool get readyIsSystem => ready && source != 'managed';
+
+  /// 已就绪、用的是**框架托管那一份**（`<数据目录>/tools/<名字>/` 下那个，兜底那份）
+  bool get readyIsManaged => ready && source == 'managed';
+
+  /// 就绪时那句来源说明（`config` 与 `path` 都是"机器上本来就有的那份"，说法沿用用户那句"系统 PATH"）
+  String readyOrigin(AppStrings s) =>
+      readyIsManaged ? s.settingsDepSourceManaged : s.settingsDepSourceSystemPath;
+
+  /// 就绪时那一行：**来源 + 版本 + 路径**三件事都在（用户 2026-10-17：探到的路径与版本要显示出来）
+  String readyLine(AppStrings s) {
+    final versionText = version.isEmpty ? s.settingsDepVersionUnknown : version;
+    final pathText = path.isEmpty ? s.settingsDepPathUnknown : path;
+    return '${readyOrigin(s)} · $versionText · $pathText';
+  }
 
   static _DepEntry from(Object? raw) {
     final map = raw is Map ? raw.cast<String, dynamic>() : const <String, dynamic>{};
@@ -167,6 +234,7 @@ class _DepEntry {
       status: text('status').isEmpty ? 'missing' : text('status'),
       path: text('path'),
       version: text('version'),
+      source: text('source'),
       reason: text('reason'),
       purpose: text('purpose'),
       impact: text('impact'),
@@ -174,6 +242,11 @@ class _DepEntry {
       downloadPage: text('downloadPage').isEmpty ? null : text('downloadPage'),
       manualHint: text('manualHint').isEmpty ? null : text('manualHint'),
       managedDir: text('managedDir'),
+      // 键在不在，是两种意思："没有这一格"（null，别的依赖）与"这一格是空的"（没探到 pip）
+      pipVersion: map.containsKey('pipVersion') && map['pipVersion'] != null
+          ? map['pipVersion'].toString()
+          : null,
+      pipReason: text('pipReason'),
     );
   }
 }
@@ -300,16 +373,11 @@ enum _SysKind {
 /// 都按这一份清单走；抄九遍的下场是某一格"改了却存不进去"或"存了却不显脏"，
 /// 而这两种 bug 都不会报错，只会静静地少写一个字段。
 class _SysField {
-  const _SysField(this.path, this.label, this.kind,
-      {this.note, this.hint, this.min, this.max, this.live = false});
+  const _SysField(this.path, this.kind, {this.hint, this.min, this.max, this.live = false});
 
   /// 写进 config.json 的点路径：既是输入框的 key（测试按它定位），也是提交时的字段名
   final String path;
-  final String label;
   final _SysKind kind;
-
-  /// 框下面那句旁注：单位、范围、写法都归它（数值本身不许在这里被"换算"）
-  final String? note;
 
   /// 框里的示例（只在框空着时显示）
   final String? hint;
@@ -367,33 +435,34 @@ class _SysField {
   /// [bounds] 是**服务端给的**边界（`GET /api/config` 的 `bounds`，键 = 点路径）：闭区间
   /// 只从这个参数取，不从字段自身的 `min`/`max` 取——那两个常量字段只留给"边界就写死在
   /// 界面上"的形状（当前一个都没有）。服务端没给 ⇒ 这一格不预拦，交给服务端如实拒绝。
-  String? problem(String text, {Map<String, ({int min, int max})> bounds = const {}}) {
+  String? problem(String text, AppStrings s, {Map<String, ({int min, int max})> bounds = const {}}) {
+    final label = settingsSysLabel(s, path);
     switch (kind) {
       case _SysKind.host:
-        return text.isEmpty ? '监听地址不能为空：空值等于监听所有网卡，未保存' : null;
+        return text.isEmpty ? s.settingsSysHostEmptyError : null;
       case _SysKind.text:
-        return text.isEmpty ? '$label不能为空，未保存' : null;
+        return text.isEmpty ? s.settingsSysEmptyError(label) : null;
       case _SysKind.port:
         final value = int.tryParse(text);
-        if (value == null) return '$label要填整数，未保存';
-        return (value < 1 || value > 65535) ? '$label要在 1~65535 之间，未保存' : null;
+        if (value == null) return s.settingsSysIntRequired(label);
+        return (value < 1 || value > 65535) ? s.settingsSysPortRange(label) : null;
       case _SysKind.count:
         final value = int.tryParse(text);
-        if (value == null) return '$label要填整数，未保存';
-        return value < 1 ? '$label最小是 1，未保存' : null;
+        if (value == null) return s.settingsSysIntRequired(label);
+        return value < 1 ? s.settingsSysMinOne(label) : null;
       case _SysKind.ratio:
         final value = double.tryParse(text);
-        if (value == null) return '$label要填小数（0.8 表示 80%），未保存';
-        return (value <= 0 || value > 1) ? '$label是比例，要落在 0~1 之间（不含 0），未保存' : null;
+        if (value == null) return s.settingsSysRatioRequired(label);
+        return (value <= 0 || value > 1) ? s.settingsSysRatioRange(label) : null;
       case _SysKind.range:
         final value = int.tryParse(text);
-        if (value == null) return '$label要填整数，未保存';
+        if (value == null) return s.settingsSysIntRequired(label);
         // 服务端那份优先（同一格两处写 ⇒ 迟早一边改了另一边没改）；没有才退回字段上的常量
         final server = bounds[path];
         final lo = server?.min ?? min;
         final hi = server?.max ?? max;
-        if (lo != null && value < lo) return '$label最小是 $lo，未保存';
-        if (hi != null && value > hi) return '$label最大是 $hi，未保存';
+        if (lo != null && value < lo) return s.settingsSysMin(label, lo);
+        if (hi != null && value > hi) return s.settingsSysMax(label, hi);
         return null;
     }
   }
@@ -401,30 +470,20 @@ class _SysField {
 
 /// 系统卡的两条地址字段：分开摆是因为解析器把它们当两个字段，合成 `127.0.0.1:7788`
 /// 只是显示上的方便——而"显示方便"换个方向就是"改不了其中一半"。
-const _sysHost = _SysField('web.host', '监听地址', _SysKind.host,
-    note: '本机用就填 127.0.0.1；端口 1~65535。留空等于监听所有网卡，会被拦下。');
-const _sysPort = _SysField('web.port', '端口', _SysKind.port, hint: '7788');
-const _sysTimezone = _SysField('timezone', '时区', _SysKind.text,
-    note: 'IANA 名称，例如 Asia/Shanghai。预算的「今日」按它切分。', hint: 'Asia/Shanghai');
+const _sysHost = _SysField('web.host', _SysKind.host);
+const _sysPort = _SysField('web.port', _SysKind.port, hint: '7788');
+const _sysTimezone = _SysField('timezone', _SysKind.text, hint: 'Asia/Shanghai');
 
 /// 六条预算（与 `BudgetConfig` 同名同序）。标签沿用原来那张表上的写法，少一处漂移。
-const _sysStepTools = _SysField('budget.stepTools', '预算 · 步内工具调用上限', _SysKind.count,
-    note: '单个 step 里最多调几次工具。', hint: '20');
-const _sysTurnSteps = _SysField('budget.turnSteps', '预算 · 单 turn 步数上限', _SysKind.count,
-    note: '一个 turn 最多走多少步。', hint: '30');
-const _sysTaskTokens = _SysField('budget.taskTokens', '预算 · 任务 token 上限', _SysKind.count,
-    note: '单个任务累计上限；填原值，20M 这类简写不接受。'
-        '口径是非缓存 token（真花钱的那部分），不是账单上的用量。', hint: '500000');
+const _sysStepTools = _SysField('budget.stepTools', _SysKind.count, hint: '20');
+const _sysTurnSteps = _SysField('budget.turnSteps', _SysKind.count, hint: '30');
+const _sysTaskTokens = _SysField('budget.taskTokens', _SysKind.count, hint: '500000');
 /// 提示值 = **出厂默认值**（`src/config/config.ts` 的 `buildDefaults`：`dailyTokens: 100_000_000`）。
 /// 2026-10-04 与出厂值对齐：出厂从 2M 改成 100M 之后，这里还写着 2000000 就是在教人填一个
 /// 会被心跳自己吃穿的值（心跳是真实唤醒，2M 撑不住一天）。只改提示，校验逻辑一个字都没动。
-const _sysDailyTokens = _SysField('budget.dailyTokens', '预算 · 每日 token 上限', _SysKind.count,
-    note: '每日累计上限，按上面的时区切分。口径同上一行：只数没命中缓存的那部分。',
-    hint: '100000000');
-const _sysSoftRatio = _SysField('budget.softRatio', '预算 · 软阈值', _SysKind.ratio,
-    note: '0~1 的小数：0.8 就是 80%。到这一线先提示收尾，越过才硬停。', hint: '0.8');
-const _sysFailStreak = _SysField('budget.failStreakMax', '预算 · 连续失败上限', _SysKind.count,
-    note: '连续失败这么多次就告警并进入暂停。', hint: '5');
+const _sysDailyTokens = _SysField('budget.dailyTokens', _SysKind.count, hint: '100000000');
+const _sysSoftRatio = _SysField('budget.softRatio', _SysKind.ratio, hint: '0.8');
+const _sysFailStreak = _SysField('budget.failStreakMax', _SysKind.count, hint: '5');
 
 /// 心跳的平均间隔（`wake.heartbeatTargetMeanMin`）——**用户 2026-10-05 要的那个「我能不能控制心跳频率」**。
 ///
@@ -448,13 +507,10 @@ const _sysFailStreak = _SysField('budget.failStreakMax', '预算 · 连续失败
 /// 而写了数字的旁注一旦落后就成了假话——所以这里只说"两端各由一条上下限兜住"，数字让人去看 config.json。
 const _sysHeartbeatMean = _SysField(
   'wake.heartbeatTargetMeanMin',
-  '心跳间隔 · 平均（分钟）',
   _SysKind.range,
   min: 6,
   max: 59,
   hint: '15',
-  note: '她平均多久自己醒一次——越大越省 token，越小越常醒。'
-      '两端仍由上下限兜住：不因这个数改变，安静不足下限不会醒、到了上限必然会醒。',
 );
 
 /// 压缩线的可改区间：**不在这里存**（2026-10-11 收口）。
@@ -487,17 +543,12 @@ const _sysHeartbeatMean = _SysField(
 /// hint = 出厂默认值（`src/config/config.ts` 的 `buildDefaults`：`compactionThresholdTokens: 200_000`）。
 const _sysCompaction = _SysField(
   'persona.compactionThresholdTokens',
-  '上下文 · 压缩线（token 估算）',
   _SysKind.range,
   // ⚠️ **边界不在这里写**（2026-10-11 收口）：这一格的闭区间由服务端给
   //（`GET /api/config` 的 `bounds.compactionThreshold`，见 `_applyServerBounds`）。
   // 这里原先写的是 `kCompactionThresholdMin/Max`——那一对常量已经删了，理由见上面那段注释。
   hint: '200000',
   live: true,
-  note: '可见历史攒到这么多 token（估算）就折成一篇交接笔记，压缩只遮蔽、不删除。'
-      '单位是估算器读数，不是供方计数（估算比供方偏低约 1.65~1.66 倍）。'
-      '填原值：200000 这类写法不接受；调小 = 压得更勤，而每次压缩自己也要花一次调用。'
-      '改完立刻生效，不用重启。',
 );
 
 /// 系统卡的全部可编辑字段（回填、脏判定与销毁都遍历它）
@@ -542,18 +593,18 @@ const kTrustConfirm = 'config-update; trust-full-access';
 /// 「只限工作目录」那句里带上 [root]（= `trust.workspaceRoot`，由服务端解析器算出来），
 /// 因为"被关在一个目录里"这件事不说清是哪个目录就等于没说——被拦下的那一刻他才知道，
 /// 那就太晚了。
-String trustModeConsequence(String mode, String root) {
+String trustModeConsequence(AppStrings s, String mode, String root) {
   if (mode == kTrustWorkspace) {
     return root.isEmpty
-        ? '她只能在配置里的工作目录（trust.workspaceRoot）中活动；越界的读写与命令会被拒绝。'
-        : '她只能在 $root 里活动；越界的读写与命令会被拒绝。';
+        ? s.settingsTrustConsequenceWorkspaceUnknown
+        : s.settingsTrustConsequenceWorkspace(root);
   }
-  return '她能读写整台电脑上的文件、也能在任意目录跑命令。';
+  return s.settingsTrustConsequenceFull;
 }
 
 /// 二选一那一行的**标题**（同样两处共用）
-String trustModeLabel(String mode) =>
-    mode == kTrustWorkspace ? '只限工作目录' : '完全信任';
+String trustModeLabel(AppStrings s, String mode) =>
+    mode == kTrustWorkspace ? s.settingsTrustLabelWorkspace : s.settingsTrustLabelFull;
 
 /// 二选一的一个可点选项（**设置页与首次引导页共用同一份实现**）。
 ///
@@ -639,7 +690,7 @@ class TrustModeChoice extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      trustModeLabel(mode),
+                      trustModeLabel(IrmiaStrings.of(context), mode),
                       style: TextStyle(
                         fontSize: 13,
                         fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
@@ -684,6 +735,10 @@ const _sysRowFields = <String, List<_SysField>>{
 };
 
 class _SettingsPageState extends State<SettingsPage> {
+  /// 本页文案（当前语言）。**只在 build 路径里读**：`IrmiaStrings.of` 会登记依赖，
+  /// 语言一换本页就跟着重建；回执/toast 那些在 build 之外取的句子走 `IrmiaStrings.read`。
+  AppStrings get _s => IrmiaStrings.of(context);
+
   Map<String, dynamic>? cfg;
   String? cfgError;
   bool loading = true;
@@ -723,7 +778,7 @@ class _SettingsPageState extends State<SettingsPage> {
   Map<String, dynamic>? proj;
   String? projError;
 
-  /// 外部依赖（GET /api/deps）：三件依赖的探测结果 + 建议动作 + 自装目录
+  /// 外部依赖（GET /api/deps）：各件依赖的探测结果 + 建议动作 + 自装目录
   List<_DepEntry>? deps;
   String? depsError;
   bool depsLoading = true;
@@ -866,7 +921,7 @@ class _SettingsPageState extends State<SettingsPage> {
       if (!mounted) return;
       setState(() {
         webhookSecret = data is Map ? data.cast<String, dynamic>() : null;
-        webhookError = data is Map ? null : '凭据状态读取失败（响应不是对象）';
+        webhookError = data is Map ? null : _s.settingsWebhookStateNotObject;
         webhookLoading = false;
       });
     } catch (err) {
@@ -892,7 +947,7 @@ class _SettingsPageState extends State<SettingsPage> {
       final map = data is Map ? data.cast<String, dynamic>() : null;
       setState(() {
         protocolSide = map;
-        protocolError = map == null ? '协议端状态读取失败（响应不是对象）' : null;
+        protocolError = map == null ? _s.settingsProtocolStateNotObject : null;
         protocolLoading = false;
       });
       if (map != null) _seedProtocolDir(_protocolField('dir'));
@@ -928,7 +983,7 @@ class _SettingsPageState extends State<SettingsPage> {
       setState(() {
         deps = rawList is List ? [for (final item in rawList) _DepEntry.from(item)] : null;
         depsError = map == null
-            ? '依赖报告读取失败'
+            ? _s.settingsDepsReadFailed
             : (map['available'] == false ? map['reason']?.toString() : null);
         depsLoading = false;
       });
@@ -1031,7 +1086,7 @@ class _SettingsPageState extends State<SettingsPage> {
       if (!mounted) return;
       setState(() {
         keys = data is Map ? data.cast<String, dynamic>() : null;
-        keysError = data is Map ? null : '密钥状态读取失败';
+        keysError = data is Map ? null : _s.settingsKeysReadFailed;
         keysLoading = false;
       });
     } catch (err) {
@@ -1050,7 +1105,7 @@ class _SettingsPageState extends State<SettingsPage> {
       if (!mounted) return;
       setState(() {
         proj = data is Map ? data.cast<String, dynamic>() : null;
-        projError = data is Map ? null : '运行数据读取失败';
+        projError = data is Map ? null : _s.settingsProjectionReadFailed;
       });
     } catch (err) {
       if (mounted) setState(() => projError = '$err');
@@ -1117,18 +1172,18 @@ class _SettingsPageState extends State<SettingsPage> {
     final fields = <String, dynamic>{};
     if (form.modelDirty) {
       if (model.isEmpty) {
-        _toast('模型名不能为空，未保存', kind: ToastKind.warn);
+        _toast(_s.settingsModelNameRequired, kind: ToastKind.warn);
         return;
       }
       if (baseUrl.isEmpty) {
-        _toast('Base URL 不能为空，未保存', kind: ToastKind.warn);
+        _toast(_s.settingsBaseUrlRequired, kind: ToastKind.warn);
         return;
       }
       if (model != form.baseModel) fields['models.$lane.model'] = model;
       if (baseUrl != form.baseBaseUrl) fields['models.$lane.baseUrl'] = baseUrl;
     }
     if (fields.isEmpty && key.isEmpty) {
-      _toast('没有需要保存的改动');
+      _toast(_s.settingsNoChanges);
       return;
     }
 
@@ -1138,12 +1193,12 @@ class _SettingsPageState extends State<SettingsPage> {
       if (fields.isNotEmpty) {
         await widget.state.api
             .post('/api/commands/config-update', {'fields': fields}, confirm: 'config-update');
-        written.add('模型设置');
+        written.add(_s.settingsWrittenModelSettings);
       }
       if (key.isNotEmpty) {
         await widget.state.api
             .post('/api/commands/set-key', {'name': lane, 'value': key}, confirm: 'set-key');
-        written.add('密钥');
+        written.add(_s.settingsWrittenKey);
       }
       if (!mounted) return;
       form.keyCtl.clear();
@@ -1151,10 +1206,11 @@ class _SettingsPageState extends State<SettingsPage> {
       if (key.isNotEmpty) await _loadKeys();
       if (!mounted) return;
       // 只有配置项需要重启接管；密钥写盘即刻可用，不跟着喊重启
-      final restart = fields.isNotEmpty ? '，进程重启后生效' : '';
-      _toast('已保存${written.join('与')}$restart', kind: ToastKind.success);
+      final restart = fields.isNotEmpty ? _s.settingsRestartSuffix : '';
+      _toast(_s.settingsSaved(written.join(_s.settingsListAnd), restart),
+        kind: ToastKind.success);
     } catch (err) {
-      if (mounted) _toast('保存失败：$err', kind: ToastKind.error);
+      if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.error);
     } finally {
       if (mounted) setState(() => form.saving = false);
     }
@@ -1165,9 +1221,9 @@ class _SettingsPageState extends State<SettingsPage> {
     // 危险操作统一走 ui_kit 的确认框：灰取消 / 红确认
     final confirmed = await confirm(
       context,
-      title: '清除密钥 · ${_laneLabels[lane]}',
-      body: '清除后需重新填写；来自环境变量的值不受影响。',
-      confirmLabel: '清除',
+      title: _s.settingsClearKeyTitle(_laneLabel(_s, lane)),
+      body: _s.settingsClearKeyBody,
+      confirmLabel: _s.settingsClear,
       danger: true,
     );
     if (!confirmed || !mounted) return;
@@ -1178,10 +1234,10 @@ class _SettingsPageState extends State<SettingsPage> {
       await widget.state.api
           .post('/api/commands/set-key', {'name': lane, 'value': ''}, confirm: 'set-key');
       if (!mounted) return;
-      _toast('已清除本地密钥', kind: ToastKind.success);
+      _toast(_s.settingsKeyCleared, kind: ToastKind.success);
       await _loadKeys();
     } catch (err) {
-      if (mounted) _toast('清除失败：$err', kind: ToastKind.error);
+      if (mounted) _toast(_s.settingsClearFailed('$err'), kind: ToastKind.error);
     } finally {
       if (mounted) setState(() => form.saving = false);
     }
@@ -1258,10 +1314,11 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
+    final s = IrmiaStrings.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const PageHeader(title: '设置', subtitle: '模型密钥、界面偏好、发言节奏与系统参数'),
+        PageHeader(title: s.settingsTitle, subtitle: s.settingsSubtitle),
         Expanded(child: _pane()),
       ],
     );
@@ -1270,14 +1327,16 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 四态：loading（首次拉取）/ error（读取失败）/ empty（没返回配置本体）/ data。
   /// 前三态没有可跳转的分区，锚点栏随之隐藏，只留一条滚动区承载提示与重试。
   Widget _pane() {
+    final s = IrmiaStrings.of(context);
     if (loading && cfg == null) {
-      return _scrolling(const [StateBlock.loading(hint: '正在读取配置…')], left: 0);
+      return _scrolling([StateBlock.loading(hint: s.settingsLoadingConfig)], left: 0);
     }
     if (cfgError != null && cfg == null) {
       return _scrolling([
         StateBlock.error(
-          message: '配置读取失败：$cfgError',
-          hint: '模型密钥与系统信息需要生效配置才能显示。请确认主进程已启动。',
+          message: s.configReadFailed('$cfgError'),
+          hint: _s.settingsConfigErrorHint,
+          retryLabel: s.retry,
           onRetry: () => unawaited(load()),
         ),
       ], left: 0);
@@ -1286,9 +1345,9 @@ class _SettingsPageState extends State<SettingsPage> {
       return _scrolling([
         StateBlock.empty(
           icon: Icons.settings_suggest_outlined,
-          message: '配置不可用。',
-          hint: '本地服务 /api/config 未返回配置内容。',
-          action: StateBlock.cta('重试', () => unawaited(load())),
+          message: _s.settingsConfigUnavailable,
+          hint: _s.settingsConfigUnavailableHint,
+          action: StateBlock.cta(s.retry, () => unawaited(load())),
         ),
       ], left: 0);
     }
@@ -1328,14 +1387,12 @@ class _SettingsPageState extends State<SettingsPage> {
         _laneCard('light'),
         const SizedBox(height: 10),
         if (keysError != null)
-          _footnote('密钥状态读取失败（$keysError）。密钥徽章不可用，模型名与 Base URL 仍可保存。'),
+          _footnote(_s.settingsKeysReadFailedHint('$keysError')),
         if (savedSource == 'memory')
-          _footnote('读不到 config.json，这一页显示的是当前生效的那份（保存仍会写进文件）。'),
+          _footnote(_s.settingsConfigFallbackNote),
         if (pendingRestart.any((path) => path.startsWith('models.')))
-          _footnote('上面有改动还没生效：模型名与端点是启动参数，要重启进程才接管——'
-              '在那之前跑的还是启动时那份。保存本身是成功的，框里显示的就是盘上那份。'),
-        _footnote('密钥只写不读：本页显示的始终是掩码，完整值仅在建立连接时读取一次。'
-            '保存写入 config.json 与 data/.keys.json，进程重启后接管（环境变量优先于文件）。'),
+          _footnote(_s.settingsModelRestartNote),
+        _footnote(_s.settingsKeysNote),
       ]),
       const SizedBox(height: 18),
       _sectionBlock('ui', [_uiCard()]),
@@ -1427,6 +1484,8 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Widget _anchorTile(_Anchor anchor, bool active) {
     final scheme = Theme.of(context).colorScheme;
+    // 标签走 i18n；id 与 icon 是布局判据，**不随语言变**
+    final label = settingsNavLabel(IrmiaStrings.of(context), anchor.id);
     final tone = active ? scheme.primary : scheme.onSurfaceVariant;
     return Padding(
       padding: const EdgeInsets.only(bottom: 2),
@@ -1444,7 +1503,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 const SizedBox(width: 10),
                 Expanded(
                   child: Text(
-                    anchor.label,
+                    label,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -1479,7 +1538,7 @@ class _SettingsPageState extends State<SettingsPage> {
               Icon(anchor.icon, size: 16, color: tone),
               const SizedBox(width: 8),
               Text(
-                anchor.label,
+                settingsNavLabel(IrmiaStrings.of(context), anchor.id),
                 style: TextStyle(
                   fontSize: 13,
                   fontWeight: active ? FontWeight.w600 : FontWeight.w400,
@@ -1504,18 +1563,18 @@ class _SettingsPageState extends State<SettingsPage> {
       context,
       configured: keyState.configured,
       hintFontSize: 13,
-      base: InputDecoration(hintText: keyState.configured ? '已配置；粘贴新密钥可覆盖' : 'sk-…'),
+      base: InputDecoration(hintText: keyState.configured ? _s.settingsKeyConfiguredHint : _s.settingsKeySampleHint),
     );
 
     return _SectionCard(
-      title: _laneLabels[lane]!,
-      note: _laneNotes[lane]!,
+      title: _laneLabel(_s, lane),
+      note: _laneNote(_s, lane),
       trailing: Text('models.$lane', style: _mono(11.5, scheme.onSurfaceVariant)),
       children: [
         _FieldPair(
           cells: [
             _FieldCell(
-              label: '模型名',
+              label: _s.settingsModelName,
               field: TextField(
                 controller: form.modelCtl,
                 autocorrect: false,
@@ -1533,7 +1592,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 style: const TextStyle(fontSize: 13),
                 decoration: const InputDecoration(hintText: 'https://api.deepseek.com'),
               ),
-              note: 'API 根地址，不含 /responses。',
+              note: _s.settingsBaseUrlNote,
             ),
           ],
         ),
@@ -1558,7 +1617,7 @@ class _SettingsPageState extends State<SettingsPage> {
               _keyBadge(keyState),
             ],
           ),
-          note: '环境变量 $envName 优先；它没有值时使用此处的值（写入 data/.keys.json，只写不读）。',
+          note: _s.settingsKeyEnvNote(envName),
         ),
         const SizedBox(height: 14),
         Row(
@@ -1572,7 +1631,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   minimumSize: const Size(0, 36),
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
-                child: const Text('清除密钥'),
+                child: Text(_s.settingsClearKey),
               ),
             const Spacer(),
             // 未改动即禁用（ProviderPage.vue:78-90）；脏时紧挨按钮给一句状态
@@ -1589,7 +1648,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       height: 16,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Text('保存'),
+                  : Text(_s.save),
             ),
           ],
         ),
@@ -1609,18 +1668,18 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget _keyBadge(({bool configured, String? mask}) state) {
     if (keysLoading && keys == null) {
       return Text(
-        '读取中…',
+        _s.settingsReading,
         style: TextStyle(fontSize: 11.5, color: Theme.of(context).colorScheme.onSurfaceVariant),
       );
     }
-    if (keysError != null && keys == null) return _badge('状态读取失败', IrmiaTheme.warn);
-    if (!state.configured) return _badge('未配置', Theme.of(context).colorScheme.onSurfaceVariant);
-    return _badge('已配置 ${state.mask ?? '…'}', IrmiaTheme.ok);
+    if (keysError != null && keys == null) return _badge(_s.settingsStateReadFailed, IrmiaTheme.warn);
+    if (!state.configured) return _badge(_s.settingsNotConfigured, Theme.of(context).colorScheme.onSurfaceVariant);
+    return _badge(_s.settingsKeyConfiguredMask(state.mask ?? '…'), IrmiaTheme.ok);
   }
 
   // ── 分区二：界面（可写） ──
 
-  /// 「界面」卡：主题偏好 + **关窗行为**。
+  /// 「界面」卡：主题偏好 + **语言** + **关窗行为**。
   ///
   /// 2026-10-04 加的「关窗时收进托盘」是**界面自己的偏好**（键 `close-to-tray`，
   /// 落在 `%APPDATA%/Irmia/ui-state.json`，与主题一样**不写服务端配置**）：
@@ -1628,24 +1687,30 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 理由写在 ui_state.dart 的 [kCloseToTrayFlag] 上（她是独立进程，关窗不影响她运行；
   /// 而"藏起来"在托盘图标不可见时就是个陷阱）。
   ///
+  /// 2026-10-17 加的「语言」同理：键 `language`（见 `i18n/strings_scope.dart` 的
+  /// [kLanguageFlag]），取值 `system`/`zh`/`en`。**切换后不重启**：改的是
+  /// `effectiveLanguage` 那个 notifier，根的 `ValueListenableBuilder` 重建 MaterialApp。
+  ///
   /// 这里**不摆"需重启"**：开关本身立刻写盘，下次启动由 main.dart 读；
-  /// 而且它在同一次运行里也已经生效（窗口关闭回调读的是内存镜像，见 ui_state 的 [closeToTray]）。
+  /// 而且它在同一次运行里也已经生效（窗口关闭回调读的是内存镜像，见 ui_state 的 [closeToTray]；
+  /// 语言读的是 `effectiveLanguage` 的内存值）。
   Widget _uiCard() {
     final scheme = Theme.of(context).colorScheme;
+    final s = IrmiaStrings.of(context);
     final mode = widget.state.themeMode;
     return _SectionCard(
-      title: '界面',
-      note: '主题偏好与关窗行为；仅本地生效，不写入配置。',
-      trailing: Text('即时生效', style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
+      title: s.settingsSectionUi,
+      note: s.settingsUiNote,
+      trailing: Text(s.instantApply, style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
       children: [
         _FieldCell(
-          label: '明暗模式',
+          label: s.settingsThemeMode,
           field: Align(
             alignment: Alignment.centerLeft,
             child: SegmentedButton<ThemeMode>(
-              segments: const [
-                ButtonSegment(value: ThemeMode.light, label: Text('亮')),
-                ButtonSegment(value: ThemeMode.dark, label: Text('暗')),
+              segments: [
+                ButtonSegment(value: ThemeMode.light, label: Text(s.themeLight)),
+                ButtonSegment(value: ThemeMode.dark, label: Text(s.themeDark)),
               ],
               selected: {mode},
               showSelectedIcon: false,
@@ -1659,11 +1724,47 @@ class _SettingsPageState extends State<SettingsPage> {
               },
             ),
           ),
-          note: '仅本地偏好，即时生效；不写入配置、不影响渲染指纹。',
+          note: s.settingsThemeNote,
         ),
-        const SizedBox(height: 12),
+        const SizedBox(height: Space.x3),
+        // 语言：三选一（跟随系统 / 中文 / English）。**即时生效**，与主题那颗同一档口径。
+        // 取 `View.of(context).platformDispatcher.locale` 而不是 Localizations 里的 locale：
+        // 后者是"我们给界面设的那个语言"，拿它去解析"跟随系统"会永远是它自己。
         _FieldCell(
-          label: '关窗时收进托盘（不退出界面）',
+          label: s.settingsLanguage,
+          field: Align(
+            alignment: Alignment.centerLeft,
+            child: ValueListenableBuilder<AppLanguage>(
+              valueListenable: languagePreference,
+              builder: (context, preference, _) => SegmentedButton<AppLanguage>(
+                key: const ValueKey('language-switch'),
+                segments: [
+                  ButtonSegment(value: AppLanguage.system, label: Text(s.languageFollowSystem)),
+                  // 两条语言名各自用自己的语言写：切到英文之后还看得见"中文"，才切得回来
+                  ButtonSegment(value: AppLanguage.zh, label: Text(AppLanguage.zh.endonym)),
+                  ButtonSegment(value: AppLanguage.en, label: Text(AppLanguage.en.endonym)),
+                ],
+                selected: {preference},
+                showSelectedIcon: false,
+                style: SegmentedButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onSelectionChanged: (picked) => unawaited(
+                  setLanguage(picked.first, systemLocale: View.of(context).platformDispatcher.locale),
+                ),
+              ),
+            ),
+          ),
+          note: s.settingsLanguageNote,
+        ),
+        const SizedBox(height: Space.x3),
+        // 文案覆盖（2026-10-21）：与语言同一族——都是"界面上的字"这件事，所以紧跟选择器。
+        // 那一格整块在 lib/pages/settings_strings_section.dart（独立文件，本页只有这一行）。
+        const StringsOverrideSection(),
+        const SizedBox(height: Space.x3),
+        _FieldCell(
+          label: s.settingsCloseToTray,
           field: Align(
             alignment: Alignment.centerLeft,
             child: ValueListenableBuilder<bool>(
@@ -1677,11 +1778,14 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           // 后果要写清：托盘图标在 Windows 11 上默认被收进"隐藏的图标"面板，
           // 那时"关窗"就等于"界面不见了"——这正是用户踩过两次的那个坑。
-          note: '托盘图标若被系统收进"隐藏的图标"面板，关窗后会找不到界面；'
-              '关掉此项则点 × 直接退出（她照常运行）。',
+          note: s.settingsCloseToTrayNote,
         ),
-        const SizedBox(height: 12),
-        _readOnlyRow('当前主题', mode == ThemeMode.dark ? '暗' : '亮', restart: false),
+        const SizedBox(height: Space.x3),
+        _readOnlyRow(
+          s.settingsCurrentTheme,
+          mode == ThemeMode.dark ? s.themeDark : s.themeLight,
+          restart: false,
+        ),
       ],
     );
   }
@@ -1697,22 +1801,21 @@ class _SettingsPageState extends State<SettingsPage> {
     final saved = _amount('speak.charsPerMinute');
     final dirty = saved != '—' && _speakSpeedCtl.text.trim() != saved;
     return _SectionCard(
-      title: '发言',
-      note: '她说话时的节奏：一条条往外蹦、每条之间隔多久。只影响投递手感，不影响说话内容。',
+      title: _s.settingsNavSpeak,
+      note: _s.settingsSpeakNote,
       trailing: dirty ? const DirtyPill() : null,
       children: [
         _FieldCell(
-          label: '打字节奏',
+          label: _s.settingsSpeakTyping,
           field: Switch(
             value: typing,
             onChanged: _speakSaving ? null : (next) => unawaited(_saveSpeakTyping(next)),
           ),
-          note: '开着：按“这段话要打多久”逐条发出，像人在打字（对方也随时能插话打断）。'
-              '关掉：一次发完，内容尽快到手。',
+          note: _s.settingsSpeakTypingNote,
         ),
         const SizedBox(height: 12),
         _FieldCell(
-          label: '打字速度',
+          label: _s.settingsSpeakSpeed,
           field: Row(
             children: [
               SizedBox(
@@ -1731,20 +1834,20 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
               ),
               const SizedBox(width: 8),
-              Text('字/分钟', style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant)),
+              Text(_s.settingsSpeakSpeedUnit, style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant)),
               const SizedBox(width: 12),
               FilledButton(
                 onPressed: dirty && !_speakSaving ? () => unawaited(_saveSpeakSpeed()) : null,
-                child: const Text('保存'),
+                child: Text(_s.save),
               ),
             ],
           ),
-          note: '默认 90（中文手机输入的常见速度）。调大说得更快、等待更短；范围 30~600。',
+          note: _s.settingsSpeakSpeedNote,
         ),
         const SizedBox(height: 12),
         _readOnlyRow(
-          '当前生效',
-          saved == '—' ? '—' : (typing ? '$saved 字/分钟 · 逐条发' : '$saved 字/分钟 · 一次发完'),
+          _s.settingsCurrentlyActive,
+          saved == '—' ? '—' : (typing ? _s.settingsSpeakTypingOn(saved) : _s.settingsSpeakTypingOff(saved)),
           restart: true,
         ),
       ],
@@ -1763,9 +1866,9 @@ class _SettingsPageState extends State<SettingsPage> {
       );
       await _loadConfig(seed: true);
       if (!mounted) return;
-      _toast(value ? '已开启打字节奏（重启后接管）' : '已关闭打字节奏（重启后接管）');
+      _toast(value ? _s.settingsSpeakTypingEnabled : _s.settingsSpeakTypingDisabled);
     } catch (err) {
-      if (mounted) _toast('保存失败：$err', kind: ToastKind.warn);
+      if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.warn);
     } finally {
       if (mounted) setState(() => _speakSaving = false);
     }
@@ -1774,7 +1877,7 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _saveSpeakSpeed() async {
     final value = int.tryParse(_speakSpeedCtl.text.trim());
     if (value == null || value < 30 || value > 600) {
-      _toast('打字速度要在 30~600 之间', kind: ToastKind.warn);
+      _toast(_s.settingsSpeakSpeedRange, kind: ToastKind.warn);
       return;
     }
     setState(() => _speakSaving = true);
@@ -1788,9 +1891,9 @@ class _SettingsPageState extends State<SettingsPage> {
       );
       await _loadConfig(seed: true);
       if (!mounted) return;
-      _toast('已保存（重启后接管）');
+      _toast(_s.settingsSavedRestartNote);
     } catch (err) {
-      if (mounted) _toast('保存失败：$err', kind: ToastKind.warn);
+      if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.warn);
     } finally {
       if (mounted) setState(() => _speakSaving = false);
     }
@@ -1810,7 +1913,7 @@ class _SettingsPageState extends State<SettingsPage> {
     for (final field in fields) {
       final text = _sysText(field);
       if (text == (_sysBase[field.path] ?? '')) continue; // 没变的字段不写
-      final problem = field.problem(text, bounds: valueBounds);
+      final problem = field.problem(text, _s, bounds: valueBounds);
       if (problem != null) {
         _toast(problem, kind: ToastKind.warn);
         return;
@@ -1839,9 +1942,9 @@ class _SettingsPageState extends State<SettingsPage> {
           _resetSysDraft(fields);
           _sysEditing.remove(id);
         });
-        _toast('已保存，立刻生效（不用重启）', kind: ToastKind.success);
+        _toast(_s.settingsSavedLive, kind: ToastKind.success);
       } catch (err) {
-        if (mounted) _toast('保存失败：$err', kind: ToastKind.error);
+        if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.error);
       } finally {
         if (mounted) setState(() => _sysSaving = false);
       }
@@ -1863,9 +1966,9 @@ class _SettingsPageState extends State<SettingsPage> {
         _resetSysDraft(fields);
         _sysEditing.remove(id);
       });
-      _toast('已保存，重启后生效', kind: ToastKind.success);
+      _toast(_s.settingsSavedRestart, kind: ToastKind.success);
     } catch (err) {
-      if (mounted) _toast('保存失败：$err', kind: ToastKind.error);
+      if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.error);
     } finally {
       if (mounted) setState(() => _sysSaving = false);
     }
@@ -1887,28 +1990,27 @@ class _SettingsPageState extends State<SettingsPage> {
     final summary = depsError != null
         ? null
         : (entries == null
-            ? (depsLoading ? '读取中…' : null)
-            : (missing.isEmpty ? '全部就绪' : '建议安装 ${missing.length} 项'));
+            ? (depsLoading ? _s.settingsReading : null)
+            : (missing.isEmpty ? _s.settingsDepsAllReady : _s.settingsDepsSuggested(missing.length)));
     return _SectionCard(
-      title: '外部依赖',
+      title: _s.settingsNavDeps,
       // 用户 ⑨ 指定的新副标题
-      note: '建议安装的外部依赖，可由框架一键安装。',
+      note: _s.settingsDepsNote,
       trailing: summary == null
           ? null
           : _badge(summary, missing.isEmpty ? IrmiaTheme.ok : IrmiaTheme.warn),
       children: [
         if (depsError != null)
-          _footnote('依赖报告读取失败（$depsError）。装不了也看不见状态时，先在命令行确认主进程已启动。'),
+          _footnote(_s.settingsDepsReadFailedHint('$depsError')),
         if (entries == null && depsError == null)
-          _footnote('正在探测本机的 pwsh / ripgrep / es.exe …'),
+          _footnote(_s.settingsDepsProbing),
         for (final entry in entries ?? const <_DepEntry>[]) ...[
           _depRow(entry),
           const SizedBox(height: 10),
         ],
         if (entries != null && entries.isNotEmpty)
           // 用户 ⑨：删掉"（报告里的 managedDir 就是它）"——那是给实现者看的对应关系
-          _footnote('安装位置：<数据目录>/tools/<名字>/。'
-              '装完立即生效——探测结论会在安装后复检并刷新，下一次工具调用用的就是新引擎。'),
+          _footnote(_s.settingsDepsInstallLocation),
       ],
     );
   }
@@ -1938,16 +2040,35 @@ class _SettingsPageState extends State<SettingsPage> {
             ],
           ),
           const SizedBox(height: 6),
-          // 就绪时给"探测到的路径与版本"；没就绪时给"试过哪几处"——前者是事实，后者是下一步
+          // 就绪时给"**用的是哪一份** + 探测到的版本与路径"；没就绪时给"试过哪几处"——
+          // 前者是事实（用户 2026-10-17：探到的路径与版本要显示出来），后者是下一步
           Text(
-            entry.ready
-                ? '${entry.version.isEmpty ? '版本未知' : entry.version} · ${entry.path}'
-                : (entry.manualHint ?? entry.reason),
+            entry.ready ? entry.readyLine(_s) : (entry.manualHint ?? entry.reason),
             style: _mono(11.5, scheme.onSurfaceVariant),
           ),
+          // Python 专属：**pip 的状态要单独看得见**（用户 2026-10-16：「pip 必须要，
+          // 方便后续 agent 自行拓展能力」）。三态各有各的话，**没有 pip 绝不静默**：
+          //   · 有 pip ⇒ 版本号（她能自己 `python -m pip install <包>`）；
+          //   · 没有 pip ⇒ 明说"不可用"+ 原因（那时她的扩展能力是缺的，要让人看见）——
+          //     ⚠ 但那**不是**"未就绪"：python 可用就是可用，徽章照旧是"已就绪"，
+          //     pip 是它自己这一行的事（用户 2026-10-17 点名的那条）；
+          //   · 这一件不是 python（`pipVersion == null`）⇒ 一行都不加。
+          if (entry.pipVersion != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              entry.pipVersion!.isEmpty
+                  ? _s.settingsDepPipUnavailable(entry.pipReason.isEmpty ? null : entry.pipReason)
+                  : _s.settingsDepPipReady(entry.pipVersion!),
+              style: TextStyle(
+                fontSize: 11.5,
+                height: 1.5,
+                color: entry.pipVersion!.isEmpty ? IrmiaTheme.warn : scheme.onSurfaceVariant,
+              ),
+            ),
+          ],
           const SizedBox(height: 4),
           Text(
-            entry.ready ? entry.purpose : '${entry.purpose}。${entry.impact}',
+            entry.ready ? entry.purpose : _s.settingsDepPurposeImpact(entry.purpose, entry.impact),
             style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
           ),
         ],
@@ -1955,26 +2076,32 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 状态徽章：三态三色。字面口径与后端一致（"版本不符"不是"未安装"）
+  /// 状态徽章：三态三色。字面口径与后端一致（"版本不符"不是"未安装"）。
+  ///
+  /// 「已就绪」**分两种说法**（用户 2026-10-17）：用机器上本来就有的那份时写
+  /// 「已就绪·系统」——它是"有就用 PATH 里的"那句话的落地，不是"框架要求你装的那个"；
+  /// 用框架托管那份（兜底）时写「已就绪·托管」。两句话不能混：前者不该让人以为要去装点什么。
   Widget _depBadge(_DepEntry entry) {
-    if (entry.ready) return _badge('已就绪', IrmiaTheme.ok);
-    if (entry.mismatch) return _badge('版本不符', IrmiaTheme.danger);
-    return _badge('未安装', IrmiaTheme.warn);
+    if (entry.ready) {
+      return _badge(entry.readyIsManaged ? _s.settingsDepReadyManaged : _s.settingsDepReadySystem, IrmiaTheme.ok);
+    }
+    if (entry.mismatch) return _badge(_s.settingsDepMismatch, IrmiaTheme.danger);
+    return _badge(_s.settingsDepMissing, IrmiaTheme.warn);
   }
 
   /// 行尾动作：可一键装的给「安装」，只能人去装的给「打开下载页」。
   /// 已就绪的行**什么都不给**——一枚按下去只会重复劳动的按钮比不摆更糟。
   List<Widget> _depActions(_DepEntry entry, {required bool busy}) {
     if (entry.ready) {
-      return const [
-        Text('无需操作', style: TextStyle(fontSize: 11.5, color: IrmiaTheme.ok)),
+      return [
+        Text(_s.settingsDepNoAction, style: TextStyle(fontSize: 11.5, color: IrmiaTheme.ok)),
       ];
     }
     if (busy) {
-      return const [
+      return [
         SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
         SizedBox(width: 8),
-        Text('安装中…', style: TextStyle(fontSize: 12)),
+        Text(_s.settingsDepInstalling, style: TextStyle(fontSize: 12)),
       ];
     }
     final installing = depsInstalling != null;
@@ -1983,7 +2110,7 @@ class _SettingsPageState extends State<SettingsPage> {
         FilledButton(
           onPressed: installing ? null : () => unawaited(_installDep(entry)),
           style: _btnStyle(context),
-          child: const Text('安装'),
+          child: Text(_s.settingsInstall),
         ),
         if (entry.downloadPage != null) ...[
           const SizedBox(width: 6),
@@ -1994,7 +2121,7 @@ class _SettingsPageState extends State<SettingsPage> {
               minimumSize: const Size(0, 36),
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
             ),
-            child: const Text('下载页'),
+            child: Text(_s.settingsDownloadPage),
           ),
         ],
       ];
@@ -2007,7 +2134,7 @@ class _SettingsPageState extends State<SettingsPage> {
           minimumSize: const Size(0, 36),
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
         ),
-        child: const Text('打开下载页'),
+        child: Text(_s.settingsOpenDownloadPage),
       ),
     ];
   }
@@ -2020,10 +2147,9 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _installDep(_DepEntry entry) async {
     final confirmed = await confirm(
       context,
-      title: '安装 ${entry.label}',
-      body: '会从官方地址下载压缩包并解压到 ${entry.managedDir}，然后立即复检。'
-          '装好后 agent 就能用它（rg_search / es_search 会随之注册）。',
-      confirmLabel: '下载并安装',
+      title: _s.settingsInstallTitle(entry.label),
+      body: _s.settingsInstallConfirmBody(entry.managedDir),
+      confirmLabel: _s.settingsDownloadAndInstall,
     );
     if (!confirmed || !mounted) return;
 
@@ -2037,13 +2163,17 @@ class _SettingsPageState extends State<SettingsPage> {
       final map = data is Map ? data.cast<String, dynamic>() : const <String, dynamic>{};
       if (!mounted) return;
       if (map['ok'] == true) {
-        _toast('${entry.label} 已就绪（${map['version'] ?? ''}）', kind: ToastKind.success);
+        _toast(_s.settingsDepReadyToast(entry.label, '${map['version'] ?? ''}'),
+            kind: ToastKind.success);
       } else {
         // 三种失败分开说：下载 / 解压 / 复检各有各的下一步，合成一句"安装失败"等于没说
-        _toast('${_stepLabel(map['step'])}：${map['error'] ?? '未知原因'}', kind: ToastKind.error);
+        _toast(
+            _s.settingsStepErrorToast(
+                _stepLabel(map['step']), map['error']?.toString() ?? _s.settingsUnknownReason),
+            kind: ToastKind.error);
       }
     } catch (err) {
-      if (mounted) _toast('安装请求失败：$err', kind: ToastKind.error);
+      if (mounted) _toast(_s.settingsInstallRequestFailed('$err'), kind: ToastKind.error);
     } finally {
       if (mounted) {
         setState(() => depsInstalling = null);
@@ -2057,25 +2187,25 @@ class _SettingsPageState extends State<SettingsPage> {
   String _stepLabel(Object? step) {
     switch (step?.toString()) {
       case 'download':
-        return '下载失败';
+        return _s.settingsStepDownloadFailed;
       case 'extract':
-        return '解压失败';
+        return _s.settingsStepExtractFailed;
       case 'verify':
-        return '装完复检没通过';
+        return _s.settingsStepVerifyFailed;
       default:
-        return '安装失败';
+        return _s.settingsStepInstallFailed;
     }
   }
 
   /// 打开官方下载页（pwsh 这条路只能人工装：MSI/winget 要提权，无人值守进程里弹 UAC 只会卡住）。
   ///
-  /// 实现用 `Process.run` 调系统默认浏览器，而不是引 url_launcher：这个 GUI 是零第三方依赖的
-  /// 桌面壳，多一个包只为打开一个链接不划算（与 extensions_page 里"不摆按不出结果的按钮"
-  /// 是同一条取舍——只不过这里我们自己实现得了）。
+  /// 真正开浏览器那一步在 `lib/external_link.dart`：引导页第 2、3 步的推荐链接也走它——
+  /// 全仓只有那一条 `Process.run`，不引 url_launcher（零第三方依赖的桌面壳，见 pubspec.yaml）。
   Future<void> _openDownloadPage(_DepEntry entry) async {
     final url = entry.downloadPage;
     if (url == null) {
-      _toast('这一项没有下载页；装法：${entry.manualHint ?? '见官方文档'}', kind: ToastKind.warn);
+      _toast(_s.settingsNoDownloadPage(entry.manualHint ?? _s.settingsSeeOfficialDocs),
+          kind: ToastKind.warn);
       return;
     }
     await _openUrl(url, hint: entry.manualHint);
@@ -2084,19 +2214,12 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 用系统默认浏览器打开一个外链。打不开就**把地址说出来**——那是唯一不靠外部程序
   /// 也能让人拿到它的方式（协议端的下载页与登录界面都走这里）。
   Future<void> _openUrl(String url, {String? hint}) async {
-    try {
-      if (Platform.isWindows) {
-        await Process.run('cmd', ['/c', 'start', '', url], runInShell: true);
-      } else if (Platform.isMacOS) {
-        await Process.run('open', [url]);
-      } else {
-        await Process.run('xdg-open', [url]);
-      }
-      if (mounted) _toast('已用默认程序打开 $url');
-    } catch (err) {
-      if (mounted) {
-        _toast('打不开浏览器，地址是 $url${hint == null ? '' : '（$hint）'}', kind: ToastKind.warn);
-      }
+    final opened = await openExternalUrl(url);
+    if (!mounted) return;
+    if (opened) {
+      _toast(_s.settingsOpenedUrl(url));
+    } else {
+      _toast(_s.settingsOpenUrlFailed(url, hint), kind: ToastKind.warn);
     }
   }
 
@@ -2140,42 +2263,39 @@ class _SettingsPageState extends State<SettingsPage> {
             mainAxisSize: MainAxisSize.min,
             children: [
               if (configured) ...[
-                _badge(stateText.isEmpty ? '未知' : stateText, _protocolTone(state)),
+                _badge(stateText.isEmpty ? _s.settingsUnknown : stateText, _protocolTone(state)),
                 if (restartRequired) const SizedBox(width: 6),
               ],
               if (restartRequired)
-                _badge('需重启', IrmiaTheme.warn)
+                _badge(_s.settingsRestartRequired, IrmiaTheme.warn)
               else if (!configured)
-                _badge('未配置', scheme.onSurfaceVariant),
+                _badge(_s.settingsNotConfigured, scheme.onSurfaceVariant),
             ],
           );
 
     return _SectionCard(
-      title: '协议端（可选）',
+      title: _s.settingsProtocolTitle,
       // 2026-10-02 用户澄清：官 bot 开了「接收所有消息」之后，群聊场景它自己就能覆盖，
       // 所以这里**不再把 SnowLuma 说成"群聊场景的建议"**——两条通道各是一个独立的消息适配器
-      note: '可选：由框架拉起的 OneBot 协议端，背后是一个真实 QQ 号。'
-          '它与官方 Bot 各是一条独立的入站通道，装不装都不影响另一条。',
+      note: _s.settingsProtocolNote,
       trailing: trailing,
       children: [
         if (protocolError != null)
           StateBlock.error(
-            message: '协议端状态读取失败：$protocolError',
-            hint: '这张卡读不到不影响其它设置。先确认主进程已启动，再点重试；'
-                '在读到状态之前，这里不提供开关、目录与一键安装——那等于让你在看不到当前值的情况下写它。',
+            message: _s.settingsProtocolError('$protocolError'),
+            hint: _s.settingsProtocolErrorHint,
             onRetry: () => unawaited(_loadProtocolSide()),
           )
         else if (data == null)
-          const StateBlock.loading(hint: '正在读取协议端状态…')
+          StateBlock.loading(hint: _s.settingsProtocolLoading)
         else ...[
           if (!configured)
             StateBlock.empty(
               icon: Icons.hub_outlined,
-              message: '还没配置内置协议端。',
+              message: _s.settingsProtocolEmpty,
               // 原来的后半句是"要收群里的全量消息，点下面的「一键安装」"——那建立在"官 bot 收不到
               // 群消息"的错判上（见 docs/review.md 的「已了结」）。现在这句只讲这条路自己。
-              hint: '不开也照常用：官方 Bot 那条通道不受影响。'
-                  '要用这条路，点下面的「一键安装」把装与配一次做完。',
+              hint: _s.settingsProtocolEmptyHint,
             )
           else
             _protocolStatusRow(state),
@@ -2184,7 +2304,7 @@ class _SettingsPageState extends State<SettingsPage> {
           _protocolInstallBlock(install),
           const SizedBox(height: 14),
           _FieldCell(
-            label: '启用内置协议端',
+            label: _s.settingsProtocolEnabled,
             field: Switch(
               // key 是给测试与无障碍用的：本页不止一个开关（「发言」那张卡也有），
               // 按类型取会拿到"页面上的第几个"这种一改布局就失效的定位
@@ -2193,11 +2313,11 @@ class _SettingsPageState extends State<SettingsPage> {
               onChanged: _protocolCardBusy ? null : (next) => unawaited(_saveProtocolEnabled(next)),
             ),
             // 用户 ⑨ 指定的新副标题
-            note: '框架启动时自动连接；关闭后可在双端手动填写和配置。',
+            note: _s.settingsProtocolEnabledNote,
           ),
           const SizedBox(height: 14),
           _FieldCell(
-            label: '安装目录',
+            label: _s.settingsInstallDir,
             field: Row(
               children: [
                 Expanded(
@@ -2208,7 +2328,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     autocorrect: false,
                     enableSuggestions: false,
                     style: _mono(12.5, scheme.onSurface),
-                    decoration: const InputDecoration(hintText: r'<协议端安装目录>'),
+                    decoration: InputDecoration(hintText: _s.settingsInstallDirHint),
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -2222,14 +2342,13 @@ class _SettingsPageState extends State<SettingsPage> {
                     minimumSize: const Size(0, 36),
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
-                  child: const Text('保存目录'),
+                  child: Text(_s.settingsSaveDir),
                 ),
               ],
             ),
             // 用户 ⑨：这段原来口语化（"以后的人就得先猜它相对谁""我自己下载解压"），
             // 改成技术说明——只留填这一格真正要知道的两件事：填哪一层、谁来填
-            note: '协议端安装目录（绝对路径）。Lite 包解压后入口 index.mjs 就在这一层，'
-                '没有 dist/ 子目录；「一键安装」会自动填好。',
+            note: _s.settingsInstallDirNote,
           ),
           const SizedBox(height: 10),
           _protocolDownloadGuide(),
@@ -2278,14 +2397,13 @@ class _SettingsPageState extends State<SettingsPage> {
                       height: 16,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Text('一键安装'),
+                  : Text(_s.settingsOneClickInstall),
             ),
             const SizedBox(width: 12),
             // 用户 ⑨ 指定的四句（原文照抄，只补了中英文之间的空格与断句）
             Expanded(
               child: Text(
-                '从 SnowLuma 官方 Release 下载 Lite 包；自动下载失败时，自行下载并填写安装目录。'
-                '此包不随框架分发，不得用于商业使用。',
+                _s.settingsOneClickInstallNote,
                 style: TextStyle(fontSize: 11.5, height: 1.7, color: scheme.onSurfaceVariant),
               ),
             ),
@@ -2294,7 +2412,7 @@ class _SettingsPageState extends State<SettingsPage> {
         const SizedBox(height: 4),
         // 用户 ⑨ 指定的前提句，单独一行留警告色：这是唯一一步框架替不了他的
         Text(
-          '使用前提：本机已登录 QQ 客户端（Bot 账号）。',
+          _s.settingsOneClickPrerequisite,
           style: TextStyle(fontSize: 11.5, height: 1.7, color: IrmiaTheme.warn),
         ),
         if (protocolInstalling) ...[
@@ -2331,9 +2449,7 @@ class _SettingsPageState extends State<SettingsPage> {
         borderRadius: BorderRadius.circular(IrmiaTheme.radiusCtl),
       ),
       child: Text(
-        '正在从官方 Releases 下载并解压。要下 4.6 MB，视网速可能要一两分钟——先别急，也别再点一次。'
-        '分步记录（下到哪一步、下多大）会在这一步结束时一次性列出来：这条端点是同步请求，不是流，'
-        '中间插不进进度行。',
+        _s.settingsInstallRunningNote,
         style: TextStyle(fontSize: 11.5, height: 1.7, color: scheme.onSurface),
       ),
     );
@@ -2347,10 +2463,11 @@ class _SettingsPageState extends State<SettingsPage> {
     final scheme = Theme.of(context).colorScheme;
     final tone = install.ok ? (install.configured ? IrmiaTheme.ok : IrmiaTheme.warn) : IrmiaTheme.danger;
     // 版本号缺了就别硬凑一句话（服务端没给版本时说明它自己也没解析出 tag）
-    final head = install.ok
-        ? '已装好${install.version.isEmpty ? '' : ' ${install.version}'}'
-            '${install.configured ? '，并用它配好了；重启一下就能用。' : '，但自动配置那一步没成。'}'
-        : '安装失败';
+    final head = _s.settingsInstallHead(
+      install.ok,
+      install.version.isEmpty ? null : install.version,
+      install.configured,
+    );
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
@@ -2384,22 +2501,20 @@ class _SettingsPageState extends State<SettingsPage> {
           if (install.writeError.isNotEmpty) ...[
             const SizedBox(height: 4),
             Text(
-              '自动配置没写成：${install.writeError}。装好的目录已经替你填在下面的「安装目录」里，'
-              '点一下「保存目录」、再把「启用内置协议端」打开就行（同样是重启后接管）。',
+              _s.settingsWriteErrorNote(install.writeError),
               style: TextStyle(fontSize: 11.5, height: 1.7, color: scheme.onSurface),
             ),
           ],
           if (!install.ok) ...[
             const SizedBox(height: 4),
             Text(
-              '手动出路：从 $protocolDownloadUrl 下载发行包，解压后把那个目录填到下面的「安装目录」，'
-              '再点「保存目录」、打开开关——效果与一键安装一样，只是这几步由你做。',
+              _s.settingsInstallManualRoute(protocolDownloadUrl),
               style: TextStyle(fontSize: 11.5, height: 1.7, color: scheme.onSurface),
             ),
           ],
           const SizedBox(height: 8),
           Text(
-            install.log.isEmpty ? '过程记录：（这次没有——失败发生在动手之前）' : '过程记录：',
+            install.log.isEmpty ? _s.settingsInstallLogEmpty : _s.settingsInstallLog,
             style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: scheme.onSurfaceVariant),
           ),
           // 逐行摆出来，一行不加不减：这几行是"到底卡在哪儿"的全部证据
@@ -2435,17 +2550,12 @@ class _SettingsPageState extends State<SettingsPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            '已经装好了。下一步：先重启服务，再扫码。',
+            _s.settingsInstalledNextTitle,
             style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: scheme.onSurface),
           ),
           const SizedBox(height: 6),
           Text(
-            '① 重启服务：运行中的协议端实例是按启动时的配置建的，重启之后它才会按刚写好的配置被拉起'
-            '（框架不替你重启——重启自己失败就什么都不剩了）。\n'
-            '② 再扫码：重启后这张卡上会出现「打开面板」，点开在那边先读并同意用户协议与隐私政策'
-            '（那是法律性质的同意，要你自己按），再接入 QQ 并扫码；'
-            '首次登录要用它启动时打印的初始凭据——那句话现在就显示在按钮下面（口令打码），'
-            '旁边有「复制凭据」。扫码接的是你本机的 QQ 客户端，框架不代管登录态。',
+            _s.settingsInstalledNextBody,
             style: TextStyle(fontSize: 11.5, height: 1.8, color: scheme.onSurface),
           ),
         ],
@@ -2489,7 +2599,7 @@ class _SettingsPageState extends State<SettingsPage> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  dir.isEmpty ? '（还没填安装目录）' : dir,
+                  dir.isEmpty ? _s.settingsInstallDirEmpty : dir,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: _mono(11.5, scheme.onSurface),
@@ -2498,11 +2608,11 @@ class _SettingsPageState extends State<SettingsPage> {
               // installed 是三态：true / false / null（配置刚改过、重启后才核对得出）。
               // null 时**不许**说成"目录里没有入口"——那是另一个意思，而且很可能是错的
               if (installed == true)
-                Text('已找到可执行入口', style: TextStyle(fontSize: 11.5, color: IrmiaTheme.ok))
+                Text(_s.settingsEntryFound, style: TextStyle(fontSize: 11.5, color: IrmiaTheme.ok))
               else if (installed == false)
-                Text('目录里没有可执行入口', style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant))
+                Text(_s.settingsEntryMissing, style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant))
               else
-                Text('入口要重启后才核对', style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
+                Text(_s.settingsEntryPendingRestart, style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
             ],
           ),
           const SizedBox(height: 6),
@@ -2512,7 +2622,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           if (wsUrl.isNotEmpty) ...[
             const SizedBox(height: 4),
-            Text('对接点：$wsUrl', style: _mono(11.5, scheme.onSurfaceVariant)),
+            Text(_s.settingsEndpointPoint(wsUrl), style: _mono(11.5, scheme.onSurfaceVariant)),
           ],
           // 三档明细：证书那一行下面是"链条"，这里是"链条断在哪一环"
           _protocolChainBlock(),
@@ -2532,7 +2642,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         height: 16,
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
-                    : const Text('启动'),
+                    : Text(_s.settingsStart),
               ),
               const SizedBox(width: 8),
               FilledButton.tonal(
@@ -2545,7 +2655,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   minimumSize: const Size(0, 36),
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
-                child: const Text('停止'),
+                child: Text(_s.settingsStop),
               ),
               const Spacer(),
               // 扫码登录是在**它的 WebUI** 里做的，框架不代管 QQ 登录态；
@@ -2558,7 +2668,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     minimumSize: const Size(0, 36),
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
-                  child: const Text('打开面板'),
+                  child: Text(_s.settingsOpenPanel),
                 ),
             ],
           ),
@@ -2566,8 +2676,7 @@ class _SettingsPageState extends State<SettingsPage> {
           if (!attached) ...[
             const SizedBox(height: 2),
             Text(
-              '本次进程启动时还没读到这段配置：框架现在不持有它的实例，'
-              '「启动/停止」要等重启进程之后才有效。',
+              _s.settingsProtocolNotAttachedNote,
               style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
             ),
           ],
@@ -2598,22 +2707,22 @@ class _SettingsPageState extends State<SettingsPage> {
     final adapter = protocolSide!['adapter'];
     final rows = <Widget>[
       _protocolChainRow(
-        '① 进程',
+        _s.settingsChainProcess,
         _protocolChainText(process, (map) {
-          if (map['known'] != true) return ('未观测', '本进程没有实例，这一档没人在看');
-          if (map['running'] != true) return ('没在跑', '没有监听到它的面板端口');
+          if (map['known'] != true) return (_s.settingsChainUnobserved, _s.settingsChainNoInstance);
+          if (map['running'] != true) return (_s.settingsChainNotRunning, _s.settingsChainNoPort);
           final pid = map['pid'];
           final started = map['startedAt']?.toString() ?? '';
           final url = map['webuiUrl']?.toString() ?? '';
           final how = map['managed'] == 'spawned'
-              ? '本次进程拉起'
-              : map['managed'] == 'discovered' ? '本次进程之前就在跑' : '只探到端口';
+              ? _s.settingsChainSpawned
+              : map['managed'] == 'discovered' ? _s.settingsChainDiscovered : _s.settingsChainPortOnly;
           return (
-            '在跑',
+            _s.settingsChainRunning,
             [
               if (pid != null) 'pid $pid',
-              if (started.isNotEmpty) '${_shortTime(started)} 起',
-              if (url.isNotEmpty) '监听 $url',
+              if (started.isNotEmpty) _s.settingsChainSince(_shortTime(started)),
+              if (url.isNotEmpty) _s.settingsChainListening(url),
               how,
             ].join(' · '),
           );
@@ -2622,24 +2731,27 @@ class _SettingsPageState extends State<SettingsPage> {
         unknown: process is Map && process['known'] != true,
       ),
       _protocolChainRow(
-        '② OneBot 配置',
+        _s.settingsChainOneBotConfig,
         _protocolChainText(config, (map) {
           if (map['present'] == true) {
             final ws = map['wsUrl']?.toString() ?? '';
-            final token = map['hasToken'] == true ? '带 token' : '无 token（协议端未开校验）';
-            return ('在', [if (ws.isNotEmpty) '端点 $ws', token].join(' · '));
+            final token = map['hasToken'] == true ? _s.settingsChainWithToken : _s.settingsChainNoToken;
+            return (_s.settingsChainPresent, [if (ws.isNotEmpty) _s.settingsChainEndpoint(ws), token].join(' · '));
           }
           if (map['unreadable'] == true) {
-            return ('读不出', '那份文件在（${map['path'] ?? '?'}）但端点解析失败——要人去修它');
+            return (
+            _s.settingsChainUnreadable,
+            _s.settingsChainUnreadableDetail('${map['path'] ?? '?'}'),
+          );
           }
-          return ('缺失', '未登录 QQ：这一份是登录之后才生成的');
+          return (_s.settingsChainMissing, _s.settingsChainMissingDetail);
         }),
         ok: config is Map && config['present'] == true,
         warn: config is Map && config['unreadable'] == true,
         unknown: config == null,
       ),
       _protocolChainRow(
-        '③ 适配器',
+        _s.settingsChainAdapter,
         _protocolChainText(adapter, (map) {
           final state = map['state']?.toString() ?? '';
           final target = map['target']?.toString() ?? '';
@@ -2648,21 +2760,24 @@ class _SettingsPageState extends State<SettingsPage> {
           switch (state) {
             case 'connected':
               return (
-                '已连上',
+                _s.settingsChainConnected,
                 [
                   if (target.isNotEmpty) target,
                   if (map['selfId'] != null && '${map['selfId']}'.isNotEmpty) 'QQ ${map['selfId']}',
-                  '已收 $delivered 条',
+                  _s.settingsChainDelivered('$delivered'),
                 ].join(' · '),
               );
             case 'reconnecting':
-              return ('重连中', [if (target.isNotEmpty) target, '第 $attempts 次退避'].join(' · '));
+              return (
+                _s.settingsChainReconnecting,
+                [if (target.isNotEmpty) target, _s.settingsChainBackoff('$attempts')].join(' · '),
+              );
             case 'no-endpoint':
-              return ('没端点可连', '协议端的 OneBot 配置还没出现，配置里也没有手填地址');
+              return (_s.settingsChainNoEndpoint, _s.settingsChainNoEndpointDetail);
             case 'disabled':
-              return ('未启用', 'config.channels.onebot.enabled=false');
+              return (_s.settingsChainDisabled, 'config.channels.onebot.enabled=false');
             default:
-              return ('未装配', '本进程没有 OneBot 适配器');
+              return (_s.settingsChainNotAssembled, _s.settingsChainNotAssembledDetail);
           }
         }),
         ok: adapter is Map && adapter['state'] == 'connected',
@@ -2730,7 +2845,7 @@ class _SettingsPageState extends State<SettingsPage> {
     Object? value,
     (String, String) Function(Map<String, dynamic> map) read,
   ) {
-    if (value is! Map) return ('未观测', '这一档没有数据');
+    if (value is! Map) return (_s.settingsChainUnobserved, _s.settingsChainNoData);
     return read(value.cast<String, dynamic>());
   }
 
@@ -2763,15 +2878,13 @@ class _SettingsPageState extends State<SettingsPage> {
 
     final lines = <String>[
       if (source == 'stdout')
-        '初始凭据（本次启动从它的输出里捕到，用户 $user / 口令 $masked）'
+        _s.settingsCredentialCaptured(user, masked)
       else if (source == 'console-log')
-        '初始凭据（从框架自己的启动留痕里捞回来的：用户 $user / 口令 $masked；'
-            '若它之后又重启过，这条就作废了）'
+        _s.settingsCredentialFromLog(user, masked)
       else
-        '初始凭据找不回来：它只在启动时往自己的输出里打一次（关掉程序就没了）。'
-            '要拿到一条可用的，就让框架重启它一次（那一次的输出会被捕获并显示在这里）。',
-      if (!consentRecorded) '协议与隐私政策还没同意——面板解锁之前，接入 QQ 的入口是锁着的。',
-      if (mustChange) '初始口令还没改：两个门里第一个就是改密，面板会一直要求你先改它。',
+        _s.settingsCredentialLost,
+      if (!consentRecorded) _s.settingsConsentPending,
+      if (mustChange) _s.settingsPasswordUnchanged,
     ];
 
     return Padding(
@@ -2780,7 +2893,7 @@ class _SettingsPageState extends State<SettingsPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            '扫码登录在 $webuiUrl 里做（框架不代管 QQ 登录态）。',
+            _s.settingsQrLoginAt(webuiUrl),
             style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
           ),
           for (final line in lines)
@@ -2799,14 +2912,14 @@ class _SettingsPageState extends State<SettingsPage> {
                 child: FilledButton.tonal(
                   onPressed: () async {
                     await Clipboard.setData(ClipboardData(text: '$user $password'.trim()));
-                    if (mounted) _toast('凭据已复制（用户 + 口令）', kind: ToastKind.success);
+                    if (mounted) _toast(_s.settingsCredentialCopied, kind: ToastKind.success);
                   },
                   style: FilledButton.styleFrom(
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                     minimumSize: const Size(0, 36),
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
-                  child: const Text('复制凭据'),
+                  child: Text(_s.settingsCopyCredential),
                 ),
               ),
             ),
@@ -2826,9 +2939,7 @@ class _SettingsPageState extends State<SettingsPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          '也可以自己来：从 $protocolDownloadUrl 下载发行包解压，把那个目录填在上面。'
-          '这条路在一键安装失败、或者你想自己控制版本时用；框架也从同一个地址代下载，不随框架分发它'
-          '（许可是"源码可见非商业"，自用没问题）。',
+          _s.settingsManualDownloadGuide(protocolDownloadUrl),
           style: TextStyle(fontSize: 11.5, height: 1.7, color: scheme.onSurfaceVariant),
         ),
         const SizedBox(height: 6),
@@ -2839,7 +2950,7 @@ class _SettingsPageState extends State<SettingsPage> {
             minimumSize: const Size(0, 36),
             tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           ),
-          child: const Text('打开下载页'),
+          child: Text(_s.settingsOpenDownloadPage),
         ),
       ],
     );
@@ -2860,8 +2971,7 @@ class _SettingsPageState extends State<SettingsPage> {
         border: Border.all(color: IrmiaTheme.warn.withValues(alpha: 0.28)),
       ),
       child: Text(
-        '改动已写入 config.json，但要重启进程才接管：运行中的协议端实例是按启动时那份配置建的。'
-        '重启之前，这里显示的状态仍是本次启动的那一个。',
+        _s.settingsProtocolRestartNote,
         style: TextStyle(fontSize: 11.5, height: 1.7, color: scheme.onSurface),
       ),
     );
@@ -2899,10 +3009,10 @@ class _SettingsPageState extends State<SettingsPage> {
       final map = data is Map ? data.cast<String, dynamic>() : const <String, dynamic>{};
       await _loadProtocolSide();
       if (!mounted) return;
-      _toast('${value ? '已开启' : '已关闭'}内置协议端${_restartSuffix(map)}',
+      _toast(_s.settingsProtocolToggled(value, map['restartRequired'] == true),
           kind: ToastKind.success);
     } catch (err) {
-      if (mounted) _toast('保存失败：$err', kind: ToastKind.error);
+      if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.error);
     } finally {
       if (mounted) setState(() => protocolSaving = false);
     }
@@ -2912,7 +3022,7 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _saveProtocolDir() async {
     final dir = _protocolDirCtl.text.trim();
     if (dir.isEmpty) {
-      _toast('安装目录不能为空', kind: ToastKind.warn);
+      _toast(_s.settingsInstallDirRequired, kind: ToastKind.warn);
       return;
     }
     setState(() => protocolSaving = true);
@@ -2930,9 +3040,10 @@ class _SettingsPageState extends State<SettingsPage> {
       }
       await _loadProtocolSide();
       if (!mounted) return;
-      _toast('已保存安装目录：$saved${_restartSuffix(map)}', kind: ToastKind.success);
+      _toast(_s.settingsInstallDirSaved(saved, map['restartRequired'] == true),
+          kind: ToastKind.success);
     } catch (err) {
-      if (mounted) _toast('保存失败：$err', kind: ToastKind.error);
+      if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.error);
     } finally {
       if (mounted) setState(() => protocolSaving = false);
     }
@@ -2953,9 +3064,12 @@ class _SettingsPageState extends State<SettingsPage> {
       final kind = !changed
           ? ToastKind.info
           : (state == 'ready' ? ToastKind.success : ToastKind.warn);
-      _toast(note.isEmpty ? (action == 'start' ? '已请求启动' : '已请求停止') : note, kind: kind);
+      _toast(note.isEmpty ? (action == 'start' ? _s.settingsStartRequested : _s.settingsStopRequested) : note, kind: kind);
     } catch (err) {
-      if (mounted) _toast('${action == 'start' ? '启动' : '停止'}请求失败：$err', kind: ToastKind.error);
+      if (mounted) {
+        _toast(_s.settingsProtocolActionFailed(action == 'start', '$err'),
+            kind: ToastKind.error);
+      }
     } finally {
       if (mounted) setState(() => protocolBusy = false);
     }
@@ -2997,9 +3111,9 @@ class _SettingsPageState extends State<SettingsPage> {
       if (!mounted) return;
       setState(() {
         protocolInstalling = false;
-        protocolInstall = _ProtocolInstall.failed('安装请求失败：$err（请求没走到安装那一步，先确认主进程在跑）');
+        protocolInstall = _ProtocolInstall.failed(_s.settingsInstallRequestFailedHint('$err'));
       });
-      _toast('一键安装失败：原因见卡片', kind: ToastKind.error);
+      _toast(_s.settingsOneClickFailed, kind: ToastKind.error);
       return;
     }
 
@@ -3014,11 +3128,11 @@ class _SettingsPageState extends State<SettingsPage> {
       setState(() {
         protocolInstalling = false;
         protocolInstall = _ProtocolInstall.failed(
-          detail.isEmpty ? '安装失败，服务端没有给出原因（回执里没有 detail）' : detail,
+          detail.isEmpty ? _s.settingsInstallNoReason : detail,
           log: log,
         );
       });
-      _toast('一键安装失败：原因见卡片', kind: ToastKind.error);
+      _toast(_s.settingsOneClickFailed, kind: ToastKind.error);
       return;
     }
 
@@ -3048,7 +3162,7 @@ class _SettingsPageState extends State<SettingsPage> {
         ok: true,
         dir: saved,
         version: version,
-        detail: detail.isEmpty ? '已装好' : detail,
+        detail: detail.isEmpty ? _s.settingsInstalledOk : detail,
         log: log,
         writeError: writeError,
       );
@@ -3062,14 +3176,10 @@ class _SettingsPageState extends State<SettingsPage> {
     await _loadProtocolSide();
     if (!mounted) return;
     _toast(
-      writeError.isEmpty ? '已装好并用它配好了；重启一下就能用' : '已装好，但自动配置没写成：见卡片里的说明',
+      writeError.isEmpty ? _s.settingsInstalledConfigured : _s.settingsInstalledNotConfigured,
       kind: writeError.isEmpty ? ToastKind.success : ToastKind.warn,
     );
   }
-
-  /// 「需重启」后缀：**只信服务端算出来的那个结论**（它比较的是盘上那份与本进程启动时那份）。
-  /// 与当前生效一致时不该喊重启——喊多了这句话就不值钱了。
-  String _restartSuffix(Map<String, dynamic> map) => map['restartRequired'] == true ? '（重启进程后接管）' : '';
 
   // ── 分区七：外部回调（B9：webhook 专用凭据） ──
 
@@ -3093,42 +3203,41 @@ class _SettingsPageState extends State<SettingsPage> {
     final summary = webhookError != null
         ? null
         : (webhookSecret == null
-            ? (webhookLoading ? '读取中…' : null)
-            : (configured ? '已生成' : '还没有生成'));
+            ? (webhookLoading ? _s.settingsReading : null)
+            : (configured ? _s.settingsGenerated : _s.settingsNotGenerated));
     return _SectionCard(
-      title: '外部回调',
-      note: '外部系统往这台实例投递用的专用凭据（POST /webhook/*）。',
+      title: _s.settingsNavWebhook,
+      note: _s.settingsWebhookNote,
       trailing: summary == null ? null : _badge(summary, configured ? IrmiaTheme.ok : IrmiaTheme.warn),
       children: [
         if (webhookError != null) ...[
-          _footnote('凭据状态读取失败（$webhookError）。状态看不见时先别按"重新生成"：'
-              '轮换不可逆（旧的那份当场失效），而此刻你并不知道有没有人在用它。'),
+          _footnote(_s.settingsWebhookErrorHint('$webhookError')),
           Align(
             alignment: Alignment.centerLeft,
             child: TextButton(
               key: const ValueKey('webhook-retry'),
               onPressed: () => unawaited(_loadWebhookSecret()),
-              child: const Text('重试'),
+              child: Text(_s.retry),
             ),
           ),
         ],
         if (webhookSecret == null && webhookError == null)
-          _footnote('正在读取 webhook 凭据状态…'),
+          _footnote(_s.settingsWebhookLoading),
         if (webhookSecret != null) ...[
           _readOnlyRow(
-            '当前凭据',
-            configured ? '凭据 $secretId · 生成于 $createdAt' : '还没有生成',
+            _s.settingsWebhookCurrent,
+            configured ? _s.settingsWebhookCurrentValue(secretId, createdAt) : _s.settingsNotGenerated,
             restart: false,
             note: configured
                 ? null
-                : '这条通道现在一律 401（没有凭据就没人投得进来）。按下面的按钮生成一份。',
+                : _s.settingsWebhookNotConfiguredNote,
           ),
           if (configured)
             _readOnlyRow(
-              '上次轮换',
-              rotatedRaw.isEmpty ? '从未' : _stamp(rotatedRaw),
+              _s.settingsWebhookRotated,
+              rotatedRaw.isEmpty ? _s.settingsWebhookNever : _stamp(rotatedRaw),
               restart: false,
-              note: by.isEmpty ? null : '发起方：$by',
+              note: by.isEmpty ? null : _s.settingsWebhookBy(by),
             ),
           if (webhookRotatedNote.isNotEmpty) _footnote(webhookRotatedNote),
           const SizedBox(height: 14),
@@ -3144,7 +3253,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         height: 16,
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
-                    : Text(configured ? '重新生成' : '生成 webhook 凭据'),
+                    : Text(configured ? _s.settingsRegenerate : _s.settingsGenerateWebhook),
               ),
             ],
           ),
@@ -3160,10 +3269,10 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           child: SelectableText(_webhookCurl(), style: _mono(11.5, scheme.onSurface)),
         ),
-        _footnote('/webhook/* 不认界面凭据（也不认迁移期那份 data/.ui-token）：这条通道只认'
-            '上面那份专用凭据。它是给外部系统的——投得进来，读不到 /api/* 上的任何东西。'),
-        _footnote('凭据文件：${_secretText('file').isEmpty ? 'data/.webhook-secret.json' : _secretText('file')}'
-            '（盘上只有它的 sha256：原文只在你按下按钮那一次出现在屏幕上，之后再没人读得回来）。'),
+        _footnote(_s.settingsWebhookCredentialNote),
+        _footnote(_s.settingsWebhookFileNote(_secretText('file').isEmpty
+          ? 'data/.webhook-secret.json'
+          : _secretText('file'))),
       ],
     );
   }
@@ -3179,9 +3288,9 @@ class _SettingsPageState extends State<SettingsPage> {
     final host = _text('web.host').isEmpty ? '127.0.0.1' : _text('web.host');
     final port = _amount('web.port') == '—' ? '7788' : _amount('web.port');
     return 'curl -X POST http://$host:$port/webhook/alert \\\n'
-        '     -H "Authorization: Bearer <专用凭据>" \\\n'
+        '     -H "Authorization: Bearer ${_s.settingsWebhookCurlTokenPlaceholder}" \\\n'
         '     -H "Content-Type: application/json" \\\n'
-        "     -d '{\"level\":\"warn\",\"text\":\"磁盘快满了\"}'";
+        '     -d \'{"level":"warn","text":"${_s.settingsWebhookCurlSampleText}"}\'';
   }
 
   /// 生成 / 轮换 webhook 专用凭据（`POST /api/commands/regenerate-webhook-token`）。
@@ -3196,10 +3305,9 @@ class _SettingsPageState extends State<SettingsPage> {
     if (configured) {
       final go = await confirm(
         context,
-        title: '重新生成 webhook 凭据',
-        body: '上一份会当场失效：已经在用它的外部脚本会立刻开始收 401——记得把新凭据一起换过去。'
-            '新凭据只显示一次。',
-        confirmLabel: '重新生成',
+        title: _s.settingsRegenerateTitle,
+        body: _s.settingsRegenerateBody,
+        confirmLabel: _s.settingsRegenerate,
         danger: true,
       );
       if (!go || !mounted) return;
@@ -3221,12 +3329,12 @@ class _SettingsPageState extends State<SettingsPage> {
       if (!mounted) return;
       if (token.isEmpty) {
         // 服务端没给明文：那就没有"抄走"这回事，如实说（不猜、也不假装成功）
-        _toast('服务端没有回凭据原文，请再按一次；若反复如此，去看主进程日志', kind: ToastKind.error);
+        _toast(_s.settingsNoTokenReturned, kind: ToastKind.error);
         return;
       }
       setState(() {
         webhookRotatedNote =
-            action == 'rotate' ? '上一份已当场失效（还在用它的外部脚本会开始收 401）。' : '';
+            action == 'rotate' ? _s.settingsWebhookRotatedNote : '';
       });
       await showWebhookTokenDialog(
         context,
@@ -3236,7 +3344,7 @@ class _SettingsPageState extends State<SettingsPage> {
         previousSecretId: map['previousSecretId']?.toString(),
       );
     } catch (err) {
-      if (mounted) _toast('生成失败：$err', kind: ToastKind.error);
+      if (mounted) _toast(_s.settingsGenerateFailed('$err'), kind: ToastKind.error);
     } finally {
       if (mounted) setState(() => webhookRotating = false);
     }
@@ -3268,12 +3376,12 @@ class _SettingsPageState extends State<SettingsPage> {
     final enabled = _at(cfg, 'persona.memoryEnabled') != false;
     final pending = pendingRestart.contains('persona.memoryEnabled');
     return _SectionCard(
-      title: '记忆',
-      note: '长期记忆（MEMORIES/ 与 diary/）由谁维护：框架替你管，还是她自己读、自己写、自己整理。',
-      trailing: pending ? _badge('尚未生效', IrmiaTheme.warn) : null,
+      title: _s.settingsNavMemory,
+      note: _s.settingsMemoryNote,
+      trailing: pending ? _badge(_s.settingsNotInEffect, IrmiaTheme.warn) : null,
       children: [
         _FieldCell(
-          label: '让框架自动管记忆（关掉 = 她只知道自己有这些文件，读、写、整理全归她）',
+          label: _s.settingsMemoryEnableLabel,
           field: Align(
             alignment: Alignment.centerLeft,
             child: Switch(
@@ -3282,7 +3390,7 @@ class _SettingsPageState extends State<SettingsPage> {
               onChanged: _memorySaving ? null : (next) => unawaited(_saveMemoryEnabled(next)),
             ),
           ),
-          note: '开着：框架生成并维护 MEMORIES/INDEX.md，每轮把索引注入固定块，并每日整理一次。',
+          note: _s.settingsMemoryEnableNote,
         ),
         // 关掉时才出现的代价行：与卡头的说明分开，是因为它只在关掉这一种状态下成立
         if (!enabled) ...[
@@ -3291,21 +3399,15 @@ class _SettingsPageState extends State<SettingsPage> {
         ],
         const SizedBox(height: 12),
         _readOnlyRow(
-          '当前生效',
-          enabled ? '框架自动管记忆（每轮注入索引、每日整理）' : '她自己管（框架不生成、不注入、不整理）',
+          _s.settingsCurrentlyActive,
+          enabled ? _s.settingsMemoryOn : _s.settingsMemoryOff,
           restart: true,
         ),
-        _footnote('不受这个开关影响的两条路：MEMORIES/aliases.md 参与「会话认人 / 关注名单」'
-            '属于通道侧；STATE.md（她当前状态）是独立的一层。'),
-        _footnote('这一项是进程启动时读的：保存写进 config.json，重启后接管。'
-            '关掉不会删任何文件。'),
+        _footnote(_s.settingsMemoryUnaffectedNote),
+        _footnote(_s.settingsMemoryRestartNote),
         DetailFold(
           child: Text(
-            '关掉之后框架不生成、不注入、不整理，但她照旧能自己读写那些文件。'
-            '为什么留这个开关：给只想让 agent 自己管记忆的人一条干净的路。'
-            '每日整理的时间点由 wake.memoryMaintainCron 定（默认每日一次）：'
-            '过期的流水账并进 facts.md，另写一篇 diary/。'
-            'facts.md 的 !pinned 分区与条目 TTL 也归框架维护。',
+            _s.settingsMemoryDetail,
             style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
           ),
         ),
@@ -3327,7 +3429,7 @@ class _SettingsPageState extends State<SettingsPage> {
         border: Border.all(color: IrmiaTheme.warn.withValues(alpha: 0.28)),
       ),
       child: Text(
-        '代价：她可能忘记整理，facts.md 会一直长下去，索引也不再更新——这些都归她自己。',
+        _s.settingsMemoryCost,
         style: TextStyle(fontSize: 11.5, height: 1.7, color: scheme.onSurface),
       ),
     );
@@ -3355,9 +3457,9 @@ class _SettingsPageState extends State<SettingsPage> {
       );
       await _loadConfig(seed: true);
       if (!mounted) return;
-      _toast(value ? '已改为框架自动管记忆（重启后接管）' : '已改为她自己管记忆（重启后接管）');
+      _toast(value ? _s.settingsMemoryOnSaved : _s.settingsMemoryOffSaved);
     } catch (err) {
-      if (mounted) _toast('保存失败：$err', kind: ToastKind.warn);
+      if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.warn);
     } finally {
       if (mounted) setState(() => _memorySaving = false);
     }
@@ -3388,18 +3490,18 @@ class _SettingsPageState extends State<SettingsPage> {
     final root = _text('trust.workspaceRoot');
     final pending = _trustPending;
     return _SectionCard(
-      title: '信任范围',
-      note: '她的活动边界：整台电脑，或只有一个工作目录。越界就是拒绝，不是提醒。',
-      trailing: pending ? _badge('尚未生效', IrmiaTheme.warn) : null,
+      title: _s.settingsNavTrust,
+      note: _s.settingsTrustNote,
+      trailing: pending ? _badge(_s.settingsNotInEffect, IrmiaTheme.warn) : null,
       children: [
         _FieldCell(
-          label: '她能碰到多远',
+          label: _s.settingsTrustReachLabel,
           field: Column(
             children: [
               TrustModeChoice(
                 mode: kTrustFull,
                 selected: mode == kTrustFull,
-                consequence: trustModeConsequence(kTrustFull, root),
+                consequence: trustModeConsequence(_s, kTrustFull, root),
                 enabled: !_trustSaving,
                 onPick: (picked) => unawaited(_saveTrustMode(picked)),
               ),
@@ -3407,40 +3509,33 @@ class _SettingsPageState extends State<SettingsPage> {
               TrustModeChoice(
                 mode: kTrustWorkspace,
                 selected: mode == kTrustWorkspace,
-                consequence: trustModeConsequence(kTrustWorkspace, root),
+                consequence: trustModeConsequence(_s, kTrustWorkspace, root),
                 enabled: !_trustSaving,
                 onPick: (picked) => unawaited(_saveTrustMode(picked)),
               ),
             ],
           ),
-          note: '两档各自管什么写在选项里，改哪一档就按哪一档的后果算。',
+          note: _s.settingsTrustReachNote,
         ),
         const SizedBox(height: 12),
         // 只读的「当前生效」行：与「记忆」卡同形（服务端说了要重启就摆"需重启"，
         // 盘上那份与生效那份真的不一样时另有一行提示——见下面那条 footnote）
         _readOnlyRow(
-          '当前生效',
+          _s.settingsCurrentlyActive,
           mode == kTrustWorkspace
-              ? (root.isEmpty ? '只限工作目录（路径未读到）' : '只限工作目录 · $root')
-              : '完全信任（整台电脑）',
+              ? (root.isEmpty ? _s.settingsTrustWorkspaceUnknownPath : _s.settingsTrustWorkspaceValue(root))
+              : _s.settingsTrustFullValue,
           restart: true,
         ),
         if (pending)
-          _footnote('上面选的那一档还没生效：盘上已经写下了，但正跑着的这个进程用的仍是'
-              '启动时读到的那份——重启后接管。在那之前，她照旧按当前生效的那一档活动。'),
-        _footnote('工作目录由服务端算出来（默认 <配置目录>/workspace），界面上不手填：'
-            '同一条边界写两个值，就一定会出现"配置说 A、实际拦在 B"。'),
-        _footnote('它是边界，不是提醒：越界的读写与命令一律被拒绝。'),
+          _footnote(_s.settingsTrustPendingNote),
+        _footnote(_s.settingsTrustRootNote),
+        _footnote(_s.settingsTrustBoundaryNote),
         DetailFold(
           // 定位件：设置页上「详情」不止一处，用例要的是"信任范围卡里这一处"
           key: const ValueKey('trust-rules-fold'),
           child: Text(
-            '它管 fs 工具族（safe_read / safe_write / safe_edit / rg_search 等）与 pwsh：'
-            '前者经同一条路径判定，后者的 workdir 与命令行里的路径一起受管。'
-            '它与 destructive 开关、pwsh 命令黑名单是各自独立的三道门——这一条管的是范围，'
-            '不代替那两道。\n'
-            '为什么默认完全信任：她是一台无人值守的常驻 agent，"能自己去找、去修、去装"本来'
-            '就是她存在的方式；默认把她关进一个空目录，等于出厂就让她大多数本事用不出来。',
+            _s.settingsTrustRulesDetail,
             style: TextStyle(fontSize: 11.5, height: 1.6, color: scheme.onSurfaceVariant),
           ),
         ),
@@ -3482,10 +3577,11 @@ class _SettingsPageState extends State<SettingsPage> {
     if (mode == kTrustFull) {
       final ok = await confirm(
         context,
-        title: '改成完全信任',
-        body: '改成完全信任之后：${trustModeConsequence(kTrustFull, _text('trust.workspaceRoot'))}'
-            '这是一条边界，撤掉它她是真的能做到上面这些事。确定吗？',
-        confirmLabel: '改成完全信任',
+        title: _s.settingsTrustFullTitle,
+        body: _s.settingsTrustFullBody(
+                trustModeConsequence(_s, kTrustFull, _text('trust.workspaceRoot'))) +
+            _s.settingsTrustFullConfirmTail,
+        confirmLabel: _s.settingsTrustFullTitle,
         danger: true,
       );
       if (ok != true || !mounted) return;
@@ -3508,11 +3604,11 @@ class _SettingsPageState extends State<SettingsPage> {
       if (!mounted) return;
       _toast(
         mode == kTrustWorkspace
-            ? '已改为只限工作目录；越界的读写与命令会被拒绝（重启进程后接管）'
-            : '已改为完全信任（重启进程后接管）',
+            ? _s.settingsTrustWorkspaceSaved
+            : _s.settingsTrustFullSaved,
       );
     } catch (err) {
-      if (mounted) _toast('保存失败：$err', kind: ToastKind.warn);
+      if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.warn);
     } finally {
       if (mounted) setState(() => _trustSaving = false);
     }
@@ -3538,16 +3634,14 @@ class _SettingsPageState extends State<SettingsPage> {
   ///   · tools.destructiveEnabled —— "她能碰什么"的危险开关，只在带确认短语的那一处改。
   Widget _systemCard() {
     return _SectionCard(
-      title: '系统',
+      title: _s.settingsNavSystem,
       // 卡头原来挂「只读」，脚注写着"修改请编辑 config.json"——⑪ 之后这两句都会变成假话。
       //
       // 这句话**同时也是这一页测试的定位锚**（`inSystemCard` 按它找卡——`find.textContaining`
       // 只取第一个 Container 祖先，所以这句必须**只出现一次**）。2026-10-05 加"心跳"两个字时
       // 顺手把它写成了"监听地址、时区、六条预算与心跳的平均间隔"——那正好把「监听地址」那一行的
       // 标签也变成了候选，锚点于是指到了行上，五条系统卡用例一起红。**别再往这句里塞行标签**。
-      note: '监听地址、时区、六条预算与心跳都是这个进程的启动参数：'
-          '在这里改，保存写进 config.json，重启后生效。'
-          '压缩线那一行例外——它写完立刻生效（服务端在同一个临界区里也改了内存那份）。',
+      note: _s.settingsSystemNote,
       children: [
         // 默认露前 4 行（最常看/最常调的先摆），其余 7 行收在「查看全部」后面
         // （用户 ⑭："平时可能只暴露几项，可以全部展开"）。展开/收起由 CappedChildren 自带。
@@ -3560,11 +3654,10 @@ class _SettingsPageState extends State<SettingsPage> {
             // 两条只读行与可编辑行**同族同壳**，只是不给胶囊、也不挂「需重启」（改不了的行
             // 喊重启没意义）；"为什么改不了"就写在它们自己那一行的灰字里。
             _readOnlyRow(
-              '数据目录',
+              _s.settingsDataDir,
               _text('dataDir'),
               restart: false,
-              note: '启动时定下的路径：事件日志、人格资产与密钥都在它下面，'
-                  '换它等于让下一个进程从空目录开始。',
+              note: _s.settingsDataDirNote,
             ),
             _sysEditRow('budget.stepTools'),
             _sysEditRow('budget.turnSteps'),
@@ -3584,8 +3677,7 @@ class _SettingsPageState extends State<SettingsPage> {
             _destructiveRow(),
           ],
         ),
-        _footnote('数据目录在这里改不了（它决定她的全部身家落在哪，且进程启动时就定下了）；'
-            '其余字段保存后重启进程生效——压缩线那一行除外，它保存完就当拍接管。'),
+        _footnote(_s.settingsSystemFootnote),
       ],
     );
   }
@@ -3601,7 +3693,7 @@ class _SettingsPageState extends State<SettingsPage> {
     final fields = _sysRowFields[id]!;
     final editing = _sysEditing.contains(id);
     final shown = value ?? _sysValue(fields.first);
-    final note = fields.first.note;
+    final note = settingsSysNote(_s, fields.first.path);
     return Container(
       margin: const EdgeInsets.only(top: 8),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -3617,7 +3709,8 @@ class _SettingsPageState extends State<SettingsPage> {
               // 标签列宽度与只读行一模一样（200）：两种行才对得齐
               SizedBox(
                 width: 200,
-                child: Text(fields.first.label, style: const TextStyle(fontSize: 12.5)),
+                child: Text(settingsSysLabel(_s, fields.first.path),
+                    style: const TextStyle(fontSize: 12.5)),
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -3639,11 +3732,11 @@ class _SettingsPageState extends State<SettingsPage> {
               //   · 「需重启」  = 这一类字段是启动参数，改完要重启进程才接管（常态说明）。
               // 两条只读行不挂（⑭ 的原话：改不了的行喊重启没意义）。
               if (fields.any((field) => field.live))
-                _badge('立刻生效', scheme.primary)
+                _badge(_s.settingsLiveNow, scheme.primary)
               else if (_rowPending(fields))
-                _badge('尚未生效', IrmiaTheme.warn)
+                _badge(_s.settingsNotInEffect, IrmiaTheme.warn)
               else
-                _badge('需重启', IrmiaTheme.warn),
+                _badge(_s.settingsRestartRequired, IrmiaTheme.warn),
               const SizedBox(width: 10),
               if (editing) ..._sysRowActions(id, fields) else _sysEditPill(id),
             ],
@@ -3690,7 +3783,7 @@ class _SettingsPageState extends State<SettingsPage> {
         minimumSize: const Size(0, 28),
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
       ),
-      child: const Text('编辑'),
+      child: Text(_s.settingsEdit),
     );
   }
 
@@ -3704,7 +3797,7 @@ class _SettingsPageState extends State<SettingsPage> {
         style: _sysRowBtnStyle(),
         child: _sysSaving
             ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
-            : const Text('保存'),
+            : Text(_s.save),
       ),
       const SizedBox(width: 4),
       TextButton(
@@ -3716,7 +3809,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   _sysEditing.remove(id);
                 }),
         style: _sysRowBtnStyle(),
-        child: const Text('取消'),
+        child: Text(_s.cancel),
       ),
     ];
   }
@@ -3779,23 +3872,21 @@ class _SettingsPageState extends State<SettingsPage> {
     // 改密码与登出在服务端都做不成——如实写在按钮上面，并把出路（设置密码）一起摆出来。
     final legacy = state.onLegacyToken;
     return _SectionCard(
-      title: '账号与安全',
-      note: '进来这个界面用的凭据：改密码与登出。',
+      title: _s.settingsNavAccount,
+      note: _s.settingsAccountNote,
       trailing: _badge(
-        legacy ? '旧的共享 token' : '会话凭据',
+        legacy ? _s.settingsAccountLegacyBadge : _s.settingsAccountSessionBadge,
         legacy ? IrmiaTheme.warn : IrmiaTheme.ok,
       ),
       children: [
         _readOnlyRow(
-          '当前实例',
+          _s.settingsAccountInstance,
           state.instance ?? '',
           restart: false,
-          note: '凭据按实例分文件存（%APPDATA%\\Irmia\\sessions）：同一台机器上开第二个实例'
-              '不会把这一份顶掉。',
+          note: _s.settingsAccountInstanceNote,
         ),
         if (legacy)
-          _footnote('这一份用的是旧的共享 token（这台实例还没设过密码），服务端不认它开出的'
-              '"会话"：改密码与登出都做不成。先设置一个密码，之后按会话登录/登出。'),
+          _footnote(_s.settingsAccountLegacyNote),
         const SizedBox(height: 14),
         Wrap(
           spacing: 10,
@@ -3808,7 +3899,7 @@ class _SettingsPageState extends State<SettingsPage> {
               // 而理由就写在它上面一行
               onPressed: legacy ? null : () => unawaited(_openChangePassword()),
               style: _btnStyle(context),
-              child: const Text('改密码'),
+              child: Text(_s.settingsChangePassword),
             ),
             OutlinedButton(
               key: const ValueKey('account-logout'),
@@ -3819,13 +3910,13 @@ class _SettingsPageState extends State<SettingsPage> {
                 minimumSize: const Size(0, 36),
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),
-              child: const Text('登出'),
+              child: Text(_s.settingsLogout),
             ),
             if (legacy)
               TextButton(
                 key: const ValueKey('account-setup-password'),
                 onPressed: () => state.openPasswordSetup(),
-                child: const Text('先去设置密码'),
+                child: Text(_s.settingsSetPasswordFirst),
               ),
           ],
         ),
@@ -3836,7 +3927,7 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 打开「改密码」；改成了就在这一页上留一句提示（对话框那一刻已经收起来了）
   Future<void> _openChangePassword() async {
     final changed = await showChangePasswordDialog(context, widget.state);
-    if (changed && mounted) _toast('密码已改；这台界面已经换上新凭据', kind: ToastKind.success);
+    if (changed && mounted) _toast(_s.settingsPasswordChanged, kind: ToastKind.success);
   }
 
   /// 登出：危险操作，走项目既有的 confirm（灰取消 / 红确认）。
@@ -3846,9 +3937,9 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _logoutAccount() async {
     final go = await confirm(
       context,
-      title: '登出',
-      body: '退出这个界面并回到门上；本机这份会话凭据会被清掉——下次要用密码进来。',
-      confirmLabel: '登出',
+      title: _s.settingsLogout,
+      body: _s.settingsLogoutBody,
+      confirmLabel: _s.settingsLogout,
       danger: true,
     );
     if (!go || !mounted) return;
@@ -3860,24 +3951,24 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget _aboutCard() {
     final scheme = Theme.of(context).colorScheme;
     return _SectionCard(
-      title: '关于',
-      note: '界面版本与运行期投影数据。',
-      trailing: Text('Flutter 原生界面', style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
+      title: _s.settingsNavAbout,
+      note: _s.settingsAboutNote,
+      trailing: Text(_s.settingsAboutBadge, style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant)),
       children: [
-        _readOnlyRow('版本', guiVersion, restart: false),
+        _readOnlyRow(_s.settingsVersionLabel, guiVersion, restart: false),
         const SizedBox(height: 12),
         // 守护天数与事件水位属运行期技术字段：默认收在「详情」里（§3.4）
         DetailFold(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              DetailRow(label: '守护天数', value: _guardedDays()),
-              DetailRow(label: '事件水位', value: _watermark()),
+              DetailRow(label: _s.settingsGuardedDays, value: _guardedDays()),
+              DetailRow(label: _s.settingsWatermark, value: _watermark()),
               const SizedBox(height: 10),
               if (projError != null)
-                _footnote('运行数据读取失败（$projError），守护天数与事件水位不可用。')
+                _footnote(_s.settingsProjectionReadFailedHint('$projError'))
               else
-                _footnote('守护天数与事件水位取自运行期投影（GET /api/projection），为实测值。'),
+                _footnote(_s.settingsProjectionFootnote),
             ],
           ),
         ),
@@ -3891,7 +3982,7 @@ class _SettingsPageState extends State<SettingsPage> {
     final days = _daysSince(first);
     if (days == null) return '—';
     final stamp = _stamp(first);
-    return stamp == '—' ? '$days 天' : '$days 天（自 $stamp）';
+    return stamp == '—' ? _s.settingsDaysCount('$days') : _s.settingsDaysSince('$days', stamp);
   }
 
   /// 事件水位：watermark 缺失时退回 lastSeq（与 Web 端同口径）
@@ -3928,7 +4019,7 @@ class _SettingsPageState extends State<SettingsPage> {
       child: Row(
         children: [
           const SizedBox(width: 2),
-          Text('destructive 工具策略', style: const TextStyle(fontSize: 12.5)),
+          Text(_s.settingsDestructivePolicy, style: const TextStyle(fontSize: 12.5)),
           const SizedBox(width: 10),
           Text(label, style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
           const Spacer(),
@@ -3937,7 +4028,7 @@ class _SettingsPageState extends State<SettingsPage> {
               padding: EdgeInsets.only(right: 8),
               child: SizedBox(width: 13, height: 13, child: CircularProgressIndicator(strokeWidth: 2)),
             ),
-          TextButton(onPressed: _destrSaving ? null : () => unawaited(_pickDestructivePolicy(value)), child: const Text('修改')),
+          TextButton(onPressed: _destrSaving ? null : () => unawaited(_pickDestructivePolicy(value)), child: Text(_s.settingsModify)),
         ],
       ),
     );
@@ -3950,19 +4041,19 @@ class _SettingsPageState extends State<SettingsPage> {
     final choice = await showDialog<String>(
       context: context,
       builder: (ctx) => SimpleDialog(
-        title: const Text('destructive 工具策略'),
+        title: Text(_s.settingsDestructivePolicy),
         children: [
           SimpleDialogOption(
             onPressed: () => Navigator.pop(ctx, 'none'),
-            child: const Text('全关（一件都不给她看）'),
+            child: Text(_s.settingsPolicyNoneOption),
           ),
           SimpleDialogOption(
             onPressed: () => Navigator.pop(ctx, 'all'),
-            child: const Text('全开（清单里全给）'),
+            child: Text(_s.settingsPolicyAllOption),
           ),
           SimpleDialogOption(
             onPressed: () => Navigator.pop(ctx, 'list'),
-            child: const Text('按名单（只给勾中的那几件）'),
+            child: Text(_s.settingsPolicyListOption),
           ),
         ],
       ),
@@ -3986,12 +4077,12 @@ class _SettingsPageState extends State<SettingsPage> {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setInner) => AlertDialog(
-          title: const Text('按名单开放'),
+          title: Text(_s.settingsPolicyListTitle),
           content: SizedBox(
             width: 420,
             height: 380,
             child: tools.isEmpty
-                ? const Text('没拿到工具清单（注册表可能还没起来）——先去「扩展 · 工具」看一眼再回来。',
+                ? Text(_s.settingsPolicyNoTools,
                     style: TextStyle(fontSize: 12.5))
                 : ListView(
                     children: [
@@ -4012,10 +4103,10 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: Text(_s.cancel)),
             FilledButton(
               onPressed: () => Navigator.pop(ctx, selected.toList()),
-              child: Text('保存（${selected.length} 件）'),
+              child: Text(_s.settingsPolicySave(selected.length)),
             ),
           ],
         ),
@@ -4044,10 +4135,10 @@ class _SettingsPageState extends State<SettingsPage> {
     final relaxed = value == true || (value is List && value.isNotEmpty);
     final ok = await confirm(
       context,
-      title: '修改 destructive 工具策略',
+      title: _s.settingsDestructiveTitle,
       body: relaxed
-          ? '这会让她能看到并调用会改动本机的工具（写文件、跑命令等）。确定吗？'
-          : '改回受限档：她将看不到 destructive 工具（更安全）。确定吗？',
+          ? _s.settingsDestructiveRelaxedBody
+          : _s.settingsDestructiveRestrictedBody,
     );
     if (ok != true || !mounted) return;
     setState(() => _destrSaving = true);
@@ -4059,9 +4150,9 @@ class _SettingsPageState extends State<SettingsPage> {
       );
       await _loadConfig(seed: true);
       if (!mounted) return;
-      _toast('已保存（重启后接管）');
+      _toast(_s.settingsSavedRestartNote);
     } catch (err) {
-      if (mounted) _toast('保存失败：$err', kind: ToastKind.warn);
+      if (mounted) _toast(_s.settingsSaveFailed('$err'), kind: ToastKind.warn);
     } finally {
       if (mounted) setState(() => _destrSaving = false);
     }
@@ -4070,9 +4161,13 @@ class _SettingsPageState extends State<SettingsPage> {
   /// destructive 工具策略三态（与 Web 端 policyLabel 同一口径）
   String _policy() {
     final value = _at(cfg, 'tools.destructiveEnabled');
-    if (value == true) return '全开';
-    if (value is List) return value.isEmpty ? '按名单（空）' : '按名单（${value.length} 项）';
-    return '全关';
+    if (value == true) return _s.settingsPolicyAll;
+    if (value is List) {
+      return value.isEmpty
+          ? _s.settingsPolicyListEmpty
+          : _s.settingsPolicyListCount(value.length);
+    }
+    return _s.settingsPolicyNone;
   }
 
   // ── 基础小组件（与 channels_page 同一套卡片语言） ──
@@ -4104,7 +4199,7 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
               if (restart) ...[
                 const SizedBox(width: 10),
-                _badge('需重启', IrmiaTheme.warn),
+                _badge(_s.settingsRestartRequired, IrmiaTheme.warn),
               ],
             ],
           ),
@@ -4256,6 +4351,37 @@ class _FieldPair extends StatelessWidget {
   }
 }
 
+/// 系统卡一格的**标签**（点路径 → 文案）。点路径是布局判据，永不翻译。
+String settingsSysLabel(AppStrings s, String path) => switch (path) {
+      'web.host' => s.settingsSysHostLabel,
+      'web.port' => s.settingsSysPortLabel,
+      'timezone' => s.settingsSysTimezoneLabel,
+      'budget.stepTools' => s.settingsSysStepToolsLabel,
+      'budget.turnSteps' => s.settingsSysTurnStepsLabel,
+      'budget.taskTokens' => s.settingsSysTaskTokensLabel,
+      'budget.dailyTokens' => s.settingsSysDailyTokensLabel,
+      'budget.softRatio' => s.settingsSysSoftRatioLabel,
+      'budget.failStreakMax' => s.settingsSysFailStreakLabel,
+      'wake.heartbeatTargetMeanMin' => s.settingsSysHeartbeatLabel,
+      'persona.compactionThresholdTokens' => s.settingsSysCompactionLabel,
+      _ => path,
+    };
+
+/// 系统卡一格的**旁注**（没有旁注的格子返回 null）。
+String? settingsSysNote(AppStrings s, String path) => switch (path) {
+      'web.host' => s.settingsSysHostNote,
+      'timezone' => s.settingsSysTimezoneNote,
+      'budget.stepTools' => s.settingsSysStepToolsNote,
+      'budget.turnSteps' => s.settingsSysTurnStepsNote,
+      'budget.taskTokens' => s.settingsSysTaskTokensNote,
+      'budget.dailyTokens' => s.settingsSysDailyTokensNote,
+      'budget.softRatio' => s.settingsSysSoftRatioNote,
+      'budget.failStreakMax' => s.settingsSysFailStreakNote,
+      'wake.heartbeatTargetMeanMin' => s.settingsSysHeartbeatNote,
+      'persona.compactionThresholdTokens' => s.settingsSysCompactionNote,
+      _ => null,
+    };
+
 /// 锚点栏的小标题：给左侧列表一个名分，避免四条孤立条目
 class _AnchorCaption extends StatelessWidget {
   const _AnchorCaption();
@@ -4264,7 +4390,7 @@ class _AnchorCaption extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Text(
-      '分区',
+      IrmiaStrings.of(context).settingsAnchorCaption,
       style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: scheme.onSurfaceVariant),
     );
   }

@@ -1093,7 +1093,7 @@ test('关掉 useMarkdown：直接纯文本，不多花一次失败请求', async
 test('正文里的官方 at 串逐字节原样出站：markdown 与纯文本两种 msg_type 都不动它', async () => {
   // 官方文档《文本交互》：嵌入文本用 `<qqbot-at-user id="" />`（旧协议 `<@userid>` 即将弃用），
   // 且**文本消息与 markdown 消息都支持它**——所以"这一串"与 `msg_type` 是两件事，谁都不许动谁。
-  const raw = '<qqbot-at-user id="B01F025D72D3B2075F49EFB08297D105" /> 一号，收到回个话';
+  const raw = '<qqbot-at-user id="00000000000000000000000000000004" /> 一号，收到回个话';
 
   const mdHttp = makeFakeHttp(() => ({ status: 200, text: JSON.stringify({ id: 'M-AT' }), body: { id: 'M-AT' } }));
   const mdSender = new QqMessageSender({
@@ -1487,10 +1487,10 @@ test('事件映射：全量群消息（GROUP_MESSAGE_CREATE）不再被丢掉', 
   // ① @ 标记：三种形状都换成 `@…尾四位`
   const atMarkup = mapDispatchToWakeChannel('GROUP_AT_MESSAGE_CREATE', {
     id: 'M4', group_openid: 'G1', author: { member_openid: 'P1' },
-    content: '<@23757A4ED946257ECBB87585D20A9F56> 看这个，还有 <@!AABBCCDDEEFF0011> 和 '
+    content: '<@00000000000000000000000000000006> 看这个，还有 <@!AABBCCDDEEFF0011> 和 '
       + '<qqbot-at-user id="1122334455667788" /> 也在',
   });
-  assert.ok(atMarkup?.text.includes('@…9F56'), `@ 要可读化：${atMarkup?.text}`);
+  assert.ok(atMarkup?.text.includes('@…0006'), `@ 要可读化：${atMarkup?.text}`);
   assert.ok(atMarkup?.text.includes('@…0011') && atMarkup?.text.includes('@…7788'),
     '另外两种形状同样处理');
   assert.equal(atMarkup?.text.includes('<@'), false, '不许把 markup 原样留给她');

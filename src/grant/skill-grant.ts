@@ -24,7 +24,7 @@ import { join } from 'node:path';
 import { SKILL_BODY_MAX_CHARS, SKILL_DESCRIPTION_MAX_CHARS, SKILL_FILE_NAME, SkillManager, skillNameProblem } from '../skill/skills.ts';
 import { SKILL_TRASH_DIR } from '../web/server.ts';
 import { compactTimestamp } from '../tools/fs/text-codec.ts';
-import { sanitizeGrantLine } from './mcp-grant.ts';
+import { sanitizeGrantLine, type GrantWakeFacts } from './mcp-grant.ts';
 
 /** 一份申请单里 `files[]` 的条数上限（方案稿建议 32；够一个技能带参考文档与几个脚本） */
 export const SKILL_GRANT_MAX_FILES = 32;
@@ -223,6 +223,10 @@ export function skillGrantContextOf(request: SkillGrantRequest): string {
   const lines: string[] = [];
   if (request.kind === 'skill-install') {
     lines.push(`它会做什么：${request.description}`);
+    // **来源**（用户的第 ② 条要"批准时看得到清单"）：这一行说清"这些字是谁写的"——
+    // 名字 / 描述 / 正文 / 随包文件全部来自她递的那张单子，框架只校验、不替她编一句。
+    lines.push('来源：这份申请单是**她自己写的**（名字、描述、正文、随包文件都来自那张单子）；'
+      + '框架只校验格式与安全边界，一个字都没替她补。');
     const scripts = skillScriptNames(request.files);
     const others = request.files.filter((file) => !file.path.startsWith('scripts/'));
     if (scripts.length > 0) {
@@ -230,12 +234,24 @@ export function skillGrantContextOf(request: SkillGrantRequest): string {
       lines.push(`风险点：它带 ${scripts.length} 个**可执行脚本**（scripts/）：${scripts.join('、')}`
         + '——装了之后她会照这个技能的指示做，而这些脚本是会被跑起来的东西。');
     }
-    if (others.length > 0) lines.push(`另外还带 ${others.length} 个文件：${others.map((f) => f.path).join('、')}`);
+    if (others.length > 0) {
+      const bytes = others.reduce((sum, file) => sum + Buffer.byteLength(file.content, 'utf8'), 0);
+      lines.push(`另外还带 ${others.length} 个文件（共 ${Math.max(1, Math.round(bytes / 1024))} KB）：`
+        + `${others.map((f) => f.path).join('、')}`);
+    }
+    // **可信的"不会自动跑"这一句**（用户这一轮问的就是这个）：它必须写在卡上，
+    // 因为人真正怕的是"批一下就执行了"。判据：技能进的是**说明与文件**，本仓库里
+    // 没有任何地方会执行 SKILL.md 里的指令，也没有任何地方会替她跑 `scripts/` 里的东西
+    // ——唯一能跑它的是她自己调 `pwsh`（那是另一条有门的路，见 docs/design.md §4.19）。
+    lines.push('**不会自动执行**：批准只是把这个目录装进来（外加一条信任门凭据）；'
+      + '框架不会执行 SKILL.md 里的指令，也不会替她跑 scripts/ 里的脚本'
+      + '——要跑只能是她自己调 pwsh（那条路另有门）。');
     lines.push(`正文 ${Buffer.byteLength(skillFileText(request), 'utf8')} 字节（SKILL.md）。`);
     lines.push(
       '批准之后：由 framework 建 skills/' + request.name + '/ 并写 SKILL.md（内容逐字照这份单子），'
       + '随后写一条 skill/installed{by:"human"} —— 那是**信任门**的凭据，'
-      + '写了它这个技能才进得了她下一拍的 catalog（不写就等于"装了但她看不见"）。',
+      + '写了它这个技能才进得了她下一拍的 catalog（不写就等于"装了但她看不见"），'
+      + '而**索引**要到下一次归集（压缩/重启）才改字节（与 MCP 索引同一套缓存保护）。',
     );
   } else {
     lines.push(
@@ -251,6 +267,83 @@ export function skillGrantContextOf(request: SkillGrantRequest): string {
   if (request.reason !== '') lines.push(`她写的理由：${request.reason}`);
   lines.push('不点会怎样：超时只落一条「未批准、未拒绝」的事实，这张单子原地不动，你回来照样能批。');
   return lines.join('\n');
+}
+
+// ──────────────────────────────── 结局：通知与回执（与 MCP 那两句**同一处形状**） ────────────────────────────────
+
+/**
+ * 技能那一支的 `what`（"被批/被驳的是哪件事"）：**与问题那一句同一个动词**
+ * （`skillGrantQuestionOf` 说的是"批准装一个技能「x」？"），两处各写一套迟早说成两件事。
+ */
+function skillWhatOf(kind: 'skill-install' | 'skill-remove', name: string): string {
+  return kind === 'skill-install' ? `装一个技能「${name}」` : `删掉技能「${name}」`;
+}
+
+/**
+ * 被她读的那句话（`wake/manual{via:'grant'}` 的 note）——技能那一支。
+ *
+ * **与 `mcp-grant.ts` 的 `grantWakeNoteOf` 逐段同形**（同一处调用点、同一条路径、同一种口气）：
+ * 被驳了怎么说、批了并且落地了怎么说、批了但没落地怎么说。技能特有的只有三件事实：
+ *   · 落地的是**目录**（不是 config.json 的某一段），所以"去哪儿看"要说成 SKILL.md；
+ *   · 过了信任门还得**归集**才进索引（与 MCP 索引同一条缓存保护，见 `real-loop.skillIndexSync`）；
+ *   · 删是**进回收站**（可逆），所以要把"怎么恢复"一起说了。
+ *
+ * 装成功那一支还会如实说清**脚本有没有被跑**（用户这一轮点名的安全项）：框架一个都不执行，
+ * `scripts/` 里那些东西要不要跑是她的判断。没有脚本时那句根本不出现（不编）。
+ */
+export function skillGrantWakeNoteOf(facts: GrantWakeFacts): string {
+  const kind = facts.kind === 'skill-remove' ? 'skill-remove' : 'skill-install';
+  const what = skillWhatOf(kind, facts.name);
+  if (facts.outcome === 'rejected') {
+    // 与 MCP 那一支**逐字同形**的判断：这是人的决定、他没写理由也不是没人理、下一步怎么做
+    const reason = facts.reason === null || facts.reason === ''
+      ? '他**没有写理由**——这是他的决定，不是没人理你。'
+      : `他写的理由是：「${facts.reason}」。`;
+    return `你那张申请单（${what}，id=${facts.id}）**被驳回了**。${reason}`
+      + '这是否决，不要再自行去做这件事；要再提，先把理由里的问题解决掉，或者换个做法重提一张单子。';
+  }
+  if (facts.exec.state !== 'ok') {
+    return `你那张申请单（${what}，id=${facts.id}）**已被批准，但执行没有成功**：`
+      + `${facts.exec.failure ?? '框架没给出原因。'}`
+      + '这不是"被驳回"，也不是"已经装好了"——要接着办就看上面那句原因，改好之后再提一张单子。';
+  }
+  // **索引那两句与 MCP 那条逐字同一口径**：字节不会立刻变（索引只在重大变化点归集），
+  // 变化走的是尾部追加——这条唤醒就是那条追加。
+  const indexNote = '你的常驻技能索引不会立刻改字节（索引只在重大变化点归集，加删技能走的是尾部追加，'
+    + '这条唤醒就是那条追加）';
+  if (kind === 'skill-remove') {
+    return `你那张申请单（${what}，id=${facts.id}）**已被批准并且执行成功**：`
+      + `整个目录已经移进回收站（${facts.exec.landed ?? facts.name}），内容一个字节没改，`
+      + '要恢复把它移回技能根即可。'
+      + `${indexNote} ⇒ **下一次归集（压缩/重启）之后**索引里那一行才会消失；`
+      + '在那之前索引里还留着它的名字，那是旧快照，不是它还在。';
+  }
+  const scripts = facts.scriptCount ?? 0;
+  const scriptNote = scripts > 0
+    ? `它带 ${scripts} 个可执行脚本（名单在你批准的那张卡上）——框架**没有执行**其中任何一个，`
+      + '要不要跑由你判断。'
+    : '';
+  return `你那张申请单（${what}，id=${facts.id}）**已被批准并且执行成功**：`
+    + `${facts.exec.landed ?? facts.name} 已经建在技能根里（SKILL.md 与随包文件逐字照那份单子），`
+    + '并且写了一条 skill/installed{by:"human"} —— 那是信任门的凭据，写了它这个技能才算数。'
+    + scriptNote
+    + `${indexNote} ⇒ **下一次归集（压缩/重启）之后**它才会出现在索引里；`
+    + `在那之前要读它的正文就直接 safe_read skills/${facts.name}/SKILL.md。`;
+}
+
+/** 一行回执（HTTP 应答里那一格，人/她都读得到）：与 MCP 那支同一形状 */
+export function skillGrantReceiptLine(facts: GrantWakeFacts): string {
+  if (facts.outcome === 'rejected') {
+    return facts.reason === null || facts.reason === ''
+      ? '人驳回了这张申请单，没有给理由。'
+      : `人驳回了这张申请单，理由是：${facts.reason}`;
+  }
+  if (facts.exec.state !== 'ok') {
+    return `人批准了，但框架执行没成功：${facts.exec.failure ?? '（没有原因）'}`;
+  }
+  return facts.kind === 'skill-remove'
+    ? '人批准了，框架已经把技能目录移进回收站（可逆）。'
+    : '人批准了，框架已经把技能装进技能根并落了信任门凭据。';
 }
 
 // ──────────────────────────────── 落地（**批准之后**才走这里） ────────────────────────────────

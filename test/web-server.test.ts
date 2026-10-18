@@ -40,6 +40,8 @@ import type { AppEvent, Projection } from '../src/log/types.js';
 import { defaultVisibility, emptyProjection } from '../src/log/types.ts';
 import { ensurePersonaSeeds } from '../src/persona/loader.ts';
 import { ensureMemorySeeds } from '../src/persona/memory-maintain.ts';
+import { sha256Hex } from '../src/persona/versions.ts';
+import { SkillManager } from '../src/skill/skills.ts';
 import { applyOne, finalizePressure } from '../src/state/fold.ts';
 import { ToolRegistry } from '../src/tools/registry.ts';
 import { TimerStore } from '../src/wake/timer-store.ts';
@@ -690,6 +692,118 @@ test('GET /api/replay：重建请求体并给出三指纹与当时用量', async
 
   const badArgs = await call(fx, '/api/replay?turn=abc&step=1');
   assert.equal(badArgs.status, 400);
+});
+
+test('GET /api/replay：三刀（框架唤醒/框架指令/子链）不进预览、技能索引与运行期同源', async (t) => {
+  // 预览这条路的两个洞（REVIEW P1-16 / P1-17）：
+  //   · 技能索引**整段没传**过 deriveRequest（缺省 null = "没有可用技能"，不报错，少 555 token）；
+  //   · 过滤是**自己写的一份**（只扣 `seq < stepStart` 与本轮 wake），运行期那三刀一刀都没有
+  //     ⇒ 预览里会多出整理唤醒行、框架指令行与子代理链的事件。
+  // 这条用例两个方向都钉：该在的（技能索引）在，且与运行期**同一个 SkillManager** 算出的那一份
+  // 逐字节相同；不该在的（三刀挡掉的）一条都不在。
+  const fx = await setup(t);
+  const ALPHA = '---\n'
+    + 'name: alpha-search\n'
+    + 'description: 搜网页与站内内容并按相关性排序，返回标题、链接与摘要；查资料、验证事实时用。\n'
+    + '---\n\n# alpha-search\n\n正文。\n';
+  const BETA = '---\n'
+    + 'name: beta-unconfirmed\n'
+    + 'description: 没写过 skill/installed 的技能：信任门不放行，预览里也不许出现。\n'
+    + '---\n\n# beta-unconfirmed\n\n正文。\n';
+  for (const [name, text] of [['alpha-search', ALPHA], ['beta-unconfirmed', BETA]] as const) {
+    mkdirSync(join(fx.dir, 'skills', name), { recursive: true });
+    writeFileSync(join(fx.dir, 'skills', name, 'SKILL.md'), text, 'utf8');
+  }
+  const installed = fx.append('skill/installed', {
+    name: 'alpha-search', path: 'skills/alpha-search', by: 'human', contentHash: sha256Hex(ALPHA),
+  });
+  // 运行期那一份（`main.ts` 建在 baseRoot 上的同一个类 + 启动时折全部信任事件）
+  const manager = new SkillManager({ baseRoot: fx.dir });
+  manager.setTrustEvents([installed]);
+  const catalogText = manager.catalogText();
+  assert.ok(catalogText.startsWith('[可用技能]'), '夹具的运行期 catalog 必须非空');
+
+  // 「日志里有、但当时没进她的上下文」的三条：整理唤醒 / 框架指令 / 子代理链
+  const appendRaw = (type: string, data: unknown, extra: { parentCallId?: string } = {}): AppEvent => {
+    const event = {
+      seq: fx.log.nextSeq(),
+      ts: fx.now().toISOString(),
+      type,
+      data,
+      visibility: defaultVisibility(type),
+      origin: 'test/web',
+      ...extra,
+    } as unknown as AppEvent;
+    fx.log.append(event, { sync: true });
+    applyOne(fx.projection, event);
+    return event;
+  };
+  fx.append('session/start', {
+    pid: 1, cwd: fx.dir, version: '0.1.0', schemaVersion: '1', configHash: 'cafebabe00000000',
+  });
+  appendRaw('timer/set', { timerId: 't_maintain', cron: '0 4 * * *', payload: { kind: 'memory-maintain' } });
+  appendRaw('wake/timer', {
+    timerId: 't_maintain', scheduledAt: fx.now().toISOString(), firedAt: fx.now().toISOString(),
+    payload: { kind: 'memory-maintain' },
+  });
+  appendRaw('wake/manual', { note: '/compact 上下文太长了' });
+  appendRaw('message/user', { text: '这是子代理链内部的一行（父上下文里不该有）', source: 'human' },
+    { parentCallId: 'call_parent' });
+  const wake = fx.append('wake/manual', { note: '复盘这次渲染' });
+  fx.append('turn/start', { turn: 1 });
+  fx.append('input/claimed', { turn: 1, wakeSeqs: [wake.seq], claimCounts: [0] });
+  fx.append('step/start', {
+    turn: 1, step: 1, model: 'deepseek-chat', lane: 'heavy',
+    renderVersion: '1', personaHash: 'deadbeefdeadbeef',
+  });
+
+  // 第二个服务：只多注入 skillsRoot（与生产同一句 `deps.skillsRoot ?? process.cwd()`）
+  const withSkills = await startWebServer({
+    log: fx.log,
+    projection: fx.projection,
+    config: fx.config,
+    personaRoot: fx.personaRoot,
+    dataDir: fx.dataDir,
+    timers: fx.timers,
+    now: fx.now,
+    uiToken: null,
+    configPath: fx.configPath,
+    port: 0,
+    ssePollMs: 20,
+    out: () => undefined,
+    skillsRoot: fx.dir,
+  });
+  t.after(async () => {
+    await withSkills.close();
+  });
+
+  const res = await fetch(`${withSkills.url()}/api/replay?turn=1&step=1`, {
+    headers: { authorization: `Bearer ${TEST_TOKEN}` },
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    request: { input: Array<{ type?: string; role?: string; content?: unknown }> };
+  };
+  const textOf = (input: readonly { content?: unknown }[]): string => input
+    .map((item) => item.content)
+    .filter((content): content is string => typeof content === 'string')
+    .join('\n');
+  const rendered = textOf(body.request.input);
+
+  // 正：技能索引在，而且就是运行期那一份（逐字节）；没确认的技能不在
+  assert.equal(rendered.includes(catalogText), true, '预览的技能索引必须与运行期逐字节相同');
+  assert.equal(rendered.includes('beta-unconfirmed'), false, '没确认的技能不进预览（信任门同一处）');
+  // 反：三刀挡掉的那三条一条都不在（改动前它们都会在预览里）
+  const forbidden: Array<[string, string]> = [
+    ['整理唤醒', '定时器触发'],
+    ['框架指令', '/compact'],
+    ['子链事件', '这是子代理链内部的一行'],
+  ];
+  for (const [label, needle] of forbidden) {
+    assert.equal(rendered.includes(needle), false, `预览里不该有${label}：${needle}`);
+  }
+  // 正（对照）：本轮唤醒照旧在——三刀只砍框架自己的东西，不砍她该看见的
+  assert.equal(rendered.includes('复盘这次渲染'), true, '本轮唤醒仍要进预览');
 });
 
 test('GET /api/config 与 /api/doctor：管控页的配置读取与工具组自检', async (t) => {
@@ -1359,6 +1473,78 @@ test('POST /api/commands/config-update：写回配置、保注释、非法值回
 });
 
 /**
+ * `config-update` **不能整段改写 `mcp.servers`**（P1-21，2026-10-18）。
+ *
+ * 病：`config-update` 按点路径写入，一条 `{"mcp.servers": [...]}` 就把整个声明面换掉——
+ * 于是 `mcp-save` 那道 X-Confirm（"加一个 server = 扩大能力边界"）从旁边被绕开。
+ * 被绕开的不止短语：`mcp-save` 还会逐条校验 server 形状、写回执、按热更接线回答"要不要重启"，
+ * 而这条通用通道一件都不做，只把数组换掉再写一条 `config/changed`。
+ *
+ * 修：**显式拒绝并指路**（不是在这里再加一道同样的短语）。所以下面第 ③ 条很关键：
+ * 就算请求把 `mcp-save` 的短语也带上了，照样拒绝——短语不是这条路缺的唯一一样东西。
+ */
+test('POST /api/commands/config-update：mcp.servers 整段改写被拒并指路 mcp-save（P1-21）', async (t) => {
+  const fx = await setup(t);
+  const before = readFileSync(fx.configPath, 'utf8');
+  const servers = [{ name: 'sneaky', command: 'cmd.exe', args: ['/c', 'calc'] }];
+
+  // ① 扁平点路径：拒绝，且理由点名两个真正的写入口
+  const flat = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { 'mcp.servers': servers } },
+  });
+  assert.equal(flat.status, 400);
+  assert.equal(errorOf(flat).code, 'use-mcp-save');
+  assert.match(errorOf(flat).message, /mcp\.servers/u, '拒绝理由要点名是哪个字段');
+  assert.match(errorOf(flat).message, /mcp-save/u, '并且指出该走哪条命令');
+  assert.match(errorOf(flat).message, /mcp-remove/u);
+
+  // ② 嵌套写法（`{"mcp":{"servers":[...]}}`）折成同一格，同样拒绝
+  const nested = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { mcp: { servers } } },
+  });
+  assert.equal(nested.status, 400);
+  assert.equal(errorOf(nested).code, 'use-mcp-save');
+
+  // ③ 连 `mcp-save` 的短语一起带上也不放行：这条路根本不该是声明面的写入口
+  const withPhrase = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { 'mcp.servers': servers } },
+    headers: { 'x-confirm': 'update-config; mcp-save' },
+  });
+  assert.equal(withPhrase.status, 400);
+  assert.equal(errorOf(withPhrase).code, 'use-mcp-save');
+
+  // ④ 被拒的请求一个字节都不写，也不许留下"配置变了"的假事实
+  assert.equal(readFileSync(fx.configPath, 'utf8'), before, '被拒的请求不许改盘上那份');
+  const written = await fx.readAll();
+  assert.equal(written.filter((event) => event.type === 'config/changed').length, 0);
+
+  // ⑤ 反向之一：`mcp` 下**别的**字段照旧可改（门只挡声明面那一段，不是"mcp 一律不许碰"）
+  const pool = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { 'mcp.maxInFlight': 8 } },
+  });
+  assert.equal(pool.status, 200, JSON.stringify(pool.body));
+  assert.equal(
+    (JSON.parse(readFileSync(fx.configPath, 'utf8')) as { mcp?: { maxInFlight?: number } }).mcp?.maxInFlight,
+    8,
+  );
+
+  // ⑥ 反向之二：这条路的本职（普通配置字段）没被误伤
+  const budget = await call(fx, '/api/commands/config-update', {
+    method: 'POST',
+    body: { fields: { 'budget.softRatio': 0.7 } },
+  });
+  assert.equal(budget.status, 200, JSON.stringify(budget.body));
+  assert.equal(
+    (JSON.parse(readFileSync(fx.configPath, 'utf8')) as { budget: { softRatio: number } }).budget.softRatio,
+    0.7,
+  );
+});
+
+/**
  * `trust.mode` 的字段级短语（2026-10-05 加）。
  *
  * 为什么它够格进 `DANGEROUS_FIELDS`（见 server.ts 那张表自己的注释："改这些字段等于改它能碰什么"）：
@@ -1630,7 +1816,7 @@ function fakeDepsManager(
   });
 }
 
-test('GET /api/deps：三件依赖各一行，含状态/路径/版本/影响/动作/自装目录', async (t) => {
+test('GET /api/deps：四件依赖各一行，含状态/路径/版本/影响/动作/自装目录', async (t) => {
   const fx = await setup(t);
   // 这条用例要一个管理器：先建目录，再把它塞进服务
   const manager = fakeDepsManager(fx.dataDir);
@@ -1645,12 +1831,13 @@ test('GET /api/deps：三件依赖各一行，含状态/路径/版本/影响/动
       name: string; label: string; status: string; ok: boolean; path: string; version: string;
       impact: string; action: string | null; installable: boolean; downloadPage: string | null;
       managedDir: string; attempts: string[];
+      pipVersion: string | null; pipReason: string;
     }>;
   };
   assert.equal(body.available, true);
   assert.equal(body.toolsDir, join(fx.dataDir, 'tools'));
-  assert.equal(body.needsAttention, true, '三件都没装 → 有待处理项');
-  assert.deepEqual(body.entries.map((entry) => entry.name), ['pwsh', 'rg', 'es']);
+  assert.equal(body.needsAttention, true, '四件都没装 → 有待处理项');
+  assert.deepEqual(body.entries.map((entry) => entry.name), ['pwsh', 'rg', 'es', 'python']);
 
   const pwsh = body.entries[0]!;
   assert.equal(pwsh.status, 'missing');
@@ -1663,9 +1850,20 @@ test('GET /api/deps：三件依赖各一行，含状态/路径/版本/影响/动
   const rg = body.entries[1]!;
   assert.equal(rg.action, 'install');
   assert.equal(rg.installable, true);
-  assert.match(rg.impact, /不注册/u, '要写清影响：没有它 rg_search 不注册');
+  assert.match(rg.impact, /不注册/u, '要写清影响：没有它 grep 不注册');
   assert.equal(rg.managedDir, join(fx.dataDir, 'tools', 'rg'));
   assert.ok(rg.attempts.length > 0, '要说清探测试过哪几处');
+
+  // 第 4 件（2026-10-16 加）：python 与 rg / es 同档可一键装，且报告里带 pip 两格
+  const python = body.entries[3]!;
+  assert.equal(python.action, 'install');
+  assert.equal(python.installable, true);
+  assert.equal(python.managedDir, join(fx.dataDir, 'tools', 'python'));
+  assert.match(python.downloadPage ?? '', /python\.org/u, '要给出官方下载页');
+  assert.match(python.label, /Python/u);
+  // pip 的两格是 python 独有的：这一件会给，别的三件是 null / 空串
+  assert.equal(python.pipVersion, null, '这条用例里 python 没装 → 没探到 pip');
+  assert.equal(rg.pipVersion, null, '别的依赖**没有**这一格（不是空串，是 null）');
 });
 
 test('GET /api/deps：没注入管理器时如实报"没接上"，而不是给一份看起来正常的空报告', async (t) => {
@@ -1743,12 +1941,14 @@ test('POST /api/commands/dep-install：失败也回 200，但把阶段与原因�
 
 test('POST /api/commands/dep-install：非法依赖名被拒绝（并列出合法值）', async (t) => {
   const fx = await setup(t, { deps: fakeDepsManager(join(tmpdir(), 'irmia-deps-name')) });
+  // 夹具用 'ruby'：**不许用 'python'** —— 2026-10-16 起它是合法依赖名了
+  // （这一条原来就是拿 'python' 当反例的，本件落地时它必须换一个真正的非法值）
   const res = await call(fx, '/api/commands/dep-install', {
-    method: 'POST', body: { name: 'python' }, headers: { 'x-confirm': 'dep-install' },
+    method: 'POST', body: { name: 'ruby' }, headers: { 'x-confirm': 'dep-install' },
   });
   assert.equal(res.status, 400);
   assert.equal(errorOf(res).code, 'unknown-dep');
-  assert.match(errorOf(res).message, /pwsh \/ rg \/ es/u);
+  assert.match(errorOf(res).message, /pwsh \/ rg \/ es \/ python/u);
 });
 
 // ──────────────────────────────── webhook ────────────────────────────────

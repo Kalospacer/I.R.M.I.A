@@ -35,6 +35,9 @@ import {
 } from '../src/config/config.ts';
 import { DEFAULT_MAX_IN_FLIGHT } from '../src/mcp/client.ts';
 import { STDIO_LAUNCHER_ALLOWLIST_ENV } from '../src/mcp/launcher-guard.ts';
+import {
+  DEFAULT_STREAM_HARD_CAP_MS, DEFAULT_STREAM_SILENCE_MS, DEFAULT_TIMEOUT_MS,
+} from '../src/model/ds-client.ts';
 
 // ──────────────────────────────── 脚手架 ────────────────────────────────
 
@@ -1073,14 +1076,17 @@ test('persona.stateBudgetBytes：默认 8 KB，且写进默认配置文档并说
   assert.equal(loaded.config.persona.stateBudgetBytes, DEFAULT_STATE_BUDGET_BYTES);
   assert.equal(defaultConfig(dir).persona.stateBudgetBytes, DEFAULT_STATE_BUDGET_BYTES);
 
-  // 默认配置是给人看的：这个字段干什么、为什么是 8 KB、只提醒不截断，都要落在文件里
+  // 默认配置是给人看的：这个字段干什么、为什么是 8 KB、只提醒不截断、字节口径，都要落在文件里
   const doc = JSON.parse(await readFile(loaded.path, 'utf8')) as JsonObject;
   const persona = doc['persona'] as JsonObject;
   assert.equal(persona['stateBudgetBytes'], DEFAULT_STATE_BUDGET_BYTES, '默认文档要写出这个字段');
   const text = JSON.stringify(persona);
-  assert.match(text, /预算超限，记得维护，将过时内容移入记忆文件或删除/u, '用户的原话要逐字写进去');
+  assert.match(text, /2 KB = 2048 字节/u, '要写清限额口径：2 KB = 2048 字节（单位是字节）');
+  assert.match(text, /未决的事及时问他；已决、已办的销项、从 STATE\.md 移除/u, '新措辞（2026-10-17 用户的新规）要逐字写进去');
+  assert.match(text, /拿不准的跟他沟通后移除/u, '四件事里的"拿不准"不能漏');
+  assert.match(text, /保持 STATE\.md 干净整洁/u, '还要有"保持干净整洁"那一句');
   assert.match(text, /只提醒、不截断/u, '要说清框架不动她的文件');
-  assert.match(text, /8 KB/u, '要写清为什么是 8 KB');
+  assert.match(text, /8 KB/u, '要写清为什么是 8 KB（出厂默认）');
 });
 
 test('persona.stateBudgetBytes：写多少读回多少；坏值当场报错（不静默按 8 KB 算）', async (t) => {
@@ -1103,4 +1109,94 @@ test('persona.stateBudgetBytes：写多少读回多少；坏值当场报错（�
   // 没写这个字段 = 默认值（缺字段补默认，不是"缺失即关掉提醒"）
   await writeRawConfig(dir, { persona: { owner: 'someone' } });
   assert.equal((await loadConfig(dir)).config.persona.stateBudgetBytes, DEFAULT_STATE_BUDGET_BYTES);
+});
+
+// ──────────────────── 单次模型请求的三格时限（2026-10-16） ────────────────────
+
+test('models.requestTimeout：出厂三格（120s 静默 / 3h 硬顶 / 180s 非流式）且写进默认配置文档', async (t) => {
+  const dir = await freshDir(t);
+  const loaded = await loadConfig(dir);
+
+  // 默认值与客户端构造时的缺省值**同源**（`ds-client.ts` 那三个常量，这里不抄数字）
+  assert.equal(loaded.config.models.requestTimeout.requestSilenceMs, DEFAULT_STREAM_SILENCE_MS);
+  assert.equal(loaded.config.models.requestTimeout.requestHardCapMs, DEFAULT_STREAM_HARD_CAP_MS);
+  assert.equal(loaded.config.models.requestTimeout.nonStreamTimeoutMs, DEFAULT_TIMEOUT_MS);
+  assert.equal(DEFAULT_STREAM_SILENCE_MS, 120_000, '静默 120s');
+  assert.equal(DEFAULT_STREAM_HARD_CAP_MS, 10_800_000, '硬顶 3 小时');
+  assert.equal(DEFAULT_TIMEOUT_MS, 180_000, '非流式 180s（原口径不变）');
+  assert.ok(DEFAULT_STREAM_HARD_CAP_MS > DEFAULT_STREAM_SILENCE_MS);
+
+  // 默认配置是给人看的：三格各干什么、判据为什么是"静默"、改完要重启，都要落在文件里
+  const doc = JSON.parse(await readFile(loaded.path, 'utf8')) as JsonObject;
+  const models = doc['models'] as JsonObject;
+  const rt = models['requestTimeout'] as JsonObject;
+  assert.equal(rt['requestSilenceMs'], DEFAULT_STREAM_SILENCE_MS, '默认文档要写出这一格');
+  assert.equal(rt['requestHardCapMs'], DEFAULT_STREAM_HARD_CAP_MS);
+  assert.equal(rt['nonStreamTimeoutMs'], DEFAULT_TIMEOUT_MS);
+  const text = JSON.stringify(models);
+  assert.match(text, /多久没收到任何 SSE 数据/u, '要说清流式的判据是"静默"而不是总耗时');
+  assert.match(text, /40 分钟/u, '用户的口径（超长思考很正常）要写进去');
+  assert.match(text, /永远挂着/u, '要说清硬顶兜的是什么');
+  assert.match(text, /要重启进程才生效/u, '改完要重启——不在热更白名单里');
+});
+
+test('models.requestTimeout：写多少读回多少；坏值当场报错（不静默回退默认）', async (t) => {
+  const dir = await freshDir(t);
+  await writeRawConfig(dir, {
+    models: { requestTimeout: { requestSilenceMs: 300_000, requestHardCapMs: 7_200_000, nonStreamTimeoutMs: 240_000 } },
+  });
+  const parsed = (await loadConfig(dir)).config.models.requestTimeout;
+  assert.deepEqual(parsed, { requestSilenceMs: 300_000, requestHardCapMs: 7_200_000, nonStreamTimeoutMs: 240_000 });
+
+  // 只写一格：其余补默认（缺字段合并，不是整段替换）
+  await writeRawConfig(dir, { models: { requestTimeout: { requestSilenceMs: 60_000 } } });
+  const partial = (await loadConfig(dir)).config.models.requestTimeout;
+  assert.equal(partial.requestSilenceMs, 60_000);
+  assert.equal(partial.requestHardCapMs, DEFAULT_STREAM_HARD_CAP_MS, '没写的照旧用出厂值');
+
+  // 坏值逐类当场拦下（静默接受会造出"看起来生效其实没生效"的隐形故障）
+  //   每一条都是 `{ requestSilenceMs: <坏值> }` 的形状，**只有**"整段不是对象"那一条不是
+  const bogusCases: Array<[unknown, RegExp]> = [
+    [0, /requestSilenceMs/u],                       // 0 会让每一片之间都判超时
+    [-1, /requestSilenceMs/u],
+    ['120000', /requestSilenceMs/u],                // 字符串不是数字
+    [1.5, /requestSilenceMs/u],
+    [3_600_001, /requestSilenceMs/u],               // 超过 1 小时的上限
+  ];
+  for (const [value, pattern] of bogusCases) {
+    await writeRawConfig(dir, { models: { requestTimeout: { requestSilenceMs: value } } });
+    await assert.rejects(
+      () => loadConfig(dir),
+      (err: unknown) => err instanceof ConfigError && pattern.test((err as Error).message),
+      `${JSON.stringify(value)} 不是合法的时限，应当场报错`,
+    );
+  }
+  // 整段不是对象：当场报错（不是静默当成"没写这一段"）
+  await writeRawConfig(dir, { models: { requestTimeout: 'not-an-object' } });
+  await assert.rejects(
+    () => loadConfig(dir),
+    (err: unknown) => err instanceof ConfigError && /requestTimeout/u.test((err as Error).message),
+  );
+
+  // 空对象是**合法**的（= 三格全用出厂值）：它与"没写这一段"同义，不该报错
+  await writeRawConfig(dir, { models: { requestTimeout: {} } });
+  assert.equal(
+    (await loadConfig(dir)).config.models.requestTimeout.requestSilenceMs,
+    DEFAULT_STREAM_SILENCE_MS,
+  );
+
+  // **交叉校验**：硬顶比静默还短 ⇒ 静默永远没机会开火，用户以为在调静默其实在调硬顶
+  await writeRawConfig(dir, {
+    models: { requestTimeout: { requestSilenceMs: 600_000, requestHardCapMs: 60_000 } },
+  });
+  await assert.rejects(
+    () => loadConfig(dir),
+    (err: unknown) => err instanceof ConfigError && /不得小于/u.test((err as Error).message),
+  );
+
+  // 相等是允许的（"静默到了就掐，不看总量"那种口径）
+  await writeRawConfig(dir, {
+    models: { requestTimeout: { requestSilenceMs: 60_000, requestHardCapMs: 60_000 } },
+  });
+  assert.equal((await loadConfig(dir)).config.models.requestTimeout.requestHardCapMs, 60_000);
 });

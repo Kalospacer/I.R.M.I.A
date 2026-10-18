@@ -14,7 +14,7 @@ import { join } from 'node:path';
 
 import { buildSkipSet } from './search-core.ts';
 import { DEFAULT_MAX_EDIT_BYTES } from './edit-core.ts';
-import { decodeText } from './text-codec.ts';
+import { decodeText, utf8ConsoleEnv, type DecodedText } from '../../util/bytes-text.ts';
 import {
   expandAliases,
   resolveInsideRoot,
@@ -97,14 +97,29 @@ function killTree(child: ChildProcess): void {
   }
 }
 
-function toTruncatedOutput(chunks: Buffer[]): string {
+/**
+ * 子进程原始字节 → 文本，并把"按什么解、有没有损"一起带出去。
+ *
+ * **绝不 `setEncoding('utf8')`**（2026-10-18 收口）：`rg` 与 `es.exe` 的 stdout 里可能有
+ * GBK 文件内容，流式 setEncoding 会在字节变成字符串那一刻就把非法字节换成 U+FFFD，
+ * 之后再无补救。捕获层只存字节，解码在这里一次判完（见 `util/bytes-text.ts`）。
+ */
+function decodeChunks(chunks: Buffer[]): { text: string; decoded: DecodedText } {
   const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
   const merged = Buffer.concat(chunks, total);
-  if (total <= 10 * 1024) return decodeText(merged).text;
-  const head = merged.subarray(0, 8 * 1024);
-  const tail = merged.subarray(total - 2 * 1024);
-  const decoded = `${decodeText(head).text}\n…[输出已截断：共 ${total} 字节]…\n${decodeText(tail).text}`;
-  return decoded;
+  if (total <= 10 * 1024) {
+    const decoded = decodeText(merged);
+    return { text: decoded.text, decoded };
+  }
+  // 超大输出只在**字节边界**上切头尾：切出来的两段各自判编码（都是同一条链，
+  // 不会出现"头按 UTF-8、尾按 GBK"的分叉——真要分叉就是字节本身如此）。
+  const head = decodeText(merged.subarray(0, 8 * 1024));
+  const tail = decodeText(merged.subarray(total - 2 * 1024));
+  const worst = head.lossy ? head : tail.lossy ? tail : head.encoding === 'utf8' ? tail : head;
+  return {
+    text: `${head.text}\n…[输出已截断：共 ${total} 字节]…\n${tail.text}`,
+    decoded: worst,
+  };
 }
 
 export function runProcessDefault(
@@ -117,7 +132,10 @@ export function runProcessDefault(
     try {
       child = spawn(command, args, {
         cwd: options.cwd,
-        env: options.env === undefined ? undefined : { ...process.env, ...options.env },
+        // 「请它按 UTF-8 写」只在这一个地方拼（`util/bytes-text.ts` 的 utf8ConsoleEnv）：
+        // rg / es.exe 对这两个变量闻所未闻，加了无害；真正的价值是同一个环境给到
+        // 子进程里可能被调起来的 python（它的 stdout 默认走 936）。
+        env: utf8ConsoleEnv({ ...process.env, ...options.env }),
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -154,12 +172,24 @@ export function runProcessDefault(
       settled = true;
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', onAbort);
+      const out = decodeChunks(stdoutChunks);
+      const err = decodeChunks(stderrChunks);
+      // 两路里"更有损/更不像 UTF-8"的那一份决定回执怎么说：只报 stdout 会把 stderr 上的
+      // 乱码藏起来（引擎的报错就在 stderr 上）。
+      const worst = out.decoded.lossy
+        ? out.decoded
+        : err.decoded.lossy
+          ? err.decoded
+          : out.decoded.encoding !== 'utf8'
+            ? out.decoded
+            : err.decoded;
       resolve({
         code,
-        stdout: toTruncatedOutput(stdoutChunks),
-        stderr: toTruncatedOutput(stderrChunks),
+        stdout: out.text,
+        stderr: err.text,
         failed: spawnFailed || timedOut,
         timedOut,
+        decode: { encoding: worst.encoding, replaced: worst.replaced, lossy: worst.lossy },
       });
     };
 
@@ -194,6 +224,28 @@ const defaultDeps: FsToolDeps = {
   homeDir: () => homedir(),
 };
 
+/**
+ * 别名表（`MEMORIES/` / `diary/` / `persona/` → 数据目录下的真实位置）的**唯一构造点**。
+ *
+ * 为什么单独导出（v64）：用户 2026-10-13 的裁决要求「具名根在**所有**工具里语义一致
+ * （含 `send_media`）」——而 `vision_read` / `http_download` / `send_media` **不在** fs 工具族里、
+ * 拿不到 `FsEnv`。与其让它们各写一张表（迟早漂移成两套语义），不如让它们引这一份。
+ *
+ * 形参只要 `ctx.workspaceRoot` 与可选的 `dataDir`：`dataDir` 的决议链只有一份（显式优先，
+ * 否则 `<workspaceRoot>/data`，与 `createEnv` 里的 `dataDirOf` 同一条）。
+ */
+export function pathAliasesFor(
+  ctx: { workspaceRoot: string },
+  dataDir?: string,
+): readonly PathAlias[] {
+  const data = dataDir ?? join(ctx.workspaceRoot, 'data');
+  return [
+    { prefix: MEMORY_DIR_NAME, root: join(data, 'workspace', MEMORY_DIR_NAME) },
+    { prefix: DIARY_DIR_NAME, root: join(data, 'workspace', DIARY_DIR_NAME) },
+    { prefix: PERSONA_DIR_NAME, root: join(data, PERSONA_DIR_NAME) },
+  ];
+}
+
 export function createEnv(options: FsToolOptions = {}, overrides: Partial<FsToolDeps> = {}): FsEnv {
   const deps: FsToolDeps = { ...defaultDeps, ...overrides };
   const backupKeep = options.backupKeep ?? 10;
@@ -217,14 +269,8 @@ export function createEnv(options: FsToolOptions = {}, overrides: Partial<FsTool
     },
     // 别名表**从 dataDir 推导**，不另立一处配置：表里的三个根都是数据目录下的固定位置，
     // 写成可配置的只会多一个能配错的地方。
-    pathAliases: (ctx) => {
-      const data = dataDirOf(ctx);
-      return [
-        { prefix: MEMORY_DIR_NAME, root: join(data, 'workspace', MEMORY_DIR_NAME) },
-        { prefix: DIARY_DIR_NAME, root: join(data, 'workspace', DIARY_DIR_NAME) },
-        { prefix: PERSONA_DIR_NAME, root: join(data, PERSONA_DIR_NAME) },
-      ];
-    },
+    // v64：构造搬去 `pathAliasesFor`（fs 族之外的三件工具也引同一份，语义不许分叉）。
+    pathAliases: (ctx) => pathAliasesFor(ctx, options.dataDir),
     backupKeep,
     maxReadBytes: options.maxReadBytes ?? 256 * 1024,
     maxReadLines: options.maxReadLines ?? 2000,
@@ -249,6 +295,10 @@ export function createEnv(options: FsToolOptions = {}, overrides: Partial<FsTool
  * ——先改写（别名）、后校验（边界），别名永远不能绕过越界检查。把顺序写在一处，
  * 就没有"哪一处写反了"的问题。
  *
+ * **v64 起还要带一个 `access: 'read' | 'write'`（必填）**：`trust.mode` 只作用于**写**
+ * （用户 2026-10-13 的裁决）⇒ 读类到这里时边界恒为"不设"，写类才看三态。判据只在
+ * `tools/boundary.ts` 的 `boundaryRootFor` 一处，本函数只负责把它传下去。
+ *
  * **三态原样传下去，不在这里折成具体值**：`undefined`（= 历史行为，拿 `workspaceRoot` 当边界）
  * 与"显式给了同一个根"在**判定**上等价，在**拒绝措辞**上不等价——后者要说清 trust.mode 与
  * 怎么改，而 `workspace` 档的默认边界正是工作根（`config.ts` 的 `buildDefaults`），
@@ -263,13 +313,14 @@ export function resolveGuarded(
   env: FsEnv,
   ctx: { workspaceRoot: string; boundaryRoot?: string | null },
   input: string,
-  options: GuardOptions = {},
+  options: GuardOptions,
 ): Promise<GuardResult> {
   return resolveInsideRoot(
     ctx.workspaceRoot,
     expandAliases(input, env.pathAliases(ctx), ctx.workspaceRoot),
     {
       ...options,
+      access: options.access,
       ...(ctx.boundaryRoot === undefined ? {} : { boundaryRoot: ctx.boundaryRoot }),
     },
   );

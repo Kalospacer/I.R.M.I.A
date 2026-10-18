@@ -28,6 +28,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { join } from 'node:path';
 
 import type { RenderImageRef } from '../model/render.ts';
+import { decodeText } from '../util/bytes-text.ts';
 import {
   buildContextImage,
   parseImageDataUrl,
@@ -151,7 +152,10 @@ async function compressWithGdiPlus(
           resolve(false);
           return;
         }
-        resolve(stdout.includes('ok') && existsSync(dest) && statSync(dest).size > 0);
+        // 判据是回执里那个 `ok`（ASCII），所以这里**本来就不会因为编码判错而坏掉**；
+        // 走共享解码只是为了不再有"看着像 ok、其实是替换字符"的中间态字节串。
+        const text = typeof stdout === 'string' ? stdout : decodeText(stdout).text;
+        resolve(text.includes('ok') && existsSync(dest) && statSync(dest).size > 0);
       },
     );
   });

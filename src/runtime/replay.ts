@@ -17,7 +17,12 @@
  *   - **软阈值提示**（budget-guard 的 softHint）：它按设计不落库（KV 前缀的尾部插播），
  *     日志里没有它的任何痕迹，因此重建出的请求体不含它，字节对比时会恰好差这一条；
  *   - **工具清单**：日志只记 `developer/message` 的名字增减，不记定义。重建用当前装配的
- *     工具集（tools/catalog.ts）并给出摘要哈希，供人判断"是否同一份清单"。
+ *     工具集（tools/catalog.ts）并给出摘要哈希，供人判断"是否同一份清单"；
+ *   - **技能索引**（长期记忆层的第一段，`[可用技能]` 那一行起）：2026-10-11 起与 MCP 索引
+ *     同一套缓存保护——字节只在日志里的 `skill/index` 快照上（重建读它，与运行期逐字节同源）。
+ *     那一版**之前**的轮次没有这条事件，退回运行期当时的来源再扫一次（`SkillManager` +
+ *     到这一步为止的信任事件，见 `skillCatalogForRebuild`）——技能目录是文件，改过内容/删掉
+ *     之后那一段会与当时不同（与人格资产同一条限制，报告 notes 里明说）。
  *
  * 零外部依赖：只用 node: 标准库。
  */
@@ -26,8 +31,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { AppEvent, MemorySelected, ModelLane } from '../log/types.js';
+import { isTopLevelEvent } from '../log/types.ts';
 import type { InputItem, RenderPersona, RenderedRequest } from '../model/render.js';
-import { NOW_LAYER_BANNER, RENDER_VERSION, clipTaskTitle, inputContentText, mcpIndexOf, wakeTitle } from '../model/render.ts';
+import { NOW_LAYER_BANNER, RENDER_VERSION, clipTaskTitle, inputContentText, mcpIndexOf, skillIndexOf, wakeTitle } from '../model/render.ts';
 import type { ContactFacts } from '../model/self-brief.ts';
 import type { TurnBlockFacts } from '../model/render.js';
 import { collectSessions, parseAliases, parseMemberAliases, resolvePersonNameFromTables, type SessionAlias } from '../channel/sessions.ts';
@@ -39,11 +45,133 @@ import { readMemoryIndexTextReadOnly } from '../persona/memory-injection.ts';
 import { relationshipForWake } from '../persona/relationship.ts';
 // 待办清单的唯一载体是 STATE 的两节：运行期、CLI 重放、界面预览三处都从这里读
 import { openTodoItems } from '../persona/todo-state.ts';
+// 技能索引（P1-16）：重建与预览都问**运行期同一个类**，不另写一份拼装
+import { SkillManager } from '../skill/skills.ts';
 import { catalogToolSpecs } from '../tools/catalog.ts';
 import { sha256Hex } from '../persona/versions.ts';
 import { deriveRequest } from './agent-loop.ts';
-import { isSlashCommandEvent } from './slash-commands.ts';
+import { isFrameworkCommandEvent } from './slash-commands.ts';
 import { EVENT_LOG_DIR_NAME } from './recover.ts';
+// 会话清单那两格窗口素材（v66）：**借运行期那一个判据**，不新写一份。
+// 为什么这里值一个 import：那两格是"她 7 天内回过话 / 1 小时内有人 @ 她"的折叠，
+// 判据落在 `speak/sent` 与 `mentionedInMessage` 两处既有实现上；在重放侧再写一遍，
+// 两条路的过滤结论迟早会漂成"预览少列一个群、而当时那一份列着它"——实测踩到过。
+import { foldSpokeAndMention } from './real-loop.ts';
+// 「框架自己的唤醒」判据的唯一实现（布防 / 认领 / 请求体排除三处共用）：重建只借它，不另写
+import { isMemoryMaintainPayload } from './real-loop.ts';
+
+// ───────────────────────── 进重建上下文的"那几刀"（唯一一处） ─────────────────────────
+
+/**
+ * 刀① **归属**：这条事件属于哪一条 turn 链。
+ *
+ * 顶层（`scope === undefined`）就是 `isTopLevelEvent`（运行期 `contextEventFilter` 的第一刀，
+ * 判据只有那一份实现）；子代理链（`scope` = 父 turn 里那次 `task` 调用的 callId）则是运行期
+ * 子代理 `eventFilter` 的同一句 `event.parentCallId === callId`（见 `subagent.ts`）。
+ *
+ * 为什么要这一刀：子代理链是它自己那条 turn 链的内部过程，进了父请求等于让父模型看见
+ * "自己"没说过的话（design §4.21）。
+ */
+export function eventBelongsToChain(event: AppEvent, scope: string | undefined): boolean {
+  return scope === undefined ? isTopLevelEvent(event) : event.parentCallId === scope;
+}
+
+/**
+ * 刀③ **框架自己的唤醒**（每日整理那条定时器唤醒）：不是给她的输入，不进她的上下文。
+ *
+ * 判据只有一份：运行期 `real-loop.isMemoryMaintainWake` 内部的 `isMemoryMaintainPayload`
+ * （布防 / 认领 / 排除三处共用）。重建这一侧照抄那句判断，只换"payload 从哪儿拿"：
+ *   · 事件自己带着（`WakeTimer.payload`：到期时定时器上挂着的那个 payload，见那个类型注释）；
+ *   · 否则折事件流里该 timerId 最近一条 `timer/set` 的 payload——运行期那条回退查的是
+ *     **定时器表**（`timers.get(timerId)`），而表就是这些 `timer/set` 事件的投影，同一处口径。
+ *
+ * 为什么要这一刀（REVIEW P1-17）：运行期 `agent-loop.requestEvents` 把整理唤醒挡在请求体之外
+ * （2026-10-11 用户的口径：她该看见的是效果，不是框架自己按的按钮），重建没有这一刀 ⇒
+ * 每一份重建都比当时**多一行** `[定时器触发] …`，"重建==当时"当场破损。
+ */
+export function isFrameworkWakeEvent(
+  event: AppEvent,
+  timerPayloads?: ReadonlyMap<string, unknown>,
+): boolean {
+  if (event.type !== 'wake/timer') return false;
+  if (isMemoryMaintainPayload(event.data.payload)) return true;
+  const folded = timerPayloads?.get(event.data.timerId);
+  return folded !== undefined && isMemoryMaintainPayload(folded);
+}
+
+/**
+ * 一事件是否进重建/预览的上下文——**三刀的唯一组合点**（CLI 重放与界面预览都调它）。
+ *
+ *   ① 归属：同一条 turn 链（{@link eventBelongsToChain}）；
+ *   ② 框架指令：整条就是一条指令的 `wake/manual`（`/compact`、`/handoff`、打错的那些）以及
+ *      用户单聊里的 `/stop`——判据 `isFrameworkCommandEvent`（与运行期 `contextEventFilter`
+ *      第二刀同一个函数）。指令是给框架的，她要看见的是指令的**效果**（摘要/交接笔记）；
+ *   ③ 框架唤醒：每日整理那条（{@link isFrameworkWakeEvent}）。
+ *
+ * 为什么抽成一个导出的函数（REVIEW P1-17 的原话是"抽成一处共用，别再各写一份"）：界面
+ * 那条预览路径原先自己写了一份过滤（只扣 `seq < stepStart` 与本轮唤醒），三刀**一刀都没有**
+ * ——同一份日志在界面上比 CLI 重建多出框架指令行、整理唤醒行与子代理链的事件，而且不报错。
+ *
+ * 运行期那句组合（`contextEventFilter` + `isFrameworkWake` 注入）落在 `real-loop.ts` /
+ * `agent-loop.ts`：那两个文件是别的施工线在改，本次不碰；三刀各自的**判据**仍然是同一份
+ * 实现（`isTopLevelEvent` / `isFrameworkCommandEvent` / `isMemoryMaintainPayload`），
+ * 重建侧只有这一处组合。
+ */
+export function isRebuildContextEvent(
+  event: AppEvent,
+  scope: string | undefined,
+  timerPayloads?: ReadonlyMap<string, unknown>,
+): boolean {
+  if (!eventBelongsToChain(event, scope)) return false;
+  if (isFrameworkCommandEvent(event)) return false;
+  return !isFrameworkWakeEvent(event, timerPayloads);
+}
+
+/**
+ * 技能索引（`skills/*\/SKILL.md` 的 catalog）文本：**老日志（没有 `skill/index` 快照）那一段的来源**。
+ *
+ * ⚠ 2026-10-11 起它**不再**是主路：从那一版开始，技能索引与 MCP 索引同一套缓存保护——
+ * 字节只来自日志里的 `skill/index` 快照（见 {@link skillCatalogForReplay}）。这条函数现在只服务
+ * **那一版之前写下的轮次**（那时运行期确实是每 turn 现问技能目录），保留它等于保留历史保真：
+ * 同一个类、同一个基准目录、同一份信任事件——只多切一刀：**只折 `seq < throughSeq` 的那批**
+ * （那之后才确认的技能，当时还没进 catalog；不切就等于让重建凭空多一段）。
+ *
+ * "现在这份"的限制照实写在这里：SKILL.md 是**文件**，重建读到的是当前内容（与人格资产同一条
+ * 限制）。技能被改过、目录被删掉时，这一段字节会与当时不同——报告 notes 里明说这一点。
+ */
+export function skillCatalogForRebuild(
+  baseRoot: string,
+  events: readonly AppEvent[],
+  throughSeq: number,
+): string {
+  const manager = new SkillManager({ baseRoot });
+  manager.setTrustEvents(events.filter((event) => event.seq < throughSeq));
+  return manager.catalogText();
+}
+
+/**
+ * 重建时那一段技能索引：**新日志读快照，老日志退回当时那条来源**（2026-10-11）。
+ *
+ * 为什么要这一层分派（这一格的判据就是 `SkillIndexSnapshot` 注释的最后一段）：
+ *   · 从这一版起，技能索引的字节**只在日志里**（`skill/index` 快照，由 `real-loop.skillIndexSync`
+ *     在重大变化点写）。重建读它 = 与运行期**逐字节同源**，技能目录之后被改过/删掉也不影响；
+ *   · 但**老日志没有这条事件**（这一版之前写下的轮次）——那时索引是"运行期现问技能目录"的。
+ *     拿"没有快照"当"当时没有技能"会把整段历史重建成少一截的另一个请求（实测那段 2,460 字节），
+ *     所以老轮次必须退回 {@link skillCatalogForRebuild}（同一个 `SkillManager` + 到那一步为止的
+ *     信任事件）——那条路的有损之处（读到的是**现在**的 SKILL.md）在报告 notes 里已经说过。
+ *
+ * `throughSeq` 那一刀与运行期同一条口径：快照是**轮首**写的，所以"这一步之前"的那些事件里
+ * 正好包含本步该用的那一份；那之后才写的（后面轮次的）不许拿来用。
+ */
+export function skillCatalogForReplay(
+  baseRoot: string,
+  events: readonly AppEvent[],
+  throughSeq: number,
+): string {
+  const point = skillIndexOf(events.filter((event) => event.seq < throughSeq));
+  if (point.seq !== 0) return point.text ?? '';
+  return skillCatalogForRebuild(baseRoot, events, throughSeq);
+}
 
 // ──────────────────────────────── 定位 ────────────────────────────────
 
@@ -65,7 +193,10 @@ export interface ReplayPosition {
   step: number;
   /** 该次调用的 step/start 事件（三指纹：renderVersion / personaHash / model+lane 都在它身上） */
   stepStart: AppEvent & { type: 'step/start' };
-  /** render 的事件流：seq < step/start.seq 的全部事件，按 seq 升序 */
+  /**
+   * render 的事件流：`seq < step/start.seq`、**已过那三刀**（归属 / 框架指令 / 框架唤醒，
+   * 见 {@link isRebuildContextEvent}），按 seq 升序
+   */
   eventsBefore: AppEvent[];
   /** 本步的新输入（仅第 1 步非 null）；已从 eventsBefore 里剔除 */
   wakeEvent: AppEvent | null;
@@ -96,19 +227,12 @@ export function locateStep(events: readonly AppEvent[], turn: number, step: numb
     return { ok: false, reason: `找不到 turn ${turn} step ${step} 的 step/start（${hint}）` };
   }
 
-  // 归属过滤（design §4.21）：重建「这一次调用当时看到了什么」，就必须用与运行期同一份可见性——
-  // 顶层 turn 的上下文里没有子代理链的事件（那是另一条 turn 链），子代理也看不见父历史
-  // （它从空事件序列起）。少这一刀，重建结果会多出一批当时根本没进上下文的事件。
-  //
-  // 第二刀与运行期**同源**（`real-loop.ts` 的 `contextEventFilter`）：整条就是一条指令的
-  // `wake/manual` 也不在她的上下文里（B1 第二步）。判据引的是同一个 `isSlashCommandEvent`，
-  // 两处各写一遍迟早会漂移成"重建出来的请求比当时多一条消息"。
+  // 归属过滤（design §4.21）：重建「这一次调用当时看到了什么」，就必须用与运行期同一份可见性。
+  // **三刀只有一处组合**（{@link contextEventsForRebuild}）：① 归属（子代理链不进父上下文）；
+  // ② 框架指令（`/compact` / `/handoff` / `/stop` 不进她的上下文）；③ 框架唤醒（每日整理那条
+  // 定时器唤醒——运行期 `agent-loop.requestEvents` 也是把它从**事件流**里摘掉的）。
   const scope = stepStart.parentCallId;
-  const eventsBefore = events.filter(
-    (event) => event.seq < stepStart.seq
-      && event.parentCallId === scope
-      && !isSlashCommandEvent(event),
-  );
+  const eventsBefore = contextEventsForRebuild(events, scope, stepStart.seq);
 
   // 该 turn 的认领：取**第一笔**。一个 turn 可以分批认领（开头一笔 + 中途被她看见的插话各一笔，
   // 见 agent-loop 的 claimInterruption），而这里要的"本轮新输入"始终是开头那一笔；
@@ -122,15 +246,20 @@ export function locateStep(events: readonly AppEvent[], turn: number, step: numb
   }
 
   const firstWakeSeq = claimedWakeSeqs[0];
+  // **本轮新输入按 seq 从整份日志里取**（运行期也是 `log.get(wakeSeq)`）：它不依赖"进不进上下文"
+  // ——框架自己的唤醒在事件流里被刀③挡住，而它仍可能是本轮认领的那条输入（那时它走
+  // `wakeEvent` 这个**独立通道**进请求，不是历史里的一行）。
   const firstWake = firstWakeSeq === undefined
     ? null
-    : eventsBefore.find((event) => event.seq === firstWakeSeq) ?? null;
+    : events.find((event) => event.seq === firstWakeSeq) ?? null;
   // 第 1 步之外的 step 没有"本轮新输入"：它与首步看到的是同一份历史（只多了自己产生的工具结果）
   const wakeEvent = step === 1 ? firstWake : null;
 
-  const payloads = timerPayloadsOf(eventsBefore);
-  // 标题口径必须与运行期逐字节一致（agent-loop 的 taskCard 用的是 wakeTitle，不是 renderWake）
-  const title = firstWake === null ? '' : clipTaskTitle(wakeTitle(firstWake, payloads));
+  // 标题口径必须与运行期逐字节一致（agent-loop 的 taskCard 用的是 wakeTitle，不是 renderWake）。
+  // payload 折的是**本步之前的整段**（不减去那三刀）：`wake/timer` 自身可能不带 payload，
+  // 而标题/渲染都要它——与 `contextEventsForRebuild` 内部折的是同一份实现。
+  const timerPayloads = timerPayloadsOf(events.filter((event) => event.seq < stepStart.seq));
+  const title = firstWake === null ? '' : clipTaskTitle(wakeTitle(firstWake, timerPayloads));
 
   let coveredUpToSeq = 0;
   for (const event of eventsBefore) {
@@ -238,14 +367,35 @@ export function memoryIndexTextForRebuild(
   return lookup.kind === 'injected' ? lookup.text : readMemoryIndexTextReadOnly(dataDir);
 }
 
-/** timerId → 最近一条 timer/set 的 payload（与 render 内部同口径：wake/timer 自身不带 payload） */
-function timerPayloadsOf(events: readonly AppEvent[]): Map<string, unknown> {
+/**
+ * timerId → 最近一条 timer/set 的 payload（与 render 内部同口径：`wake/timer` 事件可能不带
+ * payload）。导出是给**界面预览**用的：它按同一条口径折一次，才能与 CLI 的重建认下同一个
+ * "框架唤醒"（{@link isFrameworkWakeEvent}）。
+ */
+export function timerPayloadsOf(events: readonly AppEvent[]): Map<string, unknown> {
   const map = new Map<string, unknown>();
   for (const event of events) {
     if (event.type === 'timer/set') map.set(event.data.timerId, event.data.payload);
     if (event.type === 'timer/cancelled') map.delete(event.data.timerId);
   }
   return map;
+}
+
+/**
+ * 重建/预览用的事件流：`seq < beforeSeq`、过那三刀（{@link isRebuildContextEvent}），保序。
+ *
+ * **两条重建路径都调它**（CLI 的重放与界面预览；P1-17 的原话是"抽成一处共用，别再各写一份"）：
+ * 过滤 + 折 timer payload 这两步只有这一份实现。各写一份的结果实测过——界面预览比 CLI 重建
+ * 多出框架指令行、整理唤醒行与子代理链的事件，而两边都声称是"她当时收到的请求"。
+ */
+export function contextEventsForRebuild(
+  events: readonly AppEvent[],
+  scope: string | undefined,
+  beforeSeq: number,
+): AppEvent[] {
+  const scoped = events.filter((event) => event.seq < beforeSeq);
+  const timerPayloads = timerPayloadsOf(scoped);
+  return scoped.filter((event) => isRebuildContextEvent(event, scope, timerPayloads));
 }
 
 /**
@@ -276,6 +426,115 @@ function rebuildContact(position: ReplayPosition, options: RebuildOptions): Cont
     ...(gate.aliases === undefined ? {} : { aliases: gate.aliases }),
     ...(gate.memberAliases === undefined ? {} : { memberAliases: gate.memberAliases }),
   });
+}
+
+/**
+ * **上一轮的"本轮新输入"**（v69）：第 1 步重建时要用它（它决定"点名"那一项在不在、
+ * 以及任务卡标题是不是那句提及通知）。CLI 重建这一侧只有事件池，所以从 `input/claimed`
+ * 里取本 turn 认领的**第一笔** wakeSeq，再回池子里找那条事件。
+ *
+ * 为什么非要它：v69 的基线是"上一步**完整**的那一层"，第 2 步的基线就是重新渲染出来的第 1 步；
+ * 而第 1 步的 `点名：` 在提及那一轮是**不出现**的（那句话已经作为本轮输入摆在她面前）。
+ * 不带 wakeEvent 重建第 1 步 ⇒ 基线里多一条 `点名：` ⇒ 与当时那一份逐字节不同 ⇒ 当前步
+ * 会把它判成"没变"而不发（重建 ≠ 当时）。取不到就返回 null（退化成"每个字段都发"那一侧）。
+ */
+function firstWakeOf(pool: readonly AppEvent[], turn: number): AppEvent | null {
+  for (const event of pool) {
+    if (event.type !== 'input/claimed' || event.data.turn !== turn) continue;
+    const wakeSeq = event.data.wakeSeqs[0];
+    if (wakeSeq === undefined) return null;
+    return pool.find((item) => item.seq === wakeSeq) ?? null;
+  }
+  return null;
+}
+
+/**
+ * **同一 turn 上一步完整的那一层此刻层**（v66 引入；v69 换成 `nowLayerFull`）：CLI 重建用它，
+ * 界面预览那一侧**有意不递归**（见 `web/server.ts` 里 `buildReplay` 那一段的已知边界注：
+ * 那边是给人看的，CLI 这条逐字节比对的路才是要紧的那一条）。
+ *
+ * `build` 是"把上一步渲染出来"的回调，返回 null 表示那一步渲染不出来 ⇒ 退化成"每个字段都发"
+ * （与引入这一版之前逐字节相同）。判据全在入参里（池子、turn、step），所以这个函数是纯的。
+ *
+ * ⚠ **池子必须是"上一步也看得见"的那一份**（`position.eventsBefore` 不行——那是本步之前的
+ * 切片，连本步的 `step/start` 都在里面，而上一步的 `step/start` 恰恰不在）。
+ *
+ * ⚠ **必须取 `nowLayerFull` 而不是 input 里那一条此刻层 item**（v69）：后者是**裁剪过**的，
+ * 被省掉的字段在下下步的基线里就不存在了 ⇒ 重建会比当时多发一行（隔步重发那条老病的镜像）。
+ */
+function previousNowLayerIn(
+  pool: readonly AppEvent[],
+  turn: number,
+  step: number,
+  build: (previous: { wake: AppEvent & { type: 'step/start' }; events: readonly AppEvent[] }) => RenderedRequest | null,
+): string | null {
+  if (step <= 1) return null;
+  const found = pool.find(
+    (event): event is AppEvent & { type: 'step/start' } =>
+      event.type === 'step/start' && event.data.turn === turn && event.data.step === step - 1,
+  );
+  if (found === undefined) return null;
+  let request: RenderedRequest | null;
+  try {
+    request = build({ wake: found, events: pool.filter((event) => event.seq < found.seq) });
+  } catch {
+    return null;
+  }
+  if (request === null) return null;
+  // v69：取**完整的那一层**（未经增量裁剪）。input 里那一条是裁剪后的——拿它当基线，
+  // 重建出来的下一步会"忘了"上一步被省掉的字段 ⇒ 比当时多发出一行。
+  return request.nowLayerFull;
+}
+
+/**
+ * **同一 turn 上一步完整的那一层此刻层**（v66 引入；v69 换口径）：逐字段增量的参照物。
+ *
+ * 为什么重建这一侧也要它：运行期第 ≥2 步只发"变了的字段"，而重建若把每个字段都渲染出来，
+ * 第 3 步就会比当时**多出**那几行——"重建必须等于当时"是这个模块的全部意义（见文件头）。
+ * 做法是把上一步**照同一条路再算一遍**（`rebuildRenderedRequest` 递归一次），取它的
+ * `nowLayerFull`（**完整**那一层，不是 input 里裁剪后的那一条）。代价是每重建一步多渲染一次
+ * （纯计算、不读盘），换来的是逐字节可比。
+ *
+ * 判据本体在 {@link previousNowLayerIn}（界面的预览走同一个函数）。
+ *
+ * 四条边界：
+ *   · **第 1 步没有上一步** ⇒ null（运行期也是这一支：没有参照物 ⇒ 每个字段都发）；
+ *   · 上一步的 `step/start` 找不到（没给池子 / 被压缩遮蔽）⇒ null（同上）；
+ *   · **只递归一层**：递归调用显式传 `previousNowLayer: null`，不会无限往下钻——`nowLayerFull`
+ *     本身与基线无关，所以一层就够（要完整的那一层，不要"上一步裁剪后的结果"）；
+ *   · **重建上一步要用"那一步"的步号与本轮 wake**（v69）：任务卡里的 `已 M 步` 若用**当前**
+ *     步号，重建出来的上一份卡片会与当前这份逐字节相同 ⇒ 当前那行会被判成"没变"而不发；
+ *     第 1 步还要带上本轮 wake（`点名：` 的在场判据与提及标题都靠它）。
+ */
+function previousNowLayerFor(
+  position: ReplayPosition,
+  options: RebuildOptions,
+  nowOverride: string | undefined,
+): string | null {
+  const pool = options.previousPool;
+  if (pool === undefined) return null;
+  const turn = position.stepStart.data.turn;
+  const firstWake = firstWakeOf(pool, turn);
+  return previousNowLayerIn(
+    pool,
+    turn,
+    position.stepStart.data.step,
+    (previous) => rebuildRenderedRequest(
+      {
+        ...position,
+        stepStart: previous.wake,
+        step: previous.wake.data.step,
+        // 任务卡按**那一步**的步号重建（见上一条边界：用当前步号会让"当前任务"这一项被误省）
+        taskCard: { ...position.taskCard, step: previous.wake.data.step },
+        // 本轮新输入只在第 1 步有；第 ≥2 步必须是 null（渲染层据此把 wake 从历史里剔掉）
+        wakeEvent: previous.wake.data.step === 1 ? firstWake : null,
+        eventsBefore: [...previous.events],
+      },
+      options,
+      undefined,
+      null,
+    ),
+  );
 }
 
 /**
@@ -315,6 +574,11 @@ export function contactFactsForReplay(input: {
       topics.set(event.data.sid, event.data.topic);
     }
   }
+  // 会话清单的窗口素材（v66 两格，v67 加频次的时刻表）：**用运行期同一个函数**折同一批事件
+  //（`foldSpokeAndMention`，判据只此一处）。不折的后果实测过：预览里那个刚 @ 过她的群
+  // 会因为"她没回过话、也没记录到提及"被滤掉，而当时真发出去的那一份列着它——
+  // 而这条路的全部意义就是"重建出同一份请求"。
+  const { spokeAt, mentionedAt, spokeTimes } = foldSpokeAndMention(input.events);
 
   const wake = input.wakeEvent;
   const wakeMessage = wake !== null && wake.type === 'wake/channel'
@@ -341,6 +605,9 @@ export function contactFactsForReplay(input: {
       resolvePersonNameFromTables(person, input.contacts, input.aliases, input.memberAliases),
     wakeMessage,
     topics,
+    spokeAt,
+    mentionedAt,
+    spokeTimes,
   };
 }
 
@@ -393,6 +660,15 @@ export interface RebuildOptions {
   /** 时间上下文的覆盖点（--diff 的右侧渲染用当前时刻；缺省取 step/start.ts） */
   now?: string;
   /**
+   * **一份"上一步也看得见"的事件流**（v66）：算"同一 turn 上一步的此刻层"要用它。
+   *
+   * 为什么不能拿 `position.eventsBefore` 凑合：那是**本步之前**的切片，而"上一步的
+   * `step/start`"恰恰不在里面（它的 seq 比本步大）——用它去找上一步永远找不到。
+   * `buildReplayReport` 传的是 `located.eventsBefore`（全量那份）。不给 ⇒ 不算上一步 ⇒
+   * 重建出来的此刻层**每个字段都发**（与引入这一版之前逐字节相同）。
+   */
+  previousPool?: readonly AppEvent[];
+  /**
    * 联络事实里**只能从盘上拿**的那几样（会话簿与话题是从事件折的，见下面 rebuildContact）。
    *
    * 与人格资产同一口径：联系人与别名是"现在这份"，不是当时的快照——它们不在事件里，
@@ -424,6 +700,18 @@ export interface RebuildOptions {
    * 这一格留给老日志（2026-10-15 之前：整张指针表可由盘上 `INDEX.md` 复原）与其它调用点。
    */
   memoryIndex?: string | null;
+  /**
+   * 技能索引文本（长期记忆层的**第一段**，design §4.19 渐进披露第 1 层）。
+   *
+   * 不给时由 `buildReplayReport` 走 {@link skillCatalogForReplay}：**新日志读 `skill/index`
+   * 快照**（与运行期逐字节同源），**老日志退回** {@link skillCatalogForRebuild}（同一个
+   * `SkillManager` + 同一个基准目录 + 到这一步为止的 `skill/installed`）。这一格留给
+   * 嵌入方/测试**显式注入**。
+   *
+   * 为什么它原来整段缺失而没人发现：缺省（`null`）在渲染层的语义是"没有可用技能，该段不出现"
+   * ——少一段不报错、不影响任何断言，只在逐字节比对时差一截（真日志实测 2,460 字节，与 REVIEW 记的 555 token 同量级）。
+   */
+  skillCatalog?: string | null;
   /**
    * `persona.memoryEnabled`（v32 起真的接上了执行路径，见 docs/persona.md §3.1）。
    *
@@ -491,6 +779,7 @@ export function rebuildRenderedRequest(
   position: ReplayPosition,
   options: RebuildOptions,
   nowOverride?: string,
+  previousNowLayer?: string | null,
 ): RenderedRequest {
   const events = position.wakeEvent === null
     ? [...position.eventsBefore]
@@ -533,16 +822,25 @@ export function rebuildRenderedRequest(
     // 可能还在（框架只是不再动它），照旧把它渲染进重建结果就等于让重建显示一份"她当时根本没看见"
     // 的东西——而"重建必须等于当时"是这个模块的全部意义。
     memoryIndex: options.memoryEnabled === false ? null : (options.memoryIndex ?? null),
+    // 技能索引（长期记忆层的第一段）：**与 MCP 索引同一套缓存保护**（2026-10-11）——
+    // 新日志的字节只在日志里（`skill/index` 快照），老日志退回当时的来源
+    // （`skillCatalogForReplay`，判据与理由写在那一处）。这一格原来压根没传：缺省 null 在渲染层
+    // 是"没有可用技能"（该段不出现），于是重建每份请求都少一截而不报错。
+    skillCatalog: options.skillCatalog ?? null,
     // MCP 常驻索引（v46）：**取当时那一版**——最后一条 `mcp/index` 快照（`mcpIndexOf` 扫的是
     // 本步之前的事件流，与运行期读"最后一条"同一判据）。**老轮次没有这条事件 ⇒ null ⇒
     // 那一段整段不出现**，重建结果与当时逐字节相同（这是硬判据，不许拿现在的配置去补写）。
-    // 与技能 catalog 不同：那一个由 `RebuildOptions.skills` 从**现在**的技能目录重建
-    // （报告里那句"技能层按当前内容重建"覆盖的就是它）；索引这一版不走那条路——
-    // 它的字节只有日志里有，盘上没有对应的文件（配置 + 缓存都只代表"现在"）。
     mcpIndex: mcpIndexOf(events).text,
     // STATE 预算（v32）：重建要用的阈值与运行期同一个来源（当时生效的那份 config.json）。
     // 缺省 = 出厂 8 KB（`deriveRequest` 的兜底）；CLI 与界面两条重建路都从这里进，口径一致。
     ...(options.stateBudgetBytes === undefined ? {} : { stateBudgetBytes: options.stateBudgetBytes }),
+    // 上一步的此刻层（v66 引入；v69 起是**完整的那一层**）：逐字段增量（不变的那些不发）要一个
+    // 参照物，而那个参照物就是**同一 turn 上一步那一条 `nowLayerFull`**（运行期从
+    // `RenderedRequest.nowLayerFull` 存下来，见 agent-loop 的 `previousNow`）。给了就用；
+    // 没给且这不是第 1 步 ⇒ 现算一次（见 `previousNowLayerFor`）——不这样，重建出来的第 3 步
+    // 会比当时**多出**那些"其实没发"的字段，而"重建等于当时"是这个模块的全部意义。
+    previousNowLayer: previousNowLayer
+      ?? previousNowLayerFor(position, options, nowOverride),
     // 豁免判据：与人格/别名同一条"现在这份"的限制，但**必须传**——不传就会多渲染出那句
     // 规则提示，重建与当时逐字节一致这条承诺当场作废（见 RebuildOptions.warnExempt）。
     warnExempt: options.warnExempt ?? null,
@@ -700,6 +998,16 @@ export function formatRequestDiff(diff: RequestDiff): string[] {
 export interface ReplayReportOptions {
   /** config.json 所在目录（默认 process.cwd()）；**只读**：不存在不创建 */
   cwd?: string;
+  /**
+   * 技能根基准目录（`skills/`、`.agents/skills/` 的父目录）；缺省 = `cwd`。
+   *
+   * 为什么缺省是 `cwd`：运行期那份 `SkillManager` 建在 `process.cwd()` 上（`main.ts`），
+   * 而 `cwd` 就是 config.json 所在目录（也是启动时的工作目录）——两边同一个基准，
+   * "CLI 重建看到的技能"才是"她当时看到的技能"（REVIEW P1-16）。
+   */
+  skillsRoot?: string;
+  /** 技能索引文本覆盖点（测试与嵌入方注入）；缺省按**当前**技能目录 + 到该步为止的信任事件重建 */
+  skillCatalog?: string | null;
   /** 工具清单覆盖点（测试与嵌入方注入）；缺省用当前装配（tools/catalog.ts） */
   tools?: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
   /** 工具清单视角，默认与真实循环一致（不列破坏性工具） */
@@ -729,10 +1037,19 @@ export interface ReplayReport {
     configHash: { recorded: string | null; current: string | null; matches: boolean | null; source: string };
   };
   tools: { count: number; digest: string; source: 'current-catalog'; problems: string[] };
+  /**
+   * 长期记忆层里**技能索引**那一段的读数（REVIEW P1-16）。
+   *
+   * 为什么要一格读数：这一段原来整段缺失而**不报错**（缺省 null 的语义是"没有可用技能"），
+   * 只能靠逐字节比对发现。有了字节数，"重建比当时少一截"这件事在报告里直接看得见。
+   */
+  skills: { bytes: number };
   events: {
     scanned: number;
-    /** 参与渲染的事件条数（= seq < step/start.seq 的条数） */
+    /** 参与渲染的事件条数（= seq < step/start.seq、且过了那三刀的条数） */
     inStream: number;
+    /** 被那三刀挡掉、但 seq 仍小于 step/start 的事件条数（归属 / 框架指令 / 框架唤醒） */
+    filteredOut: number;
     rendered: number;
     coveredUpToSeq: number;
     wakeSeq: number | null;
@@ -834,6 +1151,12 @@ export async function buildReplayReport(
     relationship,
   };
 
+  // 技能索引（长期记忆层的第一段）：**新日志读快照、老日志退回当时的来源**——
+  // 分派判据只写在 `skillCatalogForReplay` 一处（这一版起与 MCP 索引同一套缓存保护）。
+  const skillCatalog = options.skillCatalog !== undefined
+    ? options.skillCatalog
+    : skillCatalogForReplay(options.skillsRoot ?? cwd, scan.events, stepStart.seq);
+
   const request = rebuildRenderedRequest(
     located,
     {
@@ -842,6 +1165,9 @@ export async function buildReplayReport(
       // 老事件才从盘上读回（只读，不建文件）。`dataDir` 仍要传：重建联系人/别名那条路要用它。
       dataDir,
       memoryIndex: memoryIndexTextForRebuild(located.eventsBefore, located.turn, dataDir),
+      // 技能索引：与运行期同一份来源（见上），两条重建（当时口径 / --diff 右栏）**用同一串字节**
+      // ——右栏若少了它，差异报告会把"装配缺失"说成"当前口径变了"
+      skillCatalog,
       // v32：框架代管记忆的总开关与 STATE 字节预算，都照**盘上那份配置**判（上面读一次）。
       // 与运行期同一个字段、同一条口径：关掉时重建出来的固定块里没有索引——那才是她当时看到的。
       memoryEnabled,
@@ -850,6 +1176,8 @@ export async function buildReplayReport(
       // 判据本身只有一处实现（WarnExemptBook.isExempt），这里只把它递给重建。
       warnExempt: warnExemptJudgeOf(dataDir),
       ...(contactGate === undefined ? {} : { contact: contactGate }),
+      // 上一步的此刻层要一份"全量"事件流才找得到（见 `RebuildOptions.previousPool`）
+      previousPool: located.eventsBefore,
     },
   );
   const compareRequest = rebuildRenderedRequest(
@@ -859,10 +1187,12 @@ export async function buildReplayReport(
       now: options.compareNow ?? new Date().toISOString(),
       dataDir,
       memoryIndex: memoryIndexTextForRebuild(located.eventsBefore, located.turn, dataDir),
+      skillCatalog,
       memoryEnabled,
       ...(stateBudgetBytes === undefined ? {} : { stateBudgetBytes }),
       warnExempt: warnExemptJudgeOf(dataDir),
       ...(contactGate === undefined ? {} : { contact: contactGate }),
+      previousPool: located.eventsBefore,
     },
   );
 
@@ -909,6 +1239,16 @@ export async function buildReplayReport(
   if (toolResult.problems.length > 0) {
     notes.push(`工具集装配有 ${toolResult.problems.length} 处问题：${toolResult.problems.slice(0, 3).join('；')}`);
   }
+  // 技能索引那一段的"现在这份"限制（REVIEW P1-16）：不写这一条，"重建里技能少了/多了"会被
+  // 当成装配 bug 查半天——与人格资产同一条限制，如实写在这里。
+  notes.push('技能索引（长期记忆层的第一段）按**现在这份** `skills/` 目录 + 到这一步为止的 '
+    + '`skill/installed` 重建：SKILL.md 改过内容、技能目录被删掉/新装（还没确认）时，'
+    + '这一段字节会与当时不同');
+
+  // 那三刀挡掉了多少条（seq 仍小于 step/start 的读数）：回答"重建的事件集与日志差多少"。
+  // 少了这个数，"重建==当时"一旦破损只能靠逐字节比对发现——而它正是 P1-17 那条的代价。
+  const rawBefore = scan.events.filter((event) => event.seq < stepStart.seq).length;
+  const filteredOut = Math.max(0, rawBefore - located.eventsBefore.length);
 
   return {
     ok: true,
@@ -950,9 +1290,11 @@ export async function buildReplayReport(
         source: 'current-catalog',
         problems: toolResult.problems,
       },
+      skills: { bytes: Buffer.byteLength(skillCatalog ?? '', 'utf8') },
       events: {
         scanned: scan.events.length,
         inStream: located.eventsBefore.length,
+        filteredOut,
         rendered: request.input.length,
         coveredUpToSeq: located.coveredUpToSeq,
         wakeSeq: located.wakeEvent?.seq ?? null,
@@ -978,11 +1320,13 @@ export function formatReplaySummary(report: ReplayReport): string[] {
     `指纹 configHash：记录 ${short(report.fingerprints.configHash.recorded)}`
     + ` / 当前 ${short(report.fingerprints.configHash.current)}`
     + ` → ${report.fingerprints.configHash.matches === null ? '无法比对' : report.fingerprints.configHash.matches ? '一致' : '不一致'}`,
-    `事件流：参与渲染 ${report.events.inStream} 条（扫描 ${report.events.scanned} 条）`
+    `事件流：参与渲染 ${report.events.inStream} 条（扫描 ${report.events.scanned} 条`
+    + `${report.events.filteredOut > 0 ? ` · 三刀挡掉 ${report.events.filteredOut} 条` : ''}）`
     + ` · 本轮新输入 ${report.events.wakeSeq === null ? '（无，非首步）' : `seq ${report.events.wakeSeq}`}`
     + ` · 遮蔽点 seq ${report.events.coveredUpToSeq}`,
     `请求体：${report.request.input.length} 条 input · ${jsonBytes(report.request)} 字节`
-    + ` · 工具 ${report.tools.count} 件（digest ${report.tools.digest.slice(0, 12)}）`,
+    + ` · 工具 ${report.tools.count} 件（digest ${report.tools.digest.slice(0, 12)}）`
+    + ` · 技能索引 ${report.skills.bytes} 字节`,
   ];
   for (const note of report.notes) lines.push(`注：${note}`);
   return lines;

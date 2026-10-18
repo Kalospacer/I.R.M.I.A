@@ -28,11 +28,11 @@ function privateEvent(raw: string, segments: unknown[]): Record<string, unknown>
     post_type: 'message',
     message_type: 'private',
     message_id: 24681357,
-    user_id: 1269541505,
+    user_id: 1234567890,
     self_id: 10001,
     raw_message: raw,
     message: segments,
-    sender: { user_id: 1269541505, nickname: '用户' },
+    sender: { user_id: 1234567890, nickname: '用户' },
   };
 }
 
@@ -42,12 +42,12 @@ function groupAtEvent(raw: string, segments: unknown[]): Record<string, unknown>
     post_type: 'message',
     message_type: 'group',
     message_id: 1739441710,
-    group_id: 427674145,
-    user_id: 1269541505,
+    group_id: 123456789,
+    user_id: 1234567890,
     self_id: 10001,
     raw_message: raw,
     message: segments,
-    sender: { user_id: 1269541505, nickname: '用户', card: '用户' },
+    sender: { user_id: 1234567890, nickname: '用户', card: '用户' },
   };
 }
 

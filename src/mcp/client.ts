@@ -45,6 +45,7 @@ import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:f
 import { join } from 'node:path';
 
 import { killProcessTree } from '../process/kill-tree.ts';
+import { createUtf8Stream, decodeText } from '../util/bytes-text.ts';
 import type { SideEffect } from '../log/types.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { ToolDefinition, ToolExecutionMode, ToolHandlerResult } from '../tools/types.js';
@@ -76,7 +77,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = ['2025-06-18', '20
 /** clientInfo（握手时上报；server 侧日志靠它辨认调用方）。version 与 main.ts 的 AGENT_VERSION 同步 */
 export const DEFAULT_CLIENT_INFO: { readonly name: string; readonly version: string } = {
   name: 'irmia-agent',
-  version: '0.1.0-beta.10',
+  version: '0.1.0-beta.11',
 };
 
 /** 每请求软超时：progress 通知可重置这个时钟 */
@@ -1055,15 +1056,27 @@ function wrapChildProcess(child: ChildProcess): McpProcess {
   const emitExit = (code: number | null, signal: string | null): void => {
     if (settled) return;
     settled = true;
+    // 退出前把两个流解器的结尾吐干净（跨块的半个字符在这里补齐；正常情况是空串）
+    const outTail = outStream.flush();
+    if (outTail !== '') for (const handler of stdoutHandlers) handler(outTail);
+    const errTail = errStream.flush();
+    if (errTail !== '') for (const handler of stderrHandlers) handler(errTail);
     for (const handler of exitHandlers) handler(code, signal);
   };
 
+  // MCP 的 stdio 帧是**换行分隔的 JSON、规范就是 UTF-8**：这里要的不是"猜编码"，
+  // 而是"别把跨块的多字节字符切成两半"。`createUtf8Stream` 用一个带 stream 状态的
+  // TextDecoder 做到这一点，并如实统计替换字符（某个 server 真写了非 UTF-8 时能发现）。
+  const outStream = createUtf8Stream();
+  const errStream = createUtf8Stream();
   child.stdout?.on('data', (buf: Buffer) => {
-    const text = buf.toString('utf8');
+    const text = outStream.push(buf);
+    if (text === '') return;
     for (const handler of stdoutHandlers) handler(text);
   });
   child.stderr?.on('data', (buf: Buffer) => {
-    const text = buf.toString('utf8');
+    const text = errStream.push(buf);
+    if (text === '') return;
     for (const handler of stderrHandlers) handler(text);
   });
   child.stdin?.on('error', () => {
@@ -3296,12 +3309,14 @@ export function resolveRssSampler(
 /** 跑一条只读命令并把 stdout 收回来（不经过 shell；**短超时默认 2s**，失败即 reject，由调用方兜） */
 function runCapture(command: string, args: readonly string[], timeoutMs = SINGLE_SAMPLE_TIMEOUT_MS): Promise<string> {
   return new Promise<string>((resolve, reject) => {
-    execFile(command, [...args], { timeout: timeoutMs, windowsHide: true, encoding: 'utf8' }, (err, stdout) => {
+    // **不收 `encoding:'utf8'`**：这条命令是 `powershell -Command "<读进程 RSS 的脚本>"`，
+    // 它出错时的中文诊断在中文 Windows 上是 GBK 字节。收原始字节再判一次（见 util/bytes-text.ts）。
+    execFile(command, [...args], { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
       if (err !== null) {
         reject(err instanceof Error ? err : new Error(String(err)));
         return;
       }
-      resolve(typeof stdout === 'string' ? stdout : '');
+      resolve(typeof stdout === 'string' ? stdout : decodeText(stdout).text);
     });
   });
 }

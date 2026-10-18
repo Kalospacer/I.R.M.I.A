@@ -551,14 +551,14 @@ test('④ 大结果走外置：清单超阈值 ⇒ 回执只剩预览 + blob 指
   assert.equal(result.isError, undefined, result.content);
   assert.ok(result.content.length < 4000, `外置之后回执要短（实际 ${result.content.length} 字符）`);
   assert.match(result.content, /MCP server「big」的工具 200 件/u, '预览里要有结论（几件）');
-  assert.match(result.content, /read_blob 取/u, '给取全文的路');
+  assert.match(result.content, /要原文用 safe_read 读这个路径/u, '给取全文的路（v64：指针里是路径 + safe_read）');
 
   // 指针必须是**同一句话**（唯一实现 `blobPointerText`）：这里从回执里抠出真正的指针
   //（最后一行、以 `[完整结果` 开头），再拿它去比那个函数的输出——两处各拼一遍必然漂移，
   //  2026-10-06 就现抓过一次。
   const pointerLine = result.content.split('\n').find((line) => line.startsWith('[完整结果'));
   assert.ok(pointerLine !== undefined, `回执里要有那一行指针（实际：${result.content.slice(-200)}）`);
-  const blobId = /data[\\/]blobs[\\/]([^\]]+)/u.exec(pointerLine)?.[1] ?? '';
+  const blobId = /data[\\/]blobs[\\/]([0-9a-f]{64})/u.exec(pointerLine)?.[1] ?? '';
   assert.notEqual(blobId, '', '指针里要有 blobId');
   const bytes = Number(/\[完整结果 (\d+) 字节/u.exec(pointerLine)?.[1] ?? '0');
   assert.ok(bytes > 0, '指针里要有全文字节数');
@@ -834,7 +834,7 @@ test('⑪ 回执说清"这次披露了几件 / 约多少 token"（外部稿「�
   assert.equal(bigList.isError, undefined, bigList.content);
   assert.match(bigList.content, /本次披露 64 件，约 \d+ token/u,
     `外置之后那句读数仍要在（实际：${bigList.content.slice(-400)}）`);
-  assert.match(bigList.content, /read_blob 取/u, '超限走的是既有外置那条路（她仍然能取回全文）');
+  assert.match(bigList.content, /要原文用 safe_read 读这个路径/u, '超限走的是既有外置那条路（她仍然能取回全文）');
   assert.equal(/不给|拒绝披露|超过预算/u.test(bigList.content), false,
     '那句读数**绝不许**变成拒绝披露的理由');
 });

@@ -1,3 +1,7 @@
+// TODO(i18n): 本文件还有 3 处硬编码中文字符串字面量未迁（2026-10-17 盘点，lib/format.dart）。
+// 迁移口径在 lib/i18n/app_strings.dart：往 AppStrings 里加 getter（ZhStrings / EnStrings 各实现一次），
+// 页面里 `final s = IrmiaStrings.of(context);` 之后取用，**别在页面里拼字符串**（语序因语言而异）。
+// 不许迁的：她的人设文案、她的发言/记忆正文、她说话的口吻——那是内容，不是界面的一层皮。
 /// 数字口径与单位格式的**界面实现**——与 `src/format/units.ts` **逐字镜像**。
 ///
 /// 立这个文件的那条意见（用户 2026-10-05，逐字）：

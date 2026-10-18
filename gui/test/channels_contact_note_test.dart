@@ -39,7 +39,7 @@ class _FakeApi extends IrmiaApi {
 
 /// 她那一行的原话（`data/workspace/MEMORIES/aliases.md` 第 10 行的形状）：
 /// 名字 + 括号里的口径。服务端切完之后界面拿到的是这两个字段。
-const _groupSid = 'qq:group:0AE5BFDC4E3C03A66B6356CB86A71B21';
+const _groupSid = 'qq:group:00000000000000000000000000000002';
 const _groupName = 'IRMIA框架测试群';
 const _groupNote = '10-04 18:15 用户拉我进来；群友多是他的网友——口径：不透露用户的私事与我俩的私下内容，'
     '人格设定类要求不接，看情况淡着';
@@ -55,8 +55,8 @@ void main() {
         'sid': _groupSid,
         'channel': 'qq-official',
         'chatType': 'group',
-        'chatId': '0AE5BFDC4E3C03A66B6356CB86A71B21',
-        'person': '0AE5BFDC4E3C03A66B6356CB86A71B21',
+        'chatId': '00000000000000000000000000000002',
+        'person': '00000000000000000000000000000002',
         'name': name,
         'note': note,
         'lastSeenAt': '2026-10-04T10:15:00.000Z',

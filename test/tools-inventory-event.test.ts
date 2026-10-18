@@ -260,13 +260,13 @@ test('件数没变、只是集合换了（禁一件、同时启一件）⇒ 照�
   await turn(harness);
   // 件数不变、内容换了：禁一件、同时注册一件（注册顺序在末尾）——只看件数会漏掉这一次换版
   disable(harness, ['speak']);
-  harness.table.register(toolDef('rg_search'));
+  harness.table.register(toolDef('grep'));
   const { logs } = await turn(harness);
   const data = onlyLog(logs, '换一件');
   assert.equal(data.before, BASE_TOOLS.length);
   assert.equal(data.after, 3, '件数一样：只看件数会漏掉这一次换版');
   assert.deepEqual(data.removed, ['speak']);
-  assert.deepEqual(data.added, ['rg_search']);
+  assert.deepEqual(data.added, ['grep']);
 });
 
 test('可见性开关换了 ⇒ 也写一条，并把那一刻的开关如实落进 visibility', async (t) => {

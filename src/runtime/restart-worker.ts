@@ -46,6 +46,7 @@ import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import { resolve } from 'node:path';
 
+import { decodeText } from '../util/bytes-text.ts';
 import {
   RESTART_FAILURE_REASONS, endTraceLine, instanceTraceLine, restartTraceLine,
   type RestartFailureReason,
@@ -376,12 +377,13 @@ function stopGuiByPath(guiExe: string): number[] {
     '}',
     'Write-Output ($pids -join ",")',
   ].join("\n");
+  // **不收 `encoding:'utf8'`**（2026-10-18 收口）：这一格的输出是 pid 列表（ASCII），
+  // 但 Windows PowerShell 5.1 出错时的中文诊断是 GBK 字节，而它会顺着错误路径给人看见。
   const probe = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-    encoding: 'utf8',
     timeout: 20_000,
     env: { ...process.env, IRMIA_RESTART_GUI_EXE: guiExe },
   });
-  const text = (probe.stdout ?? '').trim();
+  const text = (probe.stdout === null ? '' : decodeText(probe.stdout).text).trim();
   if (text === '') return [];
   return text.split(',').map((part) => Number(part.trim())).filter((value) => Number.isInteger(value) && value > 0);
 }
@@ -441,11 +443,10 @@ export function startGuiProcess(guiExe: string): number {
   ].join("\n");
   try {
     const probe = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      encoding: 'utf8',
       timeout: 20_000,
       env: { ...process.env, IRMIA_RESTART_GUI_EXE: guiExe },
     });
-    const pid = Number((probe.stdout ?? '').trim());
+    const pid = Number((probe.stdout === null ? '' : decodeText(probe.stdout).text).trim());
     return Number.isInteger(pid) && pid > 0 ? pid : 0;
   } catch {
     return 0;

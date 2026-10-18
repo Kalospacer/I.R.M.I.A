@@ -73,6 +73,7 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { resolveRestartShell } from './restart-shell.ts';
+import { decodeText } from '../util/bytes-text.ts';
 
 // ──────────────────────────────── 常量与文件名 ────────────────────────────────
 
@@ -457,8 +458,6 @@ function resolveShell(): string {
 
 export function listPidsByExePath(exe: string, shell = resolveShell()): Promise<number[]> {
   return new Promise<number[]>((resolve, reject) => {
-    let stdout = '';
-    let stderr = '';
     let settled = false;
     const child = spawn(shell, ['-NoProfile', '-NonInteractive', '-Command', GUI_PROBE_SCRIPT], {
       env: { ...process.env, IRMIA_GUI_GUARD_EXE: exe },
@@ -471,8 +470,15 @@ export function listPidsByExePath(exe: string, shell = resolveShell()): Promise<
       reject(new Error(`探活超时（${PROBE_TIMEOUT_MS} 毫秒）：${shell}`));
     }, PROBE_TIMEOUT_MS);
     timer.unref();
-    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
-    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
+    // **收原始字节**（2026-10-18）：探活脚本的输出里 `PIDS=` 是 ASCII，但**失败路径**上
+    // stderr 会被拼进那句错误里给用户看——Windows PowerShell 5.1 的中文诊断是 GBK 字节，
+    // `chunk.toString('utf8')` 会当场换成 U+FFFD。
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+    const decodeOut = (): string => decodeText(Buffer.concat(outChunks)).text;
+    const decodeErr = (): string => decodeText(Buffer.concat(errChunks)).text;
+    child.stdout?.on('data', (chunk: Buffer) => { outChunks.push(chunk); });
+    child.stderr?.on('data', (chunk: Buffer) => { errChunks.push(chunk); });
     child.on('error', (err) => {
       if (settled) return;
       settled = true;
@@ -483,6 +489,8 @@ export function listPidsByExePath(exe: string, shell = resolveShell()): Promise<
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      const stdout = decodeOut();
+      const stderr = decodeErr();
       // 判据是那一行 `PIDS=`：没有它 = 这次没问出来，**绝不当成"它不在了"**
       const match = /PIDS=([0-9,\s]*)/u.exec(stdout);
       if (match === null) {
@@ -503,18 +511,20 @@ export function listPidsByExePath(exe: string, shell = resolveShell()): Promise<
  * 而它是人可感知的偶发动作（不是每一拍都跑），阻塞几百毫秒无所谓。
  */
 export function launchGuiByStartProcess(exe: string, shell = resolveShell()): GuiLaunchResult {
+  // **不收 `encoding:'utf8'`**：`ERR=` / `PID=` 是 ASCII，但失败路径上 `probe.stderr`
+  // 会被拼进给用户看的那句话里，而 Windows PowerShell 5.1 的中文诊断是 GBK 字节。
   const probe = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', GUI_LAUNCH_SCRIPT], {
-    encoding: 'utf8',
     timeout: PROBE_TIMEOUT_MS,
     env: { ...process.env, IRMIA_GUI_GUARD_EXE: exe, IRMIA_GUI_GUARD_DIR: dirname(exe) },
     windowsHide: true,
   });
-  const out = `${probe.stdout ?? ''}`.trim();
+  const out = (probe.stdout === null ? '' : decodeText(probe.stdout).text).trim();
   const fail = /ERR=(.*)/u.exec(out);
   if (fail !== null) return { ok: false, pid: 0, note: `拉起失败：${(fail[1] ?? '').trim()}` };
   const pidMatch = /PID=(\d+)/u.exec(out);
   if (pidMatch === null) {
-    const detail = (probe.stderr ?? '').trim() || out;
+    const stderrText = probe.stderr === null ? '' : decodeText(probe.stderr).text;
+    const detail = stderrText.trim() || out;
     return { ok: false, pid: 0, note: `拉起没有读数（退出码 ${String(probe.status)}）：${detail.slice(0, 200)}` };
   }
   return { ok: true, pid: Number(pidMatch[1]), note: `Start-Process pid ${pidMatch[1]}` };

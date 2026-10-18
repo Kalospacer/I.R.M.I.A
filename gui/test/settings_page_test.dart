@@ -130,8 +130,24 @@ void main() {
         },
       };
 
-  /// GET /api/deps 的样例：rg 就绪、es 可一键装、pwsh 只能人工装（三态各一）
-  Map<String, dynamic> depsReport() => <String, dynamic>{
+  /// GET /api/deps 的样例：rg 就绪、es 可一键装、pwsh 只能人工装（三态各一），
+  /// 外加 v-next 的第 4 件 **Python**。
+  ///
+  /// python 那一行给的是**本机最常见的形状**（用户 2026-10-17 的口径：「Python 和 pip
+  /// 不应该是默认要求装的，而是**有就用 PATH 里的**」）：`source: 'path'` —— 机器上本来就
+  /// 有 python，所以它是「已就绪·系统」，**不是**"建议安装"。另外两态（托管那份兜底、
+  /// 一个都没有）由下面单独两条用例喂——三条各锁一句话，合并就分不清是哪一句错了。
+  ///
+  /// python 的 pip 刻意给的是"**有 pip**"这一态：用户 2026-10-16 的原话是
+  /// 「pip 必须要，方便后续 agent 自行拓展能力」⇒ 界面必须把 pip 版本显示出来。
+  /// "没有 pip"那一态由下面单独一条用例喂（`pipVersion: ''` + `pipReason`）——
+  /// 那一态是**不许静默**的，所以它值得自己一条。
+  Map<String, dynamic> depsReport({
+    String pipVersion = '26.2.1',
+    String pipReason = '',
+    String pythonSource = 'path',
+  }) =>
+      <String, dynamic>{
         'available': true,
         'dataDir': 'D:/irmia/data',
         'toolsDir': 'D:/irmia/data/tools',
@@ -190,6 +206,28 @@ void main() {
             'downloadPage': 'https://www.voidtools.com/downloads/',
             'minVersion': '1.1',
             'managedDir': 'D:/irmia/data/tools/es',
+          },
+          {
+            'name': 'python',
+            'label': 'Python 运行环境',
+            'status': 'ready',
+            'ok': true,
+            // 系统 PATH 上那一份（本机实测 3.11.5 就在 PATH 上）——"有就用 PATH 里的"
+            'path': 'C:/Users/irmia/AppData/Local/Programs/Python/Python311/python.exe',
+            'version': '3.11.5',
+            'source': pythonSource,
+            'reason': '',
+            'purpose': "给她自己扩展能力用的运行环境（含 pip）：pwsh 工具的 lang:'python' 档，"
+                '将来的 Office 工具包与 computer use 插件也挂在它上面',
+            'impact': '没有它时 pwsh 的 python 档如实报找不到解释器',
+            'action': null,
+            'installable': true,
+            'manualHint': null,
+            'downloadPage': 'https://www.python.org/downloads/windows/',
+            'minVersion': '3.8',
+            'managedDir': 'D:/irmia/data/tools/python',
+            'pipVersion': pipVersion,
+            'pipReason': pipReason,
           },
         ],
         'generatedAt': '2026-10-01T00:00:00.000Z',
@@ -256,6 +294,9 @@ void main() {
   Map<String, dynamic> installReply = <String, dynamic>{};
   /// 让 /api/deps 返回 404（"读不到依赖状态"那条路径）
   bool depsFails = false;
+  /// 覆盖整份 /api/deps 报告（默认 null = 用上面的三态样例）。
+  /// 用例用它喂**默认样例覆盖不到的态**：python 就绪但没有 pip。
+  Map<String, dynamic>? depsReportOverride;
 
   /// GET /api/protocol-side 的回执（v34）；protocolFails = 让它 500（"读不到协议端状态"）
   Map<String, dynamic> protocolSide = protocolView();
@@ -318,6 +359,7 @@ void main() {
       ..remove(r'$pending');
     (liveConfig['persona'] as Map<String, dynamic>)['compactionThresholdTokens'] = 100000;
     depsFails = false;
+    depsReportOverride = null;
     installReply = <String, dynamic>{'ok': true, 'step': 'done', 'version': '1.1.0.38'};
     protocolSide = protocolView();
     protocolFails = false;
@@ -379,7 +421,9 @@ void main() {
           response.statusCode = 500;
           response.write(jsonEncode({'error': {'message': 'deps 端点不可用'}}));
         } else {
-          response.write(jsonEncode(depsReport()));
+          // `depsReportOverride` 让某一条用例喂一份**不同态**的报告
+          // （例如"python 就绪但没有 pip"）——默认那份三态覆盖不了它
+          response.write(jsonEncode(depsReportOverride ?? depsReport()));
         }
       } else if (path == '/api/protocol-side') {
         // 协议端状态（v34）：读不到时 500，让卡片走它自己的 error 态
@@ -802,19 +846,122 @@ void main() {
     await pumpSettings(tester, size: const Size(1350, 2600));
     await pumpUntil(tester, find.text('PowerShell 7（pwsh）'));
 
-    // 徽章三态各一：就绪 / 未安装（×2）。断言限定在这张卡里——v34 的协议端卡也在用同一套词
-    expect(inDepsCard(find.text('已就绪')), findsOneWidget);
+    // 徽章三态：就绪 ×2（rg 与 python）/ 未安装 ×2（pwsh 与 es）。
+    // 断言限定在这张卡里——v34 的协议端卡也在用同一套词。
+    // ⚠ 「已就绪」现在是**两种说法**（2026-10-17）：rg 是框架托管那份、python 是系统 PATH 那份
+    expect(inDepsCard(find.text('已就绪·托管')), findsOneWidget);
+    expect(inDepsCard(find.text('已就绪·系统')), findsOneWidget);
     expect(inDepsCard(find.text('未安装')), findsNWidgets(2));
-    // 卡头的汇总徽章："建议安装 N 项"（rg 已就绪，剩 pwsh 与 es）
+    // 卡头的汇总徽章："建议安装 N 项"（rg 与 python 已就绪，剩 pwsh 与 es）
     expect(find.text('建议安装 2 项'), findsOneWidget);
 
-    // 就绪的行要给"探测到的路径与版本"（这是事实，不是承诺）
-    expect(find.textContaining('15.1.0 · D:/irmia/data/tools/rg/rg.exe'), findsOneWidget);
+    // 就绪的行要给"**用的是哪一份** + 探测到的路径与版本"（这是事实，不是承诺。
+    // python 那一行的路径是**系统 PATH 上那个**——用户 2026-10-17 要的就是这个形状）
+    expect(find.textContaining('系统 PATH · 15.1.0 · D:/irmia/data/tools/rg/rg.exe'), findsNothing,
+        reason: 'rg 命中的是自装目录，来源该写「框架托管」');
+    expect(find.textContaining('框架托管 · 15.1.0 · D:/irmia/data/tools/rg/rg.exe'), findsOneWidget);
+    expect(
+      find.textContaining(
+        '系统 PATH · 3.11.5 · C:/Users/irmia/AppData/Local/Programs/Python/Python311/python.exe',
+      ),
+      findsOneWidget,
+    );
 
     // **显式告知建议安装**：未安装的行必须写清"没有它会怎样"
     expect(find.textContaining('如实回退到 Windows PowerShell 5.1'), findsOneWidget);
     expect(find.textContaining('es_search 不注册'), findsOneWidget);
+    // 第 4 件那一行要写清"它是给谁用的"（用户点名：pwsh 的 python 档 + 将来的扩展）
+    expect(find.textContaining("pwsh 工具的 lang:'python' 档"), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('外部依赖卡片：Python 那一行显示 pip 版本（她要能自己 pip install 扩能力）', (tester) async {
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.text('Python 运行环境'));
+    expect(find.text('pip 26.2.1（她可以自己 pip install 扩能力）'), findsOneWidget);
+  });
+
+  testWidgets('外部依赖卡片：三态各一条 —— 已就绪·系统（有就用 PATH 里的那份）', (tester) async {
+    // 这一条锁用户 2026-10-17 那句「**有就用 PATH 里的**」在界面上的落点：
+    // PATH 上那份可用 ⇒ 徽章是「已就绪·系统」，**不是**"建议安装"，也没有「安装」按钮。
+    depsReportOverride = depsReport(pythonSource: 'path');
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.text('Python 运行环境'));
+    expect(inDepsCard(find.text('已就绪·系统')), findsOneWidget,
+        reason: 'PATH 上那份是"机器上本来就有的"——徽章要说清，别让人以为要去装');
+    expect(inDepsCard(find.text('已就绪·托管')), findsOneWidget, reason: '那是 rg（自装目录那份）');
+    expect(find.text('建议安装 2 项'), findsOneWidget,
+        reason: 'python 已就绪 ⇒ 建议安装的账里不该有它（只有 pwsh 与 es）');
+    // 这一行下面那条断言才是关键：就绪的行**不给按钮**（摆了只会重复劳动）
+    expect(inDepsCard(find.widgetWithText(FilledButton, '安装')), findsOneWidget,
+        reason: '只有 es 需要「安装」——python 就绪时不该给按钮');
+    expect(find.text('无需操作'), findsNWidgets(2), reason: 'rg 与 python 两行写"无需操作"');
+  });
+
+  testWidgets('外部依赖卡片：三态各一条 —— 已就绪·托管（没有 Python 的机器用兜底那份）', (tester) async {
+    // PATH 一个都没有、托管顶上：徽章是「已就绪·托管」（那是**框架装的**那份，说法不同），
+    // 那一行也要如实写"框架托管"，别写成系统的
+    depsReportOverride = depsReport(pythonSource: 'managed');
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.text('Python 运行环境'));
+    expect(inDepsCard(find.text('已就绪·托管')), findsNWidgets(2),
+        reason: 'rg（自装目录）+ python（托管兜底）各一枚');
+    expect(inDepsCard(find.text('已就绪·系统')), findsNothing, reason: '这一份报告里没有系统那份');
+    expect(find.textContaining('框架托管 · 3.11.5 · '), findsOneWidget,
+        reason: '用的是托管那份 ⇒ 那一行写「框架托管」');
+  });
+
+  testWidgets('外部依赖卡片：三态各一条 —— 未就绪（两处都没有 ⇒ 才建议安装）', (tester) async {
+    // 这是"没有的话就要求装"那一态：**只有两处都没有**时它才是未安装 + 建议安装
+    final report = depsReport();
+    report['entries'] = [
+      for (final entry in (report['entries']! as List))
+        if ((entry as Map)['name'] == 'python')
+          {
+            ...entry,
+            'status': 'missing',
+            'ok': false,
+            'path': '',
+            'version': '',
+            'source': null,
+            'reason': '未找到 python（最低要求 3.8）。已试：config: 未指定；'
+                'path: 试过 python.exe / python3.exe / python / python3 / py.exe / py',
+            'action': 'install',
+            'pipVersion': '',
+            'pipReason': 'python 未就绪，所以 pip 也没探到',
+          }
+        else
+          entry,
+    ];
+    depsReportOverride = report;
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.text('Python 运行环境'));
+    expect(inDepsCard(find.text('未安装')), findsNWidgets(3), reason: 'pwsh / es / python 三件都没装');
+    expect(find.text('建议安装 3 项'), findsOneWidget);
+    // 未就绪时那一行给的是 reason（"试过哪几处"），不是路径与版本
+    expect(find.textContaining('已试：config: 未指定'), findsOneWidget);
+    // 可一键装的两件（es 与 python）各有一枚「安装」；两个已就绪的不给
+    expect(inDepsCard(find.widgetWithText(FilledButton, '安装')), findsNWidgets(2));
+    expect(find.text('无需操作'), findsNWidgets(1), reason: '这一份报告里只有 rg 就绪 ⇒ 只有它写"无需操作"');
+  });
+
+  testWidgets('外部依赖卡片：python 就绪但**没有 pip** 时必须明说，不许静默', (tester) async {
+    // 这一态单独一条用例：默认那份报告里 python 是带 pip 的，覆盖不到它。
+    // ⚠ 用户 2026-10-17 点名的那条也在这一条里：**没有 pip 不许把 python 判成"未就绪"**
+    depsReportOverride = depsReport(
+      pipVersion: '',
+      pipReason: '系统这份 Python 上没有可用的 pip——不影响用它跑脚本',
+    );
+    await pumpSettings(tester, size: const Size(1350, 2600));
+    await pumpUntil(tester, find.text('Python 运行环境'));
+    expect(
+      find.text('pip：不可用（系统这份 Python 上没有可用的 pip——不影响用它跑脚本）'),
+      findsOneWidget,
+      reason: 'python 可用但 pip 不可用时，界面必须把这件事说出来（她的扩展能力正缺在这一环）',
+    );
+    // 徽章照旧是「已就绪·系统」——python 本身确实就绪，pip 那一行单独说清，两件事不混
+    expect(inDepsCard(find.text('已就绪·系统')), findsOneWidget);
+    expect(inDepsCard(find.text('未安装')), findsNWidgets(2), reason: 'python 不许因为没 pip 就变成未安装');
   });
 
   testWidgets('外部依赖卡片：可一键装的给「安装」、只能人装的给「打开下载页」', (tester) async {
@@ -828,8 +975,9 @@ void main() {
     expect(inDepsCard(find.widgetWithText(FilledButton, '打开下载页')), findsOneWidget);
     expect(inDepsCard(find.widgetWithText(FilledButton, '安装')), findsOneWidget,
         reason: '就绪的那件不该给「安装」按钮');
-    // 就绪行明确写"无需操作"，而不是摆一枚按下去只会重复劳动的按钮
-    expect(find.text('无需操作'), findsOneWidget);
+    // 就绪行明确写"无需操作"，而不是摆一枚按下去只会重复劳动的按钮。
+    // 两处：rg 与 python（第 4 件就绪时也不该给按钮）
+    expect(find.text('无需操作'), findsNWidgets(2));
   });
 
   testWidgets('安装走确认框 + X-Confirm: dep-install，成功后提示并复检', (tester) async {

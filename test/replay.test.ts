@@ -20,11 +20,17 @@ import { EventLog } from '../src/log/event-log.ts';
 import type { AppEvent, ModelLane, Projection } from '../src/log/types.js';
 import { defaultVisibility } from '../src/log/types.ts';
 import type { DsClient, DsRequest, DsStreamResult } from '../src/model/ds-client.ts';
-import { NOW_LAYER_BANNER, TURN_BLOCK_BANNER } from '../src/model/render.ts';
+import { LAYER_RULES, NOW_LAYER_BANNER, TURN_BLOCK_BANNER } from '../src/model/render.ts';
 import { loadPersona } from '../src/persona/loader.ts';
 import { ensureMemoryIndex, readMemoryIndexTextReadOnly } from '../src/persona/memory-injection.ts';
+import { sha256Hex } from '../src/persona/versions.ts';
 import { runTurn, type AgentLoopDeps, type AgentLoopPersona } from '../src/runtime/agent-loop.ts';
-import { buildReplayReport, formatReplaySummary, locateStep } from '../src/runtime/replay.ts';
+import {
+  buildReplayReport, contextEventsForRebuild, formatReplaySummary, isFrameworkWakeEvent,
+  jsonBytes, locateStep, rebuildRenderedRequest, type RebuildOptions, type ReplayPosition,
+} from '../src/runtime/replay.ts';
+import { isFrameworkCommandEvent } from '../src/runtime/slash-commands.ts';
+import { SkillManager } from '../src/skill/skills.ts';
 import { applyOne, fold } from '../src/state/fold.ts';
 import { ToolRegistry } from '../src/tools/registry.ts';
 import type { ToolDefinition } from '../src/tools/types.ts';
@@ -101,10 +107,14 @@ function makeRegistry(): ToolRegistry {
   return registry;
 }
 
-async function makeHarness(t: TestContext): Promise<Harness> {
+async function makeHarness(
+  t: TestContext,
+  /** 人格文件覆盖（v69：造一份**超预算**的 STATE，用此刻层那行提醒当"整轮只发一次"的判据） */
+  personaFiles: Record<string, string> = PERSONA_FILES,
+): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'irmia-replay-'));
   mkdirSync(join(dir, 'persona'), { recursive: true });
-  for (const [name, content] of Object.entries(PERSONA_FILES)) {
+  for (const [name, content] of Object.entries(personaFiles)) {
     writeFileSync(join(dir, 'persona', name), content, 'utf8');
   }
   // config.json：configHash 是 render 三指纹之一，用它验证"当时的配置"可被取回
@@ -160,7 +170,15 @@ async function makeHarness(t: TestContext): Promise<Harness> {
     registry: makeRegistry(),
     persona,
     append,
-    depsOf: (ds, extra: { assetsLine?: string } = {}) => ({
+    depsOf: (ds, extra: {
+      assetsLine?: string;
+      stateBudgetBytes?: number;
+      /** 技能索引（P1-16）：运行期那一份由 real-loop 从 `SkillManager.catalogText()` 现取 */
+      skillCatalog?: string | null;
+      /** 运行期那两刀（P1-17）：顶层 eventFilter 与框架唤醒判据 */
+      eventFilter?: (event: AppEvent) => boolean;
+      isFrameworkWake?: (event: AppEvent) => boolean;
+    } = {}) => ({
       log,
       ds,
       registry: makeRegistry(),
@@ -169,6 +187,9 @@ async function makeHarness(t: TestContext): Promise<Harness> {
       now: () => NOW,
       timezone: TIMEZONE,
       workspaceRoot: dir,
+      // STATE 预算（v32/v69）：与 `buildReplayReport` 的 options 同源（同一份 config.json 字段）。
+      // 缺省不给 = 出厂 8 KB；v69 那条多步用例显式给 2048，用"超预算提醒"当增量判据。
+      ...(extra.stateBudgetBytes === undefined ? {} : { stateBudgetBytes: extra.stateBudgetBytes }),
       // 联络事实：运行期由 real-loop 的 contactFacts 算好传进来，重放侧由 buildReplayReport
       // 从**事件 + 盘上**重建（会话簿/话题折事件，联系人与别名读盘）。这里给的这几样要
       // 与那个重建口径一致（默认配置：两条通道都关、没有告警出口、没有联系人与别名），
@@ -211,6 +232,11 @@ async function makeHarness(t: TestContext): Promise<Harness> {
             assets: extra.assetsLine,
           }),
         }),
+      // 技能索引（P1-16）：不给 = 本轮没有可用技能（该段整体不出现）
+      ...(extra.skillCatalog === undefined ? {} : { skillCatalog: extra.skillCatalog }),
+      // 运行期的上下文两刀（P1-17）：与 real-loop 的 `contextEventFilter` / `isFrameworkWake` 同形
+      ...(extra.eventFilter === undefined ? {} : { eventFilter: extra.eventFilter }),
+      ...(extra.isFrameworkWake === undefined ? {} : { isFrameworkWake: extra.isFrameworkWake }),
     }),
   };
 }
@@ -334,6 +360,57 @@ test('M6-5 单步：replay 重建的请求体与当时真实下发的逐字段�
 });
 
 // ──────────────────────────────── ② 多步与工具结果 ────────────────────────────────
+
+test('v69 多步基线：三步里"没变就不发"的那几行，重建与当时**逐字节**一致（第 3 步是关键）', async (t) => {
+  // 钉的是 v69 换掉的那条口径：**基线是上一步"完整的那一层"**（`nowLayerFull`），不是
+  // "上一步真发出去的那几行"。判据用此刻层的 `预算提醒：`——超预算的 STATE 下，它第 1 步发、
+  // 第 2/3 步省；若基线退化成"发出去的那一层"，第 3 步会把它**再发一次**（隔步重发），
+  // 而重建那一侧只要口径一致就跟着多一行 ⇒ 这条用例当场红。
+  // 顺带钉住另一处：重建"上一步"必须用**那一步**的步号重建任务卡（`已 M 步`）——用当前步号
+  // 会让"当前任务"这一项被判成"没变"而不发，同样当场红。
+  const bigState = `# 当前状态\n\n${'待命，等下一拍。'.repeat(200)}\n`;
+  assert.ok(Buffer.byteLength(bigState, 'utf8') > 2048, '夹具必须是超预算的 STATE');
+  const h = await makeHarness(t, { ...PERSONA_FILES, 'STATE.md': bigState });
+  await appendSessionStart(h);
+  const wake = h.append('wake/manual', { note: '跑三步' });
+  const model = fakeModel([
+    { toolCalls: [{ callId: 'call_1', name: 'read_file', arguments: '{"file_path":"a.txt"}' }] },
+    { toolCalls: [{ callId: 'call_2', name: 'read_file', arguments: '{"file_path":"a.txt"}' }] },
+    { text: '三步跑完了。' },
+  ]);
+  await runTurn(h.depsOf(model.ds, { stateBudgetBytes: 2048 }), [wake]);
+  assert.equal(model.requests.length, 3, '两次工具调用 = 三次模型请求');
+  h.log.close();
+
+  const nowTextOf = (input: readonly unknown[]): string => {
+    for (let i = input.length - 1; i >= 0; i -= 1) {
+      const item = input[i] as { type?: string; role?: string; content?: unknown };
+      if (item.type === 'message' && item.role === 'developer'
+        && typeof item.content === 'string' && item.content.startsWith(NOW_LAYER_BANNER)) return item.content;
+    }
+    return '';
+  };
+  // 第 1 步：提醒在（不然下面"第 2/3 步没有"就是空断言）
+  assert.ok(nowTextOf(model.requests[0]!.input).includes('预算提醒：'), '第 1 步：提醒在');
+
+  for (const step of [2, 3]) {
+    const actual = model.requests[step - 1]!;
+    const built = await buildReplayReport(h.dir, 1, step, {
+      cwd: h.dir,
+      tools: h.registry.listForModel({}),
+      timezone: TIMEZONE,
+      stateBudgetBytes: 2048,
+    });
+    assert.equal(built.ok, true, `第 ${step} 步要重建得出来`);
+    if (!built.ok) return;
+    assert.equal(
+      JSON.stringify(built.report.request.input),
+      JSON.stringify(actual.input),
+      `第 ${step} 步重建必须与当时逐字节一致（基线口径不一致就会在这里分叉）`,
+    );
+    assert.ok(!nowTextOf(actual.input).includes('预算提醒：'), `第 ${step} 步：提醒不该再发（整轮一次）`);
+  }
+});
 
 test('M6-5 多步：第二步的历史里含工具调用与结果配对，重建仍与当时一致', async (t) => {
   const h = await makeHarness(t);
@@ -493,4 +570,281 @@ test('replay：人格被改过时如实标注（用当前内容重建 + 明说�
   );
   // STATE 属状态层：新材料进的是 input 首条 developer 消息，不在 instructions
   assert.equal(JSON.stringify(built.report.request.input).includes('正在写测试'), true);
+});
+
+// ───────────────────────── ⑤ 技能索引（REVIEW P1-16） ─────────────────────────
+
+const SKILL_ALPHA = '---\n'
+  + 'name: alpha-search\n'
+  + 'description: 搜网页与站内内容并按相关性排序，返回标题、链接与摘要；查资料、验证事实时用。\n'
+  + '---\n\n# alpha-search\n\n正文不进请求（渐进披露第二层）。\n';
+const SKILL_BETA = '---\n'
+  + 'name: beta-unconfirmed\n'
+  + 'description: 只在待确认清单里：没写过 skill/installed，就不该进 catalog，也不该进重建。\n'
+  + '---\n\n# beta-unconfirmed\n\n正文。\n';
+
+/**
+ * 铺两个技能目录（`alpha-search` 已确认、`beta-unconfirmed` 没确认），返回**运行期那一份**
+ * `catalogText()`。
+ *
+ * 为什么这么造：运行期（`main.ts`）是 `new SkillManager({ baseRoot: process.cwd() })` +
+ * 启动时 `setTrustEvents(全部日志)` + 每 turn 问一次 `catalogText()`；重建侧照抄这三步
+ * （`skillCatalogForRebuild`）。所以"运行期那一份"在测试里就该用**同一个类**算，
+ * 而不是手写一段假文本——手写的那段只能证明"传进去什么就渲染什么"。
+ */
+function seedSkills(h: Harness): string {
+  for (const [name, text] of [['alpha-search', SKILL_ALPHA], ['beta-unconfirmed', SKILL_BETA]] as const) {
+    mkdirSync(join(h.dir, 'skills', name), { recursive: true });
+    writeFileSync(join(h.dir, 'skills', name, 'SKILL.md'), text, 'utf8');
+  }
+  const installed = h.append('skill/installed', {
+    name: 'alpha-search',
+    path: 'skills/alpha-search',
+    by: 'human',
+    contentHash: sha256Hex(SKILL_ALPHA),
+  });
+  const manager = new SkillManager({ baseRoot: h.dir });
+  manager.setTrustEvents([installed]);
+  return manager.catalogText();
+}
+
+test('P1-16 技能索引：重建拿到的就是运行期那一份（逐字节）；缺了这一格差一整段', async (t) => {
+  // 钉的是"每次重建少 555 token / 2,460 字节，且不报错"那个洞：`deriveRequest` 对
+  // `skillCatalog = null` 的语义是"没有可用技能，该段不出现"——少一段不抛错、不影响任何断言，
+  // 只有逐字节比对能抓住。所以这条用例的两半都必须有：
+  //   正：重建 == 当时（含技能索引那一段），且报告里那格读数 = 那一段的字节数；
+  //   反：把这一格摘掉（`skillCatalog: null`）就复现"改动前"的那一份——少一整段、请求体更小。
+  const h = await makeHarness(t);
+  const catalogText = seedSkills(h);
+  assert.ok(
+    catalogText.startsWith('[可用技能]') && catalogText.includes('alpha-search'),
+    `夹具的运行期 catalog 必须非空（否则这条是空断言）：${catalogText.slice(0, 80)}`,
+  );
+  assert.equal(catalogText.includes('beta-unconfirmed'), false, '没确认的技能不进 catalog（信任门）');
+
+  await appendSessionStart(h);
+  const wake = h.append('wake/manual', { note: '查一下资料' });
+  const model = fakeModel([{ text: '好。' }]);
+  await runTurn(h.depsOf(model.ds, { skillCatalog: catalogText }), [wake]);
+  const live = model.requests[0]!;
+  // ⚠ 比的是**渲染进 content 的原文**，不是 `JSON.stringify(input)`：后者会把换行转义成
+  // `\n` 两个字符，多行的 catalog 在里面永远比不中（这条用例第一版就栽在这里）。
+  const messageTextOf = (input: readonly unknown[]): string => input
+    .map((item) => (item as { content?: unknown }).content)
+    .filter((content): content is string => typeof content === 'string')
+    .join('\n');
+  assert.ok(
+    messageTextOf(live.input).includes(catalogText),
+    '运行期那一份真的把技能索引发进去了（不然后面比的是两段空）',
+  );
+  h.log.close();
+
+  const tools = h.registry.listForModel({});
+  const built = await buildReplayReport(h.dir, 1, 1, { cwd: h.dir, tools, timezone: TIMEZONE });
+  assert.equal(built.ok, true);
+  if (!built.ok) return;
+  assert.equal(
+    JSON.stringify(built.report.request.input),
+    JSON.stringify(live.input),
+    '重建必须与当时逐字节一致（含长期记忆层的技能索引那一段）',
+  );
+  assert.equal(
+    built.report.skills.bytes,
+    Buffer.byteLength(catalogText, 'utf8'),
+    '报告里的技能索引读数 = 当时那一段的字节数（这条改了之后才有）',
+  );
+  assert.ok(messageTextOf(built.report.request.input).includes(catalogText), '重建里那一段逐字节就是它');
+  // 反一：信任门在重建侧同样生效——没确认过的技能不许在重建里冒出来
+  assert.equal(JSON.stringify(built.report.request.input).includes('beta-unconfirmed'), false);
+
+  // 反二：把技能那一格摘掉 → 正是"改动前"的那一份（整段不见、请求体小一截）
+  const without = await buildReplayReport(h.dir, 1, 1, {
+    cwd: h.dir, tools, timezone: TIMEZONE, skillCatalog: null,
+  });
+  assert.equal(without.ok, true);
+  if (!without.ok) return;
+  assert.equal(
+    JSON.stringify(without.report.request.input).includes('[可用技能]'),
+    false,
+    'skillCatalog = null ⇒ 该段整体不出现（这正是原来那个洞的形状）',
+  );
+  assert.equal(without.report.skills.bytes, 0);
+  // 差额不是"恰好一段文本"：段头（`【长期记忆】` 那条分割线）与那条 input item 的 JSON 包装
+  // 只在有内容时才存在。所以按**渲染层那一条的原文**比，不数总字节：
+  const memoryLayerOf = (input: readonly unknown[]): string => input
+    .map((item) => item as { type?: string; role?: string; content?: unknown })
+    .filter((item) => item.type === 'message' && item.role === 'developer'
+      && typeof item.content === 'string' && item.content.startsWith(LAYER_RULES.memory))
+    .map((item) => item.content as string)
+    .join('\n');
+  assert.equal(memoryLayerOf(built.report.request.input), `${LAYER_RULES.memory}\n\n${catalogText}`,
+    '有技能时：这一层就是段头 + 那一段 catalog（逐字节）');
+  assert.equal(memoryLayerOf(without.report.request.input), '',
+    '没有技能时整层不出现（不写空段：这就是"少一整段"的准确形状）');
+  assert.ok(
+    jsonBytes(built.report.request) - jsonBytes(without.report.request) > Buffer.byteLength(catalogText, 'utf8'),
+    '带技能的那一份必须比不带的大（且多出段头与 JSON 包装）',
+  );
+  assert.ok(
+    built.report.notes.some((note) => note.includes('技能索引')),
+    '技能那一段"按现在这份重建"的限制要在 notes 里明说',
+  );
+});
+
+// ──────────────────────── ⑥ 重建少刀（REVIEW P1-17） ────────────────────────
+
+/** 直接写日志（**不折投影**）：造"当时在日志里、但不该进她的上下文"的事件 */
+function appendRaw(
+  h: Harness,
+  type: string,
+  data: unknown,
+  extra: { parentCallId?: string } = {},
+): AppEvent {
+  const event = {
+    seq: h.log.nextSeq(),
+    ts: NOW,
+    type,
+    data,
+    visibility: defaultVisibility(type),
+    origin: 'test/replay',
+    ...extra,
+  } as unknown as AppEvent;
+  h.log.append(event, { sync: true });
+  return event;
+}
+
+async function readAllOf(h: Harness): Promise<AppEvent[]> {
+  const events: AppEvent[] = [];
+  for await (const event of h.log.readAll()) events.push(event);
+  return events;
+}
+
+test('P1-17 重建不少刀：框架唤醒 / 框架指令 / 子链都不进历史（逐字节）；少一刀它们就回来', async (t) => {
+  // 钉的是"重建多出整理唤醒与框架指令行 ⇒ 重建==当时破损"那条：运行期有三刀
+  // （归属 / 框架指令 / 框架唤醒），重建侧以前只有前两刀，界面预览连一刀都没有。
+  // 这里把三条"日志里有、但当时没进她的上下文"的事件都造出来：
+  //   · 每日整理的定时器唤醒（`wake/timer` + payload.kind=memory-maintain）——刀③；
+  //   · `/compact` 这条框架指令（`wake/manual`）——刀②（重建侧早就有，预览以前没有）；
+  //   · 子代理链的一行（带 `parentCallId`）——刀①。
+  const h = await makeHarness(t);
+  await appendSessionStart(h);
+  appendRaw(h, 'timer/set', {
+    timerId: 't_maintain', cron: '0 4 * * *', payload: { kind: 'memory-maintain' },
+  });
+  const maintainWake = appendRaw(h, 'wake/timer', {
+    timerId: 't_maintain', scheduledAt: NOW, firedAt: NOW, payload: { kind: 'memory-maintain' },
+  });
+  const slashWake = appendRaw(h, 'wake/manual', { note: '/compact 上下文太长了' });
+  const subagentLine = appendRaw(
+    h, 'message/user', { text: '这是子代理链内部的一行（父上下文里不该有它）', source: 'human' },
+    { parentCallId: 'call_parent' },
+  );
+  const wake = h.append('wake/manual', { note: '跑一遍' });
+
+  // 运行期那两刀由宿主注入（`real-loop` 的 `contextEventFilter` + `isFrameworkWake`）：
+  // 判据用**同一份实现**（`isFrameworkCommandEvent` / `isRebuildContextEvent` 的底层判据），
+  // 这样比出来的"当时"才是生产里那一份，而不是夹具自己编的可见性。
+  const timerPayloads = new Map<string, unknown>([['t_maintain', { kind: 'memory-maintain' }]]);
+  const model = fakeModel([{ text: '好。' }]);
+  await runTurn(h.depsOf(model.ds, {
+    eventFilter: (event) => event.parentCallId === undefined && !isFrameworkCommandEvent(event),
+    isFrameworkWake: (event) => isFrameworkWakeEvent(event, timerPayloads),
+  }), [wake]);
+  const live = model.requests[0]!;
+  const liveText = JSON.stringify(live.input);
+  const forbidden: Array<[string, string]> = [
+    ['整理唤醒', '定时器触发'],
+    ['框架指令', '/compact'],
+    ['子链事件', '这是子代理链内部的一行'],
+  ];
+  for (const [label, needle] of forbidden) {
+    assert.equal(liveText.includes(needle), false, `当时那一份里不该有${label}：${needle}`);
+  }
+  const events = await readAllOf(h);
+  h.log.close();
+
+  const built = await buildReplayReport(h.dir, 1, 1, {
+    cwd: h.dir, tools: h.registry.listForModel({}), timezone: TIMEZONE,
+  });
+  assert.equal(built.ok, true);
+  if (!built.ok) return;
+  assert.equal(
+    JSON.stringify(built.report.request.input),
+    liveText,
+    '重建必须与当时逐字节一致（三刀都砍在同一处）',
+  );
+  assert.equal(built.report.events.filteredOut, 3, '三刀各挡掉一条（定时器那条 set 事件不算）');
+  for (const [label, needle] of forbidden) {
+    assert.equal(
+      JSON.stringify(built.report.request.input).includes(needle),
+      false,
+      `重建里也不许有${label}：${needle}`,
+    );
+  }
+
+  // 反：只过前两刀（= 改动前 replay 的口径：归属 + 框架指令）⇒ 整理唤醒那一行回来了；
+  //    再过一刀都不砍（= 改动前界面预览的口径）⇒ 三条都回来了。这就是"少刀"的代价。
+  const located = locateStep(events, 1, 1);
+  assert.equal(located.ok, true);
+  if (!located.ok) return;
+  const stepStart = located.stepStart;
+  const debugOptions: RebuildOptions = {
+    persona: {
+      identity: h.persona.identity,
+      constitution: h.persona.constitution,
+      style: h.persona.style,
+      state: h.persona.state,
+      personaHash: h.persona.personaHash,
+      relationship: null,
+    },
+    tools: h.registry.listForModel({}),
+    timezone: TIMEZONE,
+    dataDir: h.dir,
+    memoryIndex: readMemoryIndexTextReadOnly(h.dir),
+    skillCatalog: null,
+    warnExempt: null,
+  };
+  const twoKnives: ReplayPosition = {
+    ...located,
+    eventsBefore: events.filter(
+      (event) => event.seq < stepStart.seq
+        && event.parentCallId === stepStart.parentCallId
+        && !isFrameworkCommandEvent(event),
+    ),
+  };
+  const oldRequest = rebuildRenderedRequest(twoKnives, debugOptions);
+  const oldText = JSON.stringify(oldRequest.input);
+  assert.equal(oldText.includes('定时器触发'), true, '改动前：整理唤醒被当成历史里的一行（重建≠当时）');
+  assert.equal(oldText.includes('这是子代理链内部的一行'), false, '归属那一刀改动前就有');
+  assert.ok(
+    events.some((event) => event.seq === maintainWake.seq && event.type === 'wake/timer'),
+    '夹具里那条整理唤醒要真的在日志里',
+  );
+  const newRequest = rebuildRenderedRequest(located, debugOptions);
+  assert.equal(
+    oldRequest.input.length,
+    newRequest.input.length + 1,
+    '同一份事件、同一份选项：改动前后只差那一行整理唤醒',
+  );
+
+  // 预览口径（三刀一刀都没有）⇒ 三条都在：这是界面那条路改动前的样子
+  const noKnives = rebuildRenderedRequest(
+    { ...located, eventsBefore: events.filter((event) => event.seq < stepStart.seq) },
+    debugOptions,
+  );
+  const noKnivesText = JSON.stringify(noKnives.input);
+  for (const [label, needle] of forbidden) {
+    assert.equal(noKnivesText.includes(needle), true, `一刀不砍时${label}会进历史：${needle}`);
+  }
+  assert.equal(
+    noKnives.input.length,
+    newRequest.input.length + 3,
+    '三刀各一条：预览口径比正确口径多 3 条',
+  );
+  // 顺带钉住"三刀是同一个判据函数"：共享入口给出的就是这三刀之后的那一份
+  const shared = contextEventsForRebuild(events, stepStart.parentCallId, stepStart.seq);
+  assert.deepEqual(shared.map((event) => event.seq), located.eventsBefore.map((event) => event.seq));
+  for (const cut of [maintainWake, slashWake, subagentLine]) {
+    assert.equal(shared.some((event) => event.seq === cut.seq), false, `seq ${cut.seq} 应被挡掉`);
+  }
 });

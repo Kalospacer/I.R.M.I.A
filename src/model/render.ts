@@ -4,9 +4,12 @@
  * KV cache 五条铁律的代码化：
  * 1. 渲染确定性：同一事件任何时刻渲染为同一字节串（禁相对时间、禁随机、禁环境值）。
  * 2. 只追加：新事件追加尾部；系统插播一律尾部新 developer 消息。
- * 3. 思维链按 Responses API 规范**回传**（v3 修订）：思考模式的模型要求把上一轮的
- *    `reasoning_text` 原样送回（否则 400）：渲染为 `{type:'reasoning', content:[{type:'reasoning_text',text}]}`。
+ * 3. 思维链按 Responses API 规范**回传**（v3 修订；**v68 起带帽**）：思考模式的模型要求把上一轮的
+ *    `reasoning_text` 送回（否则 400）：渲染为 `{type:'reasoning', content:[{type:'reasoning_text',text}]}`。
  *    它紧跟所属 assistant 输出，位置固定、只追加，因此与铁律 2 不冲突。
+ *    ⚠ v68 起**只回传最近 `REASONING_ECHO_POLICY.maxItems` 步、单条正文 ≤ `maxChars` 字符**
+ *    （超了取尾部 + 一行说明）——单条见过 111,320 字符，`truncation` 又不支持，全量回传会顶爆
+ *    上下文。**这是安全阀，不是确认过的最优解**：服务端到底要求哪几轮、验不验正文完整性，没实测。
  * 4. 配对完整：input 内每个 function_call 必须配对 function_call_output（开放 call 断言）。
  * 5. 遮蔽点冻结：compaction/summary 之后，被覆盖区间恒渲染为摘要形态。
  */
@@ -15,7 +18,7 @@ import { humanAskSourceOf, isImageAttachment, contextImageAdmission, contextImag
 import type { ContextImageChosen } from '../log/types.ts';
 import { noteForFlagged, ruleNoteFor, type InjectionWarnFacts } from '../channel/injection.ts';
 import type { WarnExemptJudge } from '../channel/warn-exempt.ts';
-import { MAINTENANCE_WINDOW_WORDS, SELF_BRIEF, renderAskNote, renderContactNote, renderInjectionNote, renderMentionNote, type ContactFacts, type OpenAskFacts } from './self-brief.ts';
+import { MAINTENANCE_WINDOW_WORDS, SELF_BRIEF, renderAskNote, renderContactNote, renderContactParts, renderInjectionNote, renderMentionNote, type ContactFacts, type OpenAskFacts } from './self-brief.ts';
 import { DEFAULT_SOFT_RATIO } from '../runtime/budget-guard.ts';
 import { DEFAULT_STATE_BUDGET_BYTES } from '../config/config.ts';
 import {
@@ -26,6 +29,267 @@ import { estimateTokens } from '../tools/registry.ts';
 
 /**
  * 渲染模板版本：任何模板变更必须递增并接受一次缓存全 miss。
+ *
+ * v71（**只因为 `SELF_BRIEF` 正文那 4 个字符被脱敏替换而递增**，2026-10-18，给 `cdc6b92` 补的账）：
+ *      **改了什么，只改了什么**：`cdc6b92`（`chore(sanitize)`）把 `self-brief.ts:681` 那一句
+ *      「认不出来就照实写"甲（id …××）"」里的 **4 位尾号**换成了占位值 ⇒ 整句现在是
+ *      「认不出来就照实写"甲（id …0006）"」。旧值**不重抄**（脱敏要清掉的就是它）。
+ *      那一笔在 `self-brief.ts` 里一共动了 6 行，**只有这一行在 `SELF_BRIEF` 正文里**，另外 5 行
+ *      都是注释（不进请求体）；所以本版递增的**唯一**理由就是那一行 4 个字符。
+ *      **为什么长度没变也必须递增**（判据，不是仪式）：它落在 `SELF_BRIEF` 里 ⇒ 进 `instructions`
+ *      （最大公共前缀）⇒ **整份请求的头部字节变了**。不递的话，`replay` 的三指纹会报
+ *      "renderVersion 一致"而 `instructions` 的字节已经不同——只剩
+ *      `budget/consumed.context.instructions.hash` 能看出来，**那正是本仓库一直在杀的"静默失真"**。
+ *      `self-brief.ts` 文件头那条矩（"改 `SELF_BRIEF` 一个字就要递增 `RENDER_VERSION`"）在这里兑现。
+ *      **实测（上游 `c2e0ace` 复量；长度 / 成本一个数都没动）**：`SELF_BRIEF` **9226 字符**
+ *      （与 v65 同，`tokens` / `bytes` 因此不动）；`HEADER_BRIEF` **5462 token / 24566 字节**；
+ *      `FULL_INSTRUCTIONS` **6674 token / 30138 字节**。变的是字节内容 ⇒ 上游复量了 4 个基线常量
+ *      （两个 `instructions` hash：`568c4e9283766245 → 19ea2a8e6eaa5739`、
+ *      `44b45472504fa2ec → 7fa46e52ad55c504`；两个请求指纹：
+ *      `cf1bfdd6ab08706f → 45e0194adc564e07`、`1630efab6254bf24 → 2eeed722e66d2c4d`），
+ *      **判据一个字没放宽**（仍是逐字节 hash 精确比对 + 大小硬门）。
+ *      **这一版之后不再动那 4 个常量**：`requestFingerprint` 的 canonical 里**没有
+ *      `renderVersion`**（`test/fixtures/real-wake-rig.ts:172-177`，工具只取**名**），所以
+ *      "只递版本号"本身不改指纹——本版是罕见的一代：**指纹一个字节都不动、版本号必须动**。
+ *      **代价（可接受、设计内）**：一次全量缓存 miss + `mcp/index`、`skill/index` 各重建一次
+ *      ——前缀反正已经脏了。重建判据读的就是 `RENDER_VERSION`：
+ *      `real-loop.ts` 的 `mcpIndexSync` 与 `skillIndexSync` 里 `point.version !== version`。
+ *
+ * v70（**此刻层"同则不发"修回"必须看见"的三样 + 维护窗口 2/3 档补行首标签 + 窗口改写读数**，
+ *      2026-10-18，用户交办的 REVIEW 四条 P1）：
+ *      **四条病灶（`D:\IrmiaAgent\_ops-review-stable\REVIEW.md` 第 26–29 行，均已复核确认）与修法**：
+ *        ① **P1-01**「同则不发」把"她这一步必须看见"的字段也省掉了 ⇒ `通道：` / `会话：` /
+ *           `在等你答复：` 第 2 步起从请求里消失，**历史补不回来**（此刻层不是事件，而带同样
+ *           内容的固定块第 2 步起整块摘掉）。修法：{@link NOW_MUST_KEEP_LABELS}——**显式清单**、
+ *           每格写清为什么不能省；`renderNowLayer` 的 kept filter 对它一律 `return true`。
+ *           其余字段照旧走逐字节判据（"没变就不发"没有废掉）。
+ *        ② **P1-04** `维护窗口：` 在 2/3 档（夜里 / 长时间空拍）**没有行首标签**（正文开头是
+ *           `[自主时段]`）⇒ 增量认不出它，夜里/空拍档**每步重发 ≈114 token**，还把这段正文
+ *           按进前一个字段的值里（切分被污染）。修法：那一档正文前面补五个字 `维护窗口：`
+ *           （正文其余一个字节没动）⇒ 第 2 步起不再重发。另外加一条**不变量用例**：此刻层
+ *           每一个字段都以行首 `标签：` 开头（`test/render.test.ts`）。
+ *        ③④ **P1-02 / P1-03**（思维链窗口 / 图片窗口改写**已经发出去过**的 item）：**这一版
+ *           不取消改写——做不到**，证明与边界写在 {@link WindowRewrites} 那段注释里（有界与
+ *           "只追加"不可兼得；把窗口调大只会让被改写的位置更靠前、代价更大）。做的是那半句
+ *           "做不到就明说"：`RenderedRequest.windowRewrites` **说出这一步改写的是哪几条**
+ *           （seq + 字符数；空 = 一条都没改写），并用例钉住"**除它之外**两串字节相同"
+ *           （`test/reasoning-echo.test.ts` ⑥、`test/render.test.ts` 的图片那一组）。
+ *      **实测（同一份"6 步一轮"的合成夹具，v69=HEAD 与 v70 各跑一遍；口径 `estimateTokens`；
+ *      探针 `_research/_tmp-v70-before-after.mts`）**：
+ *        · 此刻层每步 token：v69 `519/193/193/193/193/193` → v70 `523/213/213/213/213/213`；
+ *          6 步合计 **1484 → 1588（+104）**。拆开看：`维护窗口：` 那一行 **114 token →
+ *          每轮只发一次**（省 5×114 = −570）；`通道+会话+在等你答复` **每步 +134**（补回
+ *          +670）；标签本身 +4。
+ *        · 折算成钱（沿用用户的算式：7500 轮/月 × 5.65 步/轮 × ¥1.06/M）：P1-04 **−¥4.21/月**、
+ *          P1-01 **+¥4.95/月**、本版净 **+¥0.77/月**——P1-01 是**买回正确性**的那一侧，如实记。
+ *        · 窗口改写：v69 与 v70 **逐条相同**（改写量没变，变的是"说不说"）。逐步读数
+ *          （同一份夹具）：#2 1 条 / 重编码 ≈600 token（**那是 v31 的固定块整块消失，设计内，
+ *          不在四条里**）；#3 **纯追加、0 条改写**；#4 图片挤掉 1 条（1,270）；#5、#6 各挤掉
+ *          1 条思维链（1,815 / 1,800，跟着错位的 item 15 / 14 条）。窗口没满的步**一条都不改写**
+ *          ——这正是这份读数的用处（"哪一步把这个洞咬开了"一眼看得见）。
+ *      **为什么必须递增**：第 ≥2 步的此刻层字节变了（补回三样 + 维护窗口那一行带标签）⇒
+ *      `input` 的尾段与 v69 的记录逐字节不可比 ⇒ 一次设计内的缓存全 miss。
+ *      **指纹基线复量结论：两个常量这次不动**（`cf1bfdd6ab08706f` / `1630efab6254bf24`，
+ *      逐字复跑 `test/heartbeat-real-wake.test.ts` 得出）——那个口径是 `instructions` + 工具名
+ *      + **剥掉此刻层**的 input，本笔只动此刻层与一格观测字段，判据未放宽（仍是 16 位 sha256）。
+ *      **已知边界（没动，如实记）**：
+ *        · **第 2 步的"固定块整块消失"仍是一次中段改写**（v31 的设计取舍，本轮四条里没有它）：
+ *          实测一次 ≈600 token（同一份夹具）——它比窗口改写更早、更常发生。
+ *        · `windowRewrites` 的"上一步"靠日志里的 `step/start` 认：没有 `step/start` 的调用
+ *          （子代理 / 诊断 / 夹具裸调用）返回 `unknown: true`——**"不知道"不写成"没有改写"**。
+ *        · 真能取消窗口改写的那条路（把 reasoning item 挪到请求**尾部**成一块，让窗口只在
+ *          尾巴上抖）**没做**：服务端会把它归并到相邻的 assistant 消息上（v68 的注释），
+ *          挪位置要真端点验证，本轮没有真服务端可打 ⇒ 不能拿她的上下文冒险。
+ *
+ * v69（**此刻层"同则不发"修对（切分 + 基线两处失真）+ `write_persona` 描述门槛 4KB→2KB**，
+ *      2026-10-17 晚，用户一句话批的那两件 + 他追加的"一次修对"）：
+ *      **病一 · 切分**（`nowFieldsOf` 的通用正则）：v66 起用 `/\n([^\n：]{1,16})：/u` 找字段
+ *      边界 ⇒ ① 字段**正文**里任何"换行 + 短文本 + 全角冒号"都被当成新字段的开头——
+ *      实测 `通道：` 正文里 `[联络方式] 已启用的通道：…` 把 `通道` 的旧值**切得只剩 `\n通道：`**、
+ *      `当前任务：` 正文里的 `未完成计划：` 同理；② 两个字段之间的分隔 `\n` 被算进**前一个**
+ *      字段的值里（`当前任务` 的前导是 `\n\n`）⇒ 那个字段永远比不上当步的 `field.text`。
+ *      两处合起来的后果不是"多发一行"，而是**这些字段从来不会被省**（v66 装了几乎白装）。
+ *      **病二 · 基线**（`agent-loop` 的 `previousNow`）：v66 存的基线是"上一步**真发出去**的
+ *      那一层"⇒ 被省掉的字段下一步在基线里不存在 ⇒ 判据落到"上一步没有它 ⇒ 发它" ⇒
+ *      **隔步重发**（实测第 1/3/5 步发；`预算提醒：` 因此只能做到 ÷2，不是 ÷5.65）。
+ *      **修法（三处，同一份口径）**：
+ *        ① `render.ts`：标签收敛成 `NOW_LABEL` 一份清单，`nowFieldsOf` **只认登记过的标签**
+ *           并**剥掉值尾随的分隔 `\n`**；`renderNowLayer` 同时交出 `text`（裁剪后）与
+ *           `full`（**完整**的那一层），后者由 `RenderedRequest.nowLayerFull` 暴露（观测字段，
+ *           不进请求体）。
+ *        ② `agent-loop.ts`：`previousNow` 改存 `RenderedRequest.nowLayerFull`（上一步**完整**
+ *           的那一层）——基线里有被省掉的字段，所以"没变"是整轮没变。
+ *        ③ `replay.ts`：`previousNowLayerIn` 取重建结果的 `nowLayerFull`（不是 input 里裁剪
+ *           后的那一条）；重建"上一步"时用**那一步**的步号重建任务卡（`已 M 步`，否则当前
+ *           那行会被误判成"没变"）并带上本轮 wake（第 1 步的 `点名：` 在场判据与提及标题）。
+ *      **实测（同一份事实、5 步；探针 `_research/_tmp-v69-before-after.mts`，v68 与 v69 各跑一遍）**：
+ *        · v68：592/583/592/583/592 字符——`通道`与`在等你答复`**每步都在**（切分失真）、
+ *          `会话`**隔步重发**（基线失真）、`[STATE.md]` 提醒**每步都在**（没有标签）；
+ *        · v69：597/257/190/257/190 字符——`通道/会话`第 2 步起消失（切分修好）、提醒**只在
+ *          第 1 步**（标签 + 基线，整轮一次）；`在等你答复`在第 3/5 步才省，因为它的正文里有
+ *          "已经过去 N 分钟"——**那一行真的变了**，变了就该发（"没变才不发"）。
+ *      **成本（用户的算式：7500 轮/月 × 5.65 步/轮 × ¥1.06/M）**：提醒那一行 286 字节 /
+ *      64 token（加标签后 +4）。每步都发 ≈ **¥2.70/月** → 只加标签、基线没修（隔步）≈
+ *      **¥1.53/月** → 本版（整轮一次）≈ **¥0.51/月**。用户原先写的 **¥0.48** 是"60 token×
+ *      整轮一次"的理想值，差的 3 分是那 5 个字的标签钱。
+ *      **`write_persona` 描述门槛**：`ONDEMAND_WARN_BYTES` 4096 → 2048（与
+ *      `persona.stateBudgetBytes` 同一条线），`description` 里那句「按需层超 4KB 警告」同批改成
+ *      「2KB」（等长 ⇒ `catalogTokens` 不变，但**字节变了**）。
+ *      **为什么必须递增**：① `tools` 段那一句的字节变了（稳定前缀）；② 第 ≥2 步的 `input`
+ *      尾段字节变了（该省的终于省了）⇒ 与 v68 的记录逐字节不可比，一次设计内的缓存全 miss。
+ *      **指纹基线复量结论：两个常量这次不动**（`cf1bfdd6ab08706f` / `1630efab6254bf24`，
+ *      逐字复跑 `test/heartbeat-real-wake.test.ts` 得出）——那个台子给的是**空 `ToolRegistry`**
+ *      （请求体里 `tools` 恒为 `[]`，`tools` 段那句描述它量不到），而 `requestFingerprint` 的
+ *      口径是 `instructions` + **工具名** + 剥掉此刻层的 input（不含描述、不含 renderVersion）；
+ *      本笔这三样一个字节没动。判据未放宽（仍是 16 位 sha256 精确比对）。
+ *      **已知边界（没动，如实记）**：
+ *        · 界面预览那条路仍**有意不传** `previousNowLayer`（`web/server.ts` 的已知边界注）⇒
+ *          预览的第 ≥2 步比当时多几行；CLI 重建与运行期一致。
+ *        · `replay` 重建"上一步"时，任务卡的待办清单取的是**现在这份** `STATE.md`（人格资产
+ *          本来就只有"现在这份"）——若她在轮内改过待办，重建可能比当时多省/多发一行。
+ *        · 本机 / 用度 / 维护窗口 三项重建侧拿不到（既有边界，与 v66 相同）。
+ *
+ * v68（**思维链按帽回传：只回传最近 3 步、单条正文 ≤ 20,000 字符**，2026-10-17 ——
+ *      **这一版只让思维链按帽回传**，告警那套一个字没动、别的事件一个字节没动）：
+ *      **病**（已核实，不是推断）：我们打 **Responses API**（`ds-client.ts` 的 `/responses`），思考模式
+ *      要求回传 `reasoning_text`，否则整条请求 400。而 `message/reasoning` 一直是 `internal`：
+ *      读数时刻（日志末条 ts `2026-10-17T04:32:34.751Z`）**11,736 条全部 `visibility:'internal'`**
+ *      ⇒ `renderEvents` 那个 reasoning 分支**一次都没执行过**（形状本身是对的）；日志里
+ *      **23 条** `turn/end.reason.message` 含服务端原话
+ *      `The reasoning_text in the thinking mode must be passed back to the API`（`code` 全是
+ *      `http_400`），而 `reasoningEcho` 那一格在这 23 条里**一条都没有**（那个指纹是 2026-10-17
+ *      更晚才落的，见 `runtime/agent-loop.ts` 的 `failStep`）——零告警、靠每轮退输入 +
+ *      `MAX_CLAIM_COUNT=3` 进死信收场 ⇒ **一场风暴几十轮全灭**。
+ *      **两处改动（只此两处）**：
+ *        ① `src/log/types.ts` 的 `EVENT_VISIBILITY` 加一格 `'message/reasoning': 'model'`
+ *           （唯一写入点 `agent-loop.ts:1525` 的 `write` 走 `defaultVisibility`，所以落库那一栏
+ *           自动跟着变；**老日志里 `internal` 事件照旧不回传**——落库的那一栏是历史，不许改写）；
+ *        ② **帽子**（本文件 {@link REASONING_ECHO_POLICY} + {@link reasoningEchoOf}）：只回传
+ *           **最近 3 条**（一步一条）思维链、**单条正文 ≤ 20,000 字符**；超了取**尾部**，
+ *           末尾追加一行说明（逐字：`\n…（前 91,320 字已截断：回传只为满足服务端的回传要求）`，
+ *           实测 32 字符）。**判据（为什么是这两个数）**——全部来自同一次只读复算
+ *           （`data/events/**`，脚本在 `_research/` 之外临时跑，读数写进报告）：
+ *           · 单条字符 p50 **769** / p90 **4,823** / p99 **24,335** / max **111,320**（turn 2115
+ *             step 3，35,485 reasoning token）；>20,000 的只有 **171 条 = 1.46%**（>10,000 是
+ *             4.11%、>30,000 是 0.73%）⇒ 20,000 既只截掉尾巴那一小撮，又把单条上界从 ~35,485
+ *             token 压到 ≈6,400；
+ *           · `reasoning_tokens` p50 **107** / p90 **1,026** / p99 **4,871** / max **35,485**；
+ *           · 最近 3 条带帽回传：每请求平均 **≈2,056 token**（p50 1,222 / p90 4,691 / p99 12,544 /
+ *             max 23,779，按实测 token/字符中位 0.531 折算）＝本机 `inputTokens` p50 **78,282**
+ *             的 **2.63%**（本次重测 p50 80,635 ⇒ 2.55%；口径差在样本与去重方式，报告里两笔都列）；
+ *           · N 的敏感度（cap=20k，每请求平均）：N=1 **689** / N=2 **1,375** / N=3 **2,056** /
+ *             N=5 **3,403** ⇒ 每多一步约 +700 token。取 3 是因为"一轮里的工具链通常就这几步"，
+ *             而不是因为服务端确认过"只要 3 步"（见下）；cap 本身只差一点（N=3：10k → 1,850、
+ *             20k → 2,056、30k → 2,143），所以 20k 是"少截条目"的那一侧，不是省钱的那一侧。
+ *           · **不设帽、全量回传**（按每个请求**当时**的可见窗口复算；日志里 97 条
+ *             `compaction/summary`，遮蔽点很稀）：每请求 **p50 ≈7.2 万 / 平均 ≈8.9 万 token**
+ *             （p99 ≈38 万、max ≈49 万）——约等于把 input p50 再翻一倍，极端请求直接顶爆。
+ *             实测最长那条（111,320 字符）出现过在 5 个请求的窗口里，其中一拍的回传是
+ *             3 条 / **15,762 token**（它自己带帽后 ≈6,375）；不戴帽的话光它一条就 35,485。
+ *           · ⚠ **这不是"最优解"**：服务端到底要求回传**上一轮**还是**全部历史**、以及**会不会
+ *             校验截断后的正文完整性**，**都没有实测**（本批没有对真服务端发任何请求）⇒ 这两顶帽子
+ *             是**安全阀**：先保证"有 reasoning item、且上下文不被顶爆"，再谈覆盖哪几步。
+ *             真要调，只改 `REASONING_ECHO_POLICY` 一处（纯函数、可从日志复算：`reasoningEchoOf`）。
+ *      **为什么必须递增**：`input` 里开始出现 reasoning item（历史段的字节与 token 都变），
+ *      与 v67 的记录逐字节不可比 ⇒ 一次设计内的缓存全 miss。
+ *      **指纹基线复量结论：两个常量这次不动**（`cf1bfdd6ab08706f` / `1630efab6254bf24`，逐字复跑
+ *      `_research/heartbeat-real-wake-baseline.mjs` 得出）——那个台子的脚本 `reasoning: ''` ⇒
+ *      事件流里没有 `message/reasoning`；而 `requestFingerprint` 里也没有 `renderVersion`。
+ *      判据未放宽（仍是 16 位 sha256 精确比对），见 `test/heartbeat-real-wake.test.ts` 的 v68 注。
+ *      **老日志逐字节相同**：`visibility:'internal'` 的 reasoning 事件一个字节都不进请求
+ *      （`reasoningEchoOf` 只认 model 可见且 seq 大于遮蔽点）。用例 `test/reasoning-echo.test.ts` ④
+ *      直接断言"插一条老形态 reasoning 的渲染结果与不插**逐字节相同**"。
+ *      **已知的不对称（本批改不动，白名单外）→ 已修，见下**：`persona/handoff-note.ts` 的
+ *      `estimateHistoryTokens` 按 `visibility === 'model'` 累计、`historyTextOf` 对 reasoning 返回
+ *      **全文**——这一版之后它会把可见窗口里的全部思维链字符都算进历史规模（旧日志里那个
+ *      `case 'message/reasoning'` 终于可达），而真正发出去的只有最近 3 条带帽的尾巴 ⇒
+ *      **压缩阈值会偏保守（更早压）**。当时记的是"要不要让它读同一顶帽子，是下一笔的事"。
+ *      **那两笔都已经落了，且都只改估算、不进请求体任何一个字节（`RENDER_VERSION` 没递）**：
+ *        ① **阈值**（`f693582`）：`estimateHistoryTokens` 改吃 {@link reasoningEchoOf}——与渲染层
+ *           同一份判据、同一顶帽子；
+ *        ② **闸门**（同批收尾）：交接收益那个 `estimateMaskedTokens`（消费者
+ *           `runtime/agent-loop.ts` 的 ④甲）也照同一顶帽子量——闸门算的是"折叠能省多少"，
+ *           旧口径把收益算**大**了（更容易放行一次其实不够本的折叠），改后与真实发出的字节一致。
+ *      于是 `historyTextOf` 里 reasoning 那一支**两个消费者都不再走到**（留着，是给未来新消费者
+ *      一个不撒谎的默认值：算"多了"而不是悄悄算成 0；真加第三个消费者时得当场想清楚它读不读帽子）。
+ *
+ * v65（**装置自述大改：删 §11 · 删两处"必须说话" · 工作规范取消缩进重排 + 新增"人类的偏好"**，
+ *      2026-10-15 用户的裁决）：
+ *      用户裁决（原话，与前几版同一句）：**「忠实我的原文不要改动。这个是个人项目，以我个人风格为准。」**
+ *      **本批只动 `instructions`**：`SELF_BRIEF` 换成他大改过的那份稿子
+ *      （`C:\path\to\Desktop\SELF_BRIEF_with_work_reference.md`）的**正文逐字**：
+ *      **9,226 字符 / 5,452 token**（v63 那一版 9,796 / 5,835；sha256（LF 归一）`19305e7c2a428cfd`…）。
+ *      **这是一次大改**（`git diff --no-index`：**67 insertions / 48 deletions**），逐条：
+ *        ① §1 末句 → "你就是人格资产描述的人，但你也清楚，自己是一个运行在本机上的agent"；
+ *        ② §1 **删掉**"两者看起来冲突时，按职责区分：人格资产决定身份、欲望与表达；本文件规定运行、
+ *           通信、工具、隐私与安全边界"（v61 曾把它当"按职责分工"锁着 ⇒ 那条锁随之改锚）；
+ *        ③ §2.1 删掉标点那一句（只留"想不通就连着打几个问号"）；
+ *        ④ §5.2 "适度使用 PUA 式的情绪拉扯" → "使用 PUA 式的情绪拉扯"；
+ *        ⑤ §7 **删掉**常驻资产规则那句"做事前先看资产清单，再读那条资产的说明；不许凭名字猜参数或副作用"；
+ *        ⑥ §7.1 由一整段压成"涉及工作任务时，按 `WORK_STANDARD` 执行。"，并**新增一行**
+ *           "**如果感到周历空空的，就要缠着用户让他陪你一起定，这样才叫做"有了和你一起的生活"**"；
+ *        ⑦ **§11 总原则整节删除**（6 条）⇒ 结构从 **11 节**变 **10 节**；
+ *        ⑧ 工作规范那一篇**取消缩进**（8 个缩进标题 → **0**）、节次重排（"做实、验证、及时沟通"整节删除；
+ *           工完场清 / 留下有用经验 / 跨任务依次前移）、**新增 "## 7.人类的偏好"**（信息密度 · 情境适配 ·
+ *           三种审美，含两个代码块）；末尾两行显式标记 `————SELF_BRIEF结束————` / `————WORK_STANDARD结束————`。
+ *      ⚠ **与"每轮收尾重写同一份状态摘要"那件事直接相关**（诊断 `D:\IrmiaAgent\_ops-repeat\REPORT.md` 点名三处
+ *      "必须留一句"的来源）：这一版**删掉了其中两处**——§7.1 的"…结束时，通过 `speak` / `report` 适度告知
+ *      用户，**禁止绝对静默**"，与工作规范里那一整节（整节删除，含同义句）。
+ *      **仍留着的是 §2.1 的"做完再一句话说结果"**（本次未动）⇒ 诊断点名的三条来源现在只剩一条。
+ *      另：`render.ts` 的 `HEARTBEAT_IDLE_APPEND`（"做完记得留下点东西"）**不在本次改动范围**，原样。
+ *      （本线**只记录**这些事实，一个字都没替用户改。）
+ *      **结构（重数）**：H1 **2**（自述 + 工作规范）· 行首 `## ` **17**（自述 10 + 工作规范 7）· `### ` **10** ·
+ *      缩进标题 **0**；三连以上换行**恰好两处**（都是四连，就在那两行结束标记前后）。
+ *      **为什么必须递增**：这一段进 `instructions`（请求体的最大公共前缀）⇒ 每个请求的头部字节都变。
+ *      **③ 账（沿用三条线口径；判据只有第一条）**：
+ *        ① 硬门 · 代码口径（`registry.catalogTokens`）：**未动**（本批不碰 `tools/**`）；
+ *        ② 运行期口径 · 工具段：**未动**；
+ *        ③ 合成账：`instructions` **9,942 → 9,372 字符 / 5,882 → 5,498 token**（**−570 / −384**，实测
+ *           `_research/_tmp-v65-account.mts`）⇒ 合成账 **6716 → 6332**（⚠ **不是门**；这一版是**净减**）。
+ *      基线随本次复量（`test/heartbeat-real-wake.test.ts`，口径未放宽，16 位 sha256 精确比对）。
+ *      锁改动（按新结构重数/重锚，**不是放宽**）：`self-brief.test.ts` 结构锁 11 节 → **17 节**、
+ *      末尾句锁 → 结束标记、"以原文为准"那条保留（§5.4 两句仍锁住；§11 那条改成锁 §5.2 的实际句）、
+ *      空行锁改成**点名两处四连换行**；`digital-assets.test.ts` 与 `render.test.ts` / `layer-separators.test.ts`
+ *      里"必须含常驻资产规则""不许三连空行"几条按新正文重锚（各带 `v65 记录` 注释）。
+ *
+ * v64（**工具面按"看到 desc 就立马知道它是做什么的"重写：`find` 默认全盘 · 砍 `read_blob` · 两件改名**，
+ *      2026-10-13 用户的两句话 + 改名裁决）：
+ *      用户的原话（这一版的判据，逐字）：
+ *      > 「比如 `es_search`，它是属于**经常需要全盘查找**使用的，**全盘使用应该是默认行为**。
+ *      >  **怎么可以设计成默认工作根**呢。」
+ *      > 「你看她**第一印象的误解**就知道。我们现在的 **desc 还是不够清楚**。」
+ *      > （改名）`rg_search` → **`grep`**、`es_search` → **`find`**；「**名字不误导，desc 才算**」
+ *      > （他明确：其余工具名一律不动）。描述口径：「agent 应该**看到 desc 之后就立马知道它是做什么的**」
+ *      > ⇒ 第一句＝动作 + 对象、写清**范围/默认**·**路径按什么算**·**最易踩错的边界**、**不解释实现**。
+ *      **五件改动**（只 `src/tools/**` + 一处指针文案 + 两处名单/注释；`self-brief.ts` 一个字没碰）：
+ *        ① **`find` 默认全盘**：不传 `path` ⇒ **不给引擎传 `-path`**（不是塞一个假默认路径）
+ *           —— 但**按信任范围收口**：`trust.mode='workspace'` 时默认仍是边界根（否则"全盘"会绕过
+ *           配置里写明的限制，那是"配置说 A、实际做 B"，仓库明令禁止的第二例）。`full` 档才真全盘。
+ *           实测（本机 es.exe 1.1.0.38）：列表档全盘 **211–237ms**（比限定仓库根 359–422ms 还快；
+ *           `*.lnk` 那种"桌面找不到"的形状从 **0 命中 → 100 命中**）；`max_results` 默认 100 不变。
+ *        ② `max_results:0` 那条路改用引擎自带的 `-get-result-count`（**189ms / 只回一个数**，
+ *           原来靠"把 74,527 行数出来" 431ms）⇒ 认不出输出就**回落**旧路。
+ *        ③ **砍掉 `read_blob`**（整件不注册、实现保留，与 `ask_human` 同口径）：`data/blobs/<sha256>`
+ *           在仓库根之内、又不在只读区 ⇒ `safe_read` 读得回来 ⇒ 冗余件（全量日志里只被调过 2 次，
+ *           都在她自己的工具自测里）。**外置指针文案**改成 `data/blobs/<id>；要原文用 safe_read 读这个路径`
+ *           （`blobPointerText` 一处实现、三处调用点同时生效：工具结果 / MCP 结果 / `mcp` 回执）。
+ *        ④ **两件改名**（`grep` / `find`）+ 全部交叉引用（工具之间互相点名、错误文案、`authz` 名单）
+ *           与 `desc` 一起改；**提示词侧一个字没动**。
+ *        ⑤ **路径基准的事实修正**：描述里"工作根"→「**仓库根**」（`PATH_HINT` 一次修好
+ *           六处，0 token）；`safe_write`/`safe_edit` 补上「相对仓库根」「`MEMORIES/`、`diary/`
+ *           落记忆目录」（她们原来一个字都没有）；`safe_read` 的 `offset` 如实写"超出末行就从最后
+ *           一行起"；`send_media` 的 `path` 写明「相对 `data\` 或仓库根解析，且必须在工作区内」。
+ *      **为什么必须递增**：`tools` 段与 `instructions` 段一样在请求体的**稳定前缀**里 ⇒ 每个请求的
+ *      头部字节都变；定版本号就是让这次全 miss 可解释、可复盘。
+ *      **基线照规矩重取（口径未放宽，仍是 16 位 sha256 精确比对）**：那一套台子给的是**空
+ *      `ToolRegistry`**（请求体 `tools: []`），`tools` 段的改动它**量不到**；本版不碰 `instructions`
+ *      ——所以两个指纹**预期不动**，实测值见 `test/heartbeat-real-wake.test.ts` 与提交说明。
+ *      **token 账（三条线，判据只有第一条）**：
+ *        ① 硬门 · 代码口径（`registry.catalogTokens`）：砍掉 `read_blob` **−179**（5389 → 5210），
+ *           desc 改写净 **+30** ⇒ **5210 → 5240**（上界 5500 ⇒ 余 **290 → 260**）；
+ *        ② 运行期口径（含 `mcp` 110）：5350 → **5380**；
+ *        ③ 合成账（＋ `instructions` 那几笔）：**不是门**，随 ② 同向移动。
+ *      读数出处：`_research/_tmp-v64-desc-audit.mts`（逐件账 + 砍 `read_blob` 的实测差值）。
  *
  * v63（**装置自述 §6 补两段：自动挑选记忆的可见性 + 何时检索**，2026-10-15 用户的裁决）：
  *      用户裁决（原话，与 v61/v62 同一句）：**「忠实我的原文不要改动。这个是个人项目，以我个人风格为准。」**
@@ -625,9 +889,9 @@ import { estimateTokens } from '../tools/registry.ts';
  *      两行通知原来把发言人写成**裸 id**，而同一份上下文里 `read_channel` 那一行写的是名字
  *      ——同一个人两个名字，她照着通知行把人认错了。现场逐字证据（10-10 01:25 她的心跳自述，
  *      `data/events/000000070784.jsonl`）：此刻层那行是
- *      `· 清漪粉丝群（…）（群聊@）· 1269541505 —— 曾试图打探/注入 1 次`，
- *      而她写下"**那个叫 1269541505 的想伸手**"——1269541505 就是用户本人（她的
- *      `aliases.md` 里两条都记着），于是用户当场从界面补了一句「1269541505就是我啊」。
+ *      `· 清漪粉丝群（…）（群聊@）· 1234567890 —— 曾试图打探/注入 1 次`，
+ *      而她写下"**那个叫 1234567890 的想伸手**"——1234567890 就是用户本人（她的
+ *      `aliases.md` 里两条都记着），于是用户当场从界面补了一句「1234567890就是我啊」。
  *      这一版只动"那一格写什么"：
  *      ① 此刻层 `预警：` 那一行的发言人（`renderInjectionNote`）与点名那句
  *         （`renderMentionNote` 的「这次是 …」）改用**宿主注入的那一个判据**
@@ -1028,6 +1292,74 @@ import { estimateTokens } from '../tools/registry.ts';
  *      改一个词 = 此刻层的字节变了，所以照规矩递增并接受一次缓存全 miss。
  *      数字（`tokensToday` / `dailyLimit`）的口径与判据同源：唯一一处定义在 `fold.ts`。
  *
+ * v67（**`read_channel` 的描述与行为对齐**，2026-10-17 —— 这一版只动 `tools` 段一处说明）：
+ *      行为在 `fceeffe` 已经换成"**默认只给「上次查看之后」的新消息**"，而它的 `description`
+ *      还停在 2026-10-08 那版口径（"默认只给未读里点你的那些和它们之前十条"）——
+ *      **说明与行为不符**，而**她只能靠描述理解这条能力**：一句错的描述会让她按旧口径去猜
+ *      "为什么没给全"，然后往前翻——正是 `fceeffe` 要治的那件事。用户批了在 beta11 之前改掉。
+ *      **为什么必须递增**：`description` 在 `tools` 段里、**逐字节进每一条请求**
+ *      （判据见 `src/tools/mcp-entry.ts:58-61`），字节一变就是一次设计内的缓存全 miss。
+ *      **代价如实说**：`read_channel` 一件 **247 → 253 token**（描述 **84 → 90**、其余零改动），
+ *      整段 `tools` 代码口径 **5365 → 5371（+6）**；这是**每轮常驻**的一笔。描述仍 <100 的硬门
+ *      （余量 **10**——`test/tool-catalog.test.ts` 那条"距硬门不足 10 token 就红"的判据是
+ *      `MAX − tokens < 10`，**10 正好不红**）。腾出来的字节是"每页 50 条"那半句——它本来就逐字
+ *      写在 `before` 的参数描述里（参数不进那份预算，而她两个都看得到）。
+ *      这一段新写的四件事（默认 = 增量 / 翻历史不改已读 / 提及行 `▶` + 相对时间、旧的写明
+ *      "不是新消息" / 看过的标已读）**逐字**由 `test/read-channel-incremental.test.ts` ⑦ 钉住。
+ *      **指纹基线不动**：`requestFingerprint` 只取 `tools` 里那一串**名字**
+ *      （`test/fixtures/real-wake-rig.ts:175`），而这次只改了描述的一个字节都不碰名字 ⇒
+ *      `test/heartbeat-real-wake.test.ts` 的两个常量**这次照旧不动**（与 v52/v57/v59 同一形态的
+ *      已知盲区：那个台子的注册表是空的，"生产那份请求体的 `tools` 字节变了"由
+ *      `test/tool-catalog.test.ts` 直接钉）。
+ *
+ * v66（**此刻层结构压缩 + 会话清单窗口 + `read_channel` 列会话簿**，2026-10-16 用户的方向）：
+ *      用户的原话：「**总体应当是减少输入为优化目标。包括精简每次工具调用的文案、回执，
+ *      此刻层也是每次的成本，应当压缩。**」这一版做的全是"她自己看的字"，
+ *      **判据一处都没有放宽**（下面逐条给出判据与代价）：
+ *      ① **此刻层里"一轮之内不变"的那几件挪进本轮固定块**（`renderTurnBlock`）：
+ *         每扇门后面是谁那几行 bullet + 告警出口那一句（原先在 `renderContactNote` 里、
+ *         逐 step 发）。它们一个字都不会在一轮之内变 ⇒ 现在只在**第 1 步**发一次，
+ *         与状态 / 关系档案 / 记忆索引同一个位置、同一条取舍（v31 那一条的延长）。
+ *         取材仍是 `renderContactParts`（**切分，不是重写**）：那几句逐字被
+ *         `test/self-brief.test.ts` 锁着，两份实现迟早漂成两套说法。
+ *      ② **此刻层逐字段增量**（`previousNowLayer`）：与**同一 turn 上一步**渲染出来的那一层
+ *         逐字节比对，**不变的那些这一次不发**（`时刻：` 唯一例外——它是这一层的锚点，
+ *         她拿它判断"这一步离上一步过了多久"）。整层都被省掉时**连 item 都不推**（不写空壳）。
+ *         第 1 步没有参照物 ⇒ 每个字段都发（与引入它之前逐字节相同）。
+ *         出处：`real-loop`/`TurnRunner` 把上一步那一份文本转手下来（`previousNow`），
+ *         渲染层仍是纯函数（判据全在入参里，可复算）。
+ *      ③ **会话清单加窗口**（`sessionInList`）：**私聊全部常驻**（那是人对人的那条线，
+ *         一共没几个）；**群聊只列两类**——(a) 她 7 天内在这个群回过话（`spokeAt`，
+ *         素材从 `speak/sent` 折，与 `read_channel` 的"我自己的发言"同一个判据）、
+ *         (b) 最近 1 小时内有 @/提及她的（`mentionedAt`，判据**直接复用**
+ *         `real-loop.mentionedInMessage`）。两个阈值各是一个常量
+ *         （`GROUP_SPOKE_WINDOW_MS` / `GROUP_MENTION_WINDOW_MS`），窗口判断在渲染层。
+ *         ⚠ **v67 更正**：上面这两条已被用户纠正 —— ① **私聊不再无条件常驻**（"我不是说私聊默认保留"），
+ *         私聊与群聊**同一套规则**；② 保留判据改成 **(a) 1 小时内被 @/提及** ∪ **(b) 她回复频次前 3**
+ *         （跨私聊+群聊一起排）。两个常量因此改名/删除：现为 `SESSION_MENTION_WINDOW_MS` 与
+ *         `SESSION_FREQ_WINDOW_MS` + `SESSION_FREQ_TOP_N`。**本段其余叙述作为 v66 的历史记录保留**。
+ *         没列出来的**照实说还有几个**，并给出口：`read_channel` **不给 sid** 就是列会话簿。
+ *         ⚠ 重放/界面预览走**同一个折叠函数**（`foldSpokeAndMention`）：不这样，
+ *         预览会把"刚 @ 过她但她还没回过"的群滤掉，而当时那一份列着它（实测踩到）。
+ *      ④ **`read_channel` 的 `sid` 从必填变可选**（不给 sid + 不给 before ⇒ 列会话簿）。
+ *         **不新增动作名**：工具清单的每个字节都是冻结前缀的常驻成本。
+ *         **为什么这一版必须递增**：③④ 都动了 `tools` 段的字节（`required: ['sid']` → `[]`、
+ *         描述与参数说明都长了），① 动了 `input` 里那一层的位置——两者都与 v65 逐字节不可比。
+ *      **代价如实说**：`tools` 段 `read_channel` 一件 **208 → 247 token**（描述 67 → 84、
+ *     `sid` 参数说明 16 → 39；描述仍 <100 的硬门），这是**每轮常驻**的一笔；
+ *     换回来的是"清单有窗口之后她仍看得到全部会话"这个出口。
+ *     位移的另一半（①）是**位置移动**：`requestFingerprint` 的口径是"剥掉含 `NOW_LAYER_BANNER`
+ *     的 item"，而固定块不在剥离范围内 ⇒ 基线两个常量跟着动了一次
+ *     （见 `test/heartbeat-real-wake.test.ts` 里 v66 那一笔与那份控制实验）。
+ *     ① 的**已知边界**：`previousNowLayer` 只看逐字节相同的字段——**时钟跳变**（同一 turn 内
+ *     `now` 变但格式化结果相同）会把它当成"没变"，而那本来就该当没变（她看到的是同一句话）。
+ *     ③ 的**已知边界**：窗口素材是**内存折叠**的（`spokeAt`/`mentionedAt`），重启由 warmUp
+ *     全量补齐（与 `channelTopics` 同一条路）、取最大值 ⇒ 重复折叠幂等。
+ *
+ * v65（**装置自述大改**：删 §11 / 删两处"必须说话" / 工作规范取消缩进重排 + 新增"人类的偏好"）：
+ *      净减 570 字符（−384 token）。为什么必须递增：`instructions` 是请求体的最大公共前缀，
+ *      改它一个字之后每一个请求的头部字节都变。
+ *
  * v32（STATE 预算提醒进此刻层，2026-10-05 用户的口径）：用户说
  *      「STATE 如果超预算的话，就加个提醒 `[STATE.md]预算超限，记得维护，将过时内容移入记忆文件或删除`」，
  *      并明确选了**只提醒、不截断**（框架不动她的文件，她看到提醒自己去维护）。
@@ -1043,6 +1375,38 @@ import { estimateTokens } from '../tools/registry.ts';
  *         （尺寸真的变了）才会变，而那本来就是"她正在做的事"。
  *      为什么必须递增：此刻层的字节变了，与 v31 的记录逐字节不可比。
  *      调用方**可以不改**：`stateBudgetBytes` 缺省取 `DEFAULT_STATE_BUDGET_BYTES`（与配置默认值同源）。
+ *
+ *      2026-10-17 **措辞改写（用户的新规；`RENDER_VERSION` 不递）**：用户把限额收到 **2 KB**
+ *      （`config.json` 的 `persona.stateBudgetBytes` 改 2048，**他自己改**），并要求提醒覆盖
+ *      「未决问、已决销、拿不准沟通 + 成本 + 保持干净整洁」。这一改**只动这一行字**（此刻层
+ *      尾部、超限才出现），`tools` / `instructions` 一个字节没动 ⇒ 按用户的纪律**不递**
+ *      `RENDER_VERSION`（仍是 68）。**成本口径（实测，不是估）**：这一项**没有 `预算提醒：`
+ *      标签**，v66 的逐字段增量认不出它 ⇒ 它**每步都发**。271 字节 / 60 token（仓库估算口径；
+ *      按用户实测的比例折算约 130 token），按用户的算式 `60 × 5.65 × 7500 × ¥1.06/M ≈ **¥2.70/月**`
+ *      （估算口径；计费口径 ≈¥5.8/月。¥1.06/M 空闲价、7500 轮/月）。
+ *      "分层（此刻层短句 + 固定块完整版）"**没有**采用：按候选稿实测，分层后月成本几乎不变
+ *      （≈¥2.68 vs ≈¥2.70，差 0.7%）——短句仍要每步背着"未决问、已决销、拿不准沟通"这些关键词，
+ *      省下来的正好被第 1 步那份完整版吃掉；而它要维护两份会分岔的措辞、并让固定块随预算状态变
+ *      （v32 的契约是固定块不随尺寸变）。要真省钱只有一条路：给它加个 `预算提醒：` 标签，
+ *      让增量认得出它（每步 → 每轮，成本 ÷5.65）——那是行为变更，留给用户拍，本版没动。
+ *      为什么这条不递增 `RENDER_VERSION` 与 v32 当年的口径不同：v32 是**新增字段**（此前没有
+ *      这一行，请求形状变了）；这一次是**同一条字段换字**，且只出现在"她超限"的那些轮次，
+ *      按用户的交付纪律（工具/指令不变就不递）执行。
+ *
+ *      2026-10-17 **补 `预算提醒：` 行首标签（用户一句话批准；同日 v69 一并把增量修对，
+ *      所以这一版递了 `RENDER_VERSION` 68 → 69，见文件头 v69 那一篇）**：
+ *      那一行从"**每步都发**"变成"**每轮的第 1 步一次**"——v66 的逐字段增量按**行首标签**
+ *      切分（v69 起是 `nowFieldsOf` 只认 {@link NOW_LAYER_FIELD_LABELS} 那 11 个），裸的
+ *      `[STATE.md] …` 从来不属于任何字段；补上标签之后它与 `维护窗口：` 同形 ⇒ 第 2 步起
+ *      逐字节相同、不发。**成本（用户给的算式：¥1.06/M、7500 轮/月、5.65 步/轮）**：
+ *      60 token × 5.65 × 7500 × ¥1.06/M ≈ **¥2.70/月** → 64 token × 7500 × ¥1.06/M ≈ **¥0.51/月**
+ *      （标签本身 +4 token；用户原先按 60 token 估的 **¥0.48** 是"不加这 4 token"的理想值）。
+ *      ⚠ v66 那一版**做不到**"整轮一次"：基线是"上一步真发出去的那一层"，第 2 步省掉之后
+ *      第 3 步的基线里没有它 ⇒ 会再发一次（"奇偶交替"，实测第 1/3/5 步发 ≈¥1.53/月）。
+ *      v69 把基线换成"上一步**完整**的那一层"（`RenderedRequest.nowLayerFull`）之后才真的
+ *      整轮一次 —— 那才是上面那个 ¥0.51。
+ *      改动只在 `input` 尾部这一行里；递版本号是因为**同批**还改了 `tools` 段的一句描述
+ *      （`write_persona` 的「超 4KB 警告」→「超 2KB 警告」）与增量判据本身（input 字节变）。
  *
  * v31（**顺序改回用户定稿的那一版 + 第 1 步之后摘掉注入块**，2026-10-04 用户的口径）：
  *      两件事一起做，因为它们本来就是一条设计：
@@ -1220,7 +1584,7 @@ import { estimateTokens } from '../tools/registry.ts';
  *
  * v2：`instructions` 尾部（人格三层之后、任务卡之前）插入装置自述（self-brief.ts 的 SELF_BRIEF）。
  */
-export const RENDER_VERSION = '63';
+export const RENDER_VERSION = '71';
 
 // ──────────────── MCP 常驻索引那一段：唯一来源是日志里的快照（v46） ────────────────
 
@@ -1272,6 +1636,45 @@ export function mcpIndexOf(events: readonly AppEvent[]): McpIndexPoint {
       // 缺这一格的老快照按 0 算（= 行里没有 desc 那一截）⇒ 该重建一次（判据在那个常量的注释里）
       const clause = event.data.descClauseVersion;
       point.descClauseVersion = typeof clause === 'number' && Number.isFinite(clause) ? clause : 0;
+    } else if (event.type === 'compaction/summary') {
+      point.coveredSeq = event.seq;
+    }
+  }
+  return point;
+}
+
+// ──────────────── 技能常驻索引那一段：唯一来源是日志里的快照（与 MCP 索引同一套） ────────────────
+
+/**
+ * 日志里**最后一条** `skill/index` 快照的位置与内容（没有就是 `seq: 0 / text: null`）。
+ *
+ * 与 [mcpIndexOf] **逐条同形**（同一份判据、同一个用途），存在的理由也逐字一样：
+ *   • 它是技能索引那一段字节在运行期与重建里的**唯一来源**（`render` 是纯函数，读不到技能目录，
+ *     只能读事件）——两处各写一份扫描，迟早漂成"写了但渲染不认"；
+ *   • 写入侧（`RealLoop.skillIndexSync`）判"该不该重建"用的就是这里的 `version` 与 `coveredSeq`。
+ *
+ * ⚠ **老日志里没有这条事件**（这一版之前写下的轮次）：`seq === 0` ⇒ 调用方**不许**拿它当
+ * "当时没有技能"，必须退回当时那条来源（`replay` 的 `skillCatalogForRebuild`）——判据写在
+ * `SkillIndexSnapshot` 的注释最后一段。
+ */
+export interface SkillIndexPoint {
+  /** 最后一条 `skill/index` 的 seq；没有这种事件时为 0 */
+  seq: number;
+  /** 那一条的 `data.text`；没有那种事件时为 null（调用方据此整段不出现） */
+  text: string | null;
+  /** 那一条写的是哪一代模板（它的 `version`）：与 `RENDER_VERSION` 不等 ⇒ 这份快照该重建 */
+  version: string | null;
+  /** 最后一条 `compaction/summary` 的 seq；没有时为 0 */
+  coveredSeq: number;
+}
+
+export function skillIndexOf(events: readonly AppEvent[]): SkillIndexPoint {
+  const point: SkillIndexPoint = { seq: 0, text: null, version: null, coveredSeq: 0 };
+  for (const event of events) {
+    if (event.type === 'skill/index') {
+      point.seq = event.seq;
+      point.text = event.data.text;
+      point.version = event.data.version;
     } else if (event.type === 'compaction/summary') {
       point.coveredSeq = event.seq;
     }
@@ -1349,6 +1752,78 @@ export const NOW_LAYER_BANNER = [
   layerRule('此刻'),
   '（身为本机Agent应当自己领会，但并不与用户、话题、任务直接相关，非必要时也不需要特别与用户提及的信息）',
 ].join('\n');
+
+/**
+ * 此刻层**字段标签**的唯一一份清单（v69）：拼（`renderNowLayer`）与拆（`nowFieldsOf`）用同一份。
+ *
+ * 为什么必须只有一份：v66 的拆法是一条**通用正则**（`/\n([^\n：]{1,16})：/u`），它把字段正文里
+ * 任何"换行 + 短文本 + 全角冒号"都当成新字段的开头——实测 `通道：` 正文里那一行
+ * `[联络方式] 已启用的通道：…` 就被认成了标签（于是 `通道` 的旧值被截断、永远比不上、**从来
+ * 不会被省**），`当前任务` 正文里的 `未完成计划：` 同理。标签是**封闭集合**（这个文件里就这
+ * 11 个），所以拆的时候只认这 11 个：正文里长得像标签的行不再能把字段切断。
+ *
+ * 新增字段时**必须**在这里加一格（否则它在增量里永远"与上一步不同"⇒ 每步重发；用例
+ * `同一轮第 2 步：一个不变的字段都不重发` 会红）。
+ */
+const NOW_LABEL = {
+  clock: '时刻',
+  machine: '本机',
+  usage: '用度',
+  warn: '预警',
+  channel: '通道',
+  sessions: '会话',
+  asks: '在等你答复',
+  mention: '点名',
+  task: '当前任务',
+  maintenance: '维护窗口',
+  budget: '预算提醒',
+} as const;
+
+/**
+ * {@link NOW_LABEL} 的值表（`nowFieldsOf` 的切分表；顺序与渲染顺序一致，段头除外）。
+ *
+ * **导出**（`NOW_LAYER_FIELD_LABELS`）：用例要能"遍历此刻层每一个字段"断言行首标签不变量
+ * （`test/render.test.ts` 的 P1-04 那一组），诊断也要按同一份封闭集合切。别再另抄一份清单
+ * ——两份必然漂移，而这份是**拼与拆共用的唯一真源**。
+ */
+export const NOW_LAYER_FIELD_LABELS: readonly string[] = Object.values(NOW_LABEL);
+
+/**
+ * 此刻层里**每一步都发**的字段（v70 加的显式清单）：逐字段增量（v66）对它们不生效。
+ *
+ * ## 为什么要有这份清单（P1-01 的病灶）
+ *
+ * v66 起的增量按"与上一步**逐字节相同** ⇒ 这一次不发"一视同仁，于是同一个 turn 第 2 步起
+ * `通道：` / `会话：` / `在等你答复：` 从请求里消失。它们与 `时刻：` / `本机：` 不是一类：
+ *
+ *   · 此刻层**不是事件**——它每一步现渲染、不进历史。第 1 步那一条根本不在第 2 步的请求里；
+ *   · 而**本轮固定块第 2 步起整块摘掉**（v31，`render` 的 ④ 与 `firstStep`），原本也带着
+ *     `通道：`（`renderTurnBlock` 的联络那一段）的那一份同样不在了。
+ *
+ * ⇒ 省掉之后，这几件**跨轮事实**在这一步的上下文里**一个字都没有，历史也补不回来**：
+ *   · `在等你答复：` —— 她问出去、还没人答的那件事与"等了多久"（跨轮，只有这一层会说）；
+ *   · `会话：` —— 谁在等她、未读多少（`read_channel` 能查到，但那要她先想到去查）；
+ *   · `通道：` —— 门后是谁、哪些通道开着（联络方式与告警出口）。
+ *
+ * 代价如实记（不是省钱的那一侧）：这三样每步重发，实测 **+134 token/步**（6 步一轮合计 +670；
+ * 同一份夹具里 `维护窗口：` 那一行省下 −570，两笔相抵净 +104——读数见本文件头 v70 那一篇）。
+ * 买的是"她动手期间眼前一直有这几件事实"。
+ *
+ * ## 为什么写成显式清单，而不是一条能从形状推出来的判据
+ *
+ * 这是**产品决定**（哪几件"必须看见"），不是"名字里带等字"之类的性质——所以它必须是一份
+ * 人写的、带理由的清单。新增字段时：属于"这一步必须看见"的，在这里加一格并写清为什么；
+ * 不在清单里的一律照增量走（默认省）。
+ *
+ * 用例（`test/render.test.ts` 的「此刻层 · 必须看见的字段」那一组）：正面钉"第 2/3 步这些
+ * 字段仍在"，反面钉"不在清单里的不变字段照旧不发"（别把这份清单读成"增量作废"）。
+ */
+export const NOW_MUST_KEEP_LABELS: readonly string[] = Object.freeze([
+  NOW_LABEL.asks, NOW_LABEL.sessions, NOW_LABEL.channel,
+]);
+
+/** {@link NOW_MUST_KEEP_LABELS} 的查表形态（`renderNowLayer` 的判据；清单是唯一真源） */
+const NOW_MUST_KEEP: ReadonlySet<string> = new Set(NOW_MUST_KEEP_LABELS);
 
 /**
  * 「本轮固定块」的段头（B2，2026-10-04）。
@@ -1627,9 +2102,16 @@ export interface RenderInput {
    * `persona/STATE.md` 的字节预算（v32；`config.persona.stateBudgetBytes`，默认
    * [DEFAULT_STATE_BUDGET_BYTES] = 8 KB）。
    *
+   * **单位是字节**（与 `write_persona` 的 `Buffer.byteLength` 同源）⇒ **2 KB = 2048 字节**；
+   * 判据是 **`stateBytes > budgetBytes`（严格大于）**：正好等于预算不提醒，多一个字节才提醒。
+   *
    * 缺省取默认值（而不是"不设预算"）：预算的默认值属于**代码口径**，调用方漏传时也该按
    * 出厂口径判——否则"提醒怎么不出现"会变成一个只在某条路径上复现的谜。
    * 真要关掉这一行，把自己的 STATE 压回预算内即可（它是提醒，不是开关）。
+   *
+   * ⚠ 改这个数要**同时**改 `config.ts` 的 `DEFAULT_STATE_BUDGET_BYTES` 与 `buildDefaults()`
+   * 里那个字面量（出包脚本按字面量核对）；本仓库的现网口径由用户在 `config.json` 里定，
+   * 代码默认值不跟着改。
    */
   stateBudgetBytes?: number | null;
   /** 当前时刻 ISO（调用方给；渲染层不读时钟） */
@@ -1698,6 +2180,10 @@ export interface RenderInput {
   /**
    * 此刻的联络事实（状态层素材，见 self-brief.ts）：启用了哪些通道、告警出口在不在、
    * 本轮能不能把话发回唤醒来源。null/缺省表示不渲染这一段（重放与诊断场景）。
+   *
+   * **v66 起它也进本轮固定块**（见 `renderTurnBlock`）：那段里"一轮之内不变"的几件
+   * （每扇门后面是谁、告警出口）挪去了固定块，此刻层只留逐 step 会变的那几件。
+   * 素材来源与纪律一个字没变（宿主算好递进来，渲染层不读配置）。
    */
   contact?: ContactFacts | null;
   /**
@@ -1726,6 +2212,16 @@ export interface RenderInput {
   loadImage?: ((ref: RenderImageRef) => ContextImageChosen | null) | null;
   /** 最多把几张图片放进上下文（默认 IMAGE_INJECT_MAX；0 = 一张都不放，全走文字与读图工具） */
   maxContextImages?: number;
+  /**
+   * **思维链回传的帽子**（v68）：只回传最近几步、单条最多多少字符（见 {@link ReasoningEchoPolicy}）。
+   *
+   * 缺省 = 出厂帽子 {@link REASONING_ECHO_POLICY}（最近 3 步、单条 ≤ 20,000 字符）——
+   * **生产的三条路（`real-loop` / `replay` / 界面预览）都不传**，所以它们拿到的是同一顶帽子，
+   * "同一份日志重建同一份请求"这条承诺照旧成立（换帽子 = 换模板 = 递增 `RENDER_VERSION`）。
+   * 传它是给**用例与诊断**用的：`maxItems: 1` 可钉住"更早的不回传"、`maxChars: 100` 可钉住截断、
+   * `maxItems: 0` 可钉住"整段关掉"。判据在 {@link reasoningEchoOf}，这里只是把它递进去。
+   */
+  reasoningEcho?: Partial<ReasoningEchoPolicy> | null;
   /**
    * 通道消息的显示名（谁在哪个会话里说的）。
    *
@@ -1778,6 +2274,22 @@ export interface RenderInput {
    * 真正的请求。行为逐字节不变（还是那条 developer 消息，还是排在最后）。
    */
   softHint?: string | null;
+  /**
+   * **同一 turn 上一步完整的那一层此刻层**（v66 引入；v69 把"发出去的那几行"改成"完整的那一层"）。
+   * 逐字段比对用，见 `renderNowLayer`。
+   *
+   * 为什么由调用方转手、而不是渲染层自己记：渲染层是**纯函数**（缓存铁律 1）——同一份
+   * `RenderInput` 在任何进程、任何时刻必须渲染成同一串字节，所以"上一步是什么"只能当入参传。
+   * `TurnRunner` 在同一个 turn 内把上一步的 {@link RenderedRequest.nowLayerFull} 转手下来
+   * （turn 结束即丢弃，不落库、不进历史）；重放从**重建出来的上一步请求**里读同一格
+   * （`replay` 的 `previousNowLayerFor`），于是"同一轮第 3 步"在运行期与重建期渲染成同一串字节。
+   *
+   * ⚠ **必须是完整的那一层**（`nowLayerFull`），不是 `input` 里那一条此刻层 item：后者是
+   * 裁剪过的，被省掉的字段在下一步的基线里不存在 ⇒ 那一行会隔一步重发一次（v66 的老病）。
+   *
+   * 缺省 null = 没有参照物 ⇒ 每个字段都发（与引入这一版之前逐字节相同）。
+   */
+  previousNowLayer?: string | null;
 }
 
 export interface RenderedRequest {
@@ -1785,6 +2297,37 @@ export interface RenderedRequest {
   instructions: string;
   input: InputItem[];
   tools: Array<{ type: 'function'; name: string; description: string; parameters: Record<string, unknown> }>;
+  /**
+   * 此刻层**完整**的文本（v69；**观测字段，不进请求体**）。
+   *
+   * 它就是"这一步本来该说的每一行"——**未经逐字段增量裁剪**（见 `renderNowLayer`）。
+   * 运行期把**上一步的这一份**当下一步的比对基线（`agent-loop` 的 `previousNow`），重放从
+   * 重建出来的上一步请求里读同一个字段（`replay` 的 `previousNowLayerFor`）——三处同一份口径，
+   * 不是"上一步真发出去的那几行"。
+   *
+   * 为什么不直接把 `input` 里那一条此刻层 item 当基线（v66 的做法，v69 改）：那一份是**裁剪后**
+   * 的，被省掉的字段在下一步的基线里根本不存在 ⇒ 判据落到"上一步没有它 ⇒ 发它" ⇒ 同一行
+   * 隔一步重发一次（实测：第 1/3/5 步发）。基线换成"完整的那一层"之后，"没变"就是整轮没变，
+   * 于是**整轮只发一次**（成本读数见 `stateBudgetReminder` 那一篇）。
+   *
+   * 它不参与序列化：`ds-client.buildRequestBody` 只认 model / input / instructions / tools /
+   * reasoning / max_output_tokens / text / temperature / top_p，与 `context` 一样一个字节都不进
+   * 请求体。所以它本身不改请求字节——改的是**下一步**的裁剪判据（那才是要递版本号的原因）。
+   */
+  nowLayerFull: string;
+  /**
+   * **这一步改写了哪几条"已经发出去过"的历史 item**（v70，P1-02 / P1-03；**观测字段，不进请求体**）。
+   *
+   * 思维链窗口（v68）与图片窗口都会在第 N+1 条到达时挤掉最老那条——那一条在之前几步的请求里
+   * 已经发过了，所以它一变，**它之后的一切重编码**（KV 前缀命中的分界线就在它那里）。铁律 2
+   * "只追加"在这两处被有界窗口咬出洞来，这份读数的职责就是**不许那件事静默发生**：空 = 这一步
+   * 一条都没改写；非空 = 这几条（`seq` 指得到原话），口径与"为什么取消不了"写在
+   * {@link WindowRewrites} 的注释里。
+   *
+   * 它与 `nowLayerFull` 同一条纪律：**不参与序列化**（`ds-client.buildRequestBody` 的白名单里
+   * 没有它）⇒ 加它本身不改请求字节；它是事件的纯函数 ⇒ 重放/预览读到同一个答案。
+   */
+  windowRewrites: WindowRewrites;
   /**
    * 本次请求的上下文构成（token + 段哈希）。
    *
@@ -1825,6 +2368,9 @@ export function render(input: RenderInput): RenderedRequest {
   if (wakeEvent !== null && wakeEvent.seq > builtAtSeq) builtAtSeq = wakeEvent.seq;
 
   const instructions = renderInstructions(persona);
+  // 思维链回传的帽子（v68）：这里归一一次，交给 `renderEvents` 执行（判据在 `reasoningEchoOf`）。
+  // 生产三条路都不传 ⇒ 出厂帽子；同一份日志因此渲染出同一份请求（可重放/可预览）。
+  const reasoningEcho = reasoningEchoPolicyOf(input.reasoningEcho ?? null);
 
   // 通道消息各自的框架话（注入预警），按 messageId 归各自那条——**不能共用一个上下文**：
   // 共用会把"当前这条被判过"贴到历史里每一条通道消息旁边，而历史里真正被判过的那条反而丢话。
@@ -1879,7 +2425,7 @@ export function render(input: RenderInput): RenderedRequest {
   const historyStart = items.length;
   items.push(...renderEvents(
     events, coveredUpToSeq, NO_REQUEUED, images, input.channelRender, channelNotes,
-    input.mentionNotice ?? null, input.warnExempt ?? null,
+    input.mentionNotice ?? null, input.warnExempt ?? null, reasoningEcho,
   ));
   const historyItems = items.slice(historyStart);
 
@@ -1944,7 +2490,9 @@ export function render(input: RenderInput): RenderedRequest {
   //    点名 / 任务卡）：它们每步都发（见 ⑤）。任务卡尤其重要——待办清单就挂在它身上
   //    （2026-10-04 起载体是 STATE 的两节，见 persona/todo-state.ts），她动手期间必须看得见。
   const turnBlockStart = items.length;
-  const turnBlock = firstStep ? renderTurnBlock(input.turnBlock ?? null, input.memoryIndex ?? null) : '';
+  const turnBlock = firstStep
+    ? renderTurnBlock(input.turnBlock ?? null, input.memoryIndex ?? null, input.contact ?? null, timezone, now)
+    : '';
   if (turnBlock !== '') items.push({ type: 'message', role: 'developer', content: turnBlock });
   const turnBlockSegment = segmentOfItems(items.slice(turnBlockStart));
 
@@ -1955,25 +2503,29 @@ export function render(input: RenderInput): RenderedRequest {
   //    成为可命中的前缀——它逐 step 变，前缀断在它这一格是设计内的。
   //    她的状态与关系档案**不在这里**（B2 起在固定块），记忆索引也不在这里（v30 起在固定块）。
   const nowStart = items.length;
-  items.push({
-    type: 'message', role: 'developer',
-    content: renderNowLayer(
-      now, timezone,
-      input.contact ?? null,
-      taskCard, input.asks ?? [],
-      input.machine ?? null, input.usage ?? null,
-      input.injection ?? [],
-      // 提及那一轮：通知已经在她这一轮的输入里了，此刻层不再重复写「点名：」
-      input.mentionNotice ?? null,
-      // 维护窗口（2026-10-11）：宿主轮首算好的那一条（三个窗口 + 一道闸，见 `maintenanceWindowOf`）。
-      // 缺省 = 不是窗口 ⇒ 整行不出现（这条路径给的是 `RenderInput` 的老调用点：子代理、诊断、重放）。
-      input.maintenanceWindow ?? null,
-      // STATE 预算提醒（v32）：素材是"她的 STATE 有多少字节"与"预算多少"两个数，
-      // 由调用方给（`deriveRequest` 在装配点上量一次）。没量到就整行不出现。
-      input.stateBytes ?? null,
-      input.stateBudgetBytes ?? DEFAULT_STATE_BUDGET_BYTES,
-    ),
-  });
+  const nowLayer = renderNowLayer(
+    now, timezone,
+    input.contact ?? null,
+    taskCard, input.asks ?? [],
+    input.machine ?? null, input.usage ?? null,
+    input.injection ?? [],
+    // 提及那一轮：通知已经在她这一轮的输入里了，此刻层不再重复写「点名：」
+    input.mentionNotice ?? null,
+    // 维护窗口（2026-10-11）：宿主轮首算好的那一条（三个窗口 + 一道闸，见 `maintenanceWindowOf`）。
+    // 缺省 = 不是窗口 ⇒ 整行不出现（这条路径给的是 `RenderInput` 的老调用点：子代理、诊断、重放）。
+    input.maintenanceWindow ?? null,
+    // STATE 预算提醒（v32）：素材是"她的 STATE 有多少字节"与"预算多少"两个数，
+    // 由调用方给（`deriveRequest` 在装配点上量一次）。没量到就整行不出现。
+    input.stateBytes ?? null,
+    input.stateBudgetBytes ?? DEFAULT_STATE_BUDGET_BYTES,
+    // 上一步**完整的**那一层（v69；v66 起叫"上一步渲染出来的那一层"）：
+    // **逐字段比对，不变就不发**（见 renderNowLayer 的说明）。缺省 null = 没有参照
+    // （本轮第 1 步，或重放/子代理那些旧调用点）⇒ 每个字段都发。
+    input.previousNowLayer ?? null,
+  );
+  // 整层都被省掉（每个字段都与上一步逐字节相同）时**不推这条 item**：不写空壳、不留一行
+  // 只有一个段头的 developer 消息（她读到的会是"框架又说了句没用的话"）。
+  if (nowLayer.text !== '') items.push({ type: 'message', role: 'developer', content: nowLayer.text });
   const nowSegment = segmentOfItems(items.slice(nowStart));
 
   // ⑥ 尾部插播（软阈值提示 / 钩子注入）：**照旧每步都发**——它不属于"轮首注入块"：
@@ -1990,11 +2542,28 @@ export function render(input: RenderInput): RenderedRequest {
     type: 'function' as const, name: t.name, description: t.description, parameters: t.parameters,
   }));
 
+  // ⑦ **窗口改写的读数**（v70，P1-02 / P1-03；观测，不进请求体）：这一步把哪几条已经发出去过的
+  //    历史 item 改写掉了。判据与"为什么取消不了"见 `WindowRewrites`。放在这里是因为它要的
+  //    三样（事件表、遮蔽点、两顶帽子的参数）在这个函数里刚好都是现成的；`loadImage` 为 null
+  //    （图片直通关掉）时图片那一格自动为空——没有图进去，也就没有图被挤出来。
+  const windowRewrites = windowRewritesOf(
+    events, wakeEvent, coveredUpToSeq, reasoningEcho,
+    input.loadImage === null || input.loadImage === undefined
+      ? 0
+      : (input.maxContextImages ?? IMAGE_INJECT_MAX),
+  );
+
   return {
     model: input.model,
     instructions,
     input: items,
     tools,
+    // 这一层**完整**的文本（v69，观测字段：不进请求体）：下一步的比对基线。
+    // 为什么不是"这一步真发出去的那几行"：被省掉的字段在下一步的基线里就不存在了，判据会落到
+    // "上一步没有它 ⇒ 发它"，于是同一行**隔步重发**（v66 的实测形状：第 1/3/5 步发）。
+    nowLayerFull: nowLayer.full,
+    // 这一步被窗口挤出去的那几条（v70，观测字段：不进请求体）
+    windowRewrites,
     context: {
       renderVersion: RENDER_VERSION,
       // 构造点（观测字段，不进请求体）：见上面那段注释与 `ContextBreakdown.builtAtSeq`
@@ -2136,7 +2705,13 @@ function renderMemoryLayer(
  * 素材的纪律与此刻层一致：全部由调用方**一轮读一次**递进来（索引也是——轮内不许重建，
  * 否则同一轮相邻两步的固定块就不再逐字节相同），渲染层不读文件系统（缓存铁律 1）。
  */
-function renderTurnBlock(facts: TurnBlockFacts | null, memoryIndex: string | null): string {
+function renderTurnBlock(
+  facts: TurnBlockFacts | null,
+  memoryIndex: string | null,
+  contact: ContactFacts | null,
+  timezone: string | undefined,
+  now: string,
+): string {
   const sections: string[] = [];
   // v56：块内三节之间用**同一种无标签横线**（`SECTION_RULE`）分开——用户点名的
   // "state 和上下两块也要有分割线"。为什么不再挂一个同名标签：这三节自己的名字已经写在
@@ -2157,6 +2732,16 @@ function renderTurnBlock(facts: TurnBlockFacts | null, memoryIndex: string | nul
   // 放在最后：理由见函数头"为什么索引排最后"。
   const index = (memoryIndex ?? '').trim();
   if (index !== '') sections.push(index);
+  // 联络方式里**一轮之内不变的那几件**（v66）：每扇门后面是谁那几行 bullet + 告警出口那一句。
+  // 它们原先逐 step 重发（此刻层那段），而它们一个字都不会在一轮之内变——挪进来之后
+  // 只在第 1 步出现，与状态/关系档案/记忆索引同一个位置、同一条取舍。
+  // 排在最前：先回答"你能联络到哪儿"（她据此决定这一轮做什么），再是"你是谁、能查什么"。
+  if (contact !== null) {
+    const turnParts = renderContactParts(contact, contactOptionsOf(timezone, now));
+    const doors = turnParts.doors.length === 0 ? '' : `\n${turnParts.doors.join('\n')}`;
+    const note = `${turnParts.banner}${turnParts.channels}${doors}${turnParts.exit}`.trim();
+    if (note !== '') sections.unshift(note);
+  }
   if (sections.length === 0) return '';
   // 分割线只插在**节与节之间**（不在段头与第一节之间：那会与段头那条线叠成两根）
   return [TURN_BLOCK_BANNER, sections.join(`\n\n${SECTION_RULE}\n\n`)].join('\n\n');
@@ -2174,8 +2759,16 @@ function renderTurnBlock(facts: TurnBlockFacts | null, memoryIndex: string | nul
  * **B2 起这里只剩真正逐 step 变的东西**：她的状态与关系档案挪去了固定块
  * （`renderTurnBlock`）——它们一轮之内不变，留在这里等于每步重发（实测整份 `STATE.md`
  * 约 3845 token/步）。任务卡留在这里：它带 `已 M 步`，本来就是逐步变的。
- * v32 的 STATE 预算提醒也在这里，理由与任务卡同源：她压回预算内之前那一行要**每步都看得见**
- * （固定块 v31 起第 2 步就摘了），而她改小了 STATE 之后它本来就该消失——逐 step 变正是它的性质。
+ * v32 的 STATE 预算提醒也在这里：那一刻她正在动手，而这一层就是她看得见的那一层
+ * （固定块 v31 起第 2 步就摘了）；她改小了 STATE 之后它本来就该消失。
+ *
+ * **v66 的逐字段增量对它生效（2026-10-17 起）**：这一行带 `预算提醒：` 行首标签，与
+ * `维护窗口：` 同形 ⇒ 同一 turn 的第 2 步起它与上一步逐字节相同、**不再发**（一轮的第 1 步
+ * 发一次）。在此之前它是裸的一行 `[STATE.md] …`（v32 贴用户给的形状），"行首标签"的比对
+ * 认不出它 ⇒ **每步都发**（271 字节 / 60 token × 5.65 次/轮 ≈ ¥2.70/月）。标签是这条增量
+ * 生效的**唯一**前提：谁把它删掉，它就退回"每步都发"——用例钉着这一条。
+ * ⚠ 它只是"最后一个字段"，所以"第 2 步省掉"成立；第 3 步会再发一次（基线是上一步**发出去的**
+ * 那一层），要做到"整轮一次"得改运行期基线口径——代价与边界见 `stateBudgetReminder` 那一篇。
  *
  * 为什么改成字段而不是接着写散文：这几样是**事实**，不是叙述。她（以及事后读日志、读重放的人）
  * 要能一眼扫到"现在几点、磁盘还剩多少、今天花了多少、外面有没有人等她答话"，而不是从几段话里
@@ -2188,6 +2781,37 @@ function renderTurnBlock(facts: TurnBlockFacts | null, memoryIndex: string | nul
  *
  * 值的纪律：`machine` / `usage` / `contact` / `asks` 全部由调用方算好递进来，这里只格式化。
  * 缺省路径一律按"不知道就说不知道"处理（写"未知"或整项省略），不抛、不写 NaN。
+ *
+ * **逐字段增量（v66；v69 修正基线与切分）**：`previousNowLayer` 给的是**同一 turn 上一步
+ * 完整的那一层**（不是"上一步真发出去的那几行"，见 {@link RenderedRequest.nowLayerFull}）。
+ * 判据是**逐字节**：
+ *   · 某个字段与上一步的那一个**逐字节相同** ⇒ 这一次不发它（`时刻：` 除外，见下）；
+ *   · 变了、或上一步没有它 ⇒ 发它（包括"上一次没出现、这一次出现"）；
+ *   · 整层每个字段都被省掉 ⇒ `text` 是空串，调用方**连这条 item 都不推**（不写空壳、
+ *     不留空段）；但 `full` 照旧给，所以下一步的基线不为空。
+ *
+ * 为什么基线必须是"上一步完整的那一层"（v69）：用"上一步**真发出去**的那几行"当基线，
+ * 被省掉的字段下一步在基线里根本不存在 ⇒ 判据落到"上一步没有它 ⇒ 发它" ⇒ 同一行在整轮里
+ * **隔一步重发一次**（实测第 1/3/5 步发）。基线改成完整的那一层之后，"没变"就是整轮没变。
+ * 拆的时候只认 {@link NOW_LAYER_FIELD_LABELS} 那 11 个标签、并剥掉值尾随的分隔换行
+ * （v66 的通用正则把正文里的 `…：` 当标签、又把分隔符算进前一个字段 ⇒ 那几项**从来没被省过**，
+ * 见 `nowFieldsOf` 的注释）。
+ *
+ * 为什么要做到"逐字段"而不是只挑会话清单与提问小结：那两样是**最常不变**的（她的提问小结
+ * 一挂几小时、会话清单在一轮之内几乎不动），"哪些字段不变"本身是**数据**、不是我们能预先
+ * 列全的清单；按同一个判据一视同仁，才不会出现"某天多出一个字段、它又在每步重复"那种回归。
+ *
+ * **`时刻：` 永远发**（唯一一个例外）：它是这一层的锚点——她把"现在几点"当作判断依据用过
+ * （v26 那次"拿 UTC 当本地时间"的教训），省掉它就让她数不清这一步离上一步过了多久。
+ *
+ * **v70 起还有第二组例外：`通道：` / `会话：` / `在等你答复：` 每一步都发**
+ * （{@link NOW_MUST_KEEP_LABELS}，理由写在那份清单的注释里：它们被省掉之后**历史补不回来**
+ * ——此刻层不是事件，而带同样内容的固定块第 2 步起已摘）。这一组**不受**下面的逐字节判据管；
+ * 其余字段照旧"没变就不发"。
+ *
+ * ⚠ **第一条永远发**：`previousNowLayer` 为 null（本轮第 1 步、重放、子代理、诊断）时
+ * 没有参照物 ⇒ 每个字段都发——与引入这一版之前**逐字节相同**。这也是"增量"这个东西的
+ * 固有形状：没有基线就没有 diff（那正是固定块 v31 的做法：第 1 步全给，之后才省）。
  */
 function renderNowLayer(
   now: string,
@@ -2202,18 +2826,32 @@ function renderNowLayer(
   maintenanceWindow: MaintenanceWindowNote | null,
   stateBytes: number | null,
   stateBudgetBytes: number | null,
-): string {
+  previousNowLayer: string | null,
+): { text: string; full: string } {
+  /** 一个字段：`label` 是它的稳定标签（比对与诊断用），`text` 是**含前导分隔**的正文 */
+  interface NowField { label: string; text: string }
+  const fields: NowField[] = [];
+  const push = (label: string, text: string): void => {
+    fields.push({ label, text: fields.length === 0 ? text : `\n${text}` });
+  };
   // ── 字段区：段头 + 每项一行。值本身可以多行（通道那一整段清单、她的提问小结）──────
-  const fields: string[] = [
-    NOW_LAYER_BANNER,
-    `时刻：${clockLine(now, timezone)}`,
-    `本机：${machineLine(machine)}`,
-  ];
+  push('banner', NOW_LAYER_BANNER);
+  push(NOW_LABEL.clock, `时刻：${clockLine(now, timezone)}`);
+  // 本机（2026-10-16）：**拿不到真值就整行不写**，不写 `本机：未知`。
+  //
+  // 判据：运行期那条路（`real-loop.machineFacts()` → `agent-loop` 的 `deps.machine`）**总是**
+  // 给全值，所以这一行在她的上下文里原本不该出现"未知"；真正会走到未知的只有"没人接上本机事实"
+  // 的那些装配（子代理、单测、诊断）。而那些场合里，「本机：未知」既不提供事实、又要每次调用
+  // 付费——与 `用度：`（v24 起默认整行不出现，不写"未知"）同一条口径：**不知道就整项省略**。
+  // `machineLine` 仍然对"有事实但某一项读不到"照实写"未知"（磁盘读不到那一项）——那是**部分
+  // 缺省**，与"整项都没有"是两件事，别合并。
+  const machineText = machineLine(machine);
+  if (machineText !== '') push(NOW_LABEL.machine, `本机：${machineText}`);
 
   // 用度：**默认整行不出现**，只在告警时出现（用户 2026-10-02："这个默认不出现，
   // 在作为告警信息时出现"）。不写"0%"、不写"未知"——那些都是"出现"，而他要的是"不出现"。
   const alert = usageAlert(usage);
-  if (alert !== null) fields.push(`用度：⚠ ${alert.parts.join(' · ')}`);
+  if (alert !== null) push(NOW_LABEL.usage, `用度：⚠ ${alert.parts.join(' · ')}`);
 
   // 预警（v25）：最近 24 小时谁被示过警。**有示警才出现**（没有就整段不出现，不写"0 次"）。
   // 它在说一件跨多轮的事：那些"想指挥你"的话不只是一次打扰，而是有人在试——她该能看见这件事
@@ -2223,14 +2861,17 @@ function renderNowLayer(
   // 每行那个"谁"、点名那句是同一个函数）——否则群里那一行会写成裸 QQ 号/openid，而她刚在同一份
   // 上下文里从消息行读到过那个人的名字（见 v47 那一篇）。
   const warnText = renderInjectionNote(injection, Date.parse(now), contact?.personNameOf ?? null).trim();
-  if (warnText !== '') fields.push(`预警：\n${warnText}`);
+  if (warnText !== '') push(NOW_LABEL.warn, `预警：\n${warnText}`);
 
   if (contact !== null) {
-    // 通道：`renderContactNote` 的内容**一字不改**，只把 @ 提示那一句摘出来单独成「点名：」
-    // 字段——否则同一句话会在这一层出现两次（withMention:false 只影响这一处的取用）。
-    const channelText = renderContactNote(contact, { withMention: false, timezone }).trim();
-    if (channelText !== '') fields.push(`通道：\n${channelText}`);
-    fields.push(`会话：${sessionDigest(contact.sessions ?? [])}`);
+    // 通道：这一段里**只留逐 step 会变的那几件**（v66）——门后是谁与告警出口那几句已经进了
+    // 本轮固定块（`renderTurnBlock`），`withTurnParts:false` 把它们摘掉；@ 提示那一句也摘出来
+    // 单独成「点名：」字段（否则同一句话会在这一层出现两次）。
+    const channelText = renderContactNote(contact, {
+      withMention: false, withTurnParts: false, ...contactOptionsOf(timezone, now),
+    }).trim();
+    if (channelText !== '') push(NOW_LABEL.channel, `通道：\n${channelText}`);
+    push(NOW_LABEL.sessions, `会话：${sessionDigest(contact.sessions ?? [])}`);
   }
 
   // 她问出去的事（design §6）：有状态的跨轮事实，放此刻层；"等了多久"用本层的时刻算，
@@ -2238,7 +2879,7 @@ function renderNowLayer(
   // 标签是字段名，正文照 `renderAskNote` **逐字**给出：那几句（未批准、未拒绝、人可能不在、
   // 要不要换个方式找人由她定）是 design §6.1 的口径，改一个字就是改设计。
   const askText = renderAskNote(asks, Date.parse(now)).trim();
-  if (askText !== '') fields.push(`在等你答复：\n${askText}`);
+  if (askText !== '') push(NOW_LABEL.asks, `在等你答复：\n${askText}`);
 
   if (contact !== null && mentionNotice === null) {
     // 点名：谁在哪个群里点了她（`renderMentionNote` 的原文，一字不改）。没有 @ 的轮次整项不出现。
@@ -2246,7 +2887,7 @@ function renderNowLayer(
     // 提及那一轮（`mentionNotice !== null`）整项**不出现**：那句话已经作为本轮输入摆在她面前了
     // ——被叫的那一次她要先知道"有人在叫我"，同一句通知不在这里再说一遍。
     const mention = (renderMentionNote(contact) ?? '').trim();
-    if (mention !== '') fields.push(`点名：${mention}`);
+    if (mention !== '') push(NOW_LABEL.mention, `点名：${mention}`);
   }
 
   // 任务卡：`已 M 步` 逐步变，所以它留在这一层（B2 唯一一件"长"的、且确实逐 step 变的东西）。
@@ -2267,25 +2908,112 @@ function renderNowLayer(
     const todo = taskCard.todoOpen.length > 0
       ? `\n未完成计划：\n${taskCard.todoOpen.map(t => `- ${t}`).join('\n')}`
       : '';
-    fields.push(`\n当前任务：${taskCard.title}（turn ${taskCard.turn}，已 ${taskCard.step} 步）${assetsLine}${todo}`);
+    push(NOW_LABEL.task, `\n当前任务：${taskCard.title}（turn ${taskCard.turn}，已 ${taskCard.step} 步）${assetsLine}${todo}`);
   }
   // 维护窗口（2026-10-11）：**排在 STATE 预算提醒之前**——预算提醒是"该动手了"的旧那一类，
   // 而这一条是"现在适合动手"（两者一起出现时，先读到的该是本轮那句时机提示）。
   // 整行不出现是默认形态（`maintenanceWindowOf` 为 null）：绝大多数轮次都没有这一行，
   // 于是"没有窗口的日子"请求字节与引入它之前**逐字节相同**（测试正面钉着这条不变量）。
   const maintenance = maintenanceWindow?.text.trim() ?? '';
-  if (maintenance !== '') fields.push(maintenance);
-  // STATE 预算提醒（v32）：**排在最后**——它是这张字段表里最后一件"框架此刻要她知道的事"，
-  // 而且放在尾部时，她压回预算内之前的那几行前缀一个字节都不受影响。
-  // 超预算才出现（没超就整行不出现，不写"正常"、不写百分比）。
+  if (maintenance !== '') push(NOW_LABEL.maintenance, maintenance);
+  // STATE 预算提醒（v32；措辞与标签 2026-10-17 换成用户的新规）：**排在最后**——它是这张
+  // 字段表里最后一件"框架此刻要她知道的事"，而且放在尾部时，她压回预算内之前的那几行前缀
+  // 一个字节都不受影响。超预算才出现（`stateBytes > stateBudgetBytes`，严格大于；没超就整行
+  // 不出现，不写"正常"、不写百分比）。它是**单行**（不含换行）、**带 `预算提醒：` 行首标签**：
+  // v66 的逐字段增量按标签切分 ⇒ 同一轮第 2 步起不再重发（每步 → 每轮的第 1 步）。
+  // 标签就是这件事的全部开关（边界见 `stateBudgetReminder` 与 `nowFieldsOf` 的注释）。
   const reminder = stateBudgetReminder(stateBytes, stateBudgetBytes);
-  if (reminder !== null) fields.push(reminder);
+  if (reminder !== null) push(NOW_LABEL.budget, reminder);
+
+  // **完整的那一层**（v69）：这一步"本来该说什么"的全文——**未经增量裁剪**。它是下一步的
+  // 比对基线（`RenderedRequest.nowLayerFull`）：基线必须是"上一步完整的这一层"，不能是
+  // "上一步真发出去的那几行"——后者会让被省掉的字段在下一步的基线里消失，判据落到
+  // "上一步没有它 ⇒ 发它"，于是同一行隔步重发（v66 的老病，实测第 1/3/5 步发）。
+  const full = fields.map(field => field.text).join('');
+
+  // ── 增量：与上一步逐字段比对，不变的不发（见函数头"逐字段增量"）──────────────────
+  const kept = fields.filter((field, index) => {
+    if (index === 0) return true; // 段头永远在（下面若整层被省掉就整个返回空串）
+    if (field.label === NOW_LABEL.clock) return true; // 唯一一个"永远发"的字段：它是这一层的锚点
+    // **每一步都必须看见的那几件**（v70）：显式清单 + 理由见 {@link NOW_MUST_KEEP_LABELS}。
+    // 这一行是那份清单唯一的执行点——删掉它，P1-01 就回来了（用例正面钉着第 2/3 步它们仍在）。
+    if (NOW_MUST_KEEP.has(field.label)) return true;
+    const previous = previousNowLayer === null ? null : nowFieldsOf(previousNowLayer).get(field.label);
+    return previous !== field.text;
+  });
+  // 只剩段头 ⇒ 这一步没有任何新事实 ⇒ 整层不发（调用方连 item 都不推）。⚠ 但 `full` 照旧给：
+  // 下一步的基线不能因为"这一次整层没发"就丢掉，否则它下一步会把所有字段重发一遍。
+  if (kept.length <= 1) return { text: '', full };
   // 一行一项（`\n`）：B2 之前这里就是单换行（状态/关系/任务卡各占一节时才用空行分隔），
-  // 现在长段落都搬走了，剩下的是一张紧凑的字段表。
-  return fields.join('\n');
+  // 现在长段落都搬走了，剩下的是一张紧凑的字段表。每个字段自带前导分隔，首项（段头）没有。
+  return { text: kept.map(field => field.text).join(''), full };
 }
 
-// ── 此刻层各字段的格式化（纯函数：只吃传进来的值） ──
+/** 段头两行的原样前缀（借用它判"这一段确实是此刻层"，见 [nowFieldsOf]） */
+const NOW_LAYER_HEAD = `${NOW_LAYER_BANNER}\n`;
+
+/**
+ * 把一段此刻层文本拆回 `标签 → 该字段正文`（**只为增量比对用**，不参与任何渲染）。
+ *
+ * **切分点只认 {@link NOW_LAYER_FIELD_LABELS} 里那 11 个标签**（v69 修）：v66 那一版用的是
+ * 通用正则 `/\n([^\n：]{1,16})：/u`，于是字段正文里任何"换行 + 短文本 + 全角冒号"都被当成
+ * 新字段的开头——实测 `通道：` 正文里 `[联络方式] 已启用的通道：…` 那一行把 `通道` 的旧值
+ * **从中间切断**，`当前任务：` 正文里的 `未完成计划：` 同理。后果不是"多发一行"，而是
+ * **这些字段永远比不上旧值 ⇒ 从来不会被省**（v66 装了很久却没省下东西的真因）。
+ * 标签是封闭集合（见 {@link NOW_LABEL}），只认它们，正文里长得像标签的行就切不断字段了。
+ *
+ * **值里的尾随 `\n` 不算正文**（同一修）：两个字段之间的分隔符只属于**下一个**字段（它自带
+ * 前导 `\n`），而 v66 的切法把它算进了**前一个**字段的值里 ⇒ `通道/会话/…` 与当步的
+ * `field.text`（不带尾随换行）永远不相等 ⇒ 同样"从来不会被省"。
+ *
+ * 认不出来（不是此刻层、或格式出乎意料）就返回空表 ⇒ 每个字段都"与上一步不同" ⇒
+ * **全部照发**。这一层是增量优化，判不出来时退化成"每步都发"（与引入它之前一样），
+ * 绝不因为猜错而少说一句话。
+ */
+function nowFieldsOf(text: string): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!text.startsWith(NOW_LAYER_BANNER)) return out;
+  const body = text.slice(NOW_LAYER_BANNER.length);
+  const marks: Array<{ label: string; at: number }> = [];
+  for (const label of NOW_LAYER_FIELD_LABELS) {
+    const needle = `\n${label}：`;
+    for (let at = body.indexOf(needle); at !== -1; at = body.indexOf(needle, at + 1)) {
+      marks.push({ label, at });
+    }
+  }
+  // 按出现位置排（标签表是并列关系，正文顺序才是唯一次序）；同一个位置不可能撞两个标签
+  marks.sort((a, b) => a.at - b.at);
+  for (const [i, mark] of marks.entries()) {
+    const end = i + 1 < marks.length ? marks[i + 1]!.at : body.length;
+    // 正文含**自己的前导 `\n`**（与 renderNowLayer 拼出来的一致），比对才是逐字节的；
+    // 但**不含**下一个字段的前导 `\n`（那是分隔符，不是这一行的一部分）。
+    let value = body.slice(mark.at, end);
+    if (value.endsWith('\n')) value = value.slice(0, -1);
+    out.set(mark.label, value);
+  }
+  return out;
+}
+
+/**
+ * 此刻层各字段的格式化（纯函数：只吃传进来的值）
+ *
+ * ── `contactOptionsOf`：此刻层与固定块共用的一份取用选项（v66）────────────────────
+ *
+ * `now` 与 `timezone` 是**同一个渲染调用**里已经有的两个值（`时刻：` 那一行就是它们算的），
+ * 而会话清单的窗口判断（v67 起：**1 小时内有人 @/提及她吗**、**她的回复频次在不在前 3**，
+ * 见 `self-brief.sessionListSelection`）
+ * 要的正是这两个。所以这里做一次转换、两处共用：**同一份事实不可能在一屏里出现两个"现在"**。
+ *
+ * `now` 解析不出来（非法时间串）时**不传 `nowMs`** ⇒ 清单不过滤（照旧全列）。
+ * 那是"不知道就别猜"那一侧：宁可多列几行，也不按一个猜出来的时刻把会话藏掉。
+ */
+function contactOptionsOf(timezone: string | undefined, now: string): { timezone?: string; nowMs?: number } {
+  const ms = Date.parse(now);
+  return {
+    ...(timezone === undefined || timezone === '' ? {} : { timezone }),
+    ...(Number.isFinite(ms) ? { nowMs: ms } : {}),
+  };
+}
 
 // ──────────────── 维护窗口（2026-10-11）：三个信号 + 一道闸 + 一行字 ────────────────
 //
@@ -2563,9 +3291,19 @@ export function lastCompactionReading(
  *     不是拦她开口。
  * 「压缩临近」那一档**保持原文案**：那一档是唯一有截止线的（再不动手，那段历史就要被折成
  * 一篇笔记），说的本来就是"该动文档了"，不该被换成"这是你自己的时间"。
+ *
+ * **v70 只加了第一行前面的五个字 `维护窗口：`**（P1-04），正文一个字没动、一行都没重排：
+ * 这一档原先**没有行首标签**（开头是 `[自主时段]`），而 `nowFieldsOf` 只认登记过的标签 ⇒
+ * 逐字段增量认不出这一项 ⇒ 夜里/空拍档**每一步都重发 ≈115 token**，还把这段正文按在
+ * `通道：` / `会话：` 那一段的**值里**（切分口径被污染，前一个字段因此永远比不上旧值）。
+ * 标签是"第 2 步起不发"的**唯一开关**（与 `预算提醒：` 同形，见 `stateBudgetReminder`），
+ * 所以它必须长在**行首**：`\n维护窗口：[自主时段] ……`。
+ * ⚠ 别把这读成 v53 的回退：v53 说的是这一档的**正文**不再讲"去整理你的文档"（那份正文原样
+ * 保留在下面，只多了一格字段名）；`维护窗口：` 在这里是**字段标签**，不是那句话的一部分。
+ * 不变量的正面锁在 `test/render.test.ts`：「此刻层每一个字段都以行首 `标签：` 开头」。
  */
 const AUTONOMOUS_WINDOW_TEXT = [
-  '[自主时段] 现在没人打扰你，这是你自己的时间。可以考虑做些事，包括但不限于：',
+  '维护窗口：[自主时段] 现在没人打扰你，这是你自己的时间。可以考虑做些事，包括但不限于：',
   '复盘今天（发生了什么事、他今天怎么样、你应过什么）· 想更远的事（你和他要一起做成什么、',
   '有什么建议值得给他）· 只是想说句话——不必等到有事。',
   '资源不用省，你觉得该做就做；但要有产出：写进你自己的文件，或者说给他听。',
@@ -2626,20 +3364,53 @@ export function stateBytesOf(state: string | null | undefined): number {
 }
 
 /**
- * 此刻层那行**STATE 预算提醒**（v32）：超预算时返回整行文本，没超返回 null（整行不出现）。
+ * 此刻层那行**STATE 预算提醒**（v32；措辞与行首标签 2026-10-17 按用户的新规矩改写）。
+ * 超预算时返回整行文本（**以 `预算提醒：` 开头**——那是 v66 逐字段增量认得出这一项的唯一
+ * 凭据，见 `renderNowLayer` 与 `nowFieldsOf`），没超返回 null（整行不出现）。
  *
- * 措辞是用户 2026-10-05 的原话（逐字）：
- *   「STATE 如果超预算的话，就加个提醒 `[STATE.md]预算超限，记得维护，将过时内容移入记忆文件或删除`」
- * 前面接上**实际数字**，形态照他给的样子：
- *   `[STATE.md] 16.6 KB / 预算 8 KB——预算超限，记得维护，将过时内容移入记忆文件或删除`
+ * 用户 2026-10-17 的原话（**这是唯一判据**）：
+ *   「**限额到 2KB**，超过限额的时候会注入框架提示吧，**未决的事及时询问，已决已办及时销项移除。
+ *     不清楚的跟用户沟通移除**。否则会造成大量输入成本，伤害用户的钱包。**保持好 STATE.md 的干净整洁**」
+ * 所以这一行必须同时说清四件事 + 一句成本理由 + 一句"干净整洁"，一条都不能省：
+ *   ① 超限了（给数字：实际字节 / 限额字节）；
+ *   ② 未决的事 → **及时问他**；
+ *   ③ 已决、已办的 → **及时销项、从 STATE.md 移除**；
+ *   ④ 拿不准的 → **跟他沟通后移除**；
+ *   ＋「否则每轮都要多背这些字，直接烧的是他的钱」（照原话的精神：省下来的是他的钱包）；
+ *   ＋「保持 STATE.md 干净整洁」。
  *
- * 为什么放在这一层（此刻层）：那一刻她**正在动手的地方**就是此刻层——固定块 v31 起第 2 步
- * 就摘掉了，提醒写在那里她根本看不见。同时它本身就是"逐 step 变"的那一类：她压回预算内，
- * 下一轮量到的新尺寸就落回线内，这一行自动消失（不需要"已读"、不需要额外状态）。
+ * **单位口径（别写成字符）**：`stateBudgetBytes` 是**字节**，与 `write_persona`
+ * （`Buffer.byteLength`）同源 ⇒ **2 KB = 2048 字节**。所以这一行把两个数都写出来
+ * （`4383 字节 / 限额 2 KB = 2048 字节`）：她删的时候看的是字节数，不是字数——这份文件几乎
+ * 全是中文，一个汉字 3 字节，两种口径差三倍。
+ *
+ * **判据是 `stateBytes > budgetBytes`（严格大于，不是 `>=`）**：正好 2048 字节**不**出现，
+ * 2049 字节才出现。"限额 2 KB"的准确读法是"**超过** 2048 字节才提醒"。
+ *
+ * 为什么放在这一层（此刻层）：那一刻她**正在动手的地方**就是此刻层（固定块 v31 起第 2 步
+ * 就摘掉了）。她压回预算内，下一轮量到的新尺寸就落回线内，这一行自动消失（不需要"已读"、
+ * 不需要额外状态）。
+ *
+ * **它多久出现一次（成本口径，2026-10-17 实测）**：**每轮的第 1 步一次**（整轮一次）。
+ * 这一项带 `预算提醒：` 行首标签（2026-10-17 用户批准补上），与 `维护窗口：` 同形——
+ * v69 起逐字段增量的基线是"上一步**完整**的那一层"（`RenderedRequest.nowLayerFull`），
+ * 所以第 2 步起它与上一步逐字节相同 ⇒ **不发**（第 3/4/5 步也一样，不是隔步）。
+ * 在此之前它是裸的一行 `[STATE.md] …`（v32 贴用户给的形状），增量认不出 ⇒ 每步都发：
+ * 271 字节 / 60 token × 5.65 步/轮 ≈ **¥2.70/月**；加上标签后 ≈ **¥0.51/月**
+ * （64 token × 7500 轮/月 × ¥1.06/M；用户原先按 60 token 估的 **¥0.48** 是理想值，
+ * 标签本身 +4 token。若基线还是"上一步真发出去的那一层"，只能做到隔步 ≈¥1.53/月）。
+ * ⚠ **标签别去掉**：它是这条成本的**全部**开关。用例 `同一轮第 2/3/4/5 步都不再出现`
+ * 钉着它，另有一条对照用例把"标签剥掉 ⇒ 退回每步都发"摆在同一处。
+ *
+ * 为什么**不再**把"完整政策"复制一份进本轮固定块（分层方案被否）：按候选稿实测，分层后
+ * 月成本几乎不变（≈¥2.68 vs ≈¥2.70，差 0.7%）——短句仍要每步背着"未决问、已决销、
+ * 拿不准沟通"这些关键词，省下的正好被第 1 步那份完整版（≈128 token）吃掉；还要维护两份
+ * 会分岔的措辞，并让固定块随预算状态变（v32 的既有契约是固定块不随尺寸变）。
+ * 省钱的真正杠杆在"减少发送次数"（见上一条），不在"把同一句话拆成两半"。
  *
  * 为什么不写百分比 / 不写时间戳：同一轮的同一份 STATE 必须渲染出**同一串字节**（缓存纪律），
  * 而百分比会把"改了四个字节"放大成一个新数字、时间戳更是每步都变——两者都会让这一行自己
- * 变成抖动源。给绝对量（多少 KB / 预算多少 KB）就够了：她要的是"我该动手了"。
+ * 变成抖动源。给绝对量（多少字节 / 限额多少字节）就够了：她要的是"我该动手了"。
  *
  * 只提醒、不截断（用户口径）：这里只**算一行字**，框架一个字节都不动 `STATE.md`。
  * `undefined` / 负数 / NaN 一律当"没量到"或"没设预算"，返回 null——不抛异常，也不写
@@ -2652,8 +3423,15 @@ export function stateBudgetReminder(
   if (typeof stateBytes !== 'number' || !Number.isFinite(stateBytes) || stateBytes < 0) return null;
   if (typeof budgetBytes !== 'number' || !Number.isFinite(budgetBytes) || budgetBytes <= 0) return null;
   if (stateBytes <= budgetBytes) return null;
-  return `[STATE.md] ${humanBytes(stateBytes)} / 预算 ${humanBytes(budgetBytes)}`
-    + '——预算超限，记得维护，将过时内容移入记忆文件或删除';
+  // 两个数都按**字节**给（`4383 字节 / 限额 2 KB = 2048 字节`）：`write_persona` 的回执也是
+  // "已写入 …：4383 字节"，她拿它一比就知道还差多少。只写 KB 会在"2049 vs 2048"这种边上
+  // 显示成"2 KB / 限额 2 KB"，看着像没超——那正是这条提醒最不该出现的歧义。
+  // **行首标签是这一行的成本开关**（2026-10-17 用户批准）：此刻层那一层按"行首标签 `^…：`"
+  // 逐字段比对（`nowFieldsOf`），没有标签的裸行认不出来 ⇒ 每步都发；带上它之后同一轮
+  // 第 2 步起逐字节相同 ⇒ 不发。删掉这 5 个字 = 成本回到每步一份，用例钉着这一条。
+  return `预算提醒：[STATE.md] ${stateBytes} 字节 / 限额 ${humanBytes(budgetBytes)} = ${budgetBytes} 字节`
+    + '——超限：未决的事及时问他；已决、已办的销项、从 STATE.md 移除；拿不准的跟他沟通后移除。'
+    + '保持 STATE.md 干净整洁——否则每轮都要多背这些字，直接烧的是他的钱';
 }
 
 /**
@@ -2733,10 +3511,13 @@ function weekdayOf(now: string, timezone: string): string | null {
  *
  * 每一项**独立缺省**：进程信息与磁盘都是会失败的系统调用（卷被卸载、权限不够），缺了就说缺了
  * ——尤其磁盘那一项，读不到时**不许**让这一行看起来像"磁盘没事"（"未知"就是未知）。
- * 全都没有时写"未知"，不写空值。
+ *
+ * **整项都没有时返回空串**（2026-10-16）：调用方据此**整行不写**——与 `用度：` 同一条口径。
+ * 返回 `'未知'` 的旧形态会让此刻层每步都多一行"本机：未知"：它不提供事实、却要每次调用付费，
+ * 与 `machineLine` 内部"某一项读不到就写未知"（那是**部分**缺省，仍要如实说出来）是两件事。
  */
 function machineLine(facts: MachineFacts | null): string {
-  if (facts === null) return '未知';
+  if (facts === null) return '';
   const parts: string[] = [];
 
   const platform = (facts.platform ?? '').trim();
@@ -2758,7 +3539,7 @@ function machineLine(facts: MachineFacts | null): string {
     parts.push(`磁盘剩余 ${humanBytes(disk.freeBytes)}（可用 ${percent.toFixed(1)}%）`);
   }
 
-  return parts.length === 0 ? '未知' : parts.join(' · ');
+  return parts.length === 0 ? '' : parts.join(' · ');
 }
 
 /**
@@ -3009,6 +3790,27 @@ function imagesOf(e: AppEvent): RenderImageRef[] {
   return out;
 }
 
+/**
+ * "最近 `max` 张图"落在**哪些事件**上（**唯一实现**：注入器与 v70 的改写读数都用它）。
+ *
+ * 从后往前数、数满 `max` 就停 ⇒ 同一批事件永远选出同一批图片（缓存前缀稳定的前提）。
+ * 判据（准入 + 可见性 + 遮蔽点）全在 `imagesOf` / `isModelVisible` 里，这里只数名额。
+ */
+function pickedImageSeqs(events: readonly AppEvent[], coveredUpToSeq: number, max: number): Set<number> {
+  const picked = new Set<number>();
+  if (max <= 0) return picked;
+  let count = 0;
+  for (let index = events.length - 1; index >= 0 && count < max; index -= 1) {
+    const e = events[index]!;
+    if (e.seq <= coveredUpToSeq || !isModelVisible(e)) continue;
+    const refs = imagesOf(e);
+    if (refs.length === 0) continue;
+    picked.add(e.seq);
+    count += refs.length;
+  }
+  return picked;
+}
+
 function makeImageInjector(
   events: readonly AppEvent[],
   coveredUpToSeq: number,
@@ -3016,18 +3818,8 @@ function makeImageInjector(
 ): ImageInjector {
   const load = input.loadImage ?? null;
   const max = input.maxContextImages ?? IMAGE_INJECT_MAX;
-  const picked = new Set<number>();
-  if (load !== null && max > 0) {
-    let count = 0;
-    for (let index = events.length - 1; index >= 0 && count < max; index -= 1) {
-      const e = events[index]!;
-      if (e.seq <= coveredUpToSeq || !isModelVisible(e)) continue;
-      const refs = imagesOf(e);
-      if (refs.length === 0) continue;
-      picked.add(e.seq);
-      count += refs.length;
-    }
-  }
+  // 没有 loader ⇒ 一张都不进（名额集合不去算：算了也没人用它）
+  const picked = load === null ? new Set<number>() : pickedImageSeqs(events, coveredUpToSeq, max);
   return {
     partsFor(e) {
       if (load === null || !picked.has(e.seq)) return [];
@@ -3045,6 +3837,245 @@ function makeImageInjector(
   };
 }
 
+/**
+ * 回传思维链的**窗口与单条上限**（v68）。纯数据：判据全在这里，渲染层只照它执行。
+ *
+ * 为什么要有它（两件事必须同时成立）：
+ *   ① **服务端强制要回传**：思考模式的 Responses API 缺 `reasoning_text` 就整条 400
+ *      （实测 23 条 `The reasoning_text in the thinking mode must be passed back to the API`）；
+ *   ② **但全量回传会把上下文顶爆**：实测单条最长 **111,320 字符**（35,485 reasoning token），
+ *      而接口不支持 `truncation` ⇒ 帽子只能我们自己戴。
+ *
+ * ⚠ **这是安全阀，不是"确认过的最优解"**：服务端到底要求回传**上一轮**还是**全部历史**、
+ * 会不会**校验截断后的正文完整性**，都没有实测（本批没有对真服务端发任何请求）。所以取的是
+ * "够用且不会顶爆"的一组数，判据与敏感度表见 `render.ts` 文件头的 v68 那一篇。
+ */
+export interface ReasoningEchoPolicy {
+  /** 最多回传几条（**一步一条**：`runStep` 每步最多写一条 `message/reasoning`）。`0` = 一条都不回传 */
+  maxItems: number;
+  /** 单条**正文**的字符上限（UTF-16 码元，与 `text.length` 同一把尺）。`0` = 一条都不回传 */
+  maxChars: number;
+}
+
+/**
+ * 出厂帽子：**最近 3 步、单条正文 ≤ 20,000 字符**（依据见 {@link ReasoningEchoPolicy} 与 v68 篇）。
+ *
+ * 为什么是 3：一轮里的工具链通常就几步，"最近 3 步"覆盖得住"上一轮最后在干什么"，而每多一步
+ * 平均多带 ≈700 token（实测敏感度：N=1 689 / N=2 1,375 / N=3 2,056 / N=5 3,403，cap=20k）。
+ * 为什么是 20,000：实测单条字符 p50 769 / p90 4,823 / p99 24,335 / max 111,320，20,000 只截掉
+ * **1.46%** 的条目（171/11,736），却把单条上界从 ~35,485 token 压到 ≈6,400。cap 放到 10k/30k
+ * 对每请求平均只差 ~±100–200 token——这顶帽子是"别顶爆"的安全阀，不是省钱旋钮。
+ */
+export const REASONING_ECHO_POLICY: ReasoningEchoPolicy = Object.freeze({ maxItems: 3, maxChars: 20_000 });
+
+/**
+ * 截断说明那一行的**上界**（字符）：`\n…（前 91,320 字已截断：回传只为满足服务端的回传要求）`
+ * 实测 32；留到 64 是给更大的数（逗号分组最多再多几位）留余量，用例拿它做"总量"的硬上界。
+ */
+export const REASONING_ECHO_NOTE_MAX_CHARS = 64;
+
+/**
+ * 一条**实际会进请求体**的思维链回传（`reasoningEchoOf` 的产物；渲染层只照它推 item）。
+ *
+ * 为什么要这个中间形态，而不是让 `renderEvents` 自己在循环里数：帽子必须是**可观测、可复算**的
+ * ——给定同一份日志，调用这个纯函数就能拿到"回传了哪几条、各带多少字、截掉多少"，
+ * 用例与事后复盘因此不必重抄一遍判据（重抄就会漂成两种帽子）。
+ */
+export interface ReasoningEchoEntry {
+  /** 那条 `message/reasoning` 的 seq（对日志定位用） */
+  seq: number;
+  /** 回传正文：原文（没截断）或 **尾部 + 一行截断说明**（截断时） */
+  text: string;
+  /** 原文的字符数（UTF-16 码元） */
+  sourceChars: number;
+  /** 丢掉了多少个字符（0 = 没截断） */
+  droppedChars: number;
+}
+
+/**
+ * **从日志里算出这次该回传哪几条思维链**（v68 的唯一一处判据；纯函数，可复算）。
+ *
+ * 三条边界（每一条都有对应用例，见 `test/reasoning-echo.test.ts`）：
+ *   ① **只回传最近 `maxItems` 条**（一步一条 ⇒ 也就是最近 N 步）：更早的**一个字节都不推**。
+ *      它们仍然留在日志里（供复盘），只是不进请求。
+ *   ② **只认 model 可见**：老日志里 `message/reasoning` 是 `internal`（11,736 条全部如此），
+ *      按单向承诺它们永远不进请求 ⇒ 老日志的请求体**逐字节不变**（不改写历史）。
+ *   ③ **遮蔽点之前的不要**（`seq <= coveredUpToSeq`）：那段已被摘要替代，回传它等于把遮蔽撕开。
+ *
+ * 帽子只作用于**正文**：超长时取尾部（`maxChars` 个字符），**末尾追加一行说明**（≤
+ * {@link REASONING_ECHO_NOTE_MAX_CHARS} 字符）。所以一条 item 的字符数上界是
+ * `maxChars + REASONING_ECHO_NOTE_MAX_CHARS`；总量上界是 `maxItems ×` 它。
+ * 切尾时**不切断代理对**（切点落在高位代理之后就把切点往前挪一格）——半截代理对是无效 UTF-16，
+ * 发出去只会换来另一类 400。
+ */
+export function reasoningEchoOf(
+  events: readonly AppEvent[],
+  coveredUpToSeq: number,
+  policy: ReasoningEchoPolicy = REASONING_ECHO_POLICY,
+): ReasoningEchoEntry[] {
+  const { maxItems, maxChars } = reasoningEchoPolicyOf(policy);
+  if (maxItems === 0 || maxChars === 0) return [];
+  // 只留最近 maxItems 条（环形：`shift` 的数组长度恒 ≤ maxItems + 1）
+  const picked: Array<{ seq: number; text: string }> = [];
+  for (const e of events) {
+    if (e.type !== 'message/reasoning') continue;
+    if (e.seq <= coveredUpToSeq) continue;
+    if (!isModelVisible(e)) continue;
+    const text = e.data.text ?? '';
+    if (text === '') continue; // 空正文不占位（与 v3 的分支同口径）
+    picked.push({ seq: e.seq, text });
+    if (picked.length > maxItems) picked.shift();
+  }
+  return picked.map((item) => {
+    if (item.text.length <= maxChars) {
+      return { seq: item.seq, text: item.text, sourceChars: item.text.length, droppedChars: 0 };
+    }
+    const body = reasoningEchoTail(item.text, maxChars);
+    const droppedChars = item.text.length - body.length;
+    return {
+      seq: item.seq,
+      text: body + reasoningEchoNote(droppedChars),
+      sourceChars: item.text.length,
+      droppedChars,
+    };
+  });
+}
+
+/** 帽子参数归一：缺省/NaN/负数一律按出厂值或 0 处理（渲染层不做"猜意图"） */
+export function reasoningEchoPolicyOf(
+  patch: Partial<ReasoningEchoPolicy> | null | undefined,
+): ReasoningEchoPolicy {
+  const items = patch?.maxItems;
+  const chars = patch?.maxChars;
+  return {
+    maxItems: Number.isFinite(items) ? Math.max(0, Math.trunc(items as number)) : REASONING_ECHO_POLICY.maxItems,
+    maxChars: Number.isFinite(chars) ? Math.max(0, Math.trunc(chars as number)) : REASONING_ECHO_POLICY.maxChars,
+  };
+}
+
+/** 取尾部 `maxChars` 个字符，**不切断代理对**（切点落在高位代理之后 ⇒ 往前挪一格，多留一个字） */
+function reasoningEchoTail(text: string, maxChars: number): string {
+  let cut = text.length - maxChars;
+  if (cut > 0) {
+    const code = text.charCodeAt(cut - 1);
+    if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+  }
+  return text.slice(Math.max(0, cut));
+}
+
+/**
+ * 截断说明那一行（**逐字**：`\n…（前 91,320 字已截断：回传只为满足服务端的回传要求）`）。
+ *
+ * 三个信息缺一不可：① 前面没了（`…` 在前）；② **丢了多少**（逗号分组，便于她与人对上号）；
+ * ③ **为什么**（"回传只为满足服务端的回传要求"——不是"这段不重要"，别让她把删掉的那截读成
+ * 框架对内容的判断）。数字分组用本文件既有的 `groupDigits`（手写、不读 locale/ICU——`toLocaleString`
+ * 依赖运行环境的区域设置，会破坏渲染确定性，见它自己的注释）。
+ */
+function reasoningEchoNote(droppedChars: number): string {
+  return `\n…（前 ${groupDigits(droppedChars)} 字已截断：回传只为满足服务端的回传要求）`;
+}
+
+/**
+ * 一条**被窗口挤出去**的历史 item（v70；观测口径，**不进请求体**）。
+ *
+ * "挤出去"= 它在**上一步的请求里还有**、在**这一步的请求里没有了**。两种窗口各一种：
+ *   · `reasoning` —— 思维链按"最近 `REASONING_ECHO_POLICY.maxItems` 条"回传（v68），
+ *     第 N+1 条到达时最老那条掉出窗口；
+ *   · `image` —— 图片按"最近 `IMAGE_INJECT_MAX` 张"注入，第 N+1 张到达时最老那个事件
+ *     的 item 从 `[文本+图]` 退回成纯文本（P1-03 说的正是这一条）。
+ */
+export interface WindowRewrite {
+  /** 哪一个窗口把它挤出去的 */
+  kind: 'reasoning' | 'image';
+  /** 那条事件的 seq（按它在 `data/events` 里定位原话） */
+  seq: number;
+  /**
+   * 被移出请求的**正文**长度（UTF-16 码元）：`reasoning` 是上一步真发出去的那段正文；
+   * `image` 是 0——图本身不记字符账（它的 item 还在，少的是 `input_image` 那一段）。
+   */
+  chars: number;
+}
+
+/**
+ * **这一步改写了哪几条"已经发出去过"的历史 item**（v70，P1-02 / P1-03 的口径）。
+ *
+ * ## 这份读数是什么、不是什么
+ *
+ * 铁律 2 说"只追加"：**历史 item 一旦发出去，字节就该永远不动**。思维链窗口（v68）与图片
+ * 窗口把这条铁律咬了两个洞——两个都是"按最近 N 条"的滑窗，第 N+1 条到达时最老那条被挤出去，
+ * 而它**本来已经在之前那几步的请求里**了 ⇒ 那一条从头到尾变了，它**之后**的一切都要重编码
+ * （KV 前缀命中的分界线正好落在它那里）。这份读数就是把那件事**明说出来**：
+ * `items` 空 = 这一步一条都没有改写（前缀是干净的延长）；非空 = 这几条（`seq` 指得到原话）。
+ *
+ * ## 为什么"挤出去"这件事本身没法取消（这一段是结论，不是借口）
+ *
+ * 两个窗口都是**函数**：给定日志 ⇒ 选出哪几条。于是"不发已发出的那几条"与"有界"不可兼得：
+ *   · 要**完全不改写** ⇒ 窗口只能单调增长（发过的永远发）⇒ 上下文无界。v68 已经量过：
+ *     不设帽全量回传**每请求 p50 ≈7.2 万 / 平均 ≈8.9 万 token**（p99 ≈38 万、max ≈49 万），
+ *     等于把 `input` 的 p50 再翻一倍、极端请求直接顶爆——所以那条路**不能走**；
+ *   · 要保持**有界** ⇒ 一定有条目被挤出去 ⇒ 一定有一次改写。挤出去的位置离尾巴越近越便宜，
+ *     所以"挤掉窗口里最老的那条"已经是**每次改写最便宜**的挤法（被改写的永远只有 1 条，
+ *     它后面剩下的就是那 2–3 步）。
+ * 组合起来：改写次数 ≈ 步数，**改写的位置固定在"尾前 2–3 步"**——这是这顶帽子的固有代价，
+ * 不是实现没修对。能改的只有两处，本版都做了：① **一条不多改写**（挤法只有"最老那条"，
+ * 用例钉住"除这条之外两串字节相同"）；② **不许静默**——这份读数就是那句话，读数见
+ * `test/reasoning-echo.test.ts` 与 `test/render.test.ts` 的读数断言。
+ *
+ * ⚠ **`unknown: true` 不是"没有改写"**：日志里认不出"上一步"（没有 `step/start`，
+ * 例如单测夹具、子代理、诊断、`render()` 的裸调用）时不知道，就如实说不知道 —— 与
+ * "没有"分开两格，免得把"没量到"读成"没发生"。
+ *
+ * ## 怎么认出"上一步"（纯函数，不用额外状态）
+ *
+ * `TurnRunner.runStep` 的顺序是**先 `deriveAt`（= render）再写 `step/start`** ⇒ 渲染这一刻，
+ * 日志里**最新那条 `step/start`** 就是上一步的起点，而"seq 小于它的事件"正好是上一步渲染时
+ * 看得见的那一批（上一轮第 1 步那条唤醒虽然当时是**单独**递进去的，但它的 seq 早于那一步的
+ * `step/start`、位置也在末尾 ⇒ 同一批、同一个顺序）。所以上一步的窗口集合可以**原样重算**，
+ * 不必记在进程里、也不必落库：重放与界面预览读到的是同一个答案。
+ */
+export interface WindowRewrites {
+  /** 这一步被挤出去的那几条（按 seq 升序）。**空 = 一条都没有改写** */
+  items: WindowRewrite[];
+  /** 日志里认不出"上一步"⇒ **不知道**（不是"没有改写"，见上面那段） */
+  unknown: boolean;
+}
+
+/** {@link WindowRewrites} 的判据（唯一实现；纯函数，可复算） */
+function windowRewritesOf(
+  events: readonly AppEvent[],
+  wakeEvent: AppEvent | null,
+  coveredUpToSeq: number,
+  reasoningEcho: ReasoningEchoPolicy,
+  imageMax: number,
+): WindowRewrites {
+  // 上一步的渲染边界：日志里**最新那条 `step/start`**（理由见 `WindowRewrites` 的注释）
+  let previousStartSeq = -1;
+  for (const event of events) {
+    if (event.type === 'step/start' && event.seq > previousStartSeq) previousStartSeq = event.seq;
+  }
+  if (previousStartSeq < 0) return { items: [], unknown: true };
+  const previousEvents = events.filter(event => event.seq < previousStartSeq);
+  // 这一步的事件表与 `renderEvents`/注入器看到的那一份必须是**同一份**：本轮唤醒在运行期是
+  // 单独递进来的（还没进 `events`），所以这里也把它接到末尾（它的 seq 本来就是最大的）。
+  const currentEvents = wakeEvent === null ? events : [...events, wakeEvent];
+
+  const items: WindowRewrite[] = [];
+  // ① 思维链：上一步回传过、这一步没回传的
+  const echoedNow = new Set(
+    reasoningEchoOf(currentEvents, coveredUpToSeq, reasoningEcho).map(entry => entry.seq),
+  );
+  for (const entry of reasoningEchoOf(previousEvents, coveredUpToSeq, reasoningEcho)) {
+    if (!echoedNow.has(entry.seq)) items.push({ kind: 'reasoning', seq: entry.seq, chars: entry.text.length });
+  }
+  // ② 图片：上一步带图、这一步退回纯文本的那些事件
+  const pickedNow = pickedImageSeqs(currentEvents, coveredUpToSeq, imageMax);
+  for (const seq of pickedImageSeqs(previousEvents, coveredUpToSeq, imageMax)) {
+    if (!pickedNow.has(seq)) items.push({ kind: 'image', seq, chars: 0 });
+  }
+  items.sort((a, b) => a.seq - b.seq);
+  return { items, unknown: false };
+}
+
 function renderEvents(
   events: AppEvent[],
   coveredUpToSeq: number,
@@ -3055,11 +4086,17 @@ function renderEvents(
   mentionNotice: { messageId: string; text: string } | null,
   /** 豁免判据（见 `RenderInput.warnExempt`）：逐条通道消息透传给 `renderWake`——名单是**消息**的属性 */
   warnExempt: WarnExemptJudge | null,
+  /** 思维链回传的帽子（v68，见 {@link ReasoningEchoPolicy}）：装配点算一次、这里只执行 */
+  reasoningEcho: ReasoningEchoPolicy,
 ): InputItem[] {
   const out: InputItem[] = [];
   // 先收集 model 可见、未被遮蔽的事件
   const visible = events.filter(e =>
     e.seq > coveredUpToSeq && isModelVisible(e),
+  );
+  // 这次要回传的思维链（唯一判据在 `reasoningEchoOf`）：seq → 已经带好帽子的正文
+  const echoes = new Map(
+    reasoningEchoOf(events, coveredUpToSeq, reasoningEcho).map(entry => [entry.seq, entry.text] as const),
   );
 
   // 工具调用按 (turn, step, callId) 配对：call 渲染为 function_call，
@@ -3085,8 +4122,13 @@ function renderEvents(
         // 思考模式的模型要求把上一轮的 reasoning_text 回传，否则下一次请求直接被拒（400）：
         // 用明文 content（Responses API 文档：summary 与 encrypted_content 不支持），
         // 服务端会把它归并到相邻的 assistant 消息上。空文本不占位。
-        const text = e.data.text ?? '';
-        if (text !== '') out.push({ type: 'reasoning', content: [{ type: 'reasoning_text', text }] });
+        //
+        // **v68 起带帽**：只有落在 `reasoningEchoOf` 窗口里的那几条才回传（最近 N 步、
+        // 单条正文 ≤ maxChars，超了取尾部 + 一行说明）。不在窗口里——更早的步、被遮蔽点切走的、
+        // 以及**老日志里 visibility:'internal' 的那些**——时**一个字节都不推**（不写空壳）。
+        // 形状本身没动（`{type:'reasoning', content:[{type:'reasoning_text',text}]}`）：服务端要的就是它。
+        const text = echoes.get(e.seq);
+        if (text !== undefined) out.push({ type: 'reasoning', content: [{ type: 'reasoning_text', text }] });
         break;
       }
       case 'tool/call': {
@@ -3221,8 +4263,12 @@ function renderEvents(
  * 现在两处都引这一个函数。
  */
 export function blobPointerText(ref: { blobId: string; bytes: number }): string {
-  return `[完整结果 ${ref.bytes} 字节，不在本次对话里；用 read_blob 取（offset/limit 可翻页）：`
-    + `${ref.blobId}，即 data/blobs/${ref.blobId}]`;
+  // v64：`read_blob` 删了 ⇒ 指针里必须给出**可读的路径 + 现成的读法**（`safe_read`）。
+  // 原来那句指着一个不存在的工具（"用 read_blob 取（offset/limit 可翻页）"），她拿到指针也用不上；
+  // 而 `data/blobs/<sha256>` 就在仓库根之内、不在只读区 ⇒ `safe_read` 直接读得回来（我核过）。
+  // 去掉"可翻页"是对的：`safe_read` 是**行号**分页，`read_blob` 那种字节分页已经没有了。
+  return `[完整结果 ${ref.bytes} 字节，不在本次对话里：data/blobs/${ref.blobId}`
+    + '；要原文用 safe_read 读这个路径]';
 }
 
 function isModelVisible(e: AppEvent): boolean {
@@ -3252,7 +4298,13 @@ function renderToolOutput(e: AppEvent & { type: 'tool/result' }): string {
       //
       // 固定那句**留在最前面**：它是唯一说"结果未知"的地方（不要假设成功），
       // 正文那一段是"接下来该怎么办"。空 content（不该有，但事件是外部写入的）不留空行。
-      return `工具执行超时（${d.durationMs ?? '?'}ms）。结果未知，不要假设成功。`
+      //
+      // **2026-10-16 压短**（用户方向：回执也是每次的成本）：`超时（Nms）→ 结果未知 →
+      // 别再重试这个目标`三步并成一行——原来的 `。结果未知，不要假设成功。` 两句展开成
+      // "结果未知 + 别假设成功"，与紧接着 executor 那句"同一个目标别再重试"重复表达同一件事。
+      // 判据没有松动：**结果未知**照旧明说（v50 那一篇的因果链一个字没动——`content` 仍接在后面，
+      // 框架软提醒仍进得了她的上下文）。
+      return `工具执行超时（${d.durationMs ?? '?'}ms）。结果未知，别重试这个目标。`
         + (d.content === '' ? '' : `\n${d.content}`);
     case 'denied':
       return `操作被策略拒绝：${d.error?.message ?? d.content}\n请换一条不越界的路径。`;

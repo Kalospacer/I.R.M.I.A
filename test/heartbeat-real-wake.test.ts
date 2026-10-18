@@ -289,7 +289,7 @@ const BEFORE_MANUAL_TYPES = [
 //     ——这个台子量的是**整份请求**（剥掉此刻层），所以它必然移动。这是**设计内**的位移，
 //     不是回归：判据（挑法 / 口径）没有一处放宽。
 //   · **阶段二**（同一批）改的是 **`tools` 段**：`memory_read` 扩三个入口（+64）、
-//     `es_search`/`safe_edit` 腾挪（−34）、`ask_human` 断装配（不在 `tools` 段里）。
+//     `find`/`safe_edit` 腾挪（−34）、`ask_human` 断装配（不在 `tools` 段里）。
 //     ⚠ 这个台子给的是**空 `ToolRegistry`**（请求体里 `tools` 恒为 `[]`）⇒ **`tools` 段的改动
 //     它量不到**（v52/v55/v57/v59 四篇都记过这条已知盲区）。所以本次位移**只来自阶段一那一处**。
 //   · **不给"等 v61 之后再复量"留口子**：工作树里留三条红比"基线提前动一次"坏得多
@@ -310,7 +310,78 @@ const BEFORE_MANUAL_TYPES = [
 //     ——同样只进 `instructions` ⇒ 两个常量再动一次：
 //     `97137a15a6b94dd8` → **`995eb71564fb53f8`**（非心跳）、`697c0a8c34118f73` → **`10c8511b8f3380c2`**（混批）。
 //     位移**只来自 `instructions`**（+198 字符 / +125 token，实测 `_research/_tmp-v63-account.mts`）。
-const BEFORE_MANUAL_FINGERPRINT = '995eb71564fb53f8';
+//   · **v65（本线）：装置自述大改**（删 §11 / 删两处"必须说话" / 工作规范取消缩进重排 + 新增"人类的偏好"；
+//     净减 570 字符）——同样只进 `instructions` ⇒ 两个常量再动一次：
+//     `995eb71564fb53f8` → **`ddac3e02f566deaa`**（非心跳）、`10c8511b8f3380c2` → **`f42566abafa24fbb`**（混批）。
+//     位移**只来自 `instructions`**（**−570 字符 / −384 token**，实测 `_research/_tmp-v65-account.mts`）。
+//   · **v66（2026-10-16，本线：此刻层结构压缩）**：`ddac3e02f566deaa` → **`cf1bfdd6ab08706f`**（非心跳）、
+//     `f42566abafa24fbb` → **`1630efab6254bf24`**（混批）。
+//     位移**只来自 `input` 里那一层的位置**（`instructions` 一个字节没动，实测 `len=9432` 两边相同；
+//     `tools` 段这台子量不到——空注册表，见上面那条已知盲区）。**控制实验逐字给出差在哪**
+//     （`_research/_tmp-fp-dump.mts`，同一台子、同一脚本，在两个 worktree 上各跑一次）：
+//       · 改动前：`[联络方式] …告警出口：未配置。这轮没人从外面叫你…` 在**此刻层**那条
+//         `通道：` 下面；
+//       · 改动后：同一句挪进**本轮固定块**（`[当前状态]` 之前那一节），此刻层那条 `通道：`
+//         只剩 `[联络方式] …这轮没人从外面叫你…`。
+//     为什么这次位移是**设计要的**（不是回归）：那几行（每扇门后面是谁 + 告警出口）一轮之内
+//     一个字都不会变，原先逐 step 重发、现在只在第 1 步发（见 `render.ts` 的 `renderTurnBlock`）。
+//     **代价如实说**：`requestFingerprint` 的口径是"剥掉含 `NOW_LAYER_BANNER` 的 item"，
+//     而固定块**不在**剥离范围内 ⇒ 这一层的移动它看得见。位移因此是"这一层换了位置"的
+//     忠实读数，判据一个字没放宽（这条用例量的仍然是"非心跳拍请求有没有被动过"）。
+//     `RENDER_VERSION` `65 → 66` 在**同一批**里落定（④b/④c + ① 的 `tools` 段改动一起，
+//     见 `render.ts` 的 v66 那一篇）：两笔之间没有部署 ⇒ 只付一次缓存失忆。
+//
+// **v67（2026-10-17，`read_channel` 的 `description` 与行为对齐）：这个常量照旧不动**——
+//   理由与实测复核写在下面 `BEFORE_MIXED_FINGERPRINT` 的 v67 那一段（同一笔、同一份复跑证据）：
+//   指纹只取工具**名**（`test/fixtures/real-wake-rig.ts:175`），而这一笔改的是描述字节（84 → 90）。
+// **v68（2026-10-17，思维链按帽回传）：这个常量照旧不动**——**复量过，结论是它不该动**：
+//   · 台子的模型脚本是 `{ text: '', toolCalls: [] }`（`runOneWake` 的缺省）⇒ `result.reasoning`
+//     为空 ⇒ **事件流里没有 `message/reasoning`**，而这一版的字节只出现在"有 reasoning 的历史"里；
+//   · `requestFingerprint` 也不含 `renderVersion`（`real-wake-rig.ts` 的 canonical 只有
+//     model / instructions / tools.map(name) / input），所以换代本身不改指纹。
+//   ⇒ 逐字复跑 `_research/heartbeat-real-wake-baseline.mjs`：非心跳 `cf1bfdd6ab08706f`、混批
+//   `1630efab6254bf24`，与这两个常量**逐字相同**。判据一个字没放宽（仍是 16 位 sha256 精确比对）。
+//   "真带了 reasoning 时会怎样"由 `test/reasoning-echo.test.ts` 直接钉（它不走这个台子）。
+// **v70（2026-10-18，此刻层的三样 must-keep + 维护窗口标签 + 窗口改写读数）：这两个常量照旧不动**
+//   ——**复量过**：本笔动的全部是**此刻层**（`NOW_MUST_KEEP_LABELS` 那三样每步发、2/3 档补行首
+//   标签）与一格**观测字段**（`RenderedRequest.windowRewrites`，不进请求体），而
+//   `requestFingerprint` 的口径就是"剥掉含 `NOW_LAYER_BANNER` 的 item"、也不含 `renderVersion`
+//   ⇒ 逐字跑本文件，两个常量与下面那两行**逐字相同**。判据未放宽（仍是 16 位 sha256 精确比对）。
+// **2026-10-18 · 脱敏那一笔（`cdc6b92`）之后重取**：`cf1bfdd6ab08706f` → **`45e0194adc564e07`**（非心跳）、
+//   `1630efab6254bf24` → **`2eeed722e66d2c4d`**（混批）。**位移只来自 `instructions` 里那一段
+//   4 位尾号（3 个字符不同）**，而且**不是 v70 造成的**——让它们移动的是 v70 之后那一笔：
+//   · `cdc6b92` 的说明写着"src 侧的改动全是注释"，实测**有一处不是**：`self-brief.ts` 里
+//     `SELF_BRIEF` 正文那句「认不出来就照实写"甲（id …××）"」的 4 位尾号被换成了占位值
+//     （旧值是真实 id 的尾巴，脱敏那一笔要清掉的就是它，**这里不重抄**）。
+//     旧 4 位 → 新 4 位**长度相同**，`SELF_BRIEF` 整段 9226 → 9226 字符 ⇒ `tokens` / `bytes`
+//     **一个数都没动**，动的是字节内容（`instructions` 是冻结前缀 ⇒ 整份请求的头部字节变了）。
+//   · v70 那一篇说的"复量后不动"**当时是真的**（它只动此刻层）；`RENDER_VERSION` 仍是 `70`
+//     （脱敏那一笔没换代，见本段末那条 ⚠）。
+//   **判据没有放宽**（仍是 16 位 sha256 精确比对，一个字节都不许差），也**不是**"改常量凑绿"：
+//   这一条量的就是"非心跳拍的请求有没有被动过"，它**真的**被动了——那 4 位尾号在冻结前缀里。
+//   **对照实验只改这一个输入**（探针 `_research/_tmp-sanitize-instructions-delta.mts`，不动工作区）：
+//     ① 用 `git show f014811:src/model/self-brief.ts` 的字节还原旧 `SELF_BRIEF`（**只在内存里**）
+//        ⇒ `segmentOfText(INSTRUCTION_RULES.brief + '\n\n' + SELF_BRIEF)` 逐字回到旧基线
+//        `5462 / 24566 / 568c4e9283766245` ⇒ 旧字节确实就是上一代那一串，位移就那一处；
+//     ② 对**同一份真实请求**（本文件同一套台子）把 `instructions` 换回旧字节再算指纹：
+//        非心跳拍回到 `cf1bfdd6ab08706f`、混批回到 `1630efab6254bf24`，**逐字相同**
+//        ⇒ `input` 与 `tools` 两侧一个字节都没动，位移**只**来自 `instructions`。
+//   **同一支探针还回答了"剥掉此刻层还盖不盖得住 v70 新加的行"**（本次最该查的一件事）：
+//     两拍那一轮（第 1 步调工具、第 2 步收尾，= must-keep 真正的作用面）第 2 条请求里
+//     `通道：` / `会话：` 各 **1** 次——**全在被剥掉的那条 item 里**，剥完之后 **0** 次；
+//     `维护窗口：` 在这几个场景里整份 input **0** 次（这一拍不是窗口，P1-04 那五个字贡献 0 字节）。
+//     ⇒ 此刻层那条 item 的段头永远在最前（`renderNowLayer` 的 `index === 0` 恒留），
+//       所以 v70 新加的 must-keep 与行首标签**都还在剥除范围内**，**判据不需要动**。
+//   ⚠ **脱敏那一笔没有递增 `RENDER_VERSION`**（仍 70），而 `self-brief.ts` 文件头那条规矩是
+//     "改 `SELF_BRIEF` 一个字就要递增"。本次只复量基线、**不动版本号**：那要牵动
+//     `maintenance-window.test.ts` 与 `reasoning-echo.test.ts` 的两条版本锁，以及 `mcp/index`、
+//     `skill/index` 快照的一次重建——是 `cdc6b92` 那条线的决定，事实记在这里供当次裁决。
+//   ✅ **裁决已落（v71，下一笔）**：`RENDER_VERSION` `70 → 71`，见 `render.ts` 的 v71 那一篇。
+//     那一笔**只动版本号 + 两条版本锁 + 注释**，**上面这两个指纹常量一个字符都没动**——
+//     成立的原因本文件已经写着：`requestFingerprint` 的 canonical 里**没有 `renderVersion`**
+//     （`test/fixtures/real-wake-rig.ts:172-177`，工具只取**名**）⇒ 换代不改指纹。
+//     `mcp/index` / `skill/index` 的**一次重建**是设计内代价（判据 `point.version !== version`）。
+const BEFORE_MANUAL_FINGERPRINT = '45e0194adc564e07';
 
 /** 改动前：混批（心跳 + `wake/manual`）——按"非纯心跳"处理，与改动前一致 */
 const BEFORE_MIXED_TYPES = [
@@ -350,8 +421,29 @@ const BEFORE_MIXED_TYPES = [
 //   `instructions`（+140 token）；`RENDER_VERSION` 这时才 `61 → 62`（这一笔自己的一代）。
 // v63（**装置自述 §6 补两段**）：`697c0a8c34118f73` → **`10c8511b8f3380c2`**——同样只来自 `instructions`
 //   （+125 token）；`RENDER_VERSION` `62 → 63`。`tools` 段零改动。
-const BEFORE_MIXED_FINGERPRINT = '10c8511b8f3380c2';
-
+// v65（**装置自述大改**）：`10c8511b8f3380c2` → **`f42566abafa24fbb`**——同样只来自 `instructions`
+//   （**−384 token**，这一版是净减）；`RENDER_VERSION` `64 → 65`。
+// v66（**此刻层结构压缩**）：`f42566abafa24fbb` → **`1630efab6254bf24`**——位移只来自 `input`
+//   里联络方式那一层的位置（此刻层 → 本轮固定块），与上面那条常量同一笔、同一份控制实验；
+//   `instructions` 零改动。混批场景把心跳唤醒行也带进了请求体，所以两个常量各变各的。
+// v67（2026-10-17，`read_channel` 的**描述**与行为对齐）：**两个常量这次照旧不动**——
+//   与 v52 / v57 / v59 同一形态，理由就是上面那条已知盲区：口径是
+//   `requestFingerprint` = `instructions` + **请求体里那一串工具名** + 剥掉此刻层的 items
+//   （`test/fixtures/real-wake-rig.ts:175` 逐字是 `tools.map(tool => tool.name)`），
+//   而 v67 改的是 `read_channel` 那一件的 **`description` 字节**（84 → 90 token）——
+//   **名字一个都没动** ⇒ 这个台子看不见它（它的注册表也一直是空的，见上面 v52 那一段）。
+//   **实测复核**（本次改动之后逐字复跑 `_research/heartbeat-real-wake-baseline.mjs`）：
+//   非心跳拍 `cf1bfdd6ab08706f`、混批 `1630efab6254bf24`——与这两个常量**逐字相同**。
+//   ⇒ 这不是"没复量"，是"复量了、结论是它不该动"（重取反而会把"指纹看不见描述字节"
+//   这件事掩盖掉）。**生产那一侧的 `tools` 字节确实变了**，它由
+//   `test/tool-catalog.test.ts`（描述预算与总量）与 `test/read-channel-incremental.test.ts` ⑦
+//   （描述逐字 + 单件/整段 token）直接钉住。
+// v68（思维链按帽回传）：**两个常量照旧不动**——理由与逐字复跑读数写在上面
+//   `BEFORE_MANUAL_FINGERPRINT` 的 v68 那一段（同一批、同一份证据）：脚本不给 reasoning ⇒
+//   没有 `message/reasoning` 事件；指纹也不含 `renderVersion`。
+// 2026-10-18 · `cdc6b92`（脱敏）：`1630efab6254bf24` → **`2eeed722e66d2c4d`**——同上一条常量、同一笔、
+//   同一份对照实验（位移只来自 `instructions` 里那 4 位尾号、差 3 个字符；混批那一拍把它一并带进请求体）。
+const BEFORE_MIXED_FINGERPRINT = '2eeed722e66d2c4d';
 /** 改动前：纯心跳拍 —— 事件序列里**没有任何 step**（当年那个形态），请求数 1（v39 起真唤醒） */
 const BEFORE_HEARTBEAT_TYPES = [
   'wake/heartbeat', 'budget/rollover', 'snapshot/checkpoint', 'turn/start', 'input/claimed', 'turn/end',

@@ -57,9 +57,9 @@ const CTX: ToolContext = {
   signal: new AbortController().signal, workspaceRoot: process.cwd(),
 };
 
-const GROUP = '705463642';
+const GROUP = '123456782';
 const SID = `onebot:group:${GROUP}`;
-const OTHER_SID = 'onebot:group:953245617';
+const OTHER_SID = 'onebot:group:123456780';
 const GROUP_NAME = 'I.R.M.I.A 内测群';
 
 /** OneBot 成功回执的**真形状**（`set_group_whole_ban` 实测就是 `data: null`，报告 §3.2） */
@@ -302,9 +302,9 @@ test('反：名字核对拦下的调用（清单里没有这件）⇒ 0 条', as
 test('反：delete_msg / send_like / set_group_add_request ⇒ 0 条（归不到会话或不是群里的事）', () => {
   const cases: Array<{ tool: string; args: Record<string, unknown>; why: string }> = [
     { tool: 'delete_msg', args: { message_id: 555001 }, why: '参数只有 message_id，归不到会话' },
-    { tool: 'send_like', args: { user_id: 1109841333, times: 1 }, why: '不是群会话里的事' },
+    { tool: 'send_like', args: { user_id: 1234567892, times: 1 }, why: '不是群会话里的事' },
     { tool: 'set_group_add_request', args: { flag: 'abc', approve: true }, why: '主键是一次性 flag，不含 group_id' },
-    { tool: 'set_group_ban', args: { user_id: 1109841333, duration: 600 }, why: '认识的写工具但平台没给 group_id' },
+    { tool: 'set_group_ban', args: { user_id: 1234567892, duration: 600 }, why: '认识的写工具但平台没给 group_id' },
   ];
   for (const item of cases) {
     const receipt: SelfActionReceipt = {
@@ -320,11 +320,11 @@ test('反：delete_msg / send_like / set_group_add_request ⇒ 0 条（归不到
   // 反面对照：认识的写工具**且带着 group_id** ⇒ 记
   const ok = actionRecordOf({
     server: 'onebot11-mcp', tool: 'set_group_ban',
-    args: { group_id: Number(GROUP), user_id: 1109841333, duration: 600 },
+    args: { group_id: Number(GROUP), user_id: 1234567892, duration: 600 },
     status: 'ok', content: '{"ok":true}', isError: false, turn: 1, callId: 'c',
   });
   assert.notEqual(ok, null, '带着 group_id 的写操作要记');
-  assert.equal(ok!.target, '1109841333', '"对谁"那一格取 user_id');
+  assert.equal(ok!.target, '1234567892', '"对谁"那一格取 user_id');
   assert.deepEqual(ok!.params, { duration: 600 }, '只留能人读的那几格');
 });
 
@@ -362,13 +362,13 @@ test('失败如实：回执体 ok:false 与 status:error 都记 failed，行里�
 
 test('失败但没有原因 ⇒ 只写「（回执失败）」，不写一个空冒号', () => {
   const noReason = actionRecordOf({
-    server: 'onebot11-mcp', tool: 'set_group_kick', args: { group_id: Number(GROUP), user_id: 1109841333 },
+    server: 'onebot11-mcp', tool: 'set_group_kick', args: { group_id: Number(GROUP), user_id: 1234567892 },
     status: 'ok', content: '{"ok":false}', isError: false, turn: 1, callId: 'c',
   });
   assert.equal(noReason?.receipt, 'failed');
   assert.equal(
     selfActionLineText(noReason!, () => GROUP_NAME),
-    `[踢出群聊 · @1109841333 · ${GROUP_NAME}]（回执失败）`,
+    `[踢出群聊 · @1234567892 · ${GROUP_NAME}]（回执失败）`,
   );
 });
 
@@ -411,12 +411,12 @@ test('不认识的动作：**整条不记**；而万一落了库也只摆协议�
 test('名字查不到给如实锚；参数缺的格一个字都不写', () => {
   const noDuration = actionRecordOf({
     server: 'onebot11-mcp', tool: 'set_group_ban',
-    args: { group_id: Number(GROUP), user_id: 1109841333 },
+    args: { group_id: Number(GROUP), user_id: 1234567892 },
     status: 'ok', content: '{"ok":true}', isError: false, turn: 1, callId: 'c',
   });
   // 名字真源给不出 ⇒ 锚（**不编群名**）；duration 没给 ⇒ **不写秒数**（不写 0、不写"未知"）
-  assert.equal(selfActionLineText(noDuration!, () => null), '[禁言 · @1109841333 · 一个群聊（…3642）]（回执 ok）');
-  assert.equal(selfActionLineText(noDuration!, () => GROUP_NAME), `[禁言 · @1109841333 · ${GROUP_NAME}]（回执 ok）`);
+  assert.equal(selfActionLineText(noDuration!, () => null), '[禁言 · @1234567892 · 一个群聊（…6782）]（回执 ok）');
+  assert.equal(selfActionLineText(noDuration!, () => GROUP_NAME), `[禁言 · @1234567892 · ${GROUP_NAME}]（回执 ok）`);
   // enable 没给 ⇒ **不说开还是关**（不编一个方向出来）
   const noEnable = actionRecordOf({
     server: 'onebot11-mcp', tool: 'set_group_whole_ban', args: { group_id: Number(GROUP) },
@@ -426,10 +426,10 @@ test('名字查不到给如实锚；参数缺的格一个字都不写', () => {
   // duration=0 是协议里"解除禁言"的那个值（与 notice 那一路同一判据）
   const lifted = actionRecordOf({
     server: 'onebot11-mcp', tool: 'set_group_ban',
-    args: { group_id: Number(GROUP), user_id: 1109841333, duration: 0 },
+    args: { group_id: Number(GROUP), user_id: 1234567892, duration: 0 },
     status: 'ok', content: '{"ok":true}', isError: false, turn: 1, callId: 'c',
   });
-  assert.equal(selfActionLineText(lifted!, () => GROUP_NAME), `[解除禁言 · @1109841333 · ${GROUP_NAME}]（回执 ok）`);
+  assert.equal(selfActionLineText(lifted!, () => GROUP_NAME), `[解除禁言 · @1234567892 · ${GROUP_NAME}]（回执 ok）`);
 });
 
 test('通道名由 server 名推导：认不出就是**空串**（不编一个像样的通道名）', () => {

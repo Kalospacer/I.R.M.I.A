@@ -26,6 +26,7 @@ import { extname, join } from 'node:path';
 
 import type { FsToolDeps } from './types.ts';
 import { toErrorMessage } from './types.ts';
+import { decodeText } from '../../util/bytes-text.ts';
 
 export type SyntaxVerdict =
   | { status: 'ok'; checker: string }
@@ -89,7 +90,9 @@ async function checkJs(absPath: string, content: Buffer, deps: FsToolDeps): Prom
 }
 
 function checkTs(content: Buffer): SyntaxVerdict {
-  const text = content.toString('utf8');
+  // 解码走共享判定链（`util/bytes-text.ts`）：一份 GBK 的源文件按 UTF-8 硬读会先被
+  // 换成替换字符，于是 `stripTypeScriptTypes` 报的是**编码造成的假语法错**——那是最误导的一类回执。
+  const text = decodeText(content).text;
   try {
     stripTypeScriptTypes(text, { mode: 'transform' });
     return { status: 'ok', checker: 'stripTypeScriptTypes(transform)' };
@@ -100,7 +103,7 @@ function checkTs(content: Buffer): SyntaxVerdict {
 }
 
 function checkJson(content: Buffer): SyntaxVerdict {
-  const text = content.toString('utf8');
+  const text = decodeText(content).text;
   if (text.trim() === '') return { status: 'ok', checker: 'JSON.parse' };
   try {
     JSON.parse(text);

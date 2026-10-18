@@ -50,9 +50,47 @@ export type ToolResultStatus =
 export type TurnEndReason =
   | { kind: 'completed' }
   | { kind: 'blocked'; by: string }
-  | { kind: 'aborted'; cause: 'user' | 'signal' | 'shutdown' }
+  /**
+   * `cause` 说的是**谁让它停的**：`user` 她自己的工具（speak 被打断一类）、
+   * `signal` 进程信号/宿主取消、`shutdown` 关机序列、`stop` 用户在通道里按了 `/stop`（2026-10-16 加）。
+   * 分出 `stop` 是为了让事后读日志的人一眼看出"这一轮是被人掐的"——它与崩溃/关机
+   * 在日志上长得一样（都是 aborted），而处置完全不同：人在等一句回执。
+   */
+  | { kind: 'aborted'; cause: 'user' | 'signal' | 'shutdown' | 'stop' }
   | { kind: 'interrupted' }
-  | { kind: 'error'; message: string; code: string }
+  /**
+   * 本轮以失败收尾。`retry` 说的是**这一轮认领的输入要不要退回队列**（2026-10-16 加的**可选**字段，
+   * 老日志里整个没有 ⇒ 按缺省读）：
+   *   · 缺省 / `'next-turn'` —— 退回去（原口径：整轮失败时输入不该就此消失，还有一次完整机会）；
+   *   · `'none'` —— **不退回**：这一轮已经花掉的工作不作废，也不把同一个请求原样重发一遍。
+   *     今天用它的只有一处：**非首步超时**（她上下文里已经有这一步之前的输出与工具结果，
+   *     重跑一遍等于把同一段活干第二次——用户报的那个循环正是这么滚起来的）。
+   * 它只影响"退不退"，不改结局本身（结局仍然是失败、仍然进失败刹车）。
+   *
+   * ───────── `reasoningEcho`：400 的一种可判别指纹（2026-10-17 加，**可选**、纯观测）─────────
+   *
+   * `true` = 服务端原话里带着「`reasoning_text` … must be passed back」——思考模式要求把上一轮的
+   * 思维链**原样回传**。2026-10-17 之前我们的 `message/reasoning` 是 `visibility:'internal'`
+   * （一个 reasoning item 都没回过），于是这条请求被 400 拒掉；**v68 起它改成 model 并按帽回传**
+   * （见 `model/render.ts` 的 v68 篇）。这一格是**指纹落地（2026-10-17）之后**才写进去的：
+   * 更早那 23 条同名 400 **没有这一格**（那时还没有这个判据，只能从 `message` 里的原话认）；
+   * 今后再出现同类 400（包括 v68 之后再出现）照样会带上它。
+   * 判据（大小写 / 中间的字符 / 200 字上限）唯一实现在
+   * `model/ds-client.ts` 的 `isReasoningEchoRejection`，这里只装结论。
+   *
+   * **它不改结局**：`kind` 仍是 `error`、`code` 仍是 `http_400`、仍然不重试、输入照旧退回队列
+   * （退回本身由 `retry` 那一格管，与本字段无关）。加这一格的唯一理由是**同一个 `http_400`
+   * 里混着好几类原因**（实测 57 条：23 条是这条、32 条是图片格式不被接受），而它们的处置
+   * 完全不同——没有这一格，事后只看得见一个 `http_400`，两条线索一起丢。
+   *
+   * 缺省 ⇒ **老日志与"别的 400"**，按缺省读（不是 `false`：没标出来就是不认识，不是"确认不是"）。
+   * 它不进请求体（`turn/end` 是 internal 事件），所以**不动 `RENDER_VERSION`**。
+   */
+  | {
+    kind: 'error'; message: string; code: string; retry?: 'next-turn' | 'none';
+    /** 400 的一种可判别指纹：思维链没回传（见上面那段）。缺省 = 不认识这一类 */
+    reasoningEcho?: true;
+  }
   | { kind: 'budget-exhausted'; layer: BudgetLayer }
   | { kind: 'rate-limited'; retryAfterMs: number }
   | { kind: 'max-tokens'; outputTokens: number };
@@ -92,6 +130,40 @@ export interface StepEnd extends EventEnvelope<'step/end', {
   turn: number; step: number; toolCalls: number;
 }> {}
 
+/**
+ * **本步推理进度的实时读数**（2026-10-17 加；internal）：只喂界面那一行「已想 X 字」。
+ *
+ * 为什么需要它：推理正文是**一步跑完才发一条整段**（紧随的 `message/reasoning`，见
+ * `runtime/agent-loop.ts` 的 `runStep`），上游 `reasoning_text.delta` 在那之前**一个都不落事件**。
+ * 实测 turn 2115：`step/start` 之后空了 153 秒才等来那条 62,854 字的正文——那 153 秒里界面手上
+ * 一个字都没有，那一格只能显示「…」。这条事件把"到这一刻已经生成了多少字"按节拍漏出来，
+ * 让那个读数**在落库之前也是真的**。
+ *
+ * 三条纪律（改它之前先读）：
+ *   ① **载荷里不许有正文，一个字符都不许**：只有 `turn`/`step` 两格定位 + `chars` 一个数。
+ *      它不是 `message/reasoning` 的摘要或预览，是个**计数器**。
+ *   ② **`chars` 的口径是 UTF-16 码元**（上游 `delta.length` 之和），与 `result.reasoning.length`、
+ *      界面 `text.length` 同一把尺——三个数要能对上，否则"实时值"与"落库真值"就差一截。
+ *   ③ **刻意 internal**（`EVENT_VISIBILITY` 里**显式写出**，不靠 defaultVisibility 兜底：
+ *      让"这条线是有意画的"看得见）。挡住它的**全是既有判据，没有为它加一行剥离代码**：
+ *      `model/render.ts` 的 `isModelVisible` 只认 `visibility === 'model'`，而 `renderEvents`
+ *      第一步就用它 filter；`state/fold.ts` 的 `applyOne` 走 default 分支（不进投影）。
+ *      ⇒ "新事件要不要在 render 里再显式挡一下"的答案是**不用**，别再补一遍。
+ *
+ * 节拍与体积：有 delta 才判，`chars` 变了且距上一条 ≥5s（本步前 120 秒）/ ≥15s（之后）才发一条；
+ * 单条约 178 字节，典型一步 0–3 条，40 分钟的极端一步 175 条 / 约 30 KB。流结束时**不补尾条**
+ * ——紧随其后的 `message/reasoning` 才是真值，补一条只多字节、还制造"live 后到"的次序风险。
+ *
+ * **已知偏差（有意留的）**：`DsClient` 内部重试同一次 `stream()` 时本计数器**跨尝试累加**，
+ * 而落库的 `result.reasoning` 是**最后一次尝试**的正文 ⇒ 极端下（第一次尝试吐了字之后被掐、
+ * 重试成功）这条读数会大于最终的 `chars`。不改成"按 attempt 归零"的理由：重试通道
+ * （`DsClient.subscribeRetry`）是**进程级多播、不带 lane**，别的 lane 的一次重试就会把我们的数
+ * 误归零——那个错比这点偏差更贵。偏差由 `message/reasoning` 那条真值覆盖修正。
+ */
+export interface StepReasoningProgress extends EventEnvelope<'step/reasoning-progress', {
+  turn: number; step: number; chars: number;
+}> {}
+
 // ──────────────────────────────── 消息 ────────────────────────────────
 
 export interface UserMessage extends EventEnvelope<'message/user', {
@@ -104,7 +176,19 @@ export interface AssistantMessage extends EventEnvelope<'message/assistant', {
   interrupted?: boolean;
 }> {}
 
-/** 思维链留存（internal；只供复盘，渲染层剥离——缓存铁律 3） */
+/**
+ * 思维链（**v68 起 `visibility:'model'`**；只按帽回传——最近几步 + 单条上限，见 `model/render.ts`
+ * 的 `REASONING_ECHO_POLICY`）。
+ *
+ * 这条事件的可见性在 2026-10-17 之前是 `internal`（只供复盘、渲染层剥离），后果是 Responses API
+ * 里一个 reasoning item 都没回过：思考模式的服务端直接 400（实测 23 条
+ * `The reasoning_text in the thinking mode must be passed back to the API`），而每轮退输入 +
+ * `MAX_CLAIM_COUNT=3` 会把整场风暴送进死信。v68 把它改成 model，并在渲染层**只回传带帽的最近几步**：
+ * 单条最长见过 111,320 字符，`truncation` 又不支持，全量回传会把上下文顶爆（那是另一类 400）。
+ *
+ * ⚠ 老日志里的这条事件仍是 `internal`（落库那一栏是历史，不改写）⇒ 它们照旧**不进请求**；
+ * 新写入的走 `defaultVisibility`，于是自动变成 model。详见 `EVENT_VISIBILITY` 里那一格。
+ */
 export interface ReasoningMessage extends EventEnvelope<'message/reasoning', {
   turn: number; step: number; text: string;
 }> {}
@@ -843,6 +927,71 @@ export interface BudgetConsumed extends EventEnvelope<'budget/consumed', {
    * `test/thinking-effort-invariant.test.ts` 钉住"每次都是一个数字"。
    */
   reasoningTokens?: number;
+  /**
+   * 输出 token 的**构成拆分·第一格**（2026-10-16 加，纯观测）：这一拍**她的话（正文）**
+   * 占的输出 token。第二格是 {@link outputToolArgTokens}。
+   *
+   * ────────── 三者关系（**别把它当恒等式读**）──────────
+   *   `outputTokens ≈ outputTextTokens + outputToolArgTokens + reasoningTokens`
+   *
+   * 三格在口径上**互斥且穷尽**：这一拍的输出只有三种去向——`message` 正文（`DsStreamResult.text`）、
+   * `function_call` 的入参 JSON（`result.toolCalls[].arguments`）、思维链（`reasoning`）。
+   * 但它**不是恒等式**，两个原因都得写清：
+   *   · 前两格是**估的**（`tools/registry.ts` 的 `estimateTokens`：中文约 1.5 字/token、
+   *     英文约 4 字符/token），只有 `reasoningTokens` 是**服务端真值**；
+   *   · 服务端按它自己的分词器计费，item 的框架字段（`function_call.name` 一类包装）也计在输出里，
+   *     而这些不在这三格里。
+   *
+   * 【实测】（2026-10-16 量 `data/events` 最新 6 个日志里 **1152** 个 `outputTokens>0` 的 heavy 拍，
+   * 口径就是本字段：`estimateTokens(text) + Σ estimateTokens(tool/call.arguments) + reasoningTokens`）：
+   *   · `(三格之和)/outputTokens` 中位 **0.868**（p10 0.595 / p90 0.973）；
+   *   · 残差 `outputTokens − 三格之和` 中位 **+62**、p90 ≤ **+100**；
+   *   · 1152 拍里只有 **3** 拍三格之和**略微超过** `outputTokens`（各超 1 token）
+   *     ⇒ 估计是**系统性偏低**，不是偏高。
+   * 用法结论：拿这三格读「**谁占多少**」（比例、量级、趋势），**不要**拿三格之和去反推
+   * `outputTokens`——真值只有 `outputTokens` 自己。
+   *
+   * ────────── 口径与误差来源（写入侧只有一处：`runtime/agent-loop.ts` 的 `accountStep`）──────────
+   * 量的是**模型这一拍吐出来的**：`estimateTokens(result.text)`；中断掉的那一拍量的是**已收到的部分**
+   * （它照样计费）。⇒ 中断拍的 `outputToolArgTokens` 可能**大于**日志里 `tool/call` 的入参之和
+   * （`agent-loop.ts` 刻意丢弃被截断的 arguments，`message/assistant.toolCalls` 在中断拍是空的）：
+   * 那是「**计费的输出**」与「**执行了的调用**」之间的**口径差异**，不是写错了。
+   * 误差来源三处，按大小排：① `estimateTokens` 本身是启发式（对中文低估最多；同一把尺的已知偏差
+   * 记在 `state/blob-store.ts` 的注释里）；② 服务端分词器与它不同源；③ 上面那条 item 包装字段。
+   *
+   * **可选**：本字段之前写下的 `budget/consumed` 里没有它（只增不改，见 docs/operations.md §3 规则 2）。
+   * 读的一侧按"缺省 = 未知"处理（要当 0 用就显式 `?? 0`），**别把缺字段本身写进任何判据**。
+   * 失败的调用（同文件的 `failStep`）照写 `0`：调用抛错 ⇒ 一个字都没回来。
+   */
+  outputTextTokens?: number;
+  /**
+   * 输出 token 的**构成拆分·第二格**（2026-10-16 加，纯观测）：这一拍**工具入参 JSON**
+   * （`DsStreamResult.toolCalls[].arguments` 的全文，逐个累加）占的输出 token。
+   *
+   * **三者关系、口径、误差来源与实测逐字见上一条 {@link outputTextTokens}**——两格同一把尺
+   * （`estimateTokens`）、同一处写入（`runtime/agent-loop.ts` 的 `accountStep`），
+   * 在这里再抄一遍必然漂移。与它**一样是可选**：老日志没有它，`failStep` 照写 `0`。
+   */
+  outputToolArgTokens?: number;
+  /**
+   * 这一拍落在**计价的哪一档**（2026-10-16 加，纯观测）：`'peak'` = 高峰全价，`'off'` = 空闲半价。
+   *
+   * 判据 = **事件时间戳（`ts`）换算到北京时间的墙上钟**（`runtime/agent-loop.ts` 的 `priceTierOf`：
+   * 显式 +8 小时后再读 UTC 字段，**不读宿主时区**——`getHours()` 读的是本机时区，
+   * 换台机器或换个 TZ 环境变量就会得出另一个结论）：
+   *   · `'peak'`：**周一至周五 09:00–12:00 与 14:00–18:00**（左闭右开：09:00:00.000 起、
+   *     12:00:00.000 止；14:00:00.000 起、18:00:00.000 止）；
+   *   · `'off'`：**其余全部**——12:00–14:00 午间、18:00–次日 09:00、周六与周日整天。
+   *
+   * ⚠ **没有节假日日历 ⇒ 法定节假日会被误判成 `'peak'`**（调休上班的周六同理会被判成 `'off'`）：
+   * 本格**只按「周一至周五 + 时段」判定**，不含任何法定节假日表。**别假装它精确**——
+   * 节假日那几天的账要人工剔，或者先把日历接进来才谈得上准。这条既是"把活挪到空闲时段（半价）"
+   * 能不能验收的前提，也是它**现在已知的缺口**。
+   *
+   * **可选**：老日志没有它；时间戳解析不出来时**这一格不写**（判不出就不猜），
+   * 读的一侧请按"未知"处理，**不要默认成 `'off'`**（那等于把"不知道"读成"半价"）。
+   */
+  tier?: 'peak' | 'off';
   durationMs: number; retryCount: number;
   finishReason: 'completed' | 'max_output_tokens' | 'failed' | 'aborted';
   /**
@@ -966,6 +1115,17 @@ export interface InputClaimed extends EventEnvelope<'input/claimed', {
 
 export interface InputDeadLetter extends EventEnvelope<'input/dead-letter', {
   inputSeq: number; claimCount: number; lastError?: string;
+  /**
+   * 为什么进死信（2026-10-16 加，**可选**：老日志里整个没有这一格）。
+   *
+   *   · `claim-limit`       —— 认领次数到上限（`MAX_CLAIM_COUNT`），毒消息保护，原口径；
+   *   · `stopped-by-owner`  —— 用户在通道里发了 `/stop`，他要求停下来，队列里的输入被清场。
+   *
+   * 为什么要把它写进事件而不是只靠 `lastError` 那句话：这两类的**下一步动作完全不同**
+   * （前者要人去查"这条输入为什么必然失败"、或者丢弃；后者只是用户按了停止，随时可以重投），
+   * 而界面只能读字段、读不了自由文本。`lastError` 照旧是给人读的原话。
+   */
+  reason?: 'claim-limit' | 'stopped-by-owner';
 }> {}
 
 /**
@@ -1021,8 +1181,15 @@ export interface InputRequeued extends EventEnvelope<'input/requeued', {
  * 不是"用户按了个按钮"。GUI 侧同样不上屏（chat_page 的映射表里没有它）。
  */
 export interface SlashHandled extends EventEnvelope<'slash/handled', {
-  /** 认出来的指令种类；`unknown` = 打了斜杠但不在名单里（只回一句话，什么都不做） */
-  kind: 'compact' | 'handoff' | 'unknown';
+  /**
+   * 认出来的指令种类；`unknown` = 打了斜杠但不在名单里（只回一句话，什么都不做）；
+   * `stop` = 用户的急停（2026-10-16 加，见 `runtime/slash-commands.ts` 的 `STOP_RECEIPT`）。
+   *
+   * 为什么急停也走这一种事件而不是新开一种：它与那两条**逐字同形**——谁按了、按的是哪个词、
+   * 带了什么理由、结局是什么、回给用户的那句话是什么。多出一种事件 = 多一处要跟着改的读日志的
+   * 地方，而这三种指令在读日志的人眼里是同一件事：**人按了一个按钮，框架办了一件事、回了一句话**。
+   */
+  kind: 'compact' | 'handoff' | 'unknown' | 'stop';
   /** 打出来的那个词（`unknown` 时是被打错的词——回话要点名） */
   name: string;
   /** 指令后面跟的那句话（理由）；没有就是空串 */
@@ -1031,9 +1198,13 @@ export interface SlashHandled extends EventEnvelope<'slash/handled', {
    * 落地结果：
    *   · `compacted` —— 真的压了一次（同一批里紧随一条 `compaction/summary`）；
    *   · `empty`     —— 事件流里渲染不出条目，一个字都没改（不写空摘要）；
-   *   · `rejected`  —— 不认识的词，只回了一句话，什么都没做。
+   *   · `rejected`  —— 不认识的词，只回了一句话，什么都没做；
+   *   · `stopped`   —— `/stop`：**确实有活在跑**（流被掐了 / 队列里有输入被清进死信）；
+   *   · `idle`      —— `/stop` 时没有在跑的活、队列也空：**什么都没停**。
+   *     `stopped` 与 `idle` 分开是刻意的（幂等的落点）：界面据此说清"是停掉了什么"
+   *     还是"本来就没在跑"，而回执文案与日志说的是同一件事。
    */
-  outcome: 'compacted' | 'empty' | 'rejected';
+  outcome: 'compacted' | 'empty' | 'rejected' | 'stopped' | 'idle';
   /** 被消费掉的那条输入（`wake/manual` 的 seq）：把"他打了什么"与"我们怎么处理"对上 */
   inputSeq: number;
   /** 遮蔽点；只有 `compacted` 有，且与紧随其后的 `compaction/summary` 是同一个数 */
@@ -1659,6 +1830,70 @@ export interface McpIndexSnapshot {
 
 export interface McpIndex extends EventEnvelope<'mcp/index', McpIndexSnapshot> {}
 
+/**
+ * **技能常驻索引的快照**（internal；2026-10-11 加，与 `mcp/index` 同一套缓存保护）。
+ *
+ * ──────────────────────────── 它治的是什么 ────────────────────────────
+ *
+ * 技能 catalog 在此之前是**每 turn 现渲染**的（`real-loop` 的装配处直接问
+ * `SkillManager.catalogText()`）。它紧挨着 `instructions` / `tools` 两段常驻前缀——
+ * 也就是说：**批准装一个技能 / 删一个技能，下一轮请求的前缀就变了一次**，
+ * 从那一刻起整段历史都掉出 KV 缓存（本仓库实测口径 ≈9.6 万 token 一轮）。
+ *
+ * 用户这一轮的判据：「**skill 索引的进入和退出也要有类似 mcp 的进入和退出那样的缓存保护的机制**」。
+ * MCP 那一套（v46）的结论是三条：**索引放在稳定位置**（长期记忆层里紧挨着技能 catalog）、
+ * **字节冻结**（只在日志里那条快照上取）、**到重大变化点才归集**（压缩 / reset / 重启）。
+ * 这一格就是把技能索引搬进**同一个**机制：与 `mcp/index` 同形状、同一处写入点、
+ * 同一组触发点、同一个渲染位置（技能在前、MCP 紧随其后）。
+ *
+ * ──────────────────────────── 三处纪律（与 `mcp/index` 逐条同形） ────────────────────────────
+ *
+ * ① **`text` 是逐字节进请求的那段文字本身**（不是"再渲染一次的素材"）。空串 = 那一刻
+ *    一个可用技能都没有 ⇒ 渲染层**整段不出现**（`render` 的 `push('skills', …)` 只在非空时出现）。
+ * ② **`version` = 写下它时的 `RENDER_VERSION`**：模板换代 ⇒ 旧快照与当前模板不是同一把尺子
+ *    ⇒ 下一次同步当场重建，而不是拿旧字节去比新模板。
+ * ③ **append-only**：快照只增不改；`render` 取**最后一条**，于是"归集到正确位置"这件事
+ *    不需要回改任何历史——此前那些"尾部追加"（申请单结局的唤醒）在历史里逐字节不动。
+ *
+ * ─────────────────── 什么时候写（`real-loop.skillIndexSync`，唯一写入点） ───────────────────
+ *
+ * 与 `mcp/index` 的**同一组**判据：① 日志里还没有快照（首次 / 老日志 / 升级）；② 最后一条
+ * 快照的 `version` ≠ 当前 `RENDER_VERSION`；③ 最后一条快照的 seq **早于**最后一条
+ * `compaction/summary`（上下文重大变化 ⇒ 该归集了）。**"技能目录变了"刻意不是触发点**：
+ * 增删技能要走尾部追加（那条 `wake/manual{via:'grant'}` + 她自己 `safe_read` 正文），
+ * 到下一次归集才把那一行进到索引里——否则每加一个技能就改一次前缀，缓存保护等于没做。
+ *
+ * ⚠ **老日志没有这条事件**（这一版之前写下的轮次）：重建（`replay`）那时**不许**拿它去补，
+ * 必须退回当时那条来源（`skillCatalogForRebuild`：同一个 `SkillManager` + 到那一步为止的
+ * 信任事件）——否则"同一份日志重建同一份请求"这条承诺当场作废。
+ */
+export interface SkillIndexSnapshot {
+  /** 写下它时的 `RENDER_VERSION`（快照的度量衡，不是缓存版本号） */
+  version: string;
+  /** **逐字节进请求的那段文字**（`CATALOG_HEADER` + 每个技能一行；空串 = 整段不出现） */
+  text: string;
+  /**
+   * 那一刻进了索引的技能（审计与复盘用：事后要回答"当时索引里为什么有这一行"）。
+   *
+   * 与 `text` 分开存：文本是请求的一部分（逐字节），事实是给人查的（改了措辞不必动它）。
+   * `description` 存的是**截断之后真正进索引的那一句**（同一份字节，不是原文）。
+   */
+  skills: SkillIndexEntry[];
+}
+
+/** 一条进了索引的技能（见 [SkillIndexSnapshot.skills]） */
+export interface SkillIndexEntry {
+  name: string;
+  /** 进索引的那一句（已按单条 token 预算截断；不是 SKILL.md 的原文） */
+  description: string;
+  /** 这一条的估算 token（`SkillManager.catalog` 算的那一份） */
+  tokens: number;
+  /** 这一句是被截断过的吗（`true` 时原文更长，正文里才看得到） */
+  truncated?: boolean;
+}
+
+export interface SkillIndex extends EventEnvelope<'skill/index', SkillIndexSnapshot> {}
+
 export interface SkillInstalled extends EventEnvelope<'skill/installed', {
   name: string; path: string; by: 'agent' | 'human';
   /**
@@ -2198,7 +2433,7 @@ export interface RuntimeRestart extends EventEnvelope<'runtime/restart', {
 export type AppEvent =
   | SessionStart | SessionEnd
   | RuntimeRestart
-  | TurnStart | TurnEnd | StepStart | StepEnd
+  | TurnStart | TurnEnd | StepStart | StepEnd | StepReasoningProgress
   | UserMessage | AssistantMessage | ReasoningMessage | DeveloperMessage
   | ToolCall | ToolResult
   | WakeTimer | WakeFile | WakeWebhook | WakeManual | WakeHeartbeat | WakeIntention | WakeJob | WakeChannel
@@ -2211,7 +2446,7 @@ export type AppEvent =
   | SlashHandled
   | AlarmSent | ReviewResolved | SnapshotCheckpoint | CompactionSummary | CompactionDecision
   | PersonaUpdated | ConfigChanged | MemoryMaintained | MemorySelected | MemoryRead
-  | McpServerStarted | McpServerStopped | McpServerResource | McpIndex | SkillInstalled | HookFired | SpeakSent
+  | McpServerStarted | McpServerStopped | McpServerResource | McpIndex | SkillIndex | SkillInstalled | HookFired | SpeakSent
   | ToolsInventoryChanged
   | GrantRequested | GrantResolved
   | IntentionRaised | IntentionActed | TodoUpdated
@@ -2235,7 +2470,24 @@ export const EVENT_VISIBILITY: Record<string, Visibility> = {
   'runtime/restart': 'internal',
   'turn/start': 'internal', 'turn/end': 'internal',
   'step/start': 'internal', 'step/end': 'internal',
+  // 推理进度的实时读数（2026-10-17）：**刻意 internal，写在这里是让"这条线是有意画的"看得见**
+  // ——它只喂界面那一行「已想 X 字」，不是给她的输入（正文那条走 `message/reasoning`）。
+  // 理由与"为什么不必在 render 里再挡一遍"见 StepReasoningProgress 的注释。
+  'step/reasoning-progress': 'internal',
   'message/user': 'model', 'message/assistant': 'model', 'developer/message': 'model',
+  // **思维链：v68 起 model**（2026-10-17；这一格是整条修复的开关）。
+  // 为什么必须写出来：Responses API 的思考模式**强制要求回传 `reasoning_text`**，缺了整条请求 400
+  // （实测 23 条 `The reasoning_text in the thinking mode must be passed back to the API`）。
+  // 这条事件从 v1 起一直是 internal（渲染层那个 reasoning 分支因此**一次都没执行过**），
+  // 而它一直是 `internal` 时靠"每轮退输入 + `MAX_CLAIM_COUNT=3` 进死信"收场 ⇒ 一场风暴几十轮全灭。
+  // **帽子在渲染层，不在这里**：`model/render.ts` 的 `REASONING_ECHO_POLICY` 只回传最近 3 步、
+  // 单条正文 ≤ 20,000 字符（超了取尾部 + 一行说明）。单条最长见过 111,320 字符，而接口不支持
+  // `truncation` ⇒ 全量回传会把上下文顶爆、换来另一类 400。**那是安全阀，不是确认过的最优解**
+  // （服务端要求哪几轮、验不验正文完整性，都没实测——见 `render.ts` 的 v68 篇）。
+  // **老日志不改写**：已落库的那些 `visibility:'internal'` 照旧不进请求（`reasoningEchoOf` 只认
+  // model 可见），所以"同一份老日志重建出同一份请求"这条承诺没有因为这一格而作废。
+  // 它进 `input` ⇒ 与 v67 逐字节不可比 ⇒ **同批递增 `RENDER_VERSION` 67 → 68**。
+  'message/reasoning': 'model',
   'tool/call': 'model', 'tool/result': 'model',
   'wake/timer': 'model', 'wake/file': 'model', 'wake/webhook': 'model',
   'authz/denied': 'internal',
@@ -2286,6 +2538,12 @@ export const EVENT_VISIBILITY: Record<string, Visibility> = {
   // 一遍是事件自己的渲染），第二遍纯属常驻开销。写在这里而不是靠 defaultVisibility 兜底，
   // 是为了让"这条线是有意画的"看得见。
   'mcp/index': 'internal',
+  // 技能常驻索引的快照（2026-10-11）**刻意 internal，理由与上一条逐字同形**：
+  // 它是"这一版索引是什么"的凭据（复现与审计用），给她看的是 `render` 从这条事件里取出来的
+  // 那段文字（进长期记忆层，与 MCP 索引同段相邻）。写成 model 就等于同一段索引在她眼前出现
+  // 两遍，第二遍纯属常驻开销。写在这里而不是靠 defaultVisibility 兜底，是为了让"这条线是有意
+  // 画的"看得见——缓存保护的那条线（索引字节只在归集时改）正是靠它成立的。
+  'skill/index': 'internal',
   // 工具清单指纹的变化（2026-10-11，BUG-3）**同样刻意 internal**，理由与上面那条逐字同形：
   // 它是**装配账**（"这一刻进请求的清单是哪几件、比上次少了哪几件"），而清单本身已经作为
   // tools 段进了请求体——再把它作为一条事件渲染一遍，就是同一件事在她眼前出现两遍。

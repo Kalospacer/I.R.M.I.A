@@ -12,6 +12,7 @@
  */
 
 import type { SideEffect } from '../../log/types.ts';
+import type { TextEncoding } from '../../util/bytes-text.ts';
 import {
   errorResult,
   okResult,
@@ -105,6 +106,14 @@ export interface ProcessResult {
   failed: boolean;
   /** 超时被杀 */
   timedOut: boolean;
+  /**
+   * 这一次输出是**按什么编码解出来的**（可选：注入的替身可以不报）。
+   *
+   * 为什么必须带出来：`rg` / `es.exe` 的输出里可能有 GBK 文件内容（中文 Windows 的文本
+   * 文件十有八九是 cp936）。解码成功时 `lossy` 为 false，回执一个字都不多说；一旦有损，
+   * 调用方**必须**把"这份输出按 X 解、N 处无法映射"写进回执——不许装作没事。
+   */
+  decode?: { encoding: TextEncoding; replaced: number; lossy: boolean } | undefined;
 }
 
 export interface RunProcessOptions {

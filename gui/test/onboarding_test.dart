@@ -7,6 +7,11 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:irmia_gui/api.dart';
 import 'package:irmia_gui/app.dart';
+// 第 3 步那两把凭据的键名（与「消息适配器」页同一份）：断言里逐字对一次
+import 'package:irmia_gui/channel_keys.dart';
+// 蓝链的打开方式：用例把它换成只记账的假函数（不起真浏览器）
+import 'package:irmia_gui/external_link.dart';
+import 'package:irmia_gui/i18n/app_strings.dart';
 import 'package:irmia_gui/onboarding.dart';
 // 信任范围那一步的两档字面量与那个二选一控件都在设置页里（两处共用一份，见 TrustModeChoice）
 import 'package:irmia_gui/pages/settings_page.dart';
@@ -50,6 +55,16 @@ void main() {
   late Map<String, String> persona;
   late List<Map<String, dynamic>> posts;
 
+  /// 第 6 步读的那份依赖报告（`GET /api/deps`）：默认**四件都已就位**。
+  ///
+  /// 为什么默认全就位：本文件钉的是前五步各写哪条通道——第 6 步在这里只该"什么都不做"
+  /// （不摆勾选框、一个 dep-install 都不发）。"要装 / 装失败 / 重启窗口"那些形状在
+  /// `onboarding_deps_test.dart` 里逐条钉。
+  late Map<String, String> depStatus;
+
+  /// 蓝链点开时"系统浏览器"收到的地址（[externalUrlOpener] 的替身记在这里）
+  late List<String> openedUrls;
+
   /// 假服务是否拒绝写命令（用来钉住"失败留在原地、不静默丢"）
   bool failCommands = false;
 
@@ -67,6 +82,9 @@ void main() {
     HttpOverrides.global = null;
     failCommands = false;
     posts = [];
+    // 蓝链：只记地址，**不真起浏览器**（真要起的话每个用例都会给这台机器弹窗）
+    openedUrls = [];
+    externalUrlOpener = (url) async => openedUrls.add(url);
     config = {
       'models': {
         'heavy': {'model': 'deepseek-chat', 'baseUrl': 'https://api.deepseek.com'},
@@ -83,6 +101,7 @@ void main() {
       'light': {'configured': false, 'mask': null},
     };
     persona = {'IDENTITY.md': seedIdentity, 'CONSTITUTION.md': '<!-- SEED -->\n# 行为宪法\n'};
+    depStatus = {'pwsh': 'ready', 'rg': 'ready', 'es': 'ready', 'python': 'ready'};
 
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     server.listen((req) async {
@@ -138,6 +157,38 @@ void main() {
           'tokens': 0,
           'reserved': true,
         }));
+      } else if (path == '/api/deps') {
+        // 形状照 src/web/server.ts 的 depsView + src/deps/manager.ts 的 DepReportEntry
+        response.write(jsonEncode({
+          'available': true,
+          'dataDir': 'D:/irmia/data',
+          'toolsDir': 'D:/irmia/data/tools',
+          'needsAttention': depStatus.values.any((status) => status != 'ready'),
+          'generatedAt': '2026-10-20T00:00:00.000Z',
+          'entries': [
+            for (final entry in depStatus.entries)
+              {
+                'name': entry.key,
+                'label': entry.key,
+                'status': entry.value,
+                'path': entry.value == 'ready' ? 'C:/tools/${entry.key}.exe' : '',
+                'version': entry.value == 'ready' ? '1.2.3' : '',
+                'source': 'path',
+                'attempts': <String>[],
+                'reason': '',
+                'purpose': '',
+                'impact': '',
+                'action': entry.value == 'ready' ? null : 'install',
+                'installable': true,
+                'manualHint': null,
+                'downloadPage': null,
+                'minVersion': '7.0',
+                'managedDir': 'D:/irmia/data/tools/${entry.key}',
+                'pipVersion': null,
+                'pipReason': '',
+              },
+          ],
+        }));
       } else {
         response.statusCode = 404;
         response.write(jsonEncode({'error': {'message': '接口不存在'}}));
@@ -148,6 +199,7 @@ void main() {
   });
 
   tearDown(() async {
+    externalUrlOpener = openUrlInSystemBrowser; // 替身用完还回去，别漏给后面的用例
     state.dispose();
     await server.close(force: true);
   });
@@ -393,8 +445,8 @@ void main() {
     });
   });
 
-  group('四步走完', () {
-    testWidgets('首次启动：四步各写对各条通道，并落盘"不再弹"', (tester) async {
+  group('六步走完', () {
+    testWidgets('首次启动：六步各写对各条通道，并落盘"不再弹"', (tester) async {
       useStateFile('onboarding-e2e');
 
       await pumpHost(tester);
@@ -430,16 +482,26 @@ void main() {
       expect(state.herName, '小七', reason: '窗口标题 / 侧栏 / 托盘读的就是它');
       await pumpUntil(tester, find.text('API 配置').first);
 
-      // ── 第 2 步：API 配置（模型名与端点与默认值一致 = 不写 config，只写密钥） ──
+      // ── 第 2 步：API 配置（模型名默认 deepseek-flash；端点没改 ⇒ 只有模型那一项要写） ──
       expect(find.text(keysRequiredNote), findsNothing, reason: '还没点继续，不该先报缺密钥');
       final fields = find.byType(TextField);
+      expect(
+        tester.widget<TextField>(fields.at(0)).controller!.text,
+        kDefaultModelName,
+        reason: '第一次进这一步，模型名预填 deepseek-flash（不空着，也不填后端出厂那个 deepseek-chat）',
+      );
       await tester.enterText(fields.at(2), 'sk-test-key');
       await tester.pump();
       await tapPrimary(tester);
 
       expect(postFor('/api/commands/set-key')['body'], {'name': 'heavy', 'value': 'sk-test-key'});
       expect(postFor('/api/commands/set-key')['confirm'], 'set-key');
-      expect(postsOf('/api/commands/config-update'), 0, reason: '模型名与端点没改就不该写 config');
+      // 预填的就是这一格的值：盘上还是后端出厂默认（deepseek-chat）⇒ 点「继续」时写一次。
+      // 端点一个字节都没动，所以 fields 里没有 baseUrl。
+      expect(postFor('/api/commands/config-update')['body'], {
+        'fields': {'models.heavy.model': kDefaultModelName},
+      });
+      expect(postFor('/api/commands/config-update')['confirm'], 'config-update');
 
       // ── 第 3 步：消息适配器 ──
       await pumpUntil(tester, find.text('QQ 官方 Bot API'));
@@ -447,10 +509,10 @@ void main() {
       await tester.pump();
       await tapPrimary(tester);
 
-      expect(postFor('/api/commands/config-update')['body'], {
+      expect(lastPostFor('/api/commands/config-update')['body'], {
         'fields': {'channels.qqOfficial.enabled': true},
       });
-      expect(postFor('/api/commands/config-update')['confirm'], 'config-update');
+      expect(lastPostFor('/api/commands/config-update')['confirm'], 'config-update');
 
       // ── 第 4 步：人格（清掉模板，写一份真的） ──
       await pumpUntil(tester, find.text('人格').first);
@@ -481,12 +543,21 @@ void main() {
       expect(find.text('她能读写整台电脑上的文件、也能在任意目录跑命令。'), findsOneWidget);
       expect(find.textContaining('她只能在'), findsOneWidget,
           reason: '两种选择各一句后果说明（只限工作目录那句要把路径念出来）');
-      expect(postsOf('/api/commands/config-update'), 1,
-          reason: '还没点完成：到这一步为止只写过通道开关那一次');
+      expect(postsOf('/api/commands/config-update'), 2,
+          reason: '到这一步为止写过两次：第 2 步的模型名（默认 deepseek-flash）+ 第 3 步的通道开关');
+      await tapPrimary(tester); // 「继续」→ 第 6 步（外部依赖）
+
+      expect(postsOf('/api/commands/config-update'), 2,
+          reason: '信任范围与盘上那份一致（都是默认的 full）→ 一个字节都不写');
+
+      // ── 第 6 步：外部依赖（四件都已就位 ⇒ 不摆勾选框，一个 dep-install 都不发） ──
+      await pumpUntil(tester, find.text(const ZhStrings().onboardingStepDepsTitle).first);
+      expect(find.text(const ZhStrings().onboardingDepsAllReady), findsOneWidget,
+          reason: '四件都就位时说清"直接点完成"，不摆一个按不动的勾选框');
+      expect(find.byKey(const ValueKey('onboarding-deps-install')), findsNothing);
       await tapPrimary(tester); // 「完成」
 
-      expect(postsOf('/api/commands/config-update'), 1,
-          reason: '信任范围与盘上那份一致（都是默认的 full）→ 一个字节都不写');
+      expect(postsOf('/api/commands/dep-install'), 0, reason: '都已就位 ⇒ 一次安装都不该发');
       expect(find.text(kOnboardingTitle), findsNothing, reason: '完成之后卡片应关掉');
 
       // 「不再弹」是落盘的，不是内存里记了一笔
@@ -561,6 +632,12 @@ void main() {
 
       // 卡头上的关闭键与「以后再说」是同一条路：结算当前这步，再退出
       await tapAndSettle(tester, find.byTooltip(kOnboardingCloseLabel));
+      // 关闭 = 把还没结算的几步补写完：除了名字那两条，第 2 步的模型名也要落盘
+      // （预填的 deepseek-flash 与盘上的出厂值不同），多一个真往返 ⇒ 再放几轮真实 I/O
+      for (var i = 0; i < 12; i++) {
+        await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 25)));
+        await tester.pump();
+      }
       await tester.pump(const Duration(milliseconds: 300));
 
       expect(find.text(kOnboardingTitle), findsNothing);
@@ -644,7 +721,7 @@ void main() {
       await pumpHost(tester);
       await expectCardShown(tester);
 
-      // 前四步一路往前走（不填、不改）：这一条只看最后那一屏。
+      // 前四步一路往前走（不填、不改）：这一条只看信任范围那一屏（第 5 步）。
       // 第 1~3 步走卡脚的「跳过这一步」（真的一个字都不写），第 4 步走主按钮
       // ——**不能一直按「跳过」**：它在最后一步上等价于「完成」，会把卡直接关掉。
       for (var i = 0; i < 3; i++) {
@@ -669,16 +746,23 @@ void main() {
       await tester.pump();
       expect(trustChoiceSelected(tester, kTrustWorkspace), isTrue, reason: '点哪一档就选哪一档');
       expect(trustChoiceSelected(tester, kTrustFull), isFalse);
-      await tapPrimary(tester); // 「完成」→ 结算这一步
+      await tapPrimary(tester); // 「继续」→ 结算信任范围，走到第 6 步（外部依赖）
 
-      expect(postFor('/api/commands/config-update')['body'], {
+      expect(lastPostFor('/api/commands/config-update')['body'], {
         'fields': {'trust.mode': 'workspace'},
       });
       // 改 `trust.mode` 的 `X-Confirm` 必须**同时**含两个短语：命令短语（声明性）+
       // 字段短语 `trust-full-access`（服务端 DANGEROUS_FIELDS 真的在校验它，两个方向都要）。
       // 少了那半截，这一步会吃 400——引导走不到底，而人只会看到一句"信任范围没写进去"。
-      expect(postFor('/api/commands/config-update')['confirm'], kTrustConfirm);
-      expect(postFor('/api/commands/config-update')['confirm'], contains('trust-full-access'));
+      expect(lastPostFor('/api/commands/config-update')['confirm'], kTrustConfirm);
+      expect(lastPostFor('/api/commands/config-update')['confirm'], contains('trust-full-access'));
+
+      // 第 6 步（外部依赖）：四件都已就位 ⇒ 不摆勾选框、一个 dep-install 都不发
+      await pumpUntil(tester, find.text(const ZhStrings().onboardingStepDepsTitle).first);
+      expect(find.text(const ZhStrings().onboardingDepsAllReady), findsOneWidget);
+      await tapPrimary(tester); // 「完成」
+
+      expect(postsOf('/api/commands/dep-install'), 0);
       expect(find.text(kOnboardingTitle), findsNothing, reason: '完成之后卡片应关掉');
       await closeOut(tester);
     });
@@ -730,6 +814,197 @@ void main() {
       await pumpHost(tester);
       await expectNoCard(tester);
       await closeOut(tester);
+    });
+  });
+
+  /// 用户 2026-10-18 提的四条（第 2/3/4 步）。
+  ///
+  /// ① 第 2 步模型名默认 `deepseek-flash`；
+  /// ② 第 2 步那段"密钥只写不读…"的解释删掉，换成推荐语 + 两个蓝链（点了开浏览器）；
+  /// ③ 第 3 步一句推荐 + 蓝链到 QQ 开放平台，并且**首次就能填** AppID / AppSecret
+  ///    （落盘走「消息适配器」页同一条 set-key）；
+  /// ④ 第 4 步那段长解释压成两三句，字数要有上界。
+  group('2026-10-18 用户的四条意见（第 2/3/4 步）', () {
+    test('① 模型名的默认值：出厂默认与空值都给 deepseek-flash，人选过的原样回填', () {
+      expect(kDefaultModelName, 'deepseek-flash');
+      expect(initialOnboardingModel(''), kDefaultModelName);
+      expect(
+        initialOnboardingModel('deepseek-chat'),
+        kDefaultModelName,
+        reason: '后端出厂值 deepseek-chat = 没人选过模型，这一格要显示推荐值',
+      );
+      expect(initialOnboardingModel('deepseek-flash'), kDefaultModelName);
+      expect(
+        initialOnboardingModel('my-own-model'),
+        'my-own-model',
+        reason: '人自己选过的模型不许被推荐值盖掉',
+      );
+    });
+
+    testWidgets('① 第 2 步一进来，模型名那格预填的就是 deepseek-flash', (tester) async {
+      // 假服务的模型名是后端出厂值 deepseek-chat（= 没人选过），正是"首次进入"的形状
+      useStateFile('onboarding-model-default');
+      await pumpHost(tester);
+      await expectCardShown(tester);
+
+      await tapAndSettle(tester, find.text(kOnboardingSkipLabel)); // 第 1 步：跳过 → 第 2 步
+      await pumpUntil(tester, find.byType(TextField));
+      final model = tester.widget<TextField>(find.byType(TextField).first);
+      expect(model.controller!.text, kDefaultModelName);
+      expect(
+        model.controller!.text,
+        'deepseek-flash',
+        reason: '用户 ①：首次进入时这一格预填的就是它，别空着、别填别的',
+      );
+      await closeOut(tester);
+    });
+
+    testWidgets('② 第 2 步两个蓝链：点了会发起打开，地址逐字对得上', (tester) async {
+      useStateFile('onboarding-links');
+      await pumpHost(tester);
+      await expectCardShown(tester);
+      await tapAndSettle(tester, find.text(kOnboardingSkipLabel)); // 第 1 步：跳过 → 第 2 步
+
+      // 用户 ②：那段"密钥只写不读…"的解释删掉了
+      expect(find.textContaining('密钥只写不读'), findsNothing);
+      expect(find.textContaining('轻量那条 lane'), findsNothing);
+
+      final modelLink = find.byKey(const ValueKey('onboarding-link-deepseek-model'));
+      final signupLink = find.byKey(const ValueKey('onboarding-link-deepseek-signup'));
+      await pumpUntil(tester, modelLink);
+      expect(signupLink, findsOneWidget, reason: '两段话里各有一颗蓝链');
+      expect(find.text(const ZhStrings().onboardingApiRecommendLead), findsOneWidget);
+      expect(find.text(const ZhStrings().onboardingApiRecommendModel), findsOneWidget);
+      expect(find.text(const ZhStrings().onboardingApiRegisterKey), findsOneWidget);
+
+      await tester.ensureVisible(modelLink);
+      await tester.pump();
+      await tester.tap(modelLink);
+      await tester.pump();
+      await tester.ensureVisible(signupLink);
+      await tester.pump();
+      await tester.tap(signupLink);
+      await tester.pump();
+
+      expect(
+        openedUrls,
+        <String>[kDeepSeekPlatformUrl, kDeepSeekSignupUrl],
+        reason: '点了哪颗就打开哪个地址（用可注入的 opener 断言，不真起浏览器）',
+      );
+      expect(kDeepSeekPlatformUrl, 'https://platform.deepseek.com/');
+      expect(kDeepSeekSignupUrl, 'https://platform.deepseek.com/sign_up');
+      await closeOut(tester);
+    });
+
+    testWidgets('③ 第 3 步推荐语里那颗蓝链指向 QQ 开放平台', (tester) async {
+      useStateFile('onboarding-qq-link');
+      await pumpHost(tester);
+      await expectCardShown(tester);
+      await tapAndSettle(tester, find.text(kOnboardingSkipLabel)); // 第 1 步
+      await tapAndSettle(tester, find.text(kOnboardingSkipLabel)); // 第 2 步 → 第 3 步
+
+      final link = find.byKey(const ValueKey('onboarding-link-qq-open-platform'));
+      await pumpUntil(tester, link);
+      expect(find.text(const ZhStrings().onboardingChannelRecommendQq), findsOneWidget);
+      await tester.ensureVisible(link);
+      await tester.pump();
+      await tester.tap(link);
+      await tester.pump();
+      expect(openedUrls, <String>[kQqOpenPlatformUrl]);
+      expect(kQqOpenPlatformUrl, 'https://q.qq.com/');
+      await closeOut(tester);
+    });
+
+    testWidgets('③ 第 3 步就地填 AppID / AppSecret：提交走「消息适配器」同一条 set-key', (tester) async {
+      useStateFile('onboarding-qq-credentials');
+      await pumpHost(tester);
+      await expectCardShown(tester);
+      await tapAndSettle(tester, find.text(kOnboardingSkipLabel)); // 第 1 步
+      await tapAndSettle(tester, find.text(kOnboardingSkipLabel)); // 第 2 步 → 第 3 步
+
+      final appId = find.byKey(const ValueKey('onboarding-qq-appid'));
+      final appSecret = find.byKey(const ValueKey('onboarding-qq-appsecret'));
+      await pumpUntil(tester, appId);
+      expect(appSecret, findsOneWidget, reason: '用户 ④：两把凭据首次就在这一页填');
+      // 两格都是密钥框（掩码）
+      expect(tester.widget<TextField>(appId).obscureText, isTrue);
+      expect(tester.widget<TextField>(appSecret).obscureText, isTrue);
+
+      await tester.enterText(appId, '10240001');
+      await tester.pump();
+      expect(
+        tester.widget<Checkbox>(find.byType(Checkbox).first).value,
+        isFalse,
+        reason: '只填了一把还不算填完（两把齐备才自动勾上）',
+      );
+      await tester.enterText(appSecret, 's3cr3t-value');
+      await tester.pump();
+      expect(
+        tester.widget<Checkbox>(find.byType(Checkbox).first).value,
+        isTrue,
+        reason: '两把都填了 ⇒ 自动勾上 QQ 官方 Bot（填完还要人再勾一下，那一步谁都漏）',
+      );
+
+      await tapPrimary(tester); // 继续 → 第 4 步（这一步结算时落盘）
+
+      // 落盘走的是「消息适配器」页那同一条 set-key、同一对键名（这里是逐字断言，
+      // 与 channels_page 的 _qqSecrets 是同一个来源：channel_keys.dart）
+      expect(kQqAppIdKey, 'qqAppId');
+      expect(kQqAppSecretKey, 'qqClientSecret');
+      final setKeys = posts.where((entry) => entry['path'] == '/api/commands/set-key').toList();
+      expect(setKeys, hasLength(2), reason: '两把凭据各写一条，走的是 set-key 不是 config-update');
+      expect(setKeys[0]['body'], {'name': 'qqAppId', 'value': '10240001'});
+      expect(setKeys[1]['body'], {'name': 'qqClientSecret', 'value': 's3cr3t-value'});
+      for (final entry in setKeys) {
+        expect(entry['confirm'], 'set-key', reason: '与设置页同一条命令、同一个确认短语');
+      }
+      expect(lastPostFor('/api/commands/config-update')['body'], {
+        'fields': {'channels.qqOfficial.enabled': true},
+      }, reason: '开关也一并写进去（填完凭据就自动勾上了）');
+      await closeOut(tester);
+    });
+
+    testWidgets('③ 已经配置过的凭据不回显：框是空的，只摆服务端给的掩码', (tester) async {
+      keys[kQqAppIdKey] = {'configured': true, 'mask': 'qq1…9f3c'};
+      useStateFile('onboarding-qq-masked');
+      await pumpHost(tester);
+      await expectCardShown(tester);
+      await tapAndSettle(tester, find.text(kOnboardingSkipLabel)); // 第 1 步
+      await tapAndSettle(tester, find.text(kOnboardingSkipLabel)); // 第 2 步 → 第 3 步
+
+      final appId = find.byKey(const ValueKey('onboarding-qq-appid'));
+      await pumpUntil(tester, appId);
+      expect(
+        tester.widget<TextField>(appId).controller!.text,
+        isEmpty,
+        reason: '密钥只写不读：已有的值一个字节都不回显',
+      );
+      expect(find.text(const ZhStrings().onboardingSecretConfigured('qq1…9f3c')), findsOneWidget);
+      // 没配过的那把：占位提示是"它是干什么的"
+      expect(find.text(const ZhStrings().onboardingQqAppSecretHint), findsOneWidget);
+      await closeOut(tester);
+    });
+
+    test('④ 第 4 步的说明压成三句：字数有上界（原来 173 字）', () {
+      const beforeChars = 173;
+      final after = const ZhStrings().onboardingPersonaHint;
+      expect(after.length, lessThanOrEqualTo(88), reason: '现在 80 字：上界钉 88，谁再加回来会红');
+      expect(after.length, lessThan(beforeChars), reason: '比原来短');
+      expect(
+        after.length * 2,
+        lessThan(beforeChars),
+        reason: '用户要的是"精简"：不到原来的一半才算明显变少',
+      );
+      // 四条关键信息一条都不许丢（压的是措辞，不是事实）
+      expect(after, contains('替换整份文件'));
+      expect(after, contains('快照'), reason: '服务端留旧版快照、可回滚');
+      expect(after, contains('留空或没改动就不写'));
+      expect(after, contains('「名字：」'), reason: '第一步那行名字别删');
+      // 英文那份同样不许比中文长太多（en 没有 CJK，长度按字符算）
+      final en = const EnStrings().onboardingPersonaHint;
+      expect(en.trim(), isNotEmpty);
+      expect(RegExp(r'[\u4e00-\u9fff]').hasMatch(en.replaceAll('名字：', '')), isFalse,
+          reason: '英文那份里除了 IDENTITY.md 那行标记，不该有别的汉字');
     });
   });
 }

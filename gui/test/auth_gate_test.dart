@@ -796,6 +796,30 @@ Future<void> _pumpGate(WidgetTester tester, AppState state) async {
 class _FakeApi extends IrmiaApi {
   _FakeApi() : super(baseUrl: 'http://127.0.0.1:7788');
 
+  /// 事件流（`GET /api/events/stream`）：接上就推一条**与 turn 无关**的帧，然后一直挂着。
+  ///
+  /// 为什么要推一条而不是给空流：这条链路的"活没活过"是界面那一侧的一个真读数
+  /// （`_eventsLive`），而它决定心跳走快档还是宽限档——空流既不结束也不来事件的话，
+  /// 界面只会当你"还没接上"，读数就不是真机上那个节奏了。
+  /// 挑 `session/start`（框架自己的簿记事件）：它不是 turn 信号，不会另外触发一次重读，
+  /// 于是这一条用例量到的仍旧是**心跳**的节拍，不是事件驱动的重读。
+  ///
+  /// 为什么也不给 `Stream.empty()`：它会立刻 `onDone`，而界面把"流结束了"当成链路断了
+  /// ⇒ 挂一条 3 秒的重连定时器 ⇒ 假时钟下的心跳读数里混进了那些重连（实测 30 秒里
+  /// 从 3 拍变 7 拍）。真机上这条流本来也不该自己结束（SSE 断了是异常，不是正常收尾）。
+  @override
+  Stream<Map<String, dynamic>> events({int? lastEventId}) {
+    final controller = StreamController<Map<String, dynamic>>();
+    controller.onListen = () {
+      scheduleMicrotask(() {
+        if (!controller.isClosed) {
+          controller.add(<String, dynamic>{'type': 'session/start', 'seq': 0, 'data': const {}});
+        }
+      });
+    };
+    return controller.stream;
+  }
+
   /// 路径 → 要抛的认证错误（模拟 401）
   final Map<String, ApiAuthError> getErrors = {};
   /// 路径 → 认证端点的成功响应
